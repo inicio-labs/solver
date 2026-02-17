@@ -1,0 +1,17 @@
+[rpc]
+endpoint = "https://rpc.testnet.miden.io"
+timeout_ms = 10000
+
+[solver]
+account_id = "0x0000000000000000"
+keystore_path = "./keystore"
+store_path = "./store.sqlite3"
+
+[engine]
+pulse_interval_ms = 5000
+fetch_interval_ms = 3000
+
+[[pairs]]
+name = "USDT-ETH"
+asset_x_faucet_id = "0x0000000000000000"
+asset_y_faucet_id = "0x0000000000000000"

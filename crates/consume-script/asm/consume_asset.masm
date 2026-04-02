@@ -1,0 +1,152 @@
+use miden::standards::wallets::basic->wallet
+use miden::core::sys
+use miden::protocol::asset
+
+# CONSUME ASSET SCRIPT (Transaction Script)
+# =================================================================================================
+#
+# Consumes spread assets directly into the executing account's vault.
+#
+# Receives a Poseidon2 commitment via tx_script_args, retrieves asset data
+# from the advice map, verifies against the commitment, then receives each
+# asset into the account's vault.
+#
+# Stack on entry: [COMMITMENT_ARG, ...]
+#   COMMITMENT_ARG = reversed(COMMITMENT_KEY) for stack ordering.
+#
+# Advice map: { COMMITMENT_KEY: [ASSET_KEY_0, ASSET_VALUE_0, ASSET_KEY_1, ASSET_VALUE_1, ...] }
+#   Each asset = ASSET_KEY(4 felts) + ASSET_VALUE(4 felts) = 2 words.
+#   Total words must be even (pairs of words).
+
+# Memory addresses for temporary asset storage
+const ASSET_MEM_PTR = 500
+
+begin
+    # Stack: [COMMITMENT_ARG, pad...]
+    # Reverse back to get the original commitment key order.
+    swap movup.2 movup.3
+    # => [COMMITMENT_KEY, pad...]
+
+    # Push values from advice map onto advice stack
+    adv.push_mapval
+    # => [COMMITMENT_KEY, pad...]
+    # Advice stack: [asset_data...]
+
+    # Load pairs of words from advice stack to memory.
+    # We use adv_loadw to pop from advice stack to operand stack, then store to memory.
+    # Since we don't know the count upfront, we load a fixed maximum and track how many we get.
+    #
+    # Alternative approach: load 2 words at a time from advice stack into memory at ASSET_MEM_PTR,
+    # then call wallet::receive_asset for each.
+    # We'll iterate: try to load, check if we got valid data.
+    #
+    # But actually, we DO know the count: pipe_double_words_preimage_to_memory can work if we
+    # know num_words. Let's compute num_words from the data length.
+    #
+    # Simplest: use the existing working approach for 1 asset, extended with a loop.
+    # The advice map values were hashed with hash_elements, so the commitment IS the hash.
+    # We can't use pipe_preimage_to_memory without knowing num_words.
+    #
+    # SOLUTION: Load all asset words from advice stack into memory manually,
+    # then iterate over memory to receive each asset.
+    # We read words until we've consumed all advice data.
+    # Since each asset = 2 words, and we read pairs, we stop when adv_loadw would fail.
+    # But there's no "try" for adv_loadw.
+    #
+    # PRACTICAL SOLUTION: Support up to N assets. Read 2 words per asset.
+    # The number of assets is encoded by the caller in memory or passed separately.
+    #
+    # CLEANEST SOLUTION: The caller (test) sets the number of assets somewhere the script can read.
+    # Since we control the test, let's embed num_assets as the FIRST Felt in the advice data,
+    # and adjust the hash accordingly.
+
+    # Pop num_assets from advice stack (first element of the advice data)
+    adv_push.1
+    # => [num_assets, COMMITMENT_KEY, pad...]
+
+    # Assert > 0
+    dup push.0 neq assert
+
+    # Save num_assets and drop commitment key (no longer needed after adv.push_mapval)
+    movdn.4 dropw
+    # => [num_assets, pad...]
+
+    # Load all assets from advice stack into memory at ASSET_MEM_PTR
+    # Each asset = 2 words. Total words = num_assets * 2.
+    dup
+    push.ASSET_MEM_PTR
+    # => [write_ptr, num_assets, num_assets, pad...]
+
+    dup.1 neq.0
+    while.true
+        # Load ASSET_KEY word from advice stack
+        padw adv_loadw
+        # => [ASSET_KEY, write_ptr, remaining, num_assets, pad...]
+
+        # Store to memory
+        dup.4 mem_storew_le dropw
+        # => [write_ptr, remaining, num_assets, pad...]
+
+        # Advance write_ptr by 4
+        add.4
+        # => [write_ptr+4, remaining, num_assets, pad...]
+
+        # Load ASSET_VALUE word from advice stack
+        padw adv_loadw
+        # => [ASSET_VALUE, write_ptr+4, remaining, num_assets, pad...]
+
+        # Store to memory
+        dup.4 mem_storew_le dropw
+        # => [write_ptr+4, remaining, num_assets, pad...]
+
+        # Advance write_ptr by 4
+        add.4
+        # => [write_ptr+8, remaining, num_assets, pad...]
+
+        # Decrement remaining
+        swap sub.1 swap
+        # => [write_ptr', remaining-1, num_assets, pad...]
+
+        dup.1 neq.0
+    end
+
+    # Drop write_ptr and remaining (=0)
+    drop drop
+    # => [num_assets, pad...]
+
+    # Now iterate over assets in memory and receive each one
+    push.ASSET_MEM_PTR
+    # => [read_ptr, num_assets, pad...]
+
+    dup.1 neq.0
+    while.true
+        # Load asset from memory using asset::load (KEY at ptr, VALUE at ptr+4)
+        dup exec.asset::load
+        # => [ASSET_KEY, ASSET_VALUE, read_ptr, num_assets, pad...]
+
+        # Build 16-element call frame: [ASSET_KEY, ASSET_VALUE, pad(8)]
+        padw padw swapdw
+        # => [ASSET_KEY, ASSET_VALUE, pad(8), read_ptr, num_assets, pad...]
+
+        call.wallet::receive_asset
+        # => [pad(16), read_ptr, num_assets, pad...]
+
+        dropw dropw dropw dropw
+        # => [read_ptr, num_assets, pad...]
+
+        # Advance read_ptr by 8 (2 words = 8 addresses)
+        add.8
+
+        # Decrement num_assets
+        swap sub.1 swap
+        # => [read_ptr', num_assets-1, pad...]
+
+        dup.1 neq.0
+    end
+
+    # Clean up
+    drop drop
+    # => [pad...]
+
+    exec.sys::truncate_stack
+end

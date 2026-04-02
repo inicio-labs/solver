@@ -1,21 +1,46 @@
+[workspace]
+members = ["crates/solver", "crates/matching-engine", "crates/consume-script"]
+
 [package]
-name = "solver"
+name = "solver-bin"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+client = ["solver/client", "miden-client", "miden-client-sqlite-store"]
+
 [dependencies]
-miden-swapp = { path = "../miden-swapp" }
-miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"] }
-miden-client-sqlite-store = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", package = "miden-client-sqlite-store" }
-miden-protocol = { version = "0.13", default-features = false, features = ["testing"] }
-miden-standards = "0.13"
-miden-core = "0.20"
-miden-crypto = "0.19"
+solver = { path = "crates/solver" }
+miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
+miden-client-sqlite-store = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", package = "miden-client-sqlite-store", optional = true }
+miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol", default-features = false, features = ["testing"] }
+miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
+miden-core = "0.22"
+miden-crypto = "0.23"
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "fs"] }
 rand = "0.9"
 anyhow = "1.0"
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+
+[[bin]]
+name = "setup"
+path = "scripts/setup.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "solver_runner"
+path = "scripts/solver_runner.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "swap_activity"
+path = "scripts/swap_activity.rs"
+required-features = ["client"]
 
 [dev-dependencies]
-miden-testing = "0.13"
+consume-script = { path = "crates/consume-script" }
+miden-testing = { path = "/Users/vaibhavjindal/protocol/crates/miden-testing" }

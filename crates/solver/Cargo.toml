@@ -1,0 +1,23 @@
+[package]
+name = "solver"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+client = ["miden-client"]
+
+[dependencies]
+consume-script = { path = "../consume-script" }
+miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
+miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol", default-features = false, features = ["testing"] }
+miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
+miden-core = "0.22"
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["macros", "time", "sync"] }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+miden-crypto = "0.23"

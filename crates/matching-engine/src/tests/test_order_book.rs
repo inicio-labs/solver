@@ -1,6 +1,6 @@
 use crate::order_book::OrderBook;
 use crate::price_feed::SimpleMapFeed;
-use super::{eth, usdc};
+use super::{eth, usdc, NoteIdGen};
 
 fn make_feed() -> SimpleMapFeed {
     let mut feed = SimpleMapFeed::new();
@@ -13,8 +13,8 @@ fn make_feed() -> SimpleMapFeed {
 fn add_order_at_oracle() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    let id = book.add_user_order(usdc(), eth(), 2000, 1);
-    assert!(id.is_some());
+    let mut gen = NoteIdGen::new();
+    assert!(book.add_user_order(gen.next(), usdc(), eth(), 2000, 1));
     assert_eq!(book.active_order_count(), 1);
 }
 
@@ -22,27 +22,28 @@ fn add_order_at_oracle() {
 fn add_order_below_oracle() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    // Offer 3000 USDC, request 1 ETH — offering more than oracle → accepted
-    let id = book.add_user_order(usdc(), eth(), 3000, 1);
-    assert!(id.is_some());
+    let mut gen = NoteIdGen::new();
+    // Offer 3000 USDC, request 1 ETH -- offering more than oracle -> accepted
+    assert!(book.add_user_order(gen.next(), usdc(), eth(), 3000, 1));
 }
 
 #[test]
 fn reject_order_above_oracle() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    // Offer 1900 USDC, request 1 ETH — offering less than oracle → rejected
-    let id = book.add_user_order(usdc(), eth(), 1900, 1);
-    assert!(id.is_none());
+    let mut gen = NoteIdGen::new();
+    // Offer 1900 USDC, request 1 ETH -- offering less than oracle -> rejected
+    assert!(!book.add_user_order(gen.next(), usdc(), eth(), 1900, 1));
 }
 
 #[test]
 fn best_order_returns_cheapest() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    book.add_user_order(usdc(), eth(), 2000, 1); // rate 1/2000
-    book.add_user_order(usdc(), eth(), 3000, 1); // rate 1/3000 — cheaper
-    book.add_user_order(usdc(), eth(), 2500, 1); // rate 1/2500
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1); // rate 1/2000
+    book.add_user_order(gen.next(), usdc(), eth(), 3000, 1); // rate 1/3000 -- cheaper
+    book.add_user_order(gen.next(), usdc(), eth(), 2500, 1); // rate 1/2500
 
     let best = book.best_order(usdc(), eth()).unwrap();
     assert_eq!(best.offered, 3000, "most generous order should be 3000:1");
@@ -52,9 +53,10 @@ fn best_order_returns_cheapest() {
 fn best_order_returns_best_rate() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    book.add_user_order(eth(), usdc(), 1, 1600); // rate 1600
-    book.add_user_order(eth(), usdc(), 1, 1800); // rate 1800
-    book.add_user_order(eth(), usdc(), 1, 1500); // rate 1500 — best (lowest rate = most generous)
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600); // rate 1600
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1800); // rate 1800
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1500); // rate 1500 -- best (lowest rate = most generous)
 
     let best = book.best_order(eth(), usdc()).unwrap();
     assert_eq!(best.requested, 1500, "best order should have lowest rate (1500)");
@@ -64,9 +66,11 @@ fn best_order_returns_best_rate() {
 fn best_order_skips_inactive() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    let id = book.add_user_order(usdc(), eth(), 2000, 1).unwrap();
-    book.orders[id as usize].full_fill();
-    book.add_user_order(usdc(), eth(), 3000, 1);
+    let mut gen = NoteIdGen::new();
+    let id = gen.next();
+    assert!(book.add_user_order(id, usdc(), eth(), 2000, 1));
+    book.orders.get_mut(&id).unwrap().full_fill();
+    book.add_user_order(gen.next(), usdc(), eth(), 3000, 1);
 
     let best = book.best_order(usdc(), eth()).unwrap();
     assert_eq!(best.offered, 3000);
@@ -76,8 +80,10 @@ fn best_order_skips_inactive() {
 fn cleanup_removes_inactive() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    let id = book.add_user_order(usdc(), eth(), 2000, 1).unwrap();
-    book.orders[id as usize].full_fill();
+    let mut gen = NoteIdGen::new();
+    let id = gen.next();
+    assert!(book.add_user_order(id, usdc(), eth(), 2000, 1));
+    book.orders.get_mut(&id).unwrap().full_fill();
     book.cleanup_order(id);
     assert_eq!(book.active_order_count(), 0);
 }

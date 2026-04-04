@@ -7,16 +7,16 @@ use crate::engine::MatchingEngine;
 use crate::order_book::OrderBook;
 use crate::price_feed::{PriceFeed, SimpleMapFeed};
 use crate::types::*;
-use super::{eth, usdc, sol, btc, matic};
+use super::{eth, usdc, sol, btc, matic, NoteIdGen, make_note_id};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     *seed >> 33
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 1. PRECISION / ROUNDING
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// offered_for and requested_for should round-trip consistently.
 /// offered_for(requested_for(x)) >= x would mean rounding favors the order (bad).
@@ -30,7 +30,7 @@ fn round_trip_offered_requested_consistency() {
         let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
         let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
         let order = Order {
-            id: 0, offered_token: eth(), requested_token: usdc(),
+            id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
         };
 
@@ -62,7 +62,7 @@ fn round_trip_offered_requested_consistency() {
 fn precision_factor_boundary() {
     // Order with extreme ratio: 1 unit offered for 200_000 requested
     let order = Order {
-        id: 0, offered_token: eth(), requested_token: usdc(),
+        id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
         offered: 1, requested: 200_000, requested_remaining: 200_000,
     };
 
@@ -79,12 +79,12 @@ fn precision_factor_boundary() {
 }
 
 /// Multiplication overflow check: offered * PRECISION_FACTOR must not overflow u32.
-/// Maximum safe offered is u32::MAX / 100_000 ≈ 42949.
+/// Maximum safe offered is u32::MAX / 100_000 ~ 42949.
 #[test]
 fn large_offered_no_overflow() {
     let large_but_safe = 1_000_000_000u32; // 10^9, well under u32 limit
     let order = Order {
-        id: 0, offered_token: eth(), requested_token: usdc(),
+        id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
         offered: large_but_safe, requested: large_but_safe / 2,
         requested_remaining: large_but_safe / 2,
     };
@@ -103,7 +103,7 @@ fn offered_for_never_exceeds_offered() {
         let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
         let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
         let order = Order {
-            id: 0, offered_token: eth(), requested_token: usdc(),
+            id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
         };
 
@@ -119,9 +119,9 @@ fn offered_for_never_exceeds_offered() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 2. NEGATIVE SURPLUS / ROUNDING STEALS FROM PROTOCOL
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// In pairwise matching, verify surplus recorded in protocol_balances is non-negative.
 /// The engine uses saturating_sub so protocol balances can't go negative,
@@ -141,14 +141,15 @@ fn protocol_surplus_non_negative_after_match() {
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 
         let mut book = OrderBook::new(feed);
+        let mut gen = NoteIdGen::new();
 
         let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
 
-        if book.add_user_order(eth(), usdc(), off_a, req_a).is_none() { continue; }
-        if book.add_user_order(usdc(), eth(), off_b, req_b).is_none() { continue; }
+        if !book.add_user_order(gen.next(), eth(), usdc(), off_a, req_a) { continue; }
+        if !book.add_user_order(gen.next(), usdc(), eth(), off_b, req_b) { continue; }
 
         let mut engine = MatchingEngine::new(book);
         let _batch = engine.run();
@@ -161,9 +162,9 @@ fn protocol_surplus_non_negative_after_match() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 3. ADVERSARIAL ORDER PLACEMENT
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// Dust attack: 100 orders with offered=1, requested=1 across all pairs.
 /// Engine should handle gracefully without hanging or panicking.
@@ -174,13 +175,14 @@ fn dust_order_attack() {
     for &t in &tokens { feed.set_price_cents(t, 100); }
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
     // Place dust orders across all pairs
     for i in 0..5 {
         for j in 0..5 {
             if i == j { continue; }
             for _ in 0..5 {
-                book.add_user_order(tokens[i], tokens[j], 2, 1);
+                book.add_user_order(gen.next(), tokens[i], tokens[j], 2, 1);
             }
         }
     }
@@ -189,7 +191,7 @@ fn dust_order_attack() {
     let batch = engine.run();
 
     // Should complete without hanging. Verify invariants.
-    for order in &engine.book.orders {
+    for order in engine.book.orders.values() {
         assert!(order.requested_filled() <= order.requested);
     }
     assert_eq!(batch.remaining_orders, engine.book.active_order_count());
@@ -205,17 +207,19 @@ fn order_splitting_no_extra_surplus() {
 
     // Run 1: one large order
     let mut book1 = OrderBook::new(feed.clone());
-    book1.add_user_order(eth(), usdc(), 1000, 800);
-    book1.add_user_order(usdc(), eth(), 1000, 800);
+    let mut gen1 = NoteIdGen::new();
+    book1.add_user_order(gen1.next(), eth(), usdc(), 1000, 800);
+    book1.add_user_order(gen1.next(), usdc(), eth(), 1000, 800);
     let mut engine1 = MatchingEngine::new(book1);
     let _batch1 = engine1.run();
     let surplus1: u32 = engine1.book.protocol_balances.values().sum();
 
     // Run 2: many small orders (same total)
     let mut book2 = OrderBook::new(feed.clone());
+    let mut gen2 = NoteIdGen::new();
     for _ in 0..100 {
-        book2.add_user_order(eth(), usdc(), 10, 8);
-        book2.add_user_order(usdc(), eth(), 10, 8);
+        book2.add_user_order(gen2.next(), eth(), usdc(), 10, 8);
+        book2.add_user_order(gen2.next(), usdc(), eth(), 10, 8);
     }
     let mut engine2 = MatchingEngine::new(book2);
     let _batch2 = engine2.run();
@@ -236,13 +240,14 @@ fn targeted_cycle_surplus_extraction() {
     feed.set_price_cents(sol(), 15_000);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
     // Existing generous orders
-    book.add_user_order(eth(), usdc(), 10, 16000);  // offers $20k for $16k
-    book.add_user_order(usdc(), sol(), 16000, 80);   // offers $16k for $12k
+    book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);  // offers $20k for $16k
+    book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);   // offers $16k for $12k
 
-    // Attacker places SOL→ETH to close the triangle, barely profitable
-    book.add_user_order(sol(), eth(), 80, 5);  // offers $12k for $10k
+    // Attacker places SOL->ETH to close the triangle, barely profitable
+    book.add_user_order(gen.next(), sol(), eth(), 80, 5);  // offers $12k for $10k
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
@@ -263,11 +268,11 @@ fn targeted_cycle_surplus_extraction() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 4. CYCLE DETECTION PITFALLS
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
-/// Reverse cycle: A→B→C→A and A→C→B→A are different opportunities.
+/// Reverse cycle: A->B->C->A and A->C->B->A are different opportunities.
 /// Both should be discoverable.
 #[test]
 fn reverse_cycle_discovered() {
@@ -277,22 +282,23 @@ fn reverse_cycle_discovered() {
     feed.set_price_cents(sol(), 100);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
-    // Forward cycle: ETH→USDC→SOL→ETH
-    book.add_user_order(eth(), usdc(), 110, 100);
-    book.add_user_order(usdc(), sol(), 110, 100);
-    book.add_user_order(sol(), eth(), 110, 100);
+    // Forward cycle: ETH->USDC->SOL->ETH
+    book.add_user_order(gen.next(), eth(), usdc(), 110, 100);
+    book.add_user_order(gen.next(), usdc(), sol(), 110, 100);
+    book.add_user_order(gen.next(), sol(), eth(), 110, 100);
 
-    // Reverse cycle: ETH→SOL→USDC→ETH
-    book.add_user_order(eth(), sol(), 110, 100);
-    book.add_user_order(sol(), usdc(), 110, 100);
-    book.add_user_order(usdc(), eth(), 110, 100);
+    // Reverse cycle: ETH->SOL->USDC->ETH
+    book.add_user_order(gen.next(), eth(), sol(), 110, 100);
+    book.add_user_order(gen.next(), sol(), usdc(), 110, 100);
+    book.add_user_order(gen.next(), usdc(), eth(), 110, 100);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
 
     // Both direct matches (Phase 1) and triangles (Phase 2) may fire.
-    // At minimum, the pairwise matches should find ETH↔USDC, ETH↔SOL, USDC↔SOL.
+    // At minimum, the pairwise matches should find ETH<->USDC, ETH<->SOL, USDC<->SOL.
     assert!(batch.cycles_executed >= 3, "should find multiple matches, got {}", batch.cycles_executed);
 }
 
@@ -306,13 +312,14 @@ fn no_infinite_loop_zero_effect_cycles() {
     feed.set_price_cents(sol(), 100);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
     // Orders that are barely profitable (1 unit surplus per cycle)
     // Engine could potentially re-find the same triangle after partial fill
     for _ in 0..10 {
-        book.add_user_order(eth(), usdc(), 101, 100);
-        book.add_user_order(usdc(), sol(), 101, 100);
-        book.add_user_order(sol(), eth(), 101, 100);
+        book.add_user_order(gen.next(), eth(), usdc(), 101, 100);
+        book.add_user_order(gen.next(), usdc(), sol(), 101, 100);
+        book.add_user_order(gen.next(), sol(), eth(), 101, 100);
     }
 
     // Should terminate (the test itself is the timeout guard)
@@ -333,29 +340,30 @@ fn stale_heap_entries_handled() {
     feed.set_price_cents(sol(), 100);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
     // Small orders that will be exhausted quickly
-    book.add_user_order(eth(), usdc(), 110, 100);
-    book.add_user_order(usdc(), sol(), 110, 100);
-    book.add_user_order(sol(), eth(), 110, 100);
+    book.add_user_order(gen.next(), eth(), usdc(), 110, 100);
+    book.add_user_order(gen.next(), usdc(), sol(), 110, 100);
+    book.add_user_order(gen.next(), sol(), eth(), 110, 100);
 
     // Second set at worse rates
-    book.add_user_order(eth(), usdc(), 105, 100);
-    book.add_user_order(usdc(), sol(), 105, 100);
-    book.add_user_order(sol(), eth(), 105, 100);
+    book.add_user_order(gen.next(), eth(), usdc(), 105, 100);
+    book.add_user_order(gen.next(), usdc(), sol(), 105, 100);
+    book.add_user_order(gen.next(), sol(), eth(), 105, 100);
 
     let mut engine = MatchingEngine::new(book);
     let _batch = engine.run();
 
     // Should execute both triangles without crash
-    for order in &engine.book.orders {
+    for order in engine.book.orders.values() {
         assert!(order.requested_filled() <= order.requested);
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 5. SETTLEMENT & CONSERVATION
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// The strongest conservation test: simulate the on-chain settlement.
 /// For a pairwise match, verify that:
@@ -368,15 +376,18 @@ fn settlement_token_balance_pairwise() {
     feed.set_price_cents(usdc(), 100);
 
     let mut book = OrderBook::new(feed);
-    let id_a = book.add_user_order(eth(), usdc(), 10, 16000).unwrap();
-    let id_b = book.add_user_order(usdc(), eth(), 20000, 10).unwrap();
+    let mut gen = NoteIdGen::new();
+    let id_a = gen.next();
+    assert!(book.add_user_order(id_a, eth(), usdc(), 10, 16000));
+    let id_b = gen.next();
+    assert!(book.add_user_order(id_b, usdc(), eth(), 20000, 10));
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
     assert!(batch.cycles_executed > 0);
 
-    let a = &engine.book.orders[id_a as usize];
-    let b = &engine.book.orders[id_b as usize];
+    let a = &engine.book.orders[&id_a];
+    let b = &engine.book.orders[&id_b];
 
     // What was actually filled
     let a_filled_usdc = a.requested_filled();  // USDC received by A
@@ -417,18 +428,20 @@ fn triangle_surplus_is_real_not_unfilled_capacity() {
     feed.set_price_cents(sol(), 15_000);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
-    // Large AB, small BC and CA → AB only partially used
-    book.add_user_order(eth(), usdc(), 100, 160000);  // $200k
-    book.add_user_order(usdc(), sol(), 3000, 10);      // $3k (bottleneck)
-    book.add_user_order(sol(), eth(), 20, 1);          // $3k
+    // Large AB, small BC and CA -> AB only partially used
+    let id_ab = gen.next();
+    book.add_user_order(id_ab, eth(), usdc(), 100, 160000);  // $200k
+    book.add_user_order(gen.next(), usdc(), sol(), 3000, 10);      // $3k (bottleneck)
+    book.add_user_order(gen.next(), sol(), eth(), 20, 1);          // $3k
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
 
     if batch.cycles_executed > 0 {
         // AB should be partially filled (bottleneck was elsewhere)
-        let ab = &engine.book.orders[0];
+        let ab = &engine.book.orders[&id_ab];
         assert!(ab.is_active(), "AB should be partially filled, not exhausted");
 
         // The unfilled portion of AB should still have its full offered_remaining
@@ -447,9 +460,9 @@ fn triangle_surplus_is_real_not_unfilled_capacity() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 6. f64 RATE KEY PRECISION
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// Two orders with different integer ratios that map to the same f64 rate.
 /// They should be stored and retrieved correctly (not lost or confused).
@@ -460,29 +473,27 @@ fn f64_rate_collision() {
     feed.set_price_cents(usdc(), 100);
 
     let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
 
     // Two orders with rates that are very close but different in integer math
-    // rate1 = 1000000000001 / 1000000000000 = 1.000000000001
-    // rate2 = 1000000000002 / 1000000000001 ≈ 1.000000000001 (same f64)
-    // These are too large for our u64 amounts, so use smaller examples:
-    // rate1 = 333333 / 1000000 = 0.333333
-    // rate2 = 333334 / 1000001 ≈ 0.333333... (very close)
-    let id1 = book.add_user_order(eth(), usdc(), 1000000, 333333).unwrap();
-    let id2 = book.add_user_order(eth(), usdc(), 1000001, 333334).unwrap();
+    let id1 = gen.next();
+    assert!(book.add_user_order(id1, eth(), usdc(), 1000000, 333333));
+    let id2 = gen.next();
+    assert!(book.add_user_order(id2, eth(), usdc(), 1000001, 333334));
 
     // Both should be retrievable
     let best = book.best_order(eth(), usdc()).unwrap();
     assert!(best.id == id1 || best.id == id2, "should find one of the orders");
 
     // Counter-order to fill both
-    book.add_user_order(usdc(), eth(), 2000000, 666666);
+    book.add_user_order(gen.next(), usdc(), eth(), 2000000, 666666);
 
     let mut engine = MatchingEngine::new(book);
     let _batch = engine.run();
 
     // Both orders should have been touched
-    let o1 = &engine.book.orders[id1 as usize];
-    let o2 = &engine.book.orders[id2 as usize];
+    let o1 = &engine.book.orders[&id1];
+    let o2 = &engine.book.orders[&id2];
     // At least one should be filled
     assert!(
         o1.requested_filled() > 0 || o2.requested_filled() > 0,
@@ -490,20 +501,20 @@ fn f64_rate_collision() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 7. MATCH_WITH EDGE CASES
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// match_with where self was already partially filled from a prior match.
 /// Verify self_requested_filled in the result is correct.
 #[test]
 fn match_with_partially_filled_self() {
     let mut order_a = Order {
-        id: 0, offered_token: eth(), requested_token: usdc(),
+        id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
         offered: 1000, requested: 500, requested_remaining: 500,
     };
     let mut order_b = Order {
-        id: 1, offered_token: usdc(), requested_token: eth(),
+        id: make_note_id(1), offered_token: usdc(), requested_token: eth(),
         offered: 100, requested: 50, requested_remaining: 50,
     };
 
@@ -516,7 +527,7 @@ fn match_with_partially_filled_self() {
 
     // Second match with a new counter
     let mut order_c = Order {
-        id: 2, offered_token: usdc(), requested_token: eth(),
+        id: make_note_id(2), offered_token: usdc(), requested_token: eth(),
         offered: 200, requested: 100, requested_remaining: 100,
     };
 
@@ -541,21 +552,22 @@ fn match_with_identical_rates() {
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
-    // Both offer 100 for 100 — identical rates
+    // Both offer 100 for 100 -- identical rates
     // But is_profitable_with requires offered*offered > requested*requested
-    // 100*100 = 10000 > 100*100 = 10000 → false. Won't match.
+    // 100*100 = 10000 > 100*100 = 10000 -> false. Won't match.
     let mut book = OrderBook::new(feed);
-    book.add_user_order(eth(), usdc(), 100, 100);
-    book.add_user_order(usdc(), eth(), 100, 100);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), eth(), usdc(), 100, 100);
+    book.add_user_order(gen.next(), usdc(), eth(), 100, 100);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
     assert_eq!(batch.cycles_executed, 0, "identical rates should not match (not strictly profitable)");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 // 8. COMPREHENSIVE FUZZ: ALL EDGE CASES COMBINED
-// ═══════════════════════════════════════════════════════════════════════════
+// ===================================================================
 
 /// The ultimate stress test: randomized orders with adversarial characteristics.
 /// Mix of dust orders, extreme ratios, and targeted triangles.
@@ -570,6 +582,7 @@ fn fuzz_adversarial_mix_500_trials() {
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed);
+        let mut gen = NoteIdGen::new();
         let order_type = pseudo_rand(&mut seed) % 4;
 
         match order_type {
@@ -584,7 +597,7 @@ fn fuzz_adversarial_mix_500_trials() {
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
                         / (prices[bi] as u128 * 100)) as u32;
                     if requested == 0 { continue; }
-                    book.add_user_order(tokens[si], tokens[bi], offered, requested);
+                    book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }
             }
             1 => {
@@ -596,7 +609,7 @@ fn fuzz_adversarial_mix_500_trials() {
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
                         / (prices[bi] as u128 * 100)) as u32;
                     if requested == 0 { continue; }
-                    book.add_user_order(tokens[si], tokens[bi], offered, requested);
+                    book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }
             }
             2 => {
@@ -614,7 +627,7 @@ fn fuzz_adversarial_mix_500_trials() {
                         let requested = (offered as u128 * prices[s] as u128 * rate_pct as u128
                             / (prices[d] as u128 * 100)) as u32;
                         if requested == 0 { continue; }
-                        book.add_user_order(tokens[s], tokens[d], offered, requested);
+                        book.add_user_order(gen.next(), tokens[s], tokens[d], offered, requested);
                     }
                 }
             }
@@ -629,7 +642,7 @@ fn fuzz_adversarial_mix_500_trials() {
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
                         / (prices[bi] as u128 * 100)) as u32;
                     if requested == 0 { continue; }
-                    book.add_user_order(tokens[si], tokens[bi], offered, requested);
+                    book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }
             }
         }
@@ -638,20 +651,20 @@ fn fuzz_adversarial_mix_500_trials() {
         let batch = engine.run();
 
         // Core invariants that must NEVER be violated
-        for (i, order) in engine.book.orders.iter().enumerate() {
+        for order in engine.book.orders.values() {
             assert!(
                 order.requested_remaining <= order.requested,
-                "trial {}: order {} remaining {} > requested {}",
-                trial, i, order.requested_remaining, order.requested
+                "trial {}: order {:?} remaining {} > requested {}",
+                trial, order.id, order.requested_remaining, order.requested
             );
             if order.is_active() {
                 assert!(order.requested_remaining > 0);
             }
         }
-        for &oid in &batch.filled_orders {
+        for oid in &batch.filled_orders {
             assert!(
-                engine.book.orders[oid as usize].requested_filled() > 0,
-                "trial {}: filled order {} has 0 fill", trial, oid
+                engine.book.orders[oid].requested_filled() > 0,
+                "trial {}: filled order {:?} has 0 fill", trial, oid
             );
         }
         assert_eq!(batch.remaining_orders, engine.book.active_order_count());

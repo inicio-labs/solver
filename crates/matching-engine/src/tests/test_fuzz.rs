@@ -1,7 +1,7 @@
 use crate::engine::MatchingEngine;
 use crate::order_book::OrderBook;
 use crate::price_feed::SimpleMapFeed;
-use super::{eth, usdc, sol, btc, matic};
+use super::{eth, usdc, sol, btc, matic, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -31,15 +31,16 @@ fn fuzz_random_orders() {
                         if ba == 0 || bb == 0 { continue; }
 
                         let mut book = OrderBook::new(feed.clone());
-                        book.add_user_order(token_a, token_b, sa, ba);
-                        book.add_user_order(token_b, token_a, sb, bb);
+                        let mut gen = NoteIdGen::new();
+                        book.add_user_order(gen.next(), token_a, token_b, sa, ba);
+                        book.add_user_order(gen.next(), token_b, token_a, sb, bb);
 
                         let mut engine = MatchingEngine::new(book);
                         let batch = engine.run();
 
                         // Filled orders should have valid fill amounts
-                        for &oid in &batch.filled_orders {
-                            let order = &engine.book.orders[oid as usize];
+                        for oid in &batch.filled_orders {
+                            let order = &engine.book.orders[oid];
                             assert!(order.requested_filled() > 0);
                             assert!(order.requested_filled() <= order.requested);
                         }
@@ -63,6 +64,7 @@ fn fuzz_multi_token() {
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());
+        let mut gen = NoteIdGen::new();
 
         let n = 20 + (pseudo_rand(&mut seed) % 20) as usize;
         for _ in 0..n {
@@ -75,14 +77,14 @@ fn fuzz_multi_token() {
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
                 / (prices[bi] as u128 * 100)) as u32;
             if requested == 0 { continue; }
-            book.add_user_order(tokens[si], tokens[bi], offered, requested);
+            book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
 
         let mut engine = MatchingEngine::new(book);
         let batch = engine.run();
 
-        for &oid in &batch.filled_orders {
-            let order = &engine.book.orders[oid as usize];
+        for oid in &batch.filled_orders {
+            let order = &engine.book.orders[oid];
             assert!(order.requested_filled() > 0, "trial {}: filled order has 0 fill", trial);
             assert!(order.requested_filled() <= order.requested, "trial {}: fill exceeds order", trial);
         }
@@ -103,6 +105,7 @@ fn fuzz_no_panic() {
         feed.set_price_cents(token_b, 1);
 
         let mut book = OrderBook::new(feed);
+        let mut gen = NoteIdGen::new();
 
         let ba = (pseudo_rand(&mut seed) % 100) as u32;
         let bb = (pseudo_rand(&mut seed) % 100000) as u32;
@@ -113,12 +116,12 @@ fn fuzz_no_panic() {
             let s = 1 + (pseudo_rand(&mut seed) % 50) as u32;
             let rp = 60 + (pseudo_rand(&mut seed) % 40) as u32;
             let b = s * 2000 * rp / 100;
-            if b > 0 { book.add_user_order(token_a, token_b, s, b); }
+            if b > 0 { book.add_user_order(gen.next(), token_a, token_b, s, b); }
 
             let sb = 2000 + (pseudo_rand(&mut seed) % 50000) as u32;
             let rpb = 60 + (pseudo_rand(&mut seed) % 40) as u32;
             let bb = sb * rpb / (2000 * 100);
-            if bb > 0 { book.add_user_order(token_b, token_a, sb, bb); }
+            if bb > 0 { book.add_user_order(gen.next(), token_b, token_a, sb, bb); }
         }
 
         let mut engine = MatchingEngine::new(book);
@@ -138,6 +141,7 @@ fn fuzz_realistic() {
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());
+        let mut gen = NoteIdGen::new();
 
         let n = 30 + (pseudo_rand(&mut seed) % 50) as usize;
         for _ in 0..n {
@@ -158,7 +162,7 @@ fn fuzz_realistic() {
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
                 / (prices[bi] as u128 * 100)) as u32;
             if requested == 0 { continue; }
-            book.add_user_order(tokens[si], tokens[bi], offered, requested);
+            book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
 
         if pseudo_rand(&mut seed) % 3 == 0 {
@@ -170,8 +174,8 @@ fn fuzz_realistic() {
         let mut engine = MatchingEngine::new(book);
         let batch = engine.run();
 
-        for &oid in &batch.filled_orders {
-            let order = &engine.book.orders[oid as usize];
+        for oid in &batch.filled_orders {
+            let order = &engine.book.orders[oid];
             assert!(order.requested_filled() <= order.requested,
                 "trial {}: fill exceeds order", trial);
         }

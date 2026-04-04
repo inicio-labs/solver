@@ -64,16 +64,16 @@ fn match_user_orders<F: PriceFeed>(
 
         // Check profitability
         {
-            let order_a = &book.orders[order_a_id as usize];
-            let order_b = &book.orders[order_b_id as usize];
+            let order_a = &book.orders[&order_a_id];
+            let order_b = &book.orders[&order_b_id];
             if !order_a.is_profitable_with(order_b) {
                 break;
             }
         }
 
         // Match — clone to avoid double mutable borrow
-        let mut order_a = book.orders[order_a_id as usize].clone();
-        let mut order_b = book.orders[order_b_id as usize].clone();
+        let mut order_a = book.orders[&order_a_id].clone();
+        let mut order_b = book.orders[&order_b_id].clone();
 
         let match_result = match order_a.match_with(&mut order_b) {
             Some(r) => r,
@@ -81,32 +81,22 @@ fn match_user_orders<F: PriceFeed>(
         };
 
         // Write back
-        book.orders[order_a_id as usize] = order_a;
-        book.orders[order_b_id as usize] = order_b;
+        book.orders.insert(order_a_id, order_a);
+        book.orders.insert(order_b_id, order_b);
 
         // Track filled orders
         filled_orders.insert(order_a_id);
         filled_orders.insert(order_b_id);
 
         // Add surplus to protocol balance
-        if match_result.surplus_offered > 0 {
-            book.add_protocol_balance(token_a, match_result.surplus_offered);
-        }
-        if match_result.surplus_requested > 0 {
-            book.add_protocol_balance(token_b, match_result.surplus_requested);
-        }
+        book.add_protocol_balance(token_a, match_result.surplus_offered);
+        book.add_protocol_balance(token_b, match_result.surplus_requested);
 
-        // Cleanup fully consumed orders from BTreeMap
-        if book.orders[order_a_id as usize].is_completely_filled() {
-            book.cleanup_order(order_a_id);
-        }
-        if book.orders[order_b_id as usize].is_completely_filled() {
-            book.cleanup_order(order_b_id);
-        }
+        book.cleanup_if_filled(order_a_id);
+        book.cleanup_if_filled(order_b_id);
 
         cycles += 1;
     }
 
     cycles
 }
-

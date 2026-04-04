@@ -1,8 +1,9 @@
 use miden_protocol::account::AccountId;
+use miden_protocol::note::NoteId;
 use std::collections::HashSet;
 
 pub type TokenId = AccountId;
-pub type OrderId = u32;
+pub type OrderId = NoteId;
 pub type Amount = u32;
 
 const PRECISION_FACTOR: u64 = 100_000;

@@ -1,7 +1,7 @@
 use crate::engine::MatchingEngine;
 use crate::order_book::OrderBook;
 use crate::price_feed::SimpleMapFeed;
-use super::{eth, usdc, sol};
+use super::{eth, usdc, sol, NoteIdGen};
 
 fn make_feed() -> SimpleMapFeed {
     let mut feed = SimpleMapFeed::new();
@@ -14,8 +14,9 @@ fn make_feed() -> SimpleMapFeed {
 fn engine_basic() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
-    book.add_user_order(usdc(), eth(), 2000, 1);
-    book.add_user_order(eth(), usdc(), 1, 1600);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
@@ -41,10 +42,11 @@ fn engine_multi_pair() {
     feed.set_price_cents(sol(), 150);
 
     let mut book = OrderBook::new(feed);
-    book.add_user_order(usdc(), eth(), 2000, 1);
-    book.add_user_order(eth(), usdc(), 1, 1600);
-    book.add_user_order(usdc(), sol(), 150, 1);
-    book.add_user_order(sol(), usdc(), 1, 120);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
+    book.add_user_order(gen.next(), usdc(), sol(), 150, 1);
+    book.add_user_order(gen.next(), sol(), usdc(), 1, 120);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();

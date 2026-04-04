@@ -1,7 +1,7 @@
 use crate::order_book::OrderBook;
 use crate::price_feed::SimpleMapFeed;
 use crate::direct_matching::run_direct_matching;
-use super::{eth, usdc};
+use super::{eth, usdc, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -15,10 +15,10 @@ fn pseudo_rand(seed: &mut u64) -> u64 {
 /// order B offers USDC, requests ETH. B releases USDC, receives ETH.
 ///
 /// ETH flow: A releases offered_for(A.requested_filled) ETH. B receives B.requested_filled ETH.
-///   → A.offered_for(A.requested_filled) >= B.requested_filled
+///   -> A.offered_for(A.requested_filled) >= B.requested_filled
 ///
 /// USDC flow: B releases offered_for(B.requested_filled) USDC. A receives A.requested_filled USDC.
-///   → B.offered_for(B.requested_filled) >= A.requested_filled
+///   -> B.offered_for(B.requested_filled) >= A.requested_filled
 ///
 /// Both must hold for the settlement to be solvent.
 #[test]
@@ -36,21 +36,24 @@ fn settlement_solvency_check() {
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 
         let mut book = OrderBook::new(feed);
+        let mut gen = NoteIdGen::new();
 
         let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
         let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
 
-        if book.add_user_order(eth(), usdc(), off_a, req_a).is_none() { continue; }
-        if book.add_user_order(usdc(), eth(), off_b, req_b).is_none() { continue; }
+        let id_a = gen.next();
+        if !book.add_user_order(id_a, eth(), usdc(), off_a, req_a) { continue; }
+        let id_b = gen.next();
+        if !book.add_user_order(id_b, usdc(), eth(), off_b, req_b) { continue; }
 
         let (filled, _) = run_direct_matching(&mut book);
         if filled.is_empty() { continue; }
         total_matched += 1;
 
-        let a = &book.orders[0]; // offers ETH, requests USDC
-        let b = &book.orders[1]; // offers USDC, requests ETH
+        let a = &book.orders[&id_a]; // offers ETH, requests USDC
+        let b = &book.orders[&id_b]; // offers USDC, requests ETH
 
         if a.requested_filled() == 0 || b.requested_filled() == 0 { continue; }
 

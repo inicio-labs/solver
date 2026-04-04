@@ -1684,7 +1684,6 @@ name = "matching-engine"
 version = "0.1.0"
 dependencies = [
  "miden-protocol 0.15.0",
- "smallvec",
 ]
 
 [[package]]

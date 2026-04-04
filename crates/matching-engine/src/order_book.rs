@@ -1,12 +1,11 @@
 use crate::price_feed::PriceFeed;
 use crate::types::*;
-use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub struct OrderBook<F: PriceFeed> {
-    pub orders: Vec<Order>,
+    pub orders: HashMap<OrderId, Order>,
     /// (offered_token, requested_token) → BTreeMap sorted by rate ascending (best first).
-    pub pair_index: HashMap<(TokenId, TokenId), BTreeMap<RateKey, SmallVec<[OrderId; 4]>>>,
+    pub pair_index: HashMap<(TokenId, TokenId), BTreeMap<RateKey, Vec<OrderId>>>,
     /// outgoing[A] = {B | order offering A requesting B exists}
     user_adjacency: HashMap<TokenId, HashSet<TokenId>>,
     /// incoming[B] = {A | order offering A requesting B exists}
@@ -21,7 +20,7 @@ pub struct OrderBook<F: PriceFeed> {
 impl<F: PriceFeed> OrderBook<F> {
     pub fn new(feed: F) -> Self {
         Self {
-            orders: Vec::new(),
+            orders: HashMap::new(),
             pair_index: HashMap::new(),
             user_adjacency: HashMap::new(),
             incoming_adjacency: HashMap::new(),
@@ -35,13 +34,14 @@ impl<F: PriceFeed> OrderBook<F> {
     /// Add a user order. Rejected if rate is worse than oracle.
     pub fn add_user_order(
         &mut self,
+        note_id: OrderId,
         offered_token: TokenId,
         requested_token: TokenId,
         offered: Amount,
         requested: Amount,
-    ) -> Option<OrderId> {
+    ) -> bool {
         if offered == 0 || requested == 0 {
-            return None;
+            return false;
         }
 
         // Reject if offered USD value ≤ requested USD value (not a good deal)
@@ -49,13 +49,11 @@ impl<F: PriceFeed> OrderBook<F> {
             .feed
             .is_order_profitable(offered_token, offered, requested_token, requested)
         {
-            return None;
+            return false;
         }
 
-        let id = self.orders.len() as OrderId;
-
         let order = Order {
-            id,
+            id: note_id,
             offered_token,
             requested_token,
             offered,
@@ -63,14 +61,14 @@ impl<F: PriceFeed> OrderBook<F> {
             requested_remaining: requested,
         };
         let key = order.rate_key();
-        self.orders.push(order);
+        self.orders.insert(note_id, order);
 
         self.pair_index
             .entry((offered_token, requested_token))
             .or_default()
             .entry(key)
-            .or_insert_with(SmallVec::new)
-            .push(id);
+            .or_default()
+            .push(note_id);
 
         *self
             .active_pair_count
@@ -90,12 +88,15 @@ impl<F: PriceFeed> OrderBook<F> {
         self.tokens.insert(offered_token);
         self.tokens.insert(requested_token);
 
-        Some(id)
+        true
     }
 
     // === Protocol Balance ===
 
     pub fn add_protocol_balance(&mut self, token: TokenId, amount: Amount) {
+        if amount == 0 {
+            return;
+        }
         *self.protocol_balances.entry(token).or_default() += amount;
         self.tokens.insert(token);
     }
@@ -110,21 +111,22 @@ impl<F: PriceFeed> OrderBook<F> {
     }
 
     /// Get the best (cheapest) active order for a pair — front of BTreeMap.
-    /// Always consumes from the back of the SmallVec (LIFO within same price),
-    /// so inactive orders only accumulate at the tail and cleanup is O(1) pops.
     pub fn best_order(&mut self, offered: TokenId, requested: TokenId) -> Option<&Order> {
         let btree = self.pair_index.get_mut(&(offered, requested))?;
         let orders = &self.orders;
 
         while let Some((&key, ids)) = btree.iter_mut().next() {
-            while ids.last().map_or(false, |&id| !orders[id as usize].is_active()) {
+            while ids.last().map_or(false, |id| {
+                orders.get(id).map_or(true, |o| !o.is_active())
+            }) {
                 ids.pop();
             }
             if ids.is_empty() {
                 btree.remove(&key);
                 continue;
             }
-            return Some(&orders[*ids.last().unwrap() as usize]);
+            let best_id = ids.last().unwrap();
+            return orders.get(best_id);
         }
 
         None
@@ -155,7 +157,10 @@ impl<F: PriceFeed> OrderBook<F> {
 
     /// Clean up a fully consumed order.
     pub fn cleanup_order(&mut self, order_id: OrderId) {
-        let order = &self.orders[order_id as usize];
+        let order = match self.orders.get(&order_id) {
+            Some(o) => o,
+            None => return,
+        };
         if order.is_active() {
             return;
         }
@@ -194,7 +199,14 @@ impl<F: PriceFeed> OrderBook<F> {
         }
     }
 
+    /// Cleanup an order if it is completely filled (removes from index).
+    pub fn cleanup_if_filled(&mut self, order_id: OrderId) {
+        if self.orders.get(&order_id).map_or(false, |o| o.is_completely_filled()) {
+            self.cleanup_order(order_id);
+        }
+    }
+
     pub fn active_order_count(&self) -> u32 {
-        self.orders.iter().filter(|o| o.is_active()).count() as u32
+        self.orders.values().filter(|o| o.is_active()).count() as u32
     }
 }

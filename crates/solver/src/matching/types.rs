@@ -1,10 +1,5 @@
-use miden_protocol::account::AccountId;
-use miden_protocol::note::NoteId;
+pub use crate::types::{TokenId, OrderId, Amount, OrderStatus};
 use std::collections::HashSet;
-
-pub type TokenId = AccountId;
-pub type OrderId = NoteId;
-pub type Amount = u32;
 
 const PRECISION_FACTOR: u64 = 100_000;
 
@@ -19,11 +14,11 @@ fn calculate_output_amount(offered_total: Amount, requested_total: Amount, fill_
     }
 
     if offered_total > requested_total {
-        let ratio = (offered_total as u64 * PRECISION_FACTOR) / requested_total as u64;
-        ((fill_amount as u64 * ratio) / PRECISION_FACTOR) as Amount
+        let ratio = (offered_total as u128 * PRECISION_FACTOR as u128) / requested_total as u128;
+        ((fill_amount as u128 * ratio) / PRECISION_FACTOR as u128) as Amount
     } else {
-        let ratio = (requested_total as u64 * PRECISION_FACTOR) / offered_total as u64;
-        ((fill_amount as u64 * PRECISION_FACTOR) / ratio) as Amount
+        let ratio = (requested_total as u128 * PRECISION_FACTOR as u128) / offered_total as u128;
+        ((fill_amount as u128 * PRECISION_FACTOR as u128) / ratio) as Amount
     }
 }
 
@@ -45,8 +40,8 @@ impl RateKey {
 
 impl PartialEq for RateKey {
     fn eq(&self, other: &Self) -> bool {
-        (self.requested as u64) * (other.offered as u64)
-            == (other.requested as u64) * (self.offered as u64)
+        (self.requested as u128) * (other.offered as u128)
+            == (other.requested as u128) * (self.offered as u128)
     }
 }
 impl Eq for RateKey {}
@@ -58,8 +53,8 @@ impl PartialOrd for RateKey {
 }
 impl Ord for RateKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let lhs = self.requested as u64 * other.offered as u64;
-        let rhs = other.requested as u64 * self.offered as u64;
+        let lhs = self.requested as u128 * other.offered as u128;
+        let rhs = other.requested as u128 * self.offered as u128;
         lhs.cmp(&rhs)
     }
 }
@@ -174,8 +169,8 @@ impl Order {
 
     /// Is matching this order against another order profitable?
     pub fn is_profitable_with(&self, other: &Order) -> bool {
-        (self.offered as u64 * other.offered as u64)
-            > (self.requested as u64 * other.requested as u64)
+        (self.offered as u128 * other.offered as u128)
+            > (self.requested as u128 * other.requested as u128)
     }
 
     /// Match this order against another counter-order.

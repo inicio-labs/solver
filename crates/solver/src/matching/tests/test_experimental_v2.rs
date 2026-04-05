@@ -3,10 +3,11 @@
 //! Sources: CoW Protocol, Balancer exploit, Sec3 bidirectional rounding,
 //! Gnosis ring trades, general MEV/solver literature.
 
-use crate::engine::MatchingEngine;
-use crate::order_book::OrderBook;
-use crate::price_feed::{PriceFeed, SimpleMapFeed};
-use crate::types::*;
+use crate::matching::engine::MatchingEngine;
+use crate::matching::order_book::OrderBook;
+use crate::matching::price_feed::PriceFeed;
+use crate::price::WatchPriceFeed;
+use crate::matching::types::*;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen, make_note_id};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
@@ -27,15 +28,15 @@ fn round_trip_offered_requested_consistency() {
     let mut violations = 0;
 
     for _ in 0..10_000 {
-        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
-        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
+        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
+        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
         let order = Order {
             id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
         };
 
         // Forward: pick a fill, get offered released
-        let fill = 1 + (pseudo_rand(&mut seed) % requested.max(1) as u64) as u32;
+        let fill = 1 + (pseudo_rand(&mut seed) % requested.max(1) as u64) as u64;
         let released = order.offered_for(fill);
         if released == 0 { continue; }
 
@@ -78,11 +79,11 @@ fn precision_factor_boundary() {
     assert_eq!(order.offered_for(200_000), 1);
 }
 
-/// Multiplication overflow check: offered * PRECISION_FACTOR must not overflow u32.
-/// Maximum safe offered is u32::MAX / 100_000 ~ 42949.
+/// Multiplication overflow check: offered * PRECISION_FACTOR must not overflow u64.
+/// With u128 intermediates, all u64 values are safe.
 #[test]
 fn large_offered_no_overflow() {
-    let large_but_safe = 1_000_000_000u32; // 10^9, well under u32 limit
+    let large_but_safe = 1_000_000_000u64; // 10^9, well under u64 limit
     let order = Order {
         id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
         offered: large_but_safe, requested: large_but_safe / 2,
@@ -100,8 +101,8 @@ fn large_offered_no_overflow() {
 fn offered_for_never_exceeds_offered() {
     let mut seed: u64 = 444555;
     for _ in 0..10_000 {
-        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
-        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
+        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
+        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
         let order = Order {
             id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
@@ -136,17 +137,17 @@ fn protocol_surplus_non_negative_after_match() {
     let mut seed: u64 = 777888;
 
     for trial in 0..2_000 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         feed.set_price_cents(eth(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 
         let mut book = OrderBook::new(feed);
         let mut gen = NoteIdGen::new();
 
-        let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
+        let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
 
         if !book.add_user_order(gen.next(), eth(), usdc(), off_a, req_a) { continue; }
         if !book.add_user_order(gen.next(), usdc(), eth(), off_b, req_b) { continue; }
@@ -157,7 +158,7 @@ fn protocol_surplus_non_negative_after_match() {
         // Protocol balances should be >= 0 (they're u64, so always true,
         // but verify they weren't set to some garbage value)
         for (&_token, &balance) in &engine.book.protocol_balances {
-            assert!(balance < u32::MAX / 2, "trial {}: suspicious balance", trial);
+            assert!(balance < u64::MAX / 2, "trial {}: suspicious balance", trial);
         }
     }
 }
@@ -170,7 +171,7 @@ fn protocol_surplus_non_negative_after_match() {
 /// Engine should handle gracefully without hanging or panicking.
 #[test]
 fn dust_order_attack() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     let tokens = [eth(), usdc(), sol(), btc(), matic()];
     for &t in &tokens { feed.set_price_cents(t, 100); }
 
@@ -201,7 +202,7 @@ fn dust_order_attack() {
 /// Total surplus extracted should be similar (not exploitable via splitting).
 #[test]
 fn order_splitting_no_extra_surplus() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -212,7 +213,7 @@ fn order_splitting_no_extra_surplus() {
     book1.add_user_order(gen1.next(), usdc(), eth(), 1000, 800);
     let mut engine1 = MatchingEngine::new(book1);
     let _batch1 = engine1.run();
-    let surplus1: u32 = engine1.book.protocol_balances.values().sum();
+    let surplus1: u64 = engine1.book.protocol_balances.values().sum();
 
     // Run 2: many small orders (same total)
     let mut book2 = OrderBook::new(feed.clone());
@@ -223,7 +224,7 @@ fn order_splitting_no_extra_surplus() {
     }
     let mut engine2 = MatchingEngine::new(book2);
     let _batch2 = engine2.run();
-    let surplus2: u32 = engine2.book.protocol_balances.values().sum();
+    let surplus2: u64 = engine2.book.protocol_balances.values().sum();
 
     // Both configurations should generate surplus (profitable orders were matched)
     assert!(surplus1 > 0, "single order match should produce surplus");
@@ -234,7 +235,7 @@ fn order_splitting_no_extra_surplus() {
 /// to capture surplus from two existing orders.
 #[test]
 fn targeted_cycle_surplus_extraction() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -276,7 +277,7 @@ fn targeted_cycle_surplus_extraction() {
 /// Both should be discoverable.
 #[test]
 fn reverse_cycle_discovered() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -306,7 +307,7 @@ fn reverse_cycle_discovered() {
 /// The engine should terminate in bounded time.
 #[test]
 fn no_infinite_loop_zero_effect_cycles() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -334,7 +335,7 @@ fn no_infinite_loop_zero_effect_cycles() {
 /// contain entries referencing those orders. Should skip gracefully.
 #[test]
 fn stale_heap_entries_handled() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -371,7 +372,7 @@ fn stale_heap_entries_handled() {
 ///   order_b.offered_released == order_a.fill + surplus_b
 #[test]
 fn settlement_token_balance_pairwise() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -422,7 +423,7 @@ fn settlement_token_balance_pairwise() {
 /// unfilled capacity that should remain available.
 #[test]
 fn triangle_surplus_is_real_not_unfilled_capacity() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -451,7 +452,7 @@ fn triangle_surplus_is_real_not_unfilled_capacity() {
 
         // Total surplus should be small (just the cycle efficiency),
         // NOT the entire unfilled AB capacity
-        let total_surplus: u32 = engine.book.protocol_balances.values().sum();
+        let total_surplus: u64 = engine.book.protocol_balances.values().sum();
         assert!(
             total_surplus < ab_remaining_offered,
             "surplus {} should be much less than unfilled AB capacity {}",
@@ -468,7 +469,7 @@ fn triangle_surplus_is_real_not_unfilled_capacity() {
 /// They should be stored and retrieved correctly (not lost or confused).
 #[test]
 fn f64_rate_collision() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -548,7 +549,7 @@ fn match_with_partially_filled_self() {
 /// match_with where both orders have the exact same rate (no surplus possible).
 #[test]
 fn match_with_identical_rates() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -578,7 +579,7 @@ fn fuzz_adversarial_mix_500_trials() {
     let mut seed: u64 = 2718281828;
 
     for trial in 0..500 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed);
@@ -592,10 +593,10 @@ fn fuzz_adversarial_mix_500_trials() {
                     let si = (pseudo_rand(&mut seed) % 5) as usize;
                     let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
                     if bi == si { bi = (si + 1) % 5; }
-                    let offered = 1 + (pseudo_rand(&mut seed) % 3) as u32;
+                    let offered = 1 + (pseudo_rand(&mut seed) % 3) as u64;
                     let rate_pct = 50 + (pseudo_rand(&mut seed) % 50) as u64;
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                        / (prices[bi] as u128 * 100)) as u32;
+                        / (prices[bi] as u128 * 100)) as u64;
                     if requested == 0 { continue; }
                     book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }
@@ -604,10 +605,10 @@ fn fuzz_adversarial_mix_500_trials() {
                 // Extreme ratios: BTC/MATIC pairs
                 for _ in 0..15 {
                     let (si, bi) = if pseudo_rand(&mut seed) % 2 == 0 { (3, 4) } else { (4, 3) };
-                    let offered = 1 + (pseudo_rand(&mut seed) % 100) as u32;
+                    let offered = 1 + (pseudo_rand(&mut seed) % 100) as u64;
                     let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                        / (prices[bi] as u128 * 100)) as u32;
+                        / (prices[bi] as u128 * 100)) as u64;
                     if requested == 0 { continue; }
                     book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }
@@ -622,10 +623,10 @@ fn fuzz_adversarial_mix_500_trials() {
                     while ci == ai || ci == bi { ci = (ci + 1) % 5; }
 
                     for &(s, d) in &[(ai, bi), (bi, ci), (ci, ai)] {
-                        let offered = 100 + (pseudo_rand(&mut seed) % 100) as u32;
+                        let offered = 100 + (pseudo_rand(&mut seed) % 100) as u64;
                         let rate_pct = 98 + (pseudo_rand(&mut seed) % 2) as u64; // near-oracle
                         let requested = (offered as u128 * prices[s] as u128 * rate_pct as u128
-                            / (prices[d] as u128 * 100)) as u32;
+                            / (prices[d] as u128 * 100)) as u64;
                         if requested == 0 { continue; }
                         book.add_user_order(gen.next(), tokens[s], tokens[d], offered, requested);
                     }
@@ -637,10 +638,10 @@ fn fuzz_adversarial_mix_500_trials() {
                     let si = (pseudo_rand(&mut seed) % 5) as usize;
                     let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
                     if bi == si { bi = (si + 1) % 5; }
-                    let offered = 1 + (pseudo_rand(&mut seed) % 10000) as u32;
+                    let offered = 1 + (pseudo_rand(&mut seed) % 10000) as u64;
                     let rate_pct = 50 + (pseudo_rand(&mut seed) % 50) as u64;
                     let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                        / (prices[bi] as u128 * 100)) as u32;
+                        / (prices[bi] as u128 * 100)) as u64;
                     if requested == 0 { continue; }
                     book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
                 }

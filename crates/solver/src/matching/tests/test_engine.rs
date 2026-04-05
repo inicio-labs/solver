@@ -1,10 +1,10 @@
-use crate::engine::MatchingEngine;
-use crate::order_book::OrderBook;
-use crate::price_feed::SimpleMapFeed;
+use crate::matching::engine::MatchingEngine;
+use crate::matching::order_book::OrderBook;
+use crate::price::WatchPriceFeed;
 use super::{eth, usdc, sol, NoteIdGen};
 
-fn make_feed() -> SimpleMapFeed {
-    let mut feed = SimpleMapFeed::new();
+fn make_feed() -> WatchPriceFeed {
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed
@@ -36,7 +36,7 @@ fn engine_empty() {
 
 #[test]
 fn engine_multi_pair() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed.set_price_cents(sol(), 150);

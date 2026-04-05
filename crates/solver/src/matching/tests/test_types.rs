@@ -1,4 +1,4 @@
-use crate::types::*;
+use crate::matching::types::*;
 use super::{eth, usdc, make_note_id};
 
 fn make_order(id: OrderId, offered_token: TokenId, requested_token: TokenId, offered: Amount, requested: Amount) -> Order {

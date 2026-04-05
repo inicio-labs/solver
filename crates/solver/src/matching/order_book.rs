@@ -1,5 +1,5 @@
-use crate::price_feed::PriceFeed;
-use crate::types::*;
+use crate::matching::price_feed::PriceFeed;
+use crate::matching::types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub struct OrderBook<F: PriceFeed> {

@@ -1,6 +1,6 @@
-use crate::order_book::OrderBook;
-use crate::price_feed::SimpleMapFeed;
-use crate::direct_matching::run_direct_matching;
+use crate::matching::order_book::OrderBook;
+use crate::price::WatchPriceFeed;
+use crate::matching::direct_matching::run_direct_matching;
 use super::{eth, usdc, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
@@ -24,24 +24,24 @@ fn pseudo_rand(seed: &mut u64) -> u64 {
 #[test]
 fn settlement_solvency_check() {
     let mut seed: u64 = 777888;
-    let mut eth_deficit_count = 0u32;
-    let mut usdc_deficit_count = 0u32;
-    let mut max_eth_deficit = 0u32;
-    let mut max_usdc_deficit = 0u32;
-    let mut total_matched = 0u32;
+    let mut eth_deficit_count = 0u64;
+    let mut usdc_deficit_count = 0u64;
+    let mut max_eth_deficit = 0u64;
+    let mut max_usdc_deficit = 0u64;
+    let mut total_matched = 0u64;
 
     for _trial in 0..10_000 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         feed.set_price_cents(eth(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 
         let mut book = OrderBook::new(feed);
         let mut gen = NoteIdGen::new();
 
-        let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
-        let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
+        let off_a = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let req_a = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
+        let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
 
         let id_a = gen.next();
         if !book.add_user_order(id_a, eth(), usdc(), off_a, req_a) { continue; }

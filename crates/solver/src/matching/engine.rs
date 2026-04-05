@@ -1,8 +1,8 @@
-use crate::direct_matching;
-use crate::three_edge_cycle;
-use crate::order_book::OrderBook;
-use crate::price_feed::PriceFeed;
-use crate::types::*;
+use crate::matching::direct_matching;
+use crate::matching::three_edge_cycle;
+use crate::matching::order_book::OrderBook;
+use crate::matching::price_feed::PriceFeed;
+use crate::matching::types::*;
 
 pub struct MatchingEngine<F: PriceFeed> {
     pub book: OrderBook<F>,

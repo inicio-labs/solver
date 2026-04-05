@@ -8,10 +8,11 @@
 //! - Verify phase 1 + phase 2 interplay under stress
 //! - Verify order book consistency after matching
 
-use crate::engine::MatchingEngine;
-use crate::order_book::OrderBook;
-use crate::price_feed::{PriceFeed, SimpleMapFeed};
-use crate::types::*;
+use crate::matching::engine::MatchingEngine;
+use crate::matching::order_book::OrderBook;
+use crate::matching::price_feed::PriceFeed;
+use crate::price::WatchPriceFeed;
+use crate::matching::types::*;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen, make_note_id};
 
 // -- Deterministic PRNG --
@@ -29,10 +30,10 @@ fn prices_5() -> [u64; 5] {
     [200_000, 100, 15_000, 6_000_000, 5_000] // ETH, USDC, SOL, BTC, MATIC in cents
 }
 
-fn make_5token_feed() -> SimpleMapFeed {
+fn make_5token_feed() -> WatchPriceFeed {
     let tokens = tokens_5();
     let prices = prices_5();
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     for i in 0..5 {
         feed.set_price_cents(tokens[i], prices[i]);
     }
@@ -42,7 +43,7 @@ fn make_5token_feed() -> SimpleMapFeed {
 // -- Invariant Checkers --
 
 /// Check all invariants that must hold after any engine run.
-fn check_invariants(engine: &MatchingEngine<SimpleMapFeed>, batch: &SettlementBatch, label: &str) {
+fn check_invariants(engine: &MatchingEngine<WatchPriceFeed>, batch: &SettlementBatch, label: &str) {
     let book = &engine.book;
 
     // 1. No overfill: every order's requested_filled <= requested
@@ -73,7 +74,7 @@ fn check_invariants(engine: &MatchingEngine<SimpleMapFeed>, batch: &SettlementBa
     for (&_token, &balance) in &book.protocol_balances {
         // balance is u64, can't be negative, but check it's not absurdly large
         assert!(
-            balance < u32::MAX / 2,
+            balance < u64::MAX / 2,
             "{}: suspiciously large protocol balance",
             label
         );
@@ -123,10 +124,10 @@ fn fuzz_5token_full_engine_200_trials() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 10000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 10000) as u64;
             let rate_pct = 50 + (pseudo_rand(&mut seed) % 50) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -147,7 +148,7 @@ fn fuzz_lopsided_prices() {
     let prices: [u64; 5] = [200_000, 100, 15_000, 6_000_000, 50];
 
     for trial in 0..100 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed);
@@ -159,10 +160,10 @@ fn fuzz_lopsided_prices() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -194,8 +195,8 @@ fn fuzz_unit_amounts() {
             if bi == si { bi = (si + 1) % 5; }
 
             // Always offer 1 unit, request what oracle says is fair or better
-            let offered = 1u32;
-            let requested_oracle = (prices[si] as u128 / prices[bi].max(1) as u128) as u32;
+            let offered = 1u64;
+            let requested_oracle = (prices[si] as u128 / prices[bi].max(1) as u128) as u64;
             let requested = requested_oracle.max(1);
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -209,7 +210,7 @@ fn fuzz_unit_amounts() {
 /// Orders with identical offered and requested (rate=1).
 #[test]
 fn fuzz_rate_one() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     let tokens = tokens_5();
     // All same price -> rate 1 orders are oracle-profitable
     for &t in &tokens { feed.set_price_cents(t, 100); }
@@ -226,9 +227,9 @@ fn fuzz_rate_one() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let amount = 1 + (pseudo_rand(&mut seed) % 1000) as u32;
+            let amount = 1 + (pseudo_rand(&mut seed) % 1000) as u64;
             // offered = requested + small bonus (rate slightly better than 1)
-            let offered = amount + 1 + (pseudo_rand(&mut seed) % 10) as u32;
+            let offered = amount + 1 + (pseudo_rand(&mut seed) % 10) as u64;
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, amount);
         }
 
@@ -244,7 +245,7 @@ fn fuzz_rate_one() {
 /// Should match perfectly with zero surplus.
 #[test]
 fn exact_cancel_zero_surplus() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -267,7 +268,7 @@ fn exact_cancel_zero_surplus() {
 /// Tests that the engine correctly matches many-to-one.
 #[test]
 fn many_small_vs_one_large() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -308,7 +309,7 @@ fn all_same_direction() {
 /// Orders that are just barely profitable (offered product exceeds requested product by 1).
 #[test]
 fn barely_profitable_direct() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -329,7 +330,7 @@ fn barely_profitable_direct() {
 /// Orders that are exactly at oracle rate (not profitable: offered == requested in USD).
 #[test]
 fn exactly_at_oracle_no_match() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -353,7 +354,7 @@ fn exactly_at_oracle_no_match() {
 /// Symmetric cycle: every leg offers X, requests X.
 #[test]
 fn symmetric_triangle() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -376,7 +377,7 @@ fn symmetric_triangle() {
 /// The tiny leg is the bottleneck.
 #[test]
 fn triangle_one_unit_bottleneck() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -469,10 +470,10 @@ fn fuzz_triangle_heavy_100_trials() {
 
             // Generate generous orders for each leg (70-95% of oracle rate)
             for &(si, di) in &[(ai, bi), (bi, ci), (ci, ai)] {
-                let offered = 10 + (pseudo_rand(&mut seed) % 990) as u32;
+                let offered = 10 + (pseudo_rand(&mut seed) % 990) as u64;
                 let rate_pct = 70 + (pseudo_rand(&mut seed) % 25) as u64;
                 let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                    / (prices[di] as u128 * 100)) as u32;
+                    / (prices[di] as u128 * 100)) as u64;
                 if requested == 0 { continue; }
                 book.add_user_order(gen.next(), tokens[si], tokens[di], offered, requested);
             }
@@ -485,10 +486,10 @@ fn fuzz_triangle_heavy_100_trials() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 500) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 500) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -507,7 +508,7 @@ fn fuzz_2token_no_triangles() {
     let mut seed: u64 = 55555;
 
     for trial in 0..50 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         feed.set_price_cents(eth(), 200_000);
         feed.set_price_cents(usdc(), 100);
 
@@ -519,10 +520,10 @@ fn fuzz_2token_no_triangles() {
             let tokens = [eth(), usdc()];
             let prices = [200_000u64, 100];
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 1000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 1000) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -539,7 +540,7 @@ fn fuzz_2token_no_triangles() {
 /// For each filled order: offered_released should not exceed original offered.
 #[test]
 fn conservation_detailed_direct_match() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -572,7 +573,7 @@ fn conservation_detailed_direct_match() {
 /// Same but for triangular matching.
 #[test]
 fn conservation_detailed_triangle() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -621,10 +622,10 @@ fn order_book_consistency_after_run() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 2000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 2000) as u64;
             let rate_pct = 55 + (pseudo_rand(&mut seed) % 45) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -658,7 +659,7 @@ fn order_book_consistency_after_run() {
 /// 50 orders per direction on a single pair. Tests order promotion heavily.
 #[test]
 fn stress_50_orders_per_direction() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -668,10 +669,10 @@ fn stress_50_orders_per_direction() {
 
     // 50 ETH->USDC orders at varying rates
     for _ in 0..50 {
-        let offered = 1 + (pseudo_rand(&mut seed) % 20) as u32;
+        let offered = 1 + (pseudo_rand(&mut seed) % 20) as u64;
         let rate_pct = 70 + (pseudo_rand(&mut seed) % 30) as u64;
         let requested = (offered as u128 * 200_000u128 * rate_pct as u128
-            / (100u128 * 100)) as u32;
+            / (100u128 * 100)) as u64;
         if requested > 0 {
             book.add_user_order(gen.next(), eth(), usdc(), offered, requested);
         }
@@ -679,10 +680,10 @@ fn stress_50_orders_per_direction() {
 
     // 50 USDC->ETH orders
     for _ in 0..50 {
-        let offered = 1000 + (pseudo_rand(&mut seed) % 40000) as u32;
+        let offered = 1000 + (pseudo_rand(&mut seed) % 40000) as u64;
         let rate_pct = 70 + (pseudo_rand(&mut seed) % 30) as u64;
         let requested = (offered as u128 * 100u128 * rate_pct as u128
-            / (200_000u128 * 100)) as u32;
+            / (200_000u128 * 100)) as u64;
         if requested > 0 {
             book.add_user_order(gen.next(), usdc(), eth(), offered, requested);
         }
@@ -713,10 +714,10 @@ fn idempotent_second_run() {
         let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
         if bi == si { bi = (si + 1) % 5; }
 
-        let offered = 10 + (pseudo_rand(&mut seed) % 500) as u32;
+        let offered = 10 + (pseudo_rand(&mut seed) % 500) as u64;
         let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
         let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-            / (prices[bi] as u128 * 100)) as u32;
+            / (prices[bi] as u128 * 100)) as u64;
         if requested == 0 { continue; }
         book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
     }
@@ -767,8 +768,8 @@ fn offered_for_precision_boundaries() {
 fn full_fill_invariant() {
     let mut seed: u64 = 66666;
     for _ in 0..1000 {
-        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
-        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u32;
+        let offered = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
+        let requested = 1 + (pseudo_rand(&mut seed) % 100_000) as u64;
         let order = Order {
             id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
@@ -786,18 +787,18 @@ fn full_fill_invariant() {
 #[test]
 fn partial_fill_additivity() {
     let mut seed: u64 = 88888;
-    let mut max_diff = 0u32;
+    let mut max_diff = 0u64;
 
     for _ in 0..1000 {
-        let offered = 100 + (pseudo_rand(&mut seed) % 10000) as u32;
-        let requested = 100 + (pseudo_rand(&mut seed) % 10000) as u32;
+        let offered = 100 + (pseudo_rand(&mut seed) % 10000) as u64;
+        let requested = 100 + (pseudo_rand(&mut seed) % 10000) as u64;
         let order = Order {
             id: make_note_id(0), offered_token: eth(), requested_token: usdc(),
             offered, requested, requested_remaining: requested,
         };
 
-        let a = 1 + (pseudo_rand(&mut seed) % (requested / 2).max(1) as u64) as u32;
-        let b = 1 + (pseudo_rand(&mut seed) % (requested - a).max(1) as u64) as u32;
+        let a = 1 + (pseudo_rand(&mut seed) % (requested / 2).max(1) as u64) as u64;
+        let b = 1 + (pseudo_rand(&mut seed) % (requested - a).max(1) as u64) as u64;
 
         let sum_parts = order.offered_for(a) + order.offered_for(b);
         let whole = order.offered_for(a + b);
@@ -828,14 +829,14 @@ fn deterministic_output() {
     let mut seed: u64 = 314159;
 
     for _ in 0..20 {
-        let orders: Vec<(usize, usize, u32, u32)> = (0..15).filter_map(|_| {
+        let orders: Vec<(usize, usize, u64, u64)> = (0..15).filter_map(|_| {
             let si = (pseudo_rand(&mut seed) % 5) as usize;
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
-            let offered = 10 + (pseudo_rand(&mut seed) % 1000) as u32;
+            let offered = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { None } else { Some((si, bi, offered, requested)) }
         }).collect();
 
@@ -889,7 +890,7 @@ fn deterministic_output() {
 /// No value should be created from nothing.
 #[test]
 fn surplus_usd_conservation_direct() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -962,10 +963,10 @@ fn fuzz_usd_conservation_200_trials() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u64;
             let rate_pct = 55 + (pseudo_rand(&mut seed) % 45) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             let id = gen.next();
             if book.add_user_order(id, tokens[si], tokens[bi], offered, requested) {
@@ -1123,7 +1124,7 @@ fn order_filled_by_both_phases() {
 /// Verifies LIFO/FIFO behavior is consistent.
 #[test]
 fn identical_orders_fair_matching() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -1162,7 +1163,7 @@ fn identical_orders_fair_matching() {
 /// The engine should not mark such orders as "filled" if nothing was released.
 #[test]
 fn no_phantom_fills() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -1214,10 +1215,10 @@ fn settlement_batch_completeness() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 5 + (pseudo_rand(&mut seed) % 1000) as u32;
+            let offered = 5 + (pseudo_rand(&mut seed) % 1000) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -1256,7 +1257,7 @@ fn protocol_balance_monotonic_across_epochs() {
     let mut seed: u64 = 22222;
 
     let mut book = OrderBook::new(feed);
-    let mut prev_total_balance = 0u32;
+    let mut prev_total_balance = 0u64;
     let mut gen = NoteIdGen::new();
 
     for epoch in 0..10 {
@@ -1267,10 +1268,10 @@ fn protocol_balance_monotonic_across_epochs() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 10 + (pseudo_rand(&mut seed) % 500) as u32;
+            let offered = 10 + (pseudo_rand(&mut seed) % 500) as u64;
             let rate_pct = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -1279,7 +1280,7 @@ fn protocol_balance_monotonic_across_epochs() {
         let _batch = engine.run();
         book = engine.book;
 
-        let total_balance: u32 = book.protocol_balances.values().sum();
+        let total_balance: u64 = book.protocol_balances.values().sum();
         assert!(
             total_balance >= prev_total_balance,
             "epoch {}: protocol balance decreased from {} to {}",
@@ -1318,10 +1319,10 @@ fn fuzz_per_token_flow_conservation() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 5000) as u64;
             let rate_pct = 55 + (pseudo_rand(&mut seed) % 45) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             let id = gen.next();
             if book.add_user_order(id, tokens[si], tokens[bi], offered, requested) {
@@ -1378,7 +1379,7 @@ fn fuzz_per_token_flow_conservation() {
 /// If two such orders are counterparts, offered_for may round to 0.
 #[test]
 fn tiny_offered_huge_requested() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -1398,7 +1399,7 @@ fn tiny_offered_huge_requested() {
 /// Both sides offer exactly 1 unit.
 #[test]
 fn both_sides_one_unit() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -1419,7 +1420,7 @@ fn both_sides_one_unit() {
 /// correct ordering (best rate matched first).
 #[test]
 fn deep_order_book_100_levels() {
-    let mut feed = SimpleMapFeed::new();
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 

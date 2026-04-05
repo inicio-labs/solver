@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/solver", "crates/matching-engine", "crates/consume-script"]
+members = ["crates/solver", "crates/consume-script"]
 
 [package]
 name = "solver-bin"

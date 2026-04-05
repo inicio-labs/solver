@@ -1,5 +1,4 @@
-use crate::types::*;
-use std::collections::HashMap;
+use crate::matching::types::*;
 
 /// One USD cent — the base unit for all price values in this module.
 /// All prices are fixed-point integers denominated in cents,
@@ -26,24 +25,4 @@ pub trait PriceFeed {
     }
 }
 
-/// In-memory price feed backed by a [`HashMap`].
-#[derive(Clone, Default)]
-pub struct SimpleMapFeed {
-    prices: HashMap<TokenId, UsdCents>,
-}
-
-impl SimpleMapFeed {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_price_cents(&mut self, token: TokenId, price: UsdCents) {
-        self.prices.insert(token, price);
-    }
-}
-
-impl PriceFeed for SimpleMapFeed {
-    fn usd_price_cents(&self, token: TokenId) -> UsdCents {
-        self.prices.get(&token).copied().unwrap_or(1)
-    }
-}
+// SimpleMapFeed removed — use crate::price::WatchPriceFeed instead.

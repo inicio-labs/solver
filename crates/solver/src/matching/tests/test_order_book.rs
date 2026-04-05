@@ -1,9 +1,9 @@
-use crate::order_book::OrderBook;
-use crate::price_feed::SimpleMapFeed;
+use crate::matching::order_book::OrderBook;
+use crate::price::WatchPriceFeed;
 use super::{eth, usdc, NoteIdGen};
 
-fn make_feed() -> SimpleMapFeed {
-    let mut feed = SimpleMapFeed::new();
+fn make_feed() -> WatchPriceFeed {
+    let mut feed = WatchPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed

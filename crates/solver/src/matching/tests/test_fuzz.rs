@@ -1,6 +1,6 @@
-use crate::engine::MatchingEngine;
-use crate::order_book::OrderBook;
-use crate::price_feed::SimpleMapFeed;
+use crate::matching::engine::MatchingEngine;
+use crate::matching::order_book::OrderBook;
+use crate::price::WatchPriceFeed;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
@@ -18,7 +18,7 @@ fn fuzz_random_orders() {
 
     let mut cases = 0u64;
     for &(pa, pb) in &prices {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         feed.set_price_cents(token_a, pa);
         feed.set_price_cents(token_b, pb);
 
@@ -26,8 +26,8 @@ fn fuzz_random_orders() {
             for &ra in &rate_pcts {
                 for &sb in &offered_amounts {
                     for &rb in &rate_pcts {
-                        let ba = (sa as u128 * pa as u128 * ra as u128 / (pb as u128 * 100)) as u32;
-                        let bb = (sb as u128 * pb as u128 * rb as u128 / (pa as u128 * 100)) as u32;
+                        let ba = (sa as u128 * pa as u128 * ra as u128 / (pb as u128 * 100)) as u64;
+                        let bb = (sb as u128 * pb as u128 * rb as u128 / (pa as u128 * 100)) as u64;
                         if ba == 0 || bb == 0 { continue; }
 
                         let mut book = OrderBook::new(feed.clone());
@@ -60,7 +60,7 @@ fn fuzz_multi_token() {
     let mut seed: u64 = 12345;
 
     for trial in 0..50 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());
@@ -72,10 +72,10 @@ fn fuzz_multi_token() {
             let mut bi = (pseudo_rand(&mut seed) % 5) as usize;
             if bi == si { bi = (si + 1) % 5; }
 
-            let offered = 1 + (pseudo_rand(&mut seed) % 1000) as u32;
+            let offered = 1 + (pseudo_rand(&mut seed) % 1000) as u64;
             let rate_pct = 50 + (pseudo_rand(&mut seed) % 50) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
@@ -100,26 +100,26 @@ fn fuzz_no_panic() {
     let mut seed: u64 = 99999;
 
     for _ in 0..50 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         feed.set_price_cents(token_a, 2000);
         feed.set_price_cents(token_b, 1);
 
         let mut book = OrderBook::new(feed);
         let mut gen = NoteIdGen::new();
 
-        let ba = (pseudo_rand(&mut seed) % 100) as u32;
-        let bb = (pseudo_rand(&mut seed) % 100000) as u32;
+        let ba = (pseudo_rand(&mut seed) % 100) as u64;
+        let bb = (pseudo_rand(&mut seed) % 100000) as u64;
         if ba > 0 { book.add_protocol_balance(token_a, ba); }
         if bb > 0 { book.add_protocol_balance(token_b, bb); }
 
         for _ in 0..10 {
-            let s = 1 + (pseudo_rand(&mut seed) % 50) as u32;
-            let rp = 60 + (pseudo_rand(&mut seed) % 40) as u32;
+            let s = 1 + (pseudo_rand(&mut seed) % 50) as u64;
+            let rp = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let b = s * 2000 * rp / 100;
             if b > 0 { book.add_user_order(gen.next(), token_a, token_b, s, b); }
 
-            let sb = 2000 + (pseudo_rand(&mut seed) % 50000) as u32;
-            let rpb = 60 + (pseudo_rand(&mut seed) % 40) as u32;
+            let sb = 2000 + (pseudo_rand(&mut seed) % 50000) as u64;
+            let rpb = 60 + (pseudo_rand(&mut seed) % 40) as u64;
             let bb = sb * rpb / (2000 * 100);
             if bb > 0 { book.add_user_order(gen.next(), token_b, token_a, sb, bb); }
         }
@@ -137,7 +137,7 @@ fn fuzz_realistic() {
     let mut seed: u64 = 20260327;
 
     for trial in 0..100 {
-        let mut feed = SimpleMapFeed::new();
+        let mut feed = WatchPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());
@@ -151,23 +151,23 @@ fn fuzz_realistic() {
 
             let size_class = pseudo_rand(&mut seed) % 100;
             let offered = if size_class < 60 {
-                10 + (pseudo_rand(&mut seed) % 190) as u32
+                10 + (pseudo_rand(&mut seed) % 190) as u64
             } else if size_class < 90 {
-                200 + (pseudo_rand(&mut seed) % 1800) as u32
+                200 + (pseudo_rand(&mut seed) % 1800) as u64
             } else {
-                2000 + (pseudo_rand(&mut seed) % 8000) as u32
+                2000 + (pseudo_rand(&mut seed) % 8000) as u64
             };
 
             let rate_pct = 70 + (pseudo_rand(&mut seed) % 30) as u64;
             let requested = (offered as u128 * prices[si] as u128 * rate_pct as u128
-                / (prices[bi] as u128 * 100)) as u32;
+                / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             book.add_user_order(gen.next(), tokens[si], tokens[bi], offered, requested);
         }
 
         if pseudo_rand(&mut seed) % 3 == 0 {
             let bt = tokens[(pseudo_rand(&mut seed) % 5) as usize];
-            let ba = 50 + (pseudo_rand(&mut seed) % 500) as u32;
+            let ba = 50 + (pseudo_rand(&mut seed) % 500) as u64;
             book.add_protocol_balance(bt, ba);
         }
 

@@ -1,10 +1,15 @@
-#[cfg(feature = "client")]
-pub mod engine;
+pub mod types;
+pub mod matching;
+pub mod db;
+pub mod ingest;
+pub mod price;
+pub mod admin;
+pub mod pipeline;
+
 pub mod events;
 #[cfg(feature = "client")]
 pub mod executor;
 pub mod order;
-pub mod simple_matcher;
 
-#[cfg(feature = "client")]
-pub use engine::start;
+#[cfg(test)]
+mod pipeline_tests;

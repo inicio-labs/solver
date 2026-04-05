@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use consume_script::ConsumeAssetScript;
-use matching_engine::engine::MatchingEngine;
-use matching_engine::order_book::OrderBook;
-use matching_engine::price_feed::SimpleMapFeed;
-use matching_engine::types::*;
+use solver::matching::engine::MatchingEngine;
+use solver::matching::order_book::OrderBook;
+use solver::price::WatchPriceFeed;
+use solver::matching::types::*;
 use miden_protocol::account::auth::AuthScheme;
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -111,9 +111,9 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     let mock_chain = builder.build()?;
 
     // ── Run matching engine ──
-    let mut feed = SimpleMapFeed::new();
-    feed.set_price(USDC_TOKEN, 1);
-    feed.set_price(ETH_TOKEN, 2000);
+    let mut feed = WatchPriceFeed::new();
+    feed.set_price_cents(USDC_TOKEN, 1);
+    feed.set_price_cents(ETH_TOKEN, 2000);
 
     let mut book = OrderBook::new(feed, Config::default());
 

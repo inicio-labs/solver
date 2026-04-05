@@ -1,7 +1,0 @@
-[package]
-name = "matching-engine"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol", default-features = false, features = ["testing"] }

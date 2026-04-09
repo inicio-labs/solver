@@ -36,3 +36,28 @@ impl OrderStatus {
         }
     }
 }
+
+/// An order with its raw note data, flowing from ingest → matcher.
+#[derive(Debug, Clone)]
+pub struct IngestOrder {
+    pub note_id: OrderId,
+    pub offered_token: TokenId,
+    pub requested_token: TokenId,
+    pub offered_amount: Amount,
+    pub requested_amount: Amount,
+    pub raw_note_data: Vec<u8>,
+}
+
+/// A filled note with its fill amount, flowing from matcher → executor.
+#[derive(Debug, Clone)]
+pub struct FilledNote {
+    pub note_id: OrderId,
+    pub requested_filled: Amount,
+    pub raw_note_data: Vec<u8>,
+}
+
+/// A batch of matched orders to be executed together.
+#[derive(Debug, Clone)]
+pub struct ExecutionBatch {
+    pub filled_notes: Vec<FilledNote>,
+}

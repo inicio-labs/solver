@@ -7,16 +7,17 @@ use tokio::task::JoinHandle;
 
 use crate::admin::{self, AdminState};
 use crate::db;
-use crate::db::models::OrderRow;
 use crate::ingest::{self, MidenClient};
+use crate::matcher;
 use crate::price::{self, PriceClient, PriceSnapshot};
-use crate::types::TokenId;
+use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Configuration for the pipeline.
 pub struct PipelineConfig {
     pub database_url: String,
     pub ingest_interval: Duration,
     pub price_interval: Duration,
+    pub match_interval: Duration,
     pub initial_tokens: Vec<TokenId>,
     pub admin_port: u16,
 }
@@ -27,6 +28,7 @@ impl Default for PipelineConfig {
             database_url: "solver.db".to_string(),
             ingest_interval: Duration::from_secs(5),
             price_interval: Duration::from_secs(10),
+            match_interval: Duration::from_secs(3),
             initial_tokens: Vec::new(),
             admin_port: 3001,
         }
@@ -37,14 +39,13 @@ impl Default for PipelineConfig {
 pub struct PipelineHandles {
     pub ingest_handle: JoinHandle<()>,
     pub price_handle: JoinHandle<()>,
+    pub matcher_handle: JoinHandle<()>,
     pub admin_handle: JoinHandle<()>,
-    pub order_rx: mpsc::Receiver<OrderRow>,
-    pub price_rx: watch::Receiver<PriceSnapshot>,
+    /// Execution channel receiver — Phase 3 executor consumes from this.
+    pub exec_rx: mpsc::Receiver<ExecutionBatch>,
 }
 
-/// Spawn the Phase 1 pipeline: ingest, price feed, and admin server.
-///
-/// Returns handles and channel receivers for Phase 2 (matcher) to consume.
+/// Spawn the full pipeline: ingest → matcher → (executor receives exec_rx).
 pub async fn spawn_pipeline<C, P>(
     config: PipelineConfig,
     client: C,
@@ -61,8 +62,9 @@ where
     admin::seed_tokens_from_config(&pool, &config.initial_tokens)?;
 
     // Create channels
-    let (order_tx, order_rx) = mpsc::channel::<OrderRow>(5000);
+    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(5000);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(5000);
 
     // Shared client for ingest + admin
     let shared_client: Arc<Mutex<dyn MidenClient + Send>> = Arc::new(Mutex::new(client));
@@ -88,6 +90,13 @@ where
         price::run_price_feed(price_client, tokens, price_tx, price_interval).await;
     });
 
+    // Spawn matcher task
+    let matcher_pool = pool.clone();
+    let match_interval = config.match_interval;
+    let matcher_handle = tokio::spawn(async move {
+        matcher::run_matcher(order_rx, price_rx, exec_tx, matcher_pool, match_interval).await;
+    });
+
     // Spawn admin server
     let admin_router = admin_state.router();
     let admin_port = config.admin_port;
@@ -103,8 +112,8 @@ where
     Ok(PipelineHandles {
         ingest_handle,
         price_handle,
+        matcher_handle,
         admin_handle,
-        order_rx,
-        price_rx,
+        exec_rx,
     })
 }

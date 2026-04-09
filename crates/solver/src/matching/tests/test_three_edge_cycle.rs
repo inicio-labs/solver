@@ -408,23 +408,23 @@ fn phase1_partial_then_phase2_triangle() {
     assert!(batch.cycles_executed >= 1);
 }
 
-// -- Oracle rejection --
+// -- Unprofitable leg --
 
-/// One leg of the triangle is rejected by oracle price check at insertion.
-/// Triangle cannot form.
+/// One leg of the triangle is unprofitable. All orders are accepted into the
+/// book, but the matching engine should not execute an unprofitable cycle.
 #[test]
-fn oracle_rejects_one_leg() {
+fn unprofitable_leg_no_cycle() {
     let mut book = OrderBook::new(make_3token_feed());
     let mut gen = NoteIdGen::new();
 
     book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
     book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);
-    // SOL->ETH: offers 5 SOL ($750), requests 1 ETH ($2000) -- rejected by oracle
-    let rejected = book.add_user_order(gen.next(), sol(), eth(), 5, 1);
-    assert!(!rejected, "oracle should reject unprofitable order");
+    // SOL->ETH: offers 5 SOL ($750), requests 1 ETH ($2000) -- accepted into book
+    let accepted = book.add_user_order(gen.next(), sol(), eth(), 5, 1);
+    assert!(accepted, "order book should accept all valid orders");
 
     let (_, cycles) = run_three_edge_cycle(&mut book);
-    assert_eq!(cycles, 0, "missing leg means no triangle");
+    assert_eq!(cycles, 0, "unprofitable cycle should not execute");
 }
 
 // -- 4+ tokens --

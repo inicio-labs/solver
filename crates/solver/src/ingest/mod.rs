@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::db::models::{NoteRow, OrderRow};
 use crate::db::{self, DbPool};
 use crate::order::Order as PipelineOrder;
-use crate::types::{OrderId, OrderStatus, TokenId};
+use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
 
 /// Result of a sync_state call — contains the block number and IDs of newly received notes.
 pub struct SyncResult {
@@ -47,7 +47,7 @@ pub trait MidenClient: Send {
 pub async fn run_ingest(
     client: Arc<Mutex<dyn MidenClient + Send>>,
     pool: DbPool,
-    order_tx: mpsc::Sender<OrderRow>,
+    order_tx: mpsc::Sender<IngestOrder>,
     interval: Duration,
 ) {
     loop {
@@ -62,7 +62,7 @@ pub async fn run_ingest(
 async fn ingest_once(
     client: &Arc<Mutex<dyn MidenClient + Send>>,
     pool: &DbPool,
-    order_tx: &mpsc::Sender<OrderRow>,
+    order_tx: &mpsc::Sender<IngestOrder>,
 ) -> Result<()> {
     // 1. Sync state — get block number and newly received note IDs
     let sync_data = {
@@ -80,12 +80,12 @@ async fn ingest_once(
         c.get_notes_by_ids(&sync_data.new_note_ids).await?
     };
 
-    // 3. Filter PSWAP notes and parse into DB records
-    let mut new_notes = Vec::new();
-    let mut new_orders = Vec::new();
+    // 3. Filter PSWAP notes and parse into DB records + channel messages
+    let mut db_notes = Vec::new();
+    let mut db_orders = Vec::new();
+    let mut ingest_orders = Vec::new();
 
     for note in &notes {
-        // Only process PSWAP notes
         if note.recipient().script().root() != PswapNote::script_root() {
             continue;
         }
@@ -98,19 +98,19 @@ async fn ingest_once(
             }
         };
 
-        let note_id = note.id().to_bytes().to_vec();
+        let note_id_bytes = note.id().to_bytes().to_vec();
 
         let mut raw_data = Vec::new();
         note.write_into(&mut raw_data);
 
-        new_notes.push(NoteRow {
-            note_id: note_id.clone(),
+        db_notes.push(NoteRow {
+            note_id: note_id_bytes.clone(),
             account_id: order.creator_id.to_bytes().to_vec(),
-            raw_data,
+            raw_data: raw_data.clone(),
         });
 
-        new_orders.push(OrderRow {
-            note_id,
+        db_orders.push(OrderRow {
+            note_id: note_id_bytes,
             account_id: order.creator_id.to_bytes().to_vec(),
             requested_asset: order.requested_faucet_id.to_bytes().to_vec(),
             requested_amount: order.requested_amount as i64,
@@ -122,18 +122,27 @@ async fn ingest_once(
                 .as_secs() as i64,
             status: OrderStatus::Active.as_str().to_string(),
         });
+
+        ingest_orders.push(IngestOrder {
+            note_id: note.id(),
+            offered_token: order.offered_faucet_id,
+            requested_token: order.requested_faucet_id,
+            offered_amount: order.offered_amount,
+            requested_amount: order.requested_amount,
+            raw_note_data: raw_data,
+        });
     }
 
-    if new_notes.is_empty() {
+    if db_notes.is_empty() {
         return Ok(());
     }
 
     // 4. Atomic DB insert (notes + orders + block number)
     let mut conn = pool.get()?;
-    db::insert_notes_batch(&mut conn, &new_notes, &new_orders, sync_data.block_num)?;
+    db::insert_notes_batch(&mut conn, &db_notes, &db_orders, sync_data.block_num)?;
 
-    // 5. Send new orders to channel
-    for order in new_orders {
+    // 5. Send IngestOrders to matcher channel
+    for order in ingest_orders {
         if let Err(e) = order_tx.send(order).await {
             eprintln!("[ingest] channel send failed: {e}");
             break;

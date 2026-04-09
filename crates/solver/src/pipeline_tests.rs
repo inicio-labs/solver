@@ -251,6 +251,7 @@ async fn spawn_pipeline_starts_successfully() {
         database_url: ":memory:".to_string(),
         ingest_interval: Duration::from_secs(3600), // long interval so it doesn't tick
         price_interval: Duration::from_secs(3600),
+        match_interval: Duration::from_secs(3600),
         initial_tokens: vec![test_token_a(), test_token_b()],
         admin_port: port,
     };
@@ -269,11 +270,13 @@ async fn spawn_pipeline_starts_successfully() {
     // Verify all handles are running (not finished).
     assert!(!handles.ingest_handle.is_finished());
     assert!(!handles.price_handle.is_finished());
+    assert!(!handles.matcher_handle.is_finished());
     assert!(!handles.admin_handle.is_finished());
 
     // Clean up: abort spawned tasks.
     handles.ingest_handle.abort();
     handles.price_handle.abort();
+    handles.matcher_handle.abort();
     handles.admin_handle.abort();
 }
 
@@ -285,6 +288,7 @@ async fn pipeline_channels_are_functional() {
         database_url: ":memory:".to_string(),
         ingest_interval: Duration::from_secs(3600),
         price_interval: Duration::from_secs(3600),
+        match_interval: Duration::from_secs(3600),
         initial_tokens: vec![test_token_a()],
         admin_port: port,
     };
@@ -300,19 +304,15 @@ async fn pipeline_channels_are_functional() {
 
     let handles = spawn_pipeline(config, client, price_client).await.unwrap();
 
-    // The price_rx should have received the initial empty snapshot (watch channel default).
-    let snapshot = handles.price_rx.borrow().clone();
-    // Initial watch value is an empty HashMap (set at channel creation).
-    assert!(snapshot.is_empty());
-
-    // The order_rx channel should be open (sender still held by ingest task).
+    // The exec_rx channel should be open (sender still held by matcher task).
     // We can't receive without data, but we can verify the receiver is alive.
     // Attempting try_recv on an empty channel returns Empty, not Disconnected.
-    assert!(handles.order_rx.is_empty());
+    assert!(handles.exec_rx.is_empty());
 
     // Clean up.
     handles.ingest_handle.abort();
     handles.price_handle.abort();
+    handles.matcher_handle.abort();
     handles.admin_handle.abort();
 }
 
@@ -324,6 +324,7 @@ async fn pipeline_admin_server_binds_and_responds() {
         database_url: ":memory:".to_string(),
         ingest_interval: Duration::from_secs(3600),
         price_interval: Duration::from_secs(3600),
+        match_interval: Duration::from_secs(3600),
         initial_tokens: vec![test_token_a()],
         admin_port: port,
     };
@@ -347,6 +348,7 @@ async fn pipeline_admin_server_binds_and_responds() {
     // Clean up.
     handles.ingest_handle.abort();
     handles.price_handle.abort();
+    handles.matcher_handle.abort();
     handles.admin_handle.abort();
 }
 

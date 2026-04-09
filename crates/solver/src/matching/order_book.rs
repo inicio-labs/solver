@@ -31,7 +31,8 @@ impl<F: PriceFeed> OrderBook<F> {
         }
     }
 
-    /// Add a user order. Rejected if rate is worse than oracle.
+    /// Add a user order to the book. All valid orders are accepted;
+    /// profitability decisions are left to the matching engine.
     pub fn add_user_order(
         &mut self,
         note_id: OrderId,
@@ -41,14 +42,6 @@ impl<F: PriceFeed> OrderBook<F> {
         requested: Amount,
     ) -> bool {
         if offered == 0 || requested == 0 {
-            return false;
-        }
-
-        // Reject if offered USD value ≤ requested USD value (not a good deal)
-        if !self
-            .feed
-            .is_order_profitable(offered_token, offered, requested_token, requested)
-        {
             return false;
         }
 

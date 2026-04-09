@@ -4,6 +4,7 @@ pub mod db;
 pub mod ingest;
 pub mod price;
 pub mod admin;
+pub mod matcher;
 pub mod pipeline;
 
 pub mod events;

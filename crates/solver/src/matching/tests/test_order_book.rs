@@ -28,12 +28,13 @@ fn add_order_below_oracle() {
 }
 
 #[test]
-fn reject_order_above_oracle() {
+fn accepts_order_above_oracle() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
-    // Offer 1900 USDC, request 1 ETH -- offering less than oracle -> rejected
-    assert!(!book.add_user_order(gen.next(), usdc(), eth(), 1900, 1));
+    // Offer 1900 USDC, request 1 ETH -- order book accepts all valid orders;
+    // profitability filtering is the matching engine's responsibility.
+    assert!(book.add_user_order(gen.next(), usdc(), eth(), 1900, 1));
 }
 
 #[test]

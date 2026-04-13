@@ -22,30 +22,20 @@ pub struct PipelineConfig {
     pub admin_port: u16,
 }
 
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        Self {
-            database_url: "solver.db".to_string(),
-            ingest_interval: Duration::from_secs(5),
-            price_interval: Duration::from_secs(10),
-            match_interval: Duration::from_secs(3),
-            initial_tokens: Vec::new(),
-            admin_port: 3001,
-        }
-    }
-}
-
 /// Handles returned by spawn_pipeline for graceful shutdown.
 pub struct PipelineHandles {
     pub ingest_handle: JoinHandle<()>,
     pub price_handle: JoinHandle<()>,
     pub matcher_handle: JoinHandle<()>,
     pub admin_handle: JoinHandle<()>,
-    /// Execution channel receiver — Phase 3 executor consumes from this.
+    /// Execution channel receiver — executor consumes from this.
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
 }
 
-/// Spawn the full pipeline: ingest → matcher → (executor receives exec_rx).
+/// Spawn the pipeline: ingest → matcher → exec_rx.
+///
+/// Returns handles and `exec_rx`. The caller is responsible for wiring
+/// the executor (e.g. `executor::run_executor`) to consume from `exec_rx`.
 pub async fn spawn_pipeline<C, P>(
     config: PipelineConfig,
     client: C,
@@ -91,10 +81,9 @@ where
     });
 
     // Spawn matcher task
-    let matcher_pool = pool.clone();
     let match_interval = config.match_interval;
     let matcher_handle = tokio::spawn(async move {
-        matcher::run_matcher(order_rx, price_rx, exec_tx, matcher_pool, match_interval).await;
+        matcher::run_matcher(order_rx, price_rx, exec_tx, match_interval).await;
     });
 
     // Spawn admin server

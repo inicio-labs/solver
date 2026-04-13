@@ -305,8 +305,6 @@ async fn pipeline_channels_are_functional() {
     let handles = spawn_pipeline(config, client, price_client).await.unwrap();
 
     // The exec_rx channel should be open (sender still held by matcher task).
-    // We can't receive without data, but we can verify the receiver is alive.
-    // Attempting try_recv on an empty channel returns Empty, not Disconnected.
     assert!(handles.exec_rx.is_empty());
 
     // Clean up.

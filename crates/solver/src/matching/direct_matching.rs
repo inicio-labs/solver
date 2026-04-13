@@ -26,18 +26,16 @@ fn collect_matchable_pairs<F: PriceFeed>(book: &OrderBook<F>) -> Vec<(TokenId, T
 }
 
 /// Direct matching: greedy on BTreeMap.
-/// Returns set of filled order IDs.
-pub fn run_direct_matching<F: PriceFeed>(book: &mut OrderBook<F>) -> (HashSet<OrderId>, u32) {
-    let mut filled_orders = HashSet::new();
+/// Inserts filled order IDs into the provided set. Returns number of cycles executed.
+pub fn run_direct_matching<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u32 {
     let mut cycles_executed = 0u32;
 
     let pairs = collect_matchable_pairs(book);
     for (token_a, token_b) in pairs {
-        let matched = match_user_orders(book, token_a, token_b, &mut filled_orders);
-        cycles_executed += matched;
+        cycles_executed += match_user_orders(book, token_a, token_b, filled_orders);
     }
 
-    (filled_orders, cycles_executed)
+    cycles_executed
 }
 
 /// User-to-user matching for a pair. Returns number of cycles executed.

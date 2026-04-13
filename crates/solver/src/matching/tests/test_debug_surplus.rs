@@ -1,6 +1,7 @@
 use crate::matching::order_book::OrderBook;
 use crate::price::WatchPriceFeed;
 use crate::matching::direct_matching::run_direct_matching;
+use std::collections::HashSet;
 use super::{eth, usdc, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
@@ -48,7 +49,8 @@ fn settlement_solvency_check() {
         let id_b = gen.next();
         if !book.add_user_order(id_b, usdc(), eth(), off_b, req_b) { continue; }
 
-        let (filled, _) = run_direct_matching(&mut book);
+        let mut filled = HashSet::new();
+        run_direct_matching(&mut book, &mut filled);
         if filled.is_empty() { continue; }
         total_matched += 1;
 

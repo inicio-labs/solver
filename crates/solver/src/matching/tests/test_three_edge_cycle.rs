@@ -2,6 +2,7 @@ use crate::matching::engine::MatchingEngine;
 use crate::matching::three_edge_cycle::run_three_edge_cycle;
 use crate::matching::order_book::OrderBook;
 use crate::price::WatchPriceFeed;
+use std::collections::HashSet;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen};
 
 fn make_3token_feed() -> WatchPriceFeed {
@@ -23,7 +24,8 @@ fn basic_triangle() {
     book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);
     book.add_user_order(gen.next(), sol(), eth(), 80, 5);
 
-    let (filled, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 1, "exactly one triangle should execute");
     assert_eq!(filled.len(), 3, "all 3 orders should be touched");
 }
@@ -38,7 +40,8 @@ fn no_profitable_cycle() {
     book.add_user_order(gen.next(), usdc(), sol(), 19000, 120);
     book.add_user_order(gen.next(), sol(), eth(), 120, 10);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 0, "equal product is not profitable");
 }
 
@@ -50,7 +53,8 @@ fn two_tokens_no_triangle() {
     book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
     book.add_user_order(gen.next(), usdc(), eth(), 16000, 10);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 0);
 }
 
@@ -58,7 +62,8 @@ fn two_tokens_no_triangle() {
 #[test]
 fn empty_book() {
     let mut book = OrderBook::new(make_3token_feed());
-    let (filled, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 0);
     assert!(filled.is_empty());
 }
@@ -69,7 +74,8 @@ fn single_order() {
     let mut book = OrderBook::new(make_3token_feed());
     let mut gen = NoteIdGen::new();
     book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 0);
 }
 
@@ -85,7 +91,8 @@ fn at_least_one_order_exhausted() {
     book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);
     book.add_user_order(gen.next(), sol(), eth(), 80, 5);
 
-    let (filled, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0);
 
     let exhausted = filled.iter()
@@ -112,7 +119,8 @@ fn asset_conservation() {
     let id_ca = gen.next();
     assert!(book.add_user_order(id_ca, sol(), eth(), 80, 5));
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0);
 
     let ab = &book.orders[&id_ab];
@@ -151,7 +159,8 @@ fn bottleneck_on_ab() {
     let id_ca = gen.next();
     book.add_user_order(id_ca, sol(), eth(), 500, 30);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0);
     // AB should be fully consumed (it was the bottleneck)
     assert!(book.orders[&id_ab].is_completely_filled(), "AB (bottleneck) should be exhausted");
@@ -175,7 +184,8 @@ fn bottleneck_on_bc() {
     let id_ca = gen.next();
     book.add_user_order(id_ca, sol(), eth(), 100, 5);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0, "should execute");
     assert!(book.orders[&id_bc].is_completely_filled(), "BC (bottleneck) should be exhausted");
     assert!(book.orders[&id_ab].is_active(), "AB should be partially filled");
@@ -196,7 +206,8 @@ fn bottleneck_on_ca() {
     let id_ca = gen.next();
     book.add_user_order(id_ca, sol(), eth(), 20, 1);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0);
     assert!(book.orders[&id_ca].is_completely_filled(), "CA (bottleneck) should be exhausted");
     assert!(book.orders[&id_ab].is_active(), "AB should be partially filled");
@@ -213,7 +224,8 @@ fn surplus_to_protocol_balance() {
     book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);
     book.add_user_order(gen.next(), sol(), eth(), 80, 5);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0);
     let total_balance: u64 = book.protocol_balances.values().sum();
     assert!(total_balance > 0, "surplus should accumulate in protocol balance");
@@ -237,7 +249,8 @@ fn minimal_surplus_tight_rates() {
     book.add_user_order(gen.next(), usdc(), sol(), 101, 100);
     book.add_user_order(gen.next(), sol(), eth(), 101, 100);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles > 0, "barely profitable cycle should still execute");
 }
 
@@ -265,7 +278,8 @@ fn multiple_triangles_highest_surplus_first() {
     book.add_user_order(gen.next(), usdc(), btc(), 16000, 1);
     book.add_user_order(gen.next(), btc(), eth(), 1, 5);
 
-    let (filled, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles >= 1);
     assert!(!filled.is_empty());
 }
@@ -286,7 +300,8 @@ fn sequential_cycles_with_order_promotion() {
     book.add_user_order(gen.next(), sol(), eth(), 80, 5);
     book.add_user_order(gen.next(), sol(), eth(), 90, 5);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles >= 1, "should execute at least one cycle");
 }
 
@@ -306,7 +321,8 @@ fn stale_order_promotes_next_best() {
     book.add_user_order(gen.next(), usdc(), sol(), 18000, 90);
     book.add_user_order(gen.next(), sol(), eth(), 90, 5);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles >= 1);
 }
 
@@ -327,7 +343,8 @@ fn tiny_amounts_no_panic() {
     book.add_user_order(gen.next(), usdc(), sol(), 1, 1);
     book.add_user_order(gen.next(), sol(), eth(), 1, 1);
 
-    let _ = run_three_edge_cycle(&mut book); // should not panic
+    let mut filled = HashSet::new();
+    run_three_edge_cycle(&mut book, &mut filled); // should not panic
 }
 
 /// Large amounts near u64 limits. Verify no overflow.
@@ -345,7 +362,8 @@ fn large_amounts_no_overflow() {
     book.add_user_order(gen.next(), usdc(), sol(), large / 2, large / 4);
     book.add_user_order(gen.next(), sol(), eth(), large / 4, large / 8);
 
-    let _ = run_three_edge_cycle(&mut book); // should not panic
+    let mut filled = HashSet::new();
+    run_three_edge_cycle(&mut book, &mut filled); // should not panic
 }
 
 // -- Integration with direct matching (Phase 1 + Phase 2) --
@@ -423,7 +441,8 @@ fn unprofitable_leg_no_cycle() {
     let accepted = book.add_user_order(gen.next(), sol(), eth(), 5, 1);
     assert!(accepted, "order book should accept all valid orders");
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert_eq!(cycles, 0, "unprofitable cycle should not execute");
 }
 
@@ -451,7 +470,8 @@ fn four_tokens_two_triangles() {
     book.add_user_order(gen.next(), eth(), sol(), 20, 1600);       // 20 ETH ($40k) for 1600 SOL ($24k) -- needs separate SOL->BTC
     book.add_user_order(gen.next(), sol(), btc(), 1600, 1);        // 1600 SOL ($240k) for 1 BTC ($60k)
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     assert!(cycles >= 1, "should execute at least one triangle, got {}", cycles);
 }
 
@@ -476,7 +496,8 @@ fn five_tokens_stress() {
     book.add_user_order(gen.next(), usdc(), matic(), 48000, 800);
     book.add_user_order(gen.next(), matic(), btc(), 800, 1);
 
-    let (_, cycles) = run_three_edge_cycle(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_three_edge_cycle(&mut book, &mut filled);
     // Should find profitable cycles without panicking
     assert!(cycles >= 1);
 }

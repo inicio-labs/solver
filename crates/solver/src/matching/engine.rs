@@ -3,6 +3,7 @@ use crate::matching::three_edge_cycle;
 use crate::matching::order_book::OrderBook;
 use crate::matching::price_feed::PriceFeed;
 use crate::matching::types::*;
+use std::collections::HashSet;
 
 pub struct MatchingEngine<F: PriceFeed> {
     pub book: OrderBook<F>,
@@ -14,16 +15,14 @@ impl<F: PriceFeed> MatchingEngine<F> {
     }
 
     pub fn run(&mut self) -> SettlementBatch {
+        let mut filled_orders = HashSet::new();
+        let mut cycles_executed = 0u32;
+
         // Phase 1: Direct (pairwise) matching
-        let (mut filled_orders, mut cycles_executed) =
-            direct_matching::run_direct_matching(&mut self.book);
+        cycles_executed += direct_matching::run_direct_matching(&mut self.book, &mut filled_orders);
 
         // Phase 2: Three-edge cycle (triangular) matching on remaining orders
-        let (filled_phase2, cycles_phase2) =
-            three_edge_cycle::run_three_edge_cycle(&mut self.book);
-
-        filled_orders.extend(filled_phase2);
-        cycles_executed += cycles_phase2;
+        cycles_executed += three_edge_cycle::run_three_edge_cycle(&mut self.book, &mut filled_orders);
 
         SettlementBatch {
             filled_orders,

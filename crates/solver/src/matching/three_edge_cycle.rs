@@ -306,9 +306,8 @@ fn simulate_full_cycle<F: PriceFeed>(
 /// Phase 1: enumerate all profitable triangles, push to max-heap by surplus.
 /// Phase 2: pop best, execute, re-evaluate dirty triangles, repeat.
 ///
-/// Returns (filled_order_ids, cycles_executed).
-pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>) -> (HashSet<OrderId>, u32) {
-    let mut filled_orders = HashSet::new();
+/// Inserts filled order IDs into the provided set. Returns number of cycles executed.
+pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u32 {
     let mut cycles_executed = 0u32;
 
     // Phase 1: build
@@ -347,7 +346,7 @@ pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>) -> (HashSet<O
             continue;
         }
 
-        execute_cycle(book, &entry, &simulation.fills, &mut filled_orders);
+        execute_cycle(book, &entry, &simulation.fills, filled_orders);
         cycles_executed += 1;
 
         // Re-evaluate triangles sharing affected pairs (deduplicated).
@@ -366,7 +365,7 @@ pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>) -> (HashSet<O
         }
     }
 
-    (filled_orders, cycles_executed)
+    cycles_executed
 }
 
 /// Execute a 3-cycle: fill orders, collect surplus, cleanup exhausted.

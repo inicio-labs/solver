@@ -1,6 +1,7 @@
 use crate::matching::direct_matching::run_direct_matching;
 use crate::matching::order_book::OrderBook;
 use crate::price::WatchPriceFeed;
+use std::collections::HashSet;
 use super::{eth, usdc, sol, NoteIdGen};
 
 fn make_feed() -> WatchPriceFeed {
@@ -18,7 +19,8 @@ fn basic_match() {
     book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
     book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
 
-    let (filled, cycles) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
     assert!(cycles > 0);
     assert_eq!(filled.len(), 2);
     assert_eq!(book.active_order_count(), 0);
@@ -32,7 +34,8 @@ fn no_match_at_oracle() {
     book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
     book.add_user_order(gen.next(), eth(), usdc(), 1, 2000);
 
-    let (_, cycles) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
     assert_eq!(cycles, 0);
 }
 
@@ -46,7 +49,8 @@ fn multiple_matches() {
     book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
     book.add_user_order(gen.next(), eth(), usdc(), 20, 32000);
 
-    let (filled, cycles) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
     assert!(cycles >= 2);
     assert_eq!(filled.len(), 4);
 }
@@ -59,7 +63,8 @@ fn partial_fill() {
     book.add_user_order(gen.next(), usdc(), eth(), 20000, 10);
     book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
 
-    let (filled, _) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
     assert!(!filled.is_empty());
     assert!(book.active_order_count() >= 1, "larger order should remain partially filled");
 }
@@ -71,7 +76,8 @@ fn one_sided_no_match() {
     let mut gen = NoteIdGen::new();
     book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
 
-    let (_, cycles) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
     assert_eq!(cycles, 0);
 }
 
@@ -83,7 +89,8 @@ fn surplus_to_protocol_balance() {
     book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
     book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
 
-    let _ = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
     let usdc_balance = book.protocol_balances.get(&usdc()).copied().unwrap_or(0);
     assert!(usdc_balance > 0, "surplus should be in protocol balance");
 }
@@ -102,7 +109,8 @@ fn multiple_pairs() {
     book.add_user_order(gen.next(), usdc(), sol(), 150, 1);
     book.add_user_order(gen.next(), sol(), usdc(), 1, 120);
 
-    let (_, cycles) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
     assert!(cycles >= 2);
 }
 
@@ -116,7 +124,8 @@ fn filled_order_details() {
     let order_b_id = gen.next();
     assert!(book.add_user_order(order_b_id, eth(), usdc(), 1, 1600));
 
-    let (filled, _) = run_direct_matching(&mut book);
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
 
     assert!(filled.contains(&order_a_id));
     assert!(filled.contains(&order_b_id));

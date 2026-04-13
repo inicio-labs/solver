@@ -199,6 +199,50 @@ impl<F: PriceFeed> OrderBook<F> {
         }
     }
 
+    /// Remove an order from the book entirely — indices and HashMap.
+    /// Works regardless of fill state.
+    pub fn remove_order(&mut self, order_id: OrderId) {
+        let order = match self.orders.get(&order_id) {
+            Some(o) => o,
+            None => return,
+        };
+
+        let pair = (order.offered_token, order.requested_token);
+        let key = order.rate_key();
+
+        if let Some(count) = self.active_pair_count.get_mut(&pair) {
+            *count = count.saturating_sub(1);
+        }
+
+        if let Some(btree) = self.pair_index.get_mut(&pair) {
+            if let Some(ids) = btree.get_mut(&key) {
+                if let Some(pos) = ids.iter().rposition(|&id| id == order_id) {
+                    ids.swap_remove(pos);
+                }
+                if ids.is_empty() {
+                    btree.remove(&key);
+                }
+            }
+            if btree.is_empty() {
+                self.pair_index.remove(&pair);
+                if let Some(adj) = self.user_adjacency.get_mut(&pair.0) {
+                    adj.remove(&pair.1);
+                    if adj.is_empty() {
+                        self.user_adjacency.remove(&pair.0);
+                    }
+                }
+                if let Some(inc) = self.incoming_adjacency.get_mut(&pair.1) {
+                    inc.remove(&pair.0);
+                    if inc.is_empty() {
+                        self.incoming_adjacency.remove(&pair.1);
+                    }
+                }
+            }
+        }
+
+        self.orders.remove(&order_id);
+    }
+
     pub fn active_order_count(&self) -> u32 {
         self.orders.values().filter(|o| o.is_active()).count() as u32
     }

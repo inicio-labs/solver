@@ -1,9 +1,7 @@
-use miden_protocol::crypto::utils::Serializable;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-use crate::db::{self, DbPool};
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::price::{PriceSnapshot, WatchPriceFeed};
@@ -17,12 +15,11 @@ use crate::types::*;
 /// 3. Run matching engine (direct + triangular)
 /// 4. For each filled order: build FilledNote with fill amount + raw note data
 /// 5. Send ExecutionBatch downstream
-/// 6. Remove fully filled orders from OrderBook, update DB status
+/// 6. Remove matched orders from OrderBook
 pub async fn run_matcher(
     mut order_rx: mpsc::Receiver<IngestOrder>,
     price_rx: watch::Receiver<PriceSnapshot>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
-    pool: DbPool,
     match_interval: Duration,
 ) {
     let feed = WatchPriceFeed::from_watch(&price_rx);
@@ -52,7 +49,7 @@ pub async fn run_matcher(
             }
         }
 
-        if engine.book.active_order_count() == 0 {
+        if engine.book.orders.is_empty() {
             continue;
         }
 
@@ -95,26 +92,10 @@ pub async fn run_matcher(
             continue;
         }
 
-        // 6. Update DB status and clean up filled orders
-        let filled_ids: Vec<OrderId> = batch.filled_orders.iter().copied().collect();
-
-        if let Ok(mut conn) = pool.get() {
-            for &order_id in &filled_ids {
-                let id_bytes = order_id.to_bytes().to_vec();
-                let _ = db::update_order_status(&mut conn, &id_bytes, OrderStatus::InFlight);
-            }
-        }
-
-        for &order_id in &filled_ids {
-            if engine
-                .book
-                .orders
-                .get(&order_id)
-                .map_or(true, |o| o.is_completely_filled())
-            {
-                engine.book.orders.remove(&order_id);
-                raw_notes.remove(&order_id);
-            }
+        // 6. Remove all matched orders from the book (indices + HashMap)
+        for &order_id in &batch.filled_orders {
+            engine.book.remove_order(order_id);
+            raw_notes.remove(&order_id);
         }
 
         engine.book.protocol_balances.clear();

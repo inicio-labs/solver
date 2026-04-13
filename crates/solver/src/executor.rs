@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -5,344 +6,190 @@ use miden_client::{
     keystore::FilesystemKeyStore, store::NoteFilter, transaction::TransactionRequestBuilder,
     Client, Felt, Word,
 };
-use miden_core::FieldElement;
 use miden_protocol::{
     account::AccountId,
     asset::{Asset, FungibleAsset},
+    crypto::utils::{Deserializable, SliceReader},
     note::{Note, NoteDetails},
 };
 use consume_script::ConsumeAssetScript;
 use miden_standards::note::PswapNote;
+use tokio::sync::mpsc;
 
-use crate::order::Order;
+use crate::types::{ExecutionBatch, FilledNote, TokenId, Amount};
 
-pub struct MatchResult {
-    pub total_x: u64,
-    pub total_y: u64,
-    pub surplus_x: u64,
-    pub surplus_y: u64,
+/// Run the executor loop: listen for ExecutionBatches and submit Miden transactions.
+pub async fn run_executor(
+    client: &mut Client<FilesystemKeyStore>,
+    solver_id: AccountId,
+    mut exec_rx: mpsc::Receiver<ExecutionBatch>,
+) {
+    while let Some(batch) = exec_rx.recv().await {
+        if batch.filled_notes.is_empty() {
+            continue;
+        }
+
+        match execute_batch(client, solver_id, &batch).await {
+            Ok(_) => println!("[executor] batch executed successfully ({} notes)", batch.filled_notes.len()),
+            Err(e) => eprintln!("[executor] batch execution failed: {e}"),
+        }
+    }
+
+    println!("[executor] channel closed, shutting down");
 }
 
-pub struct Executor;
+/// Execute a batch of filled notes in a single Miden transaction.
+///
+/// For each FilledNote:
+///   1. Deserialize raw bytes → Note → PswapNote
+///   2. Call pswap.execute(solver_id, None, Some(fill_asset)) to get output notes
+///   3. Collect input notes, expected outputs, and per-token supply/demand
+///
+/// Surplus (supply - demand) goes into the solver's vault via ConsumeAssetScript.
+async fn execute_batch(
+    client: &mut Client<FilesystemKeyStore>,
+    solver_id: AccountId,
+    batch: &ExecutionBatch,
+) -> Result<()> {
+    let mut input_notes: Vec<(Note, Option<Word>)> = Vec::new();
+    let mut expected_future_notes = Vec::new();
+    let mut expected_output_recipients = Vec::new();
 
-impl Executor {
-    /// Execute matched orders.
-    ///
-    /// Tracks supply/demand for each asset:
-    ///   - supply: note assets entering the transaction
-    ///   - demand: assets leaving via P2ID notes and remainder notes
-    ///   - surplus = supply - demand → solver's profit
-    ///
-    /// Surplus is collected via `ConsumeAssetScript`: a custom tx-script that
-    /// moves surplus assets directly into the solver's vault (no P2ID notes needed).
-    ///
-    /// Note arg layout: [input_amount=0, inflight_amount=fill, surplus_amount=0, tag=0]
-    pub async fn execute_simple_match(
-        client: &mut Client<FilesystemKeyStore>,
-        solver_id: AccountId,
-        asks: &[Order], // offer X, want Y
-        bids: &[Order], // offer Y, want X
-    ) -> Result<MatchResult> {
-        println!("Testing:: Executor::execute_simple_match");
-        println!(
-            "Testing:: asks={:?}",
-            asks.iter().map(|a| a.offered_amount).collect::<Vec<_>>()
-        );
-        println!(
-            "Testing:: asks={:?}",
-            asks.iter().map(|a| a.requested_amount).collect::<Vec<_>>()
-        );
-        println!(
-            "Testing:: asks={:?}",
-            asks.iter().map(|a| a.fill_amount).collect::<Vec<_>>()
-        );
+    // Track supply (what enters the tx) and demand (what leaves) per token
+    let mut supply: HashMap<TokenId, u64> = HashMap::new();
+    let mut demand: HashMap<TokenId, u64> = HashMap::new();
 
-        println!(
-            "Testing:: bids={:?}",
-            bids.iter().map(|b| b.offered_amount).collect::<Vec<_>>()
-        );
-        println!(
-            "Testing:: bids={:?}",
-            bids.iter().map(|b| b.requested_amount).collect::<Vec<_>>()
-        );
-        println!(
-            "Testing:: bids={:?}",
-            bids.iter().map(|b| b.fill_amount).collect::<Vec<_>>()
-        );
+    for filled in &batch.filled_notes {
+        // Deserialize raw note data back to Note
+        let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))
+            .context("failed to deserialize note from raw data")?;
 
-        println!("Testing:: bids={:?}", bids);
+        // Parse as PswapNote
+        let pswap = PswapNote::try_from(&note)
+            .map_err(|e| anyhow::anyhow!("failed to parse PswapNote: {}", e))?;
 
-        let x_faucet = asks[0].offered_faucet_id;
-        let y_faucet = bids[0].offered_faucet_id;
+        let offered_asset = pswap.offered_asset();
+        let offered_token = offered_asset.faucet_id();
+        let requested_token = pswap.storage().requested_faucet_id();
 
-        // ── Verify all input notes have full details in the local store ──
-        // Public notes received via tag tracking must have metadata and an inclusion
-        // proof before the prover can add their details to the advice map.
-        {
-            let note_ids: Vec<_> = asks
-                .iter()
-                .chain(bids.iter())
-                .map(|o| o.note.id())
-                .collect();
+        // Supply: the offered asset enters the transaction
+        *supply.entry(offered_token).or_default() += offered_asset.amount();
 
-            let records = client
-                .get_input_notes(NoteFilter::List(note_ids.clone()))
-                .await
-                .context("Failed to query note records for detail check")?;
+        // Build fill asset (inflight — from another note in the same tx)
+        let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
+            .map_err(|e| anyhow::anyhow!("failed to create fill asset: {}", e))?;
 
-            for id in &note_ids {
-                let record = records.iter().find(|r| r.id() == *id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Note {} not found in local store — call sync_state() before executing",
-                        id
-                    )
-                })?;
+        // Note args: [input_amount=0, 0, inflight_amount=fill, 0]
+        let note_args = Word::from([
+            Felt::ZERO,
+            Felt::ZERO,
+            Felt::new(filled.requested_filled),
+            Felt::ZERO,
+        ]);
+        input_notes.push((note.clone(), Some(note_args)));
 
-                if record.metadata().is_none() {
-                    anyhow::bail!(
-                        "Note {} is missing metadata — public note details not yet available (call sync_state() again)",
-                        id
-                    );
-                }
+        // Execute the PSWAP note to get output notes
+        let (p2id, remainder) = pswap
+            .execute(solver_id, None, Some(fill_asset))
+            .map_err(|e| anyhow::anyhow!("pswap execute failed: {}", e))?;
 
-                if !record.is_authenticated() {
-                    anyhow::bail!(
-                        "Note {} has no inclusion proof — not yet committed on-chain",
-                        id
-                    );
-                }
-            }
+        // P2ID note sends the requested asset to the order creator → demand
+        *demand.entry(requested_token).or_default() += note_asset_amount(&p2id);
+        let p2id_tag = p2id.metadata().tag();
+        expected_output_recipients.push(p2id.recipient().clone());
+        expected_future_notes.push((NoteDetails::from(p2id), p2id_tag));
+
+        // Remainder note (if partial fill) sends leftover offered asset back → demand
+        if let Some(rem_pswap) = remainder {
+            let rem_note = Note::from(rem_pswap);
+            *demand.entry(offered_token).or_default() += note_asset_amount(&rem_note);
+            let rem_tag = rem_note.metadata().tag();
+            expected_output_recipients.push(rem_note.recipient().clone());
+            expected_future_notes.push((NoteDetails::from(rem_note), rem_tag));
         }
-
-        let mut total_supply_x: u64 = 0;
-        let mut total_supply_y: u64 = 0;
-        let mut total_demand_x: u64 = 0;
-        let mut total_demand_y: u64 = 0;
-
-        let mut expected_future_notes = Vec::new();
-        let mut expected_output_recipients = Vec::new();
-        let mut final_input_notes = Vec::new();
-
-        // ── Process asks (offer X, want Y) ──
-        for order in asks.iter() {
-            total_supply_x += order.offered_amount;
-            println!(
-                "[ask] note={} offered={} requested={} fill={}",
-                order.note.id(),
-                order.offered_amount,
-                order.requested_amount,
-                order.fill_amount,
-            );
-            final_input_notes.push((
-                order.note.clone(),
-                Some(Word::from([
-                    Felt::ZERO,
-                    Felt::ZERO,
-                    Felt::new(order.fill_amount),
-                    Felt::ZERO,
-                ])),
-            ));
-
-            let pswap = PswapNote::try_from(&order.note)
-                .map_err(|e| anyhow::anyhow!("ask parse: {}", e))?;
-            let fill_asset = FungibleAsset::new(
-                pswap.storage().requested_faucet_id(),
-                order.fill_amount,
-            ).map_err(|e| anyhow::anyhow!("ask fill asset: {}", e))?;
-            let (p2id, remainder_pswap) = pswap.execute(solver_id, None, Some(fill_asset))
-                .map_err(|e| anyhow::anyhow!("ask output: {}", e))?;
-            let remainder = remainder_pswap.map(Note::from);
-
-            // P2ID carries Y (requested asset) → demand_y
-            total_demand_y += note_asset_amount(&p2id);
-            let p2id_tag = p2id.metadata().tag();
-            println!(
-                "  [ask] p2id recipient={:?} tag={:?} asset={}",
-                p2id.recipient().digest(),
-                p2id_tag,
-                note_asset_amount(&p2id),
-            );
-            expected_output_recipients.push(p2id.recipient().clone());
-            expected_future_notes.push((NoteDetails::from(p2id), p2id_tag));
-
-            // Remainder carries leftover X (offered asset) → demand_x
-            if let Some(rem) = remainder {
-                total_demand_x += note_asset_amount(&rem);
-                let rem_tag = rem.metadata().tag();
-                println!(
-                    "  [ask] remainder recipient={:?} tag={:?} asset={}",
-                    rem.recipient().digest(),
-                    rem_tag,
-                    note_asset_amount(&rem),
-                );
-                expected_output_recipients.push(rem.recipient().clone());
-                expected_future_notes.push((NoteDetails::from(rem), rem_tag));
-            } else {
-                println!("  [ask] no remainder (fully filled)");
-            }
-        }
-
-        // ── Process bids (offer Y, want X) ──
-        for order in bids.iter() {
-            total_supply_y += order.offered_amount;
-            println!(
-                "[bid] note={} offered={} requested={} fill={}",
-                order.note.id(),
-                order.offered_amount,
-                order.requested_amount,
-                order.fill_amount,
-            );
-            final_input_notes.push((
-                order.note.clone(),
-                Some(Word::from([
-                    Felt::ZERO,
-                    Felt::ZERO,
-                    Felt::new(order.fill_amount),
-                    Felt::ZERO,
-                ])),
-            ));
-
-            let pswap = PswapNote::try_from(&order.note)
-                .map_err(|e| anyhow::anyhow!("bid parse: {}", e))?;
-            let fill_asset = FungibleAsset::new(
-                pswap.storage().requested_faucet_id(),
-                order.fill_amount,
-            ).map_err(|e| anyhow::anyhow!("bid fill asset: {}", e))?;
-            let (p2id, remainder_pswap) = pswap.execute(solver_id, None, Some(fill_asset))
-                .map_err(|e| anyhow::anyhow!("bid output: {}", e))?;
-            let remainder = remainder_pswap.map(Note::from);
-
-            // P2ID carries X (requested asset) → demand_x
-            total_demand_x += note_asset_amount(&p2id);
-            let p2id_tag = p2id.metadata().tag();
-            println!(
-                "  [bid] p2id recipient={:?} tag={:?} asset={}",
-                p2id.recipient().digest(),
-                p2id_tag,
-                note_asset_amount(&p2id),
-            );
-            expected_output_recipients.push(p2id.recipient().clone());
-            expected_future_notes.push((NoteDetails::from(p2id), p2id_tag));
-
-            // Remainder carries leftover Y (offered asset) → demand_y
-            if let Some(rem) = remainder {
-                total_demand_y += note_asset_amount(&rem);
-                let rem_tag = rem.metadata().tag();
-                println!(
-                    "  [bid] remainder recipient={:?} tag={:?} asset={}",
-                    rem.recipient().digest(),
-                    rem_tag,
-                    note_asset_amount(&rem),
-                );
-                expected_output_recipients.push(rem.recipient().clone());
-                expected_future_notes.push((NoteDetails::from(rem), rem_tag));
-            } else {
-                println!("  [bid] no remainder (fully filled)");
-            }
-        }
-
-        println!(
-            "total_supply_x={}, total_demand_x={}",
-            total_supply_x, total_demand_x
-        );
-        println!(
-            "total_supply_y={}, total_demand_y={}",
-            total_supply_y, total_demand_y
-        );
-
-        // ── Compute surplus ──
-        let surplus_x = total_supply_x.saturating_sub(total_demand_x);
-        let surplus_y = total_supply_y.saturating_sub(total_demand_y);
-
-        println!("Surplus: x={}, y={}", surplus_x, surplus_y);
-
-        // ── Prepare ConsumeAssetScript for solver's surplus ──
-        // Surplus goes directly into the solver's vault — no output P2ID notes.
-        let mut surplus_assets: Vec<Asset> = Vec::new();
-        if surplus_x > 0 {
-            surplus_assets.push(Asset::Fungible(
-                FungibleAsset::new(x_faucet, surplus_x)
-                    .map_err(|e| anyhow::anyhow!("surplus X asset: {}", e))?,
-            ));
-        }
-        if surplus_y > 0 {
-            surplus_assets.push(Asset::Fungible(
-                FungibleAsset::new(y_faucet, surplus_y)
-                    .map_err(|e| anyhow::anyhow!("surplus Y asset: {}", e))?,
-            ));
-        }
-
-        let consume_data = if !surplus_assets.is_empty() {
-            Some(ConsumeAssetScript::prepare(&surplus_assets))
-        } else {
-            None
-        };
-
-        // ── Sync state to ensure note details are available ──
-        client.sync_state().await?;
-
-        // ── Build and submit transaction ──
-        let mut builder = TransactionRequestBuilder::new()
-            .input_notes(final_input_notes.clone())
-            .expected_future_notes(expected_future_notes.clone())
-            .expected_output_recipients(expected_output_recipients.clone());
-
-        if let Some(data) = consume_data {
-            builder = builder
-                .custom_script(ConsumeAssetScript::tx_script())
-                .script_arg(data.commitment_arg)
-                .extend_advice_map([data.advice_map_entry]);
-        }
-
-        println!("Print all the notes that are being sent to the transaction");
-        for note in final_input_notes {
-            println!("note={:?}", note.0.assets().iter().next().unwrap());
-        }
-
-        println!("Print all the notes that are expected to be output");
-        for note in expected_future_notes {
-            println!("note={:?}", note.0.assets().iter().next().unwrap());
-        }
-
-        println!("Print all the recipients that are expected to be output");
-        for recipient in expected_output_recipients {
-            println!("recipient={:?}", recipient.digest());
-            println!("recipient={:?}", recipient.digest().to_hex());
-        }
-
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        let request = builder
-            .build()
-            .context("Failed to build transaction request")?;
-
-        let tx_id = client
-            .submit_new_transaction(solver_id, request)
-            .await
-            .map_err(|e| {
-                eprintln!("submit_new_transaction failed: {:?}", e);
-                anyhow::anyhow!("Failed to submit match transaction error: {}", e)
-            })
-            .context("Failed to submit match transaction")?;
-
-        tokio::time::sleep(Duration::from_secs(100)).await;
-
-        println!(
-            "Match executed: {} asks + {} bids, surplus_x={}, surplus_y={}, tx={:?}",
-            asks.len(),
-            bids.len(),
-            surplus_x,
-            surplus_y,
-            tx_id,
-        );
-
-        Ok(MatchResult {
-            total_x: total_supply_x,
-            total_y: total_supply_y,
-            surplus_x,
-            surplus_y,
-        })
     }
+
+    // Verify input notes have full details in local store
+    verify_note_details(client, &input_notes).await?;
+
+    // Compute surplus per token (supply - demand)
+    let mut surplus_assets: Vec<Asset> = Vec::new();
+    let all_tokens: Vec<TokenId> = supply.keys().chain(demand.keys()).copied().collect();
+    for token in all_tokens {
+        let s = supply.get(&token).copied().unwrap_or(0);
+        let d = demand.get(&token).copied().unwrap_or(0);
+        let surplus = s.saturating_sub(d);
+        if surplus > 0 {
+            surplus_assets.push(Asset::Fungible(
+                FungibleAsset::new(token, surplus)
+                    .map_err(|e| anyhow::anyhow!("surplus asset: {}", e))?,
+            ));
+        }
+    }
+
+    // Prepare ConsumeAssetScript for surplus
+    let consume_data = if !surplus_assets.is_empty() {
+        Some(ConsumeAssetScript::prepare(&surplus_assets))
+    } else {
+        None
+    };
+
+    // Sync state to ensure note details are available
+    client.sync_state().await?;
+
+    // Build transaction
+    let mut builder = TransactionRequestBuilder::new()
+        .input_notes(input_notes)
+        .expected_future_notes(expected_future_notes)
+        .expected_output_recipients(expected_output_recipients);
+
+    if let Some(data) = consume_data {
+        builder = builder
+            .custom_script(ConsumeAssetScript::tx_script())
+            .script_arg(data.commitment_arg)
+            .extend_advice_map([data.advice_map_entry]);
+    }
+
+    let request = builder
+        .build()
+        .context("failed to build transaction request")?;
+
+    client
+        .submit_new_transaction(solver_id, request)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to submit transaction: {}", e))?;
+
+    Ok(())
+}
+
+/// Verify all input notes have metadata and inclusion proofs in the local store.
+async fn verify_note_details(
+    client: &Client<FilesystemKeyStore>,
+    input_notes: &[(Note, Option<Word>)],
+) -> Result<()> {
+    let note_ids: Vec<_> = input_notes.iter().map(|(n, _)| n.id()).collect();
+
+    let records = client
+        .get_input_notes(NoteFilter::List(note_ids.clone()))
+        .await
+        .context("failed to query note records")?;
+
+    for id in &note_ids {
+        let record = records
+            .iter()
+            .find(|r| r.id() == *id)
+            .ok_or_else(|| anyhow::anyhow!("note {} not found in local store", id))?;
+
+        if record.metadata().is_none() {
+            anyhow::bail!("note {} missing metadata — sync state first", id);
+        }
+
+        if !record.is_authenticated() {
+            anyhow::bail!("note {} has no inclusion proof — not yet committed on-chain", id);
+        }
+    }
+
+    Ok(())
 }
 
 /// Extract the amount of the first fungible asset from a note.

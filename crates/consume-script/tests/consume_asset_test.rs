@@ -4,11 +4,10 @@ use consume_script::{ConsumeAssetData, ConsumeAssetScript};
 use miden_protocol::account::auth::AuthScheme;
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
-use miden_protocol::note::NoteAssets;
 use miden_protocol::note::NoteType;
 use miden_protocol::transaction::RawOutputNote;
 use miden_protocol::note::Note;
-use miden_protocol::{Felt, Word, ZERO};
+use miden_protocol::Word;
 use miden_standards::note::{PswapNote, PswapNoteStorage};
 use miden_testing::{Auth, MockChain};
 
@@ -51,10 +50,8 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     let mut rng = RandomCoin::new(Word::default());
 
     // Alice's PSWAP note: offers 100 USDC, requests 10 ETH
-    let alice_requested = Asset::Fungible(FungibleAsset::new(eth_faucet.id(), 10)?);
     let alice_storage = PswapNoteStorage::builder()
-        .requested_asset_key(alice_requested.to_key_word())
-        .requested_asset_value(alice_requested.to_value_word())
+        .requested_asset(FungibleAsset::new(eth_faucet.id(), 10)?)
         .creator_account_id(alice.id())
         .build();
     let alice_note: Note = PswapNote::builder()
@@ -62,19 +59,14 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
         .storage(alice_storage)
         .serial_number(rng.draw_word())
         .note_type(NoteType::Public)
-        .assets(NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
-            usdc_faucet.id(),
-            100,
-        )?)])?)
+        .offered_asset(FungibleAsset::new(usdc_faucet.id(), 100)?)
         .build()?
         .into();
     builder.add_output_note(RawOutputNote::Full(alice_note.clone()));
 
     // Bob's PSWAP note: offers 10 ETH, requests 80 USDC
-    let bob_requested = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 80)?);
     let bob_storage = PswapNoteStorage::builder()
-        .requested_asset_key(bob_requested.to_key_word())
-        .requested_asset_value(bob_requested.to_value_word())
+        .requested_asset(FungibleAsset::new(usdc_faucet.id(), 80)?)
         .creator_account_id(bob.id())
         .build();
     let bob_note: Note = PswapNote::builder()
@@ -82,10 +74,7 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
         .storage(bob_storage)
         .serial_number(rng.draw_word())
         .note_type(NoteType::Public)
-        .assets(NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
-            eth_faucet.id(),
-            10,
-        )?)])?)
+        .offered_asset(FungibleAsset::new(eth_faucet.id(), 10)?)
         .build()?
         .into();
     builder.add_output_note(RawOutputNote::Full(bob_note.clone()));
@@ -93,24 +82,32 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     let mock_chain = builder.build()?;
 
     // Note args: cross-swap via inflight amounts
-    // Alice's note: input=0 ETH from solver vault, inflight=10 ETH (from Bob's note)
-    // Bob's note: input=0 USDC from solver vault, inflight=80 USDC (from Alice's note, 80 of 100)
+    // Alice's note: account_fill=0, note_fill=10 ETH (from Bob's note)
+    // Bob's note: account_fill=0, note_fill=80 USDC (from Alice's note)
     let mut note_args_map = BTreeMap::new();
     note_args_map.insert(
         alice_note.id(),
-        Word::from([Felt::new(0), Felt::new(10), ZERO, ZERO]),
+        PswapNote::create_args(0, 10)?,
     );
     note_args_map.insert(
         bob_note.id(),
-        Word::from([Felt::new(0), Felt::new(80), ZERO, ZERO]),
+        PswapNote::create_args(0, 80)?,
     );
 
     // Compute expected output notes
     let alice_pswap = PswapNote::try_from(&alice_note)?;
-    let (alice_p2id, _) = alice_pswap.execute(solver.id(), 0, 10)?;
+    let (alice_p2id, _) = alice_pswap.execute(
+        solver.id(),
+        None,
+        Some(FungibleAsset::new(eth_faucet.id(), 10)?),
+    )?;
 
     let bob_pswap = PswapNote::try_from(&bob_note)?;
-    let (bob_p2id, _) = bob_pswap.execute(solver.id(), 0, 80)?;
+    let (bob_p2id, _) = bob_pswap.execute(
+        solver.id(),
+        None,
+        Some(FungibleAsset::new(usdc_faucet.id(), 80)?),
+    )?;
 
     // Surplus: 100 USDC offered by Alice - 80 USDC sent to Bob = 20 USDC for solver
     let surplus_asset = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 20)?);

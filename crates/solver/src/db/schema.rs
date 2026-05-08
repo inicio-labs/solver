@@ -38,8 +38,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    registered_tokens (id) {
-        id -> Integer,
+    registered_tokens (token_id) {
         token_id -> Binary,
         created_at -> BigInt,
     }

@@ -52,17 +52,9 @@ pub struct GeneratedNoteRow {
     pub created_at: i64,
 }
 
-#[derive(Queryable, Selectable, Debug, Clone)]
+#[derive(Queryable, Selectable, Insertable, Debug, Clone)]
 #[diesel(table_name = registered_tokens)]
 pub struct RegisteredTokenRow {
-    pub id: i32,
-    pub token_id: Vec<u8>,
-    pub created_at: i64,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = registered_tokens)]
-pub struct NewRegisteredToken {
     pub token_id: Vec<u8>,
     pub created_at: i64,
 }

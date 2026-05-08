@@ -1,44 +1,33 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::db::models::{NoteRow, OrderRow};
 use crate::db::{self, DbPool};
-use crate::order::Order as PipelineOrder;
-use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
+use crate::types::Order as PipelineOrder;
+use crate::types::{IngestOrder, OrderStatus, TokenId};
 
-/// Result of a sync_state call — contains the block number and IDs of newly received notes.
+/// Result of a sync_state call — contains the block number and newly received notes.
 pub struct SyncResult {
     pub block_num: u64,
-    pub new_note_ids: Vec<OrderId>,
+    pub new_notes: Vec<Note>,
 }
 
 /// Trait abstracting the Miden Node RPC client.
-/// Object-safe (uses boxed futures) so it can be used as `dyn MidenClient`.
+#[async_trait]
 pub trait MidenClient: Send {
     /// Register note tags for a trading pair (both directions).
     /// Must be called before sync_state to receive notes for this pair.
-    fn subscribe_pair(
-        &mut self,
-        base: TokenId,
-        quote: TokenId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> Result<()>;
 
     /// Sync client state with the Miden Node.
-    /// Returns the new block number and IDs of newly received notes.
-    fn sync_state(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncResult>> + Send + '_>>;
-
-    /// Fetch full notes by their IDs from the local store.
-    fn get_notes_by_ids(
-        &self,
-        ids: &[OrderId],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Note>>> + Send + '_>>;
+    /// Returns the new block number and full note data for newly received notes.
+    async fn sync_state(&mut self) -> Result<SyncResult>;
 }
 
 /// Run the note ingestion loop.
@@ -51,10 +40,10 @@ pub async fn run_ingest(
     interval: Duration,
 ) {
     loop {
+        tokio::time::sleep(interval).await;
         if let Err(e) = ingest_once(&client, &pool, &order_tx).await {
             eprintln!("[ingest] error: {e}");
         }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -64,20 +53,9 @@ async fn ingest_once(
     pool: &DbPool,
     order_tx: &mpsc::Sender<IngestOrder>,
 ) -> Result<()> {
-    // 1. Sync state — get block number and newly received note IDs
-    let sync_data = {
+    let SyncResult { block_num, new_notes } = {
         let mut c = client.lock().await;
         c.sync_state().await?
-    };
-
-    if sync_data.new_note_ids.is_empty() {
-        return Ok(());
-    }
-
-    // 2. Fetch full notes by IDs
-    let notes = {
-        let c = client.lock().await;
-        c.get_notes_by_ids(&sync_data.new_note_ids).await?
     };
 
     // 3. Filter PSWAP notes and parse into DB records + channel messages
@@ -85,7 +63,7 @@ async fn ingest_once(
     let mut db_orders = Vec::new();
     let mut ingest_orders = Vec::new();
 
-    for note in &notes {
+    for note in &new_notes {
         if note.recipient().script().root() != PswapNote::script_root() {
             continue;
         }
@@ -97,6 +75,7 @@ async fn ingest_once(
                 continue;
             }
         };
+
 
         let note_id_bytes = note.id().to_bytes().to_vec();
 
@@ -116,8 +95,8 @@ async fn ingest_once(
             requested_amount: order.requested_amount as i64,
             offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
             offered_amount: order.offered_amount as i64,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
             status: OrderStatus::Active.as_str().to_string(),
@@ -138,15 +117,13 @@ async fn ingest_once(
     }
 
     // 4. Atomic DB insert (notes + orders + block number)
-    let mut conn = pool.get()?;
-    db::insert_notes_batch(&mut conn, &db_notes, &db_orders, sync_data.block_num)?;
+    let mut conn = pool.write_conn()?;
+    db::insert_notes_batch(&mut conn, &db_notes, &db_orders, block_num)?;
 
-    // 5. Send IngestOrders to matcher channel
+    // send blocks when full (backpressure), errors only if matcher has crashed
     for order in ingest_orders {
-        if let Err(e) = order_tx.send(order).await {
-            eprintln!("[ingest] channel send failed: {e}");
-            break;
-        }
+        order_tx.send(order).await
+            .map_err(|_| anyhow::anyhow!("matcher channel closed"))?;
     }
 
     Ok(())
@@ -176,41 +153,17 @@ pub mod tests {
         }
     }
 
+    #[async_trait]
     impl MidenClient for MockMidenClient {
-        fn subscribe_pair(
-            &mut self,
-            _base: TokenId,
-            _quote: TokenId,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
+        async fn subscribe_pair(&mut self, _offered: TokenId, _requested: TokenId) -> Result<()> {
+            Ok(())
         }
 
-        fn sync_state(
-            &mut self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SyncResult>> + Send + '_>>
-        {
-            let ids: Vec<OrderId> = self.notes.iter().map(|n| n.id()).collect();
-            let block = self.block;
-            Box::pin(async move {
-                Ok(SyncResult {
-                    block_num: block,
-                    new_note_ids: ids,
-                })
+        async fn sync_state(&mut self) -> Result<SyncResult> {
+            Ok(SyncResult {
+                block_num: self.block,
+                new_notes: self.notes.clone(),
             })
-        }
-
-        fn get_notes_by_ids(
-            &self,
-            ids: &[OrderId],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Note>>> + Send + '_>>
-        {
-            let notes: Vec<Note> = self
-                .notes
-                .iter()
-                .filter(|n| ids.contains(&n.id()))
-                .cloned()
-                .collect();
-            Box::pin(async move { Ok(notes) })
         }
     }
 }

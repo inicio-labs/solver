@@ -1,8 +1,10 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::db::{self, DbPool};
 use crate::types::TokenId;
 use crate::matching::price_feed::{PriceFeed, UsdCents};
 
@@ -10,12 +12,9 @@ use crate::matching::price_feed::{PriceFeed, UsdCents};
 pub type PriceSnapshot = HashMap<TokenId, UsdCents>;
 
 /// Trait abstracting the price service.
+#[async_trait]
 pub trait PriceClient: Send {
-    /// Fetch latest prices for the given tokens.
-    fn fetch_prices(
-        &self,
-        tokens: &[TokenId],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PriceSnapshot>> + Send + '_>>;
+    async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PriceSnapshot>;
 }
 
 /// Mock price client that returns configurable static prices.
@@ -29,14 +28,10 @@ impl MockPriceClient {
     }
 }
 
+#[async_trait]
 impl PriceClient for MockPriceClient {
-    fn fetch_prices(
-        &self,
-        _tokens: &[TokenId],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PriceSnapshot>> + Send + '_>>
-    {
-        let prices = self.prices.clone();
-        Box::pin(async move { Ok(prices) })
+    async fn fetch_prices(&self, _tokens: &[TokenId]) -> Result<PriceSnapshot> {
+        Ok(self.prices.clone())
     }
 }
 
@@ -45,18 +40,24 @@ impl PriceClient for MockPriceClient {
 /// Periodically polls the price service and broadcasts updates via the watch channel.
 pub async fn run_price_feed(
     client: impl PriceClient,
-    tokens: Vec<TokenId>,
+    pool: DbPool,
     price_tx: watch::Sender<PriceSnapshot>,
     interval: Duration,
 ) {
     loop {
+        let tokens = match db::load_registered_tokens(&pool) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[price] failed to load tokens from DB: {e}");
+                vec![]
+            }
+        };
         match client.fetch_prices(&tokens).await {
             Ok(prices) => {
                 let _ = price_tx.send(prices);
             }
             Err(e) => {
                 eprintln!("[price] fetch error: {e}");
-                // watch channel retains last value, so matcher uses stale price
             }
         }
         tokio::time::sleep(interval).await;
@@ -73,28 +74,12 @@ pub struct WatchPriceFeed {
 }
 
 impl WatchPriceFeed {
-    /// Create an empty feed.
     pub fn new() -> Self {
-        Self {
-            prices: HashMap::new(),
-        }
+        Self { prices: HashMap::new() }
     }
 
-    /// Create a new feed from the current watch channel value.
     pub fn from_watch(rx: &watch::Receiver<PriceSnapshot>) -> Self {
-        Self {
-            prices: rx.borrow().clone(),
-        }
-    }
-
-    /// Create a feed from a static price map.
-    pub fn from_map(prices: PriceSnapshot) -> Self {
-        Self { prices }
-    }
-
-    /// Set the price for a token (convenience for building feeds incrementally).
-    pub fn set_price_cents(&mut self, token: TokenId, price: UsdCents) {
-        self.prices.insert(token, price);
+        Self { prices: rx.borrow().clone() }
     }
 }
 
@@ -107,5 +92,20 @@ impl Default for WatchPriceFeed {
 impl PriceFeed for WatchPriceFeed {
     fn usd_price_cents(&self, token: TokenId) -> UsdCents {
         *self.prices.get(&token).unwrap_or(&1)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::*;
+
+    impl WatchPriceFeed {
+        pub fn from_map(prices: PriceSnapshot) -> Self {
+            Self { prices }
+        }
+
+        pub fn set_price_cents(&mut self, token: TokenId, price: UsdCents) {
+            self.prices.insert(token, price);
+        }
     }
 }

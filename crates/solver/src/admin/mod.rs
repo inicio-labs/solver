@@ -32,39 +32,16 @@ impl AdminState {
             .with_state(self)
     }
 
-    /// Load all registered tokens from DB as TokenIds.
     pub fn load_tokens_from_db(&self) -> anyhow::Result<Vec<TokenId>> {
-        let mut conn = self.pool.get()?;
-        let rows = db::get_registered_tokens(&mut conn)?;
-        let mut tokens = Vec::new();
-        for row in rows {
-            let token = TokenId::read_from(&mut SliceReader::new(&row.token_id))
-                .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
-            tokens.push(token);
-        }
-        Ok(tokens)
+        db::load_registered_tokens(&self.pool)
     }
 
-    /// Generate all pairs from registered tokens and subscribe the client to each.
-    pub async fn subscribe_all_pairs(&self) -> anyhow::Result<()> {
-        let tokens = self.load_tokens_from_db()?;
-        let mut client = self.client.lock().await;
-        for i in 0..tokens.len() {
-            for j in 0..tokens.len() {
-                if i != j {
-                    client.subscribe_pair(tokens[i], tokens[j]).await?;
-                }
-            }
-        }
-        Ok(())
-    }
 
-    /// Register a new token: persist to DB, then subscribe all new pairs with existing tokens.
     async fn register_token(&self, new_token: TokenId) -> anyhow::Result<bool> {
         let mut token_bytes = Vec::new();
         new_token.write_into(&mut token_bytes);
 
-        let mut conn = self.pool.get()?;
+        let mut conn = self.pool.write_conn()?;
         let inserted = db::register_token(&mut conn, &token_bytes)?;
 
         if inserted {
@@ -108,7 +85,7 @@ async fn list_tokens(
 async fn add_token(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<(StatusCode, &'static str), StatusCode> {
     let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let token = TokenId::read_from(&mut SliceReader::new(&bytes))
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -119,9 +96,9 @@ async fn add_token(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if inserted {
-        Ok(StatusCode::CREATED)
+        Ok((StatusCode::CREATED, "registered"))
     } else {
-        Ok(StatusCode::OK)
+        Ok((StatusCode::OK, "already registered"))
     }
 }
 
@@ -133,7 +110,7 @@ async fn remove_token(
 
     let mut conn = state
         .pool
-        .get()
+        .write_conn()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let deleted = db::unregister_token(&mut conn, &bytes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -145,23 +122,126 @@ async fn remove_token(
     }
 }
 
-/// Seed tokens from config into the DB (idempotent).
-pub fn seed_tokens_from_config(pool: &DbPool, tokens: &[TokenId]) -> anyhow::Result<()> {
-    let mut conn = pool.get()?;
-    for token in tokens {
-        let mut bytes = Vec::new();
-        token.write_into(&mut bytes);
-        db::register_token(&mut conn, &bytes)?;
-    }
-    Ok(())
-}
 
 #[derive(Deserialize)]
 pub struct TokenRequest {
     pub token_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenResponse {
     pub token_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+    };
+    use miden_protocol::account::AccountId;
+    use serde_json::json;
+
+    use crate::db;
+    use crate::ingest::tests::MockMidenClient;
+
+    fn test_token_a() -> TokenId {
+        AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()
+    }
+
+    fn test_token_b() -> TokenId {
+        AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
+    }
+
+    fn unique_db_url() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("file:admintest{}?mode=memory&cache=shared", n)
+    }
+
+    fn test_server() -> TestServer {
+        let pool = db::init_db(&unique_db_url(), 1).unwrap();
+        let client = Arc::new(Mutex::new(MockMidenClient::new()));
+        let state = Arc::new(AdminState::new(pool, client));
+        TestServer::new(state.router())
+    }
+
+    fn token_hex(token: TokenId) -> String {
+        let mut bytes = Vec::new();
+        token.write_into(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn add_token_returns_created_first_time() {
+        let server = test_server();
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(test_token_a()) }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        assert_eq!(res.text(), "registered");
+    }
+
+    #[tokio::test]
+    async fn add_token_returns_ok_on_duplicate() {
+        let server = test_server();
+        let body = json!({ "token_id": token_hex(test_token_a()) });
+        server.post("/admin/tokens").json(&body).await;
+        let res = server.post("/admin/tokens").json(&body).await;
+        res.assert_status(StatusCode::OK);
+        assert_eq!(res.text(), "already registered");
+    }
+
+    #[tokio::test]
+    async fn add_token_returns_bad_request_for_invalid_hex() {
+        let server = test_server();
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": "not_hex!" }))
+            .await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn remove_token_returns_ok_when_found() {
+        let server = test_server();
+        let body = json!({ "token_id": token_hex(test_token_a()) });
+        server.post("/admin/tokens").json(&body).await;
+        let res = server.delete("/admin/tokens").json(&body).await;
+        res.assert_status(StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn remove_token_returns_not_found_when_missing() {
+        let server = test_server();
+        let res = server
+            .delete("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(test_token_a()) }))
+            .await;
+        res.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_tokens_returns_all_registered() {
+        let server = test_server();
+        server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(test_token_a()) }))
+            .await;
+        server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(test_token_b()) }))
+            .await;
+
+        let res = server.get("/admin/tokens").await;
+        res.assert_status_ok();
+        let body: Vec<TokenResponse> = res.json();
+        assert_eq!(body.len(), 2);
+        let ids: Vec<_> = body.iter().map(|t| t.token_id.as_str()).collect();
+        assert!(ids.contains(&token_hex(test_token_a()).as_str()));
+        assert!(ids.contains(&token_hex(test_token_b()).as_str()));
+    }
 }

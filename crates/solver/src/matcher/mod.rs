@@ -36,17 +36,14 @@ pub async fn run_matcher(
 
         // 1. Drain all pending orders from the channel
         while let Ok(order) = order_rx.try_recv() {
-            let added = engine.book.add_user_order(
+            engine.book.add_user_order(
                 order.note_id,
                 order.offered_token,
                 order.requested_token,
                 order.offered_amount,
                 order.requested_amount,
             );
-
-            if added {
-                raw_notes.insert(order.note_id, order.raw_note_data);
-            }
+            raw_notes.insert(order.note_id, order.raw_note_data);
         }
 
         if engine.book.orders.is_empty() {
@@ -86,10 +83,10 @@ pub async fn run_matcher(
             });
         }
 
-        // 5. Send ExecutionBatch downstream
-        if let Err(e) = exec_tx.send(ExecutionBatch { filled_notes }).await {
-            eprintln!("[matcher] execution channel send failed: {e}");
-            continue;
+        // send only errors if executor has crashed (receiver dropped)
+        if exec_tx.send(ExecutionBatch { filled_notes }).await.is_err() {
+            eprintln!("[matcher] executor channel closed, shutting down");
+            return;
         }
 
         // 6. Remove all matched orders from the book (indices + HashMap)

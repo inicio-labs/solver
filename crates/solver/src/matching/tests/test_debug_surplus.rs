@@ -45,9 +45,9 @@ fn settlement_solvency_check() {
         let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
 
         let id_a = gen.next();
-        if !book.add_user_order(id_a, eth(), usdc(), off_a, req_a) { continue; }
+        book.add_user_order(id_a, eth(), usdc(), off_a, req_a);
         let id_b = gen.next();
-        if !book.add_user_order(id_b, usdc(), eth(), off_b, req_b) { continue; }
+        book.add_user_order(id_b, usdc(), eth(), off_b, req_b);
 
         let mut filled = HashSet::new();
         run_direct_matching(&mut book, &mut filled);

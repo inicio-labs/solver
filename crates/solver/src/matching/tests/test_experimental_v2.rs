@@ -149,8 +149,8 @@ fn protocol_surplus_non_negative_after_match() {
         let off_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
         let req_b = 10 + (pseudo_rand(&mut seed) % 1000) as u64;
 
-        if !book.add_user_order(gen.next(), eth(), usdc(), off_a, req_a) { continue; }
-        if !book.add_user_order(gen.next(), usdc(), eth(), off_b, req_b) { continue; }
+        book.add_user_order(gen.next(), eth(), usdc(), off_a, req_a);
+        book.add_user_order(gen.next(), usdc(), eth(), off_b, req_b);
 
         let mut engine = MatchingEngine::new(book);
         let _batch = engine.run();
@@ -379,9 +379,9 @@ fn settlement_token_balance_pairwise() {
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
     let id_a = gen.next();
-    assert!(book.add_user_order(id_a, eth(), usdc(), 10, 16000));
+    book.add_user_order(id_a, eth(), usdc(), 10, 16000);
     let id_b = gen.next();
-    assert!(book.add_user_order(id_b, usdc(), eth(), 20000, 10));
+    book.add_user_order(id_b, usdc(), eth(), 20000, 10);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
@@ -478,9 +478,9 @@ fn f64_rate_collision() {
 
     // Two orders with rates that are very close but different in integer math
     let id1 = gen.next();
-    assert!(book.add_user_order(id1, eth(), usdc(), 1000000, 333333));
+    book.add_user_order(id1, eth(), usdc(), 1000000, 333333);
     let id2 = gen.next();
-    assert!(book.add_user_order(id2, eth(), usdc(), 1000001, 333334));
+    book.add_user_order(id2, eth(), usdc(), 1000001, 333334);
 
     // Both should be retrievable
     let best = book.best_order(eth(), usdc()).unwrap();

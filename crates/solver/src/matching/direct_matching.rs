@@ -60,15 +60,6 @@ fn match_user_orders<F: PriceFeed>(
             None => break,
         };
 
-        // Check profitability
-        {
-            let order_a = &book.orders[&order_a_id];
-            let order_b = &book.orders[&order_b_id];
-            if !order_a.is_profitable_with(order_b) {
-                break;
-            }
-        }
-
         // Match — clone to avoid double mutable borrow
         let mut order_a = book.orders[&order_a_id].clone();
         let mut order_b = book.orders[&order_b_id].clone();

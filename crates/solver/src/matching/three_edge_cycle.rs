@@ -1,6 +1,7 @@
 use crate::matching::order_book::OrderBook;
 use crate::matching::price_feed::PriceFeed;
 use crate::matching::types::*;
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ── Data Structures ─────────────────────────────────────────────────────────
@@ -53,12 +54,12 @@ impl PartialEq for CycleEntry {
 }
 impl Eq for CycleEntry {}
 impl PartialOrd for CycleEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for CycleEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.surplus_usd.cmp(&other.surplus_usd)
     }
 }

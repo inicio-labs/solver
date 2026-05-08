@@ -111,13 +111,13 @@ fn asset_conservation() {
     let mut gen = NoteIdGen::new();
     // ETH->USDC: offers 10 ETH, requests 16000 USDC
     let id_ab = gen.next();
-    assert!(book.add_user_order(id_ab, eth(), usdc(), 10, 16000));
+    book.add_user_order(id_ab, eth(), usdc(), 10, 16000);
     // USDC->SOL: offers 16000 USDC, requests 80 SOL
     let id_bc = gen.next();
-    assert!(book.add_user_order(id_bc, usdc(), sol(), 16000, 80));
+    book.add_user_order(id_bc, usdc(), sol(), 16000, 80);
     // SOL->ETH: offers 80 SOL, requests 5 ETH
     let id_ca = gen.next();
-    assert!(book.add_user_order(id_ca, sol(), eth(), 80, 5));
+    book.add_user_order(id_ca, sol(), eth(), 80, 5);
 
     let mut filled = HashSet::new();
     let cycles = run_three_edge_cycle(&mut book, &mut filled);
@@ -438,8 +438,7 @@ fn unprofitable_leg_no_cycle() {
     book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
     book.add_user_order(gen.next(), usdc(), sol(), 16000, 80);
     // SOL->ETH: offers 5 SOL ($750), requests 1 ETH ($2000) -- accepted into book
-    let accepted = book.add_user_order(gen.next(), sol(), eth(), 5, 1);
-    assert!(accepted, "order book should accept all valid orders");
+    book.add_user_order(gen.next(), sol(), eth(), 5, 1);
 
     let mut filled = HashSet::new();
     let cycles = run_three_edge_cycle(&mut book, &mut filled);

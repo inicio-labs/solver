@@ -120,9 +120,9 @@ fn filled_order_details() {
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
     let order_a_id = gen.next();
-    assert!(book.add_user_order(order_a_id, usdc(), eth(), 2000, 1));
+    book.add_user_order(order_a_id, usdc(), eth(), 2000, 1);
     let order_b_id = gen.next();
-    assert!(book.add_user_order(order_b_id, eth(), usdc(), 1, 1600));
+    book.add_user_order(order_b_id, eth(), usdc(), 1, 1600);
 
     let mut filled = HashSet::new();
     run_direct_matching(&mut book, &mut filled);

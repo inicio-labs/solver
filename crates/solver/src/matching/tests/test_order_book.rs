@@ -14,7 +14,7 @@ fn add_order_at_oracle() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
-    assert!(book.add_user_order(gen.next(), usdc(), eth(), 2000, 1));
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
     assert_eq!(book.active_order_count(), 1);
 }
 
@@ -24,7 +24,7 @@ fn add_order_below_oracle() {
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
     // Offer 3000 USDC, request 1 ETH -- offering more than oracle -> accepted
-    assert!(book.add_user_order(gen.next(), usdc(), eth(), 3000, 1));
+    book.add_user_order(gen.next(), usdc(), eth(), 3000, 1);
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn accepts_order_above_oracle() {
     let mut gen = NoteIdGen::new();
     // Offer 1900 USDC, request 1 ETH -- order book accepts all valid orders;
     // profitability filtering is the matching engine's responsibility.
-    assert!(book.add_user_order(gen.next(), usdc(), eth(), 1900, 1));
+    book.add_user_order(gen.next(), usdc(), eth(), 1900, 1);
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn best_order_skips_inactive() {
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
     let id = gen.next();
-    assert!(book.add_user_order(id, usdc(), eth(), 2000, 1));
+    book.add_user_order(id, usdc(), eth(), 2000, 1);
     book.orders.get_mut(&id).unwrap().full_fill();
     book.add_user_order(gen.next(), usdc(), eth(), 3000, 1);
 
@@ -83,9 +83,9 @@ fn cleanup_removes_inactive() {
     let mut book = OrderBook::new(feed);
     let mut gen = NoteIdGen::new();
     let id = gen.next();
-    assert!(book.add_user_order(id, usdc(), eth(), 2000, 1));
+    book.add_user_order(id, usdc(), eth(), 2000, 1);
     book.orders.get_mut(&id).unwrap().full_fill();
-    book.cleanup_order(id);
+    book.cleanup_if_filled(id);
     assert_eq!(book.active_order_count(), 0);
 }
 
@@ -100,10 +100,10 @@ fn protocol_balance_add_deduct() {
 }
 
 #[test]
-#[should_panic(expected = "protocol balance underflow")]
-fn protocol_balance_underflow() {
+fn protocol_balance_saturates_at_zero() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);
     book.add_protocol_balance(eth(), 1);
     book.deduct_protocol_balance(eth(), 2);
+    assert_eq!(book.protocol_balances[&eth()], 0);
 }

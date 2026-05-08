@@ -898,9 +898,9 @@ fn surplus_usd_conservation_direct() {
     let mut gen = NoteIdGen::new();
     // Generous spread: Alice offers 10 ETH for 16000 USDC, Bob offers 20000 USDC for 10 ETH
     let id_a = gen.next();
-    assert!(book.add_user_order(id_a, eth(), usdc(), 10, 16000));
+    book.add_user_order(id_a, eth(), usdc(), 10, 16000);
     let id_b = gen.next();
-    assert!(book.add_user_order(id_b, usdc(), eth(), 20000, 10));
+    book.add_user_order(id_b, usdc(), eth(), 20000, 10);
 
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
@@ -969,9 +969,8 @@ fn fuzz_usd_conservation_200_trials() {
                 / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             let id = gen.next();
-            if book.add_user_order(id, tokens[si], tokens[bi], offered, requested) {
-                order_snapshot.push((id, tokens[si], tokens[bi], offered, requested));
-            }
+            book.add_user_order(id, tokens[si], tokens[bi], offered, requested);
+            order_snapshot.push((id, tokens[si], tokens[bi], offered, requested));
         }
 
         let mut engine = MatchingEngine::new(book);
@@ -1029,17 +1028,12 @@ fn same_token_order_rejected() {
     let mut gen = NoteIdGen::new();
 
     // Try to create ETH->ETH order
-    let result = book.add_user_order(gen.next(), eth(), eth(), 100, 50);
-    // The oracle check: is_order_profitable(ETH, 100, ETH, 50) -> 100*price >= 50*price -> true
-    // So the oracle won't reject it. But it's nonsensical.
-    // Current code allows it -- this test documents the behavior.
+    // ETH->ETH is nonsensical but currently allowed — documents the behavior.
     // TODO: add explicit same-token rejection in add_user_order
-    if result {
-        // If allowed, at least verify it doesn't cause engine to panic
-        let mut engine = MatchingEngine::new(book);
-        let batch = engine.run();
-        check_invariants(&engine, &batch, "same_token");
-    }
+    book.add_user_order(gen.next(), eth(), eth(), 100, 50);
+    let mut engine = MatchingEngine::new(book);
+    let batch = engine.run();
+    check_invariants(&engine, &batch, "same_token");
 }
 
 // -- Phase 1 vs Phase 2 value comparison --
@@ -1090,7 +1084,7 @@ fn order_filled_by_both_phases() {
 
     // Large ETH->USDC order (will be partially filled by Phase 1, remainder by Phase 2)
     let shared_id = gen.next();
-    assert!(book.add_user_order(shared_id, eth(), usdc(), 50, 80000));
+    book.add_user_order(shared_id, eth(), usdc(), 50, 80000);
 
     // Phase 1: small USDC->ETH direct match
     book.add_user_order(gen.next(), usdc(), eth(), 16000, 10);
@@ -1133,9 +1127,9 @@ fn identical_orders_fair_matching() {
 
     // Two identical ETH->USDC orders
     let id1 = gen.next();
-    assert!(book.add_user_order(id1, eth(), usdc(), 10, 16000));
+    book.add_user_order(id1, eth(), usdc(), 10, 16000);
     let id2 = gen.next();
-    assert!(book.add_user_order(id2, eth(), usdc(), 10, 16000));
+    book.add_user_order(id2, eth(), usdc(), 10, 16000);
 
     // One counter-order that can only fill one of them (generous: 20000 USDC for 10 ETH)
     book.add_user_order(gen.next(), usdc(), eth(), 20000, 10);
@@ -1325,9 +1319,8 @@ fn fuzz_per_token_flow_conservation() {
                 / (prices[bi] as u128 * 100)) as u64;
             if requested == 0 { continue; }
             let id = gen.next();
-            if book.add_user_order(id, tokens[si], tokens[bi], offered, requested) {
-                order_tokens.push((id, tokens[si], tokens[bi]));
-            }
+            book.add_user_order(id, tokens[si], tokens[bi], offered, requested);
+            order_tokens.push((id, tokens[si], tokens[bi]));
         }
 
         let mut engine = MatchingEngine::new(book);

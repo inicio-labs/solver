@@ -24,5 +24,3 @@ pub trait PriceFeed {
         offered_value >= requested_value
     }
 }
-
-// SimpleMapFeed removed — use crate::price::WatchPriceFeed instead.

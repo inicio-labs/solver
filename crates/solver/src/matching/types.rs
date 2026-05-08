@@ -1,25 +1,11 @@
 pub use crate::types::{TokenId, OrderId, Amount, OrderStatus};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
-const PRECISION_FACTOR: u64 = 100_000;
-
 /// Computes how much offered asset is released for a given fill of the requested asset.
-/// Matches the on-chain PSWAP MASM calculation exactly.
+/// Matches the on-chain PSWAP calculation: offered_total * fill_amount / requested_total.
 fn calculate_output_amount(offered_total: Amount, requested_total: Amount, fill_amount: Amount) -> Amount {
-    if requested_total == fill_amount {
-        return offered_total;
-    }
-    if fill_amount == 0 {
-        return 0;
-    }
-
-    if offered_total > requested_total {
-        let ratio = (offered_total as u128 * PRECISION_FACTOR as u128) / requested_total as u128;
-        ((fill_amount as u128 * ratio) / PRECISION_FACTOR as u128) as Amount
-    } else {
-        let ratio = (requested_total as u128 * PRECISION_FACTOR as u128) / offered_total as u128;
-        ((fill_amount as u128 * PRECISION_FACTOR as u128) / ratio) as Amount
-    }
+    ((offered_total as u128 * fill_amount as u128) / requested_total as u128) as Amount
 }
 
 /// BTreeMap key for ordering orders by rate. Uses cross-multiplication
@@ -47,12 +33,12 @@ impl PartialEq for RateKey {
 impl Eq for RateKey {}
 
 impl PartialOrd for RateKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for RateKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         let lhs = self.requested as u128 * other.offered as u128;
         let rhs = other.requested as u128 * self.offered as u128;
         lhs.cmp(&rhs)
@@ -111,9 +97,6 @@ impl Order {
 
     /// Ceiling inverse of offered_for: minimum requested fill such that
     /// offered_for(result) >= target.
-    ///
-    /// Guarantees: if target <= offered, then offered_for(min_fill_for_release(target)) >= target.
-    /// Uses ceiling division to round UP, ensuring the forward calculation never undershoots.
     pub fn min_fill_for_release(&self, target: Amount) -> Amount {
         if target == 0 {
             return 0;
@@ -122,24 +105,10 @@ impl Order {
             return self.requested;
         }
 
-        let p = PRECISION_FACTOR as u128;
-
-        let fill = if self.offered > self.requested {
-            // Forward: ratio = (offered * P) / requested, result = (fill * ratio) / P
-            // Need: (fill * ratio) / P >= target → fill >= ceil(target * P / ratio)
-            let ratio = (self.offered as u128 * p) / self.requested as u128;
-            ((target as u128 * p + ratio - 1) / ratio) as Amount
-        } else {
-            // Forward: ratio = (requested * P) / offered, result = (fill * P) / ratio
-            // Need: (fill * P) / ratio >= target → fill >= ceil(target * ratio / P)
-            let ratio = (self.requested as u128 * p) / self.offered as u128;
-            ((target as u128 * ratio + p - 1) / p) as Amount
-        };
-
+        let fill = ((target as u128 * self.requested as u128) / self.offered as u128) as Amount;
         let fill = fill.min(self.requested);
 
-        // Safety verify: ratio truncation could theoretically cause a 1-unit miss.
-        // If so, bump by 1.
+        // Safety check: integer truncation could cause a 1-unit miss.
         if self.offered_for(fill) >= target {
             fill
         } else {
@@ -154,7 +123,7 @@ impl Order {
 
     /// Fill some of the requested side. Returns offered released.
     pub fn fill(&mut self, requested_filled: Amount) -> Amount {
-        assert!(requested_filled <= self.requested_remaining, "fill exceeds requested_remaining");
+        let requested_filled = requested_filled.min(self.requested_remaining);
         let released = self.offered_for(requested_filled);
         self.requested_remaining -= requested_filled;
         released
@@ -179,58 +148,33 @@ impl Order {
         if !self.is_active() || !other.is_active() {
             return None;
         }
-
-        let self_can_release = self.offered_remaining();
-        let other_wants = other.requested_remaining;
-
-        if self_can_release == 0 || other_wants == 0 {
+        if !self.is_profitable_with(other) {
             return None;
         }
 
-        let (self_offered_released, other_offered_released, self_requested_filled, other_requested_filled) =
-            if self_can_release <= other_wants {
-                // Self is bottleneck → full fill self (no precision loss)
-                let self_or = self.full_fill();
-                let other_rf = self_or;
-                let other_or = other.fill(other_rf);
-                (self_or, other_or, self.requested, other_rf)
-            } else {
-                // Other is bottleneck → partial fill self, full fill other.
-                // Use ceiling inverse to guarantee self releases >= other_wants.
-                let self_rf = self.min_fill_for_release(other_wants);
+        let self_sends = self.offered_remaining().min(other.requested_remaining);
+        if self_sends == 0 {
+            return None;
+        }
 
-                if self_rf == 0 {
-                    // Can't express partial self fill — fall back to full fill self
-                    let self_or = self.full_fill();
-                    let other_rf = self_or.min(other.requested_remaining);
-                    let other_or = other.fill(other_rf);
-                    (self_or, other_or, self.requested, other_rf)
-                } else {
-                    // Guard: if ceiling pushed self_rf beyond what other can cover,
-                    // fall back to full fill self (the spread was too tight).
-                    let other_can_release = other.offered_remaining();
-                    if self_rf > other_can_release {
-                        let self_or = self.full_fill();
-                        let other_rf = self_or.min(other.requested_remaining);
-                        let other_or = other.fill(other_rf);
-                        (self_or, other_or, self.requested, other_rf)
-                    } else {
-                        // Fill self first → guaranteed release >= other_wants
-                        let self_or = self.fill(self_rf);
-                        // Other receives exactly what self released
-                        let other_rf = self_or.min(other.requested_remaining);
-                        let other_or = other.fill(other_rf);
-                        (self_or, other_or, self_rf, other_rf)
-                    }
-                }
-            };
+        // Other fills with what self sends, releasing its offered token back to self
+        let other_releases = other.fill(self_sends);
+        if other_releases == 0 {
+            return None;
+        }
 
-        let surplus_offered = self_offered_released.saturating_sub(other_requested_filled);
-        let surplus_requested = other_offered_released.saturating_sub(self_requested_filled);
+        // Self fills with what other released, capped at what self still needs
+        let self_receives = other_releases.min(self.requested_remaining);
+        let self_releases = self.fill(self_receives);
+
+        // Profitability invariant: self must release at least as much as it sends
+        if self_releases < self_sends {
+            return None;
+        }
 
         Some(MatchResult {
-            surplus_offered,
-            surplus_requested,
+            surplus_offered: self_releases.saturating_sub(self_sends),
+            surplus_requested: other_releases.saturating_sub(self_receives),
         })
     }
 }

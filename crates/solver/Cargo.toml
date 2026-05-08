@@ -6,21 +6,25 @@ edition = "2021"
 [features]
 default = []
 client = ["miden-client"]
+testing = []
 
 [dependencies]
 consume-script = { path = "../consume-script" }
 miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
-miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol", default-features = false, features = ["testing"] }
-miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
+miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
+miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
 miden-core = "0.22"
 anyhow = "1.0"
+async-trait = "0.1"
 tokio = { version = "1.40", features = ["macros", "time", "sync"] }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 diesel = { version = "2.2", features = ["sqlite", "r2d2"] }
+diesel_migrations = "2.2"
 axum = { version = "0.8", features = ["json"] }
 hex = "0.4"
 
 [dev-dependencies]
 miden-crypto = "0.23"
+axum-test = "20"

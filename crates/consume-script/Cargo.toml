@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol" }
-miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
+miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
+miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
 miden-crypto = "0.23"
 miden-core = "0.22"
 
 [dev-dependencies]
-miden-testing = { path = "/Users/vaibhavjindal/protocol/crates/miden-testing" }
-miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
-solver = { path = "../solver" }
+miden-testing = { git = "https://github.com/0xMiden/protocol", branch = "next" }
+solver = { path = "../solver", features = ["testing"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1.0"

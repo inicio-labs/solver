@@ -14,8 +14,8 @@ client = ["solver/client", "miden-client", "miden-client-sqlite-store"]
 solver = { path = "crates/solver" }
 miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
 miden-client-sqlite-store = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", package = "miden-client-sqlite-store", optional = true }
-miden-protocol = { path = "/Users/vaibhavjindal/protocol/crates/miden-protocol", default-features = false, features = ["testing"] }
-miden-standards = { path = "/Users/vaibhavjindal/protocol/crates/miden-standards" }
+miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
+miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
 miden-core = "0.22"
 miden-crypto = "0.23"
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "fs"] }
@@ -43,4 +43,4 @@ required-features = ["client"]
 
 [dev-dependencies]
 consume-script = { path = "crates/consume-script" }
-miden-testing = { path = "/Users/vaibhavjindal/protocol/crates/miden-testing" }
+miden-testing = { git = "https://github.com/0xMiden/protocol", branch = "next" }

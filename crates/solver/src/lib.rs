@@ -7,10 +7,6 @@ pub mod admin;
 pub mod matcher;
 pub mod pipeline;
 
-pub mod events;
 #[cfg(feature = "client")]
 pub mod executor;
-pub mod order;
 
-#[cfg(test)]
-mod pipeline_tests;

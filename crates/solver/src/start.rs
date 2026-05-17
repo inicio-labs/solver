@@ -70,26 +70,33 @@ fn run_on_local_runtime<F: std::future::Future<Output = ()>>(
 /// through this adapter) can both share the same underlying instance without
 /// fighting over ownership.
 ///
-/// Note discovery: we read PSWAPs from two `SyncSummary` fields:
-///   * `new_public_notes` — notes the screener inserted (not previously tracked).
-///     Production path for PSWAPs created by other accounts.
-///   * `committed_notes` — notes the screener marked as already tracked, including
-///     the solver's own output notes that just got committed. This covers
-///     **remainder PSWAPs** produced when the solver partially fills a swap:
-///     the remainder lives in the solver's `output_notes` table, so without
-///     this second pass the matcher would never reconsider it. The ingest
-///     filter drops non-PSWAP notes (paybacks, surplus moves), so this is
-///     safe to be generous about.
+/// Note discovery (post the keyless-ingest / keystore-executor split):
+/// PSWAPs come from a single `SyncSummary` source —
+///   * `new_public_notes` ∪ `new_private_notes` — notes the screener
+///     inserted into the input-notes table on this sync (tag-discovered,
+///     not previously tracked).
 ///
-/// Dedup: the adapter is intentionally stateless. `committed_notes` is
-/// edge-triggered (a note appears on exactly one sync — the one whose
-/// `sync_notes` block range covers its inclusion block — and never again,
-/// since ranges advance and are non-overlapping), and `new_public_notes`
-/// (Insert) / `committed_notes` (Update) are disjoint within a sync. Any
+/// The **ingest client is keyless and tracks no accounts**, so it has no
+/// `output_notes` table and its `committed_notes` never carries the
+/// solver's own notes. Solver-produced **remainder PSWAPs** (from partial
+/// fills) are `Public` and tag-matched, so the ingest client re-discovers
+/// them here via `new_public_notes` on the sync after the executor's
+/// settle commits — exactly like any externally-created PSWAP. (The old
+/// single-client model needed a second `committed_notes` pass because the
+/// solver client owned the account and its remainder surfaced as its own
+/// committed output note; that pass is dead post-split and was removed.)
+/// The **executor client** subscribes no tags, so its `sync_state`
+/// discovers nothing — it runs only to keep the chain tip / solver
+/// account fresh; its returned notes are discarded by the sync task.
+///
+/// Dedup: the adapter is intentionally stateless. `new_public_notes` /
+/// `new_private_notes` are edge-triggered (a note appears on exactly one
+/// sync — the one whose block range covers its inclusion block — and
+/// never again, since ranges advance and are non-overlapping). Any
 /// residual double-emit is absorbed durably downstream: `ingest_once`
-/// forwards an order to the matcher only when `insert_notes_batch` reports
-/// it as newly inserted (the `orders` primary key is the dedup authority,
-/// which also survives restarts).
+/// forwards an order to the matcher only when `insert_notes_batch`
+/// reports it as newly inserted (the `orders` primary key is the dedup
+/// authority, which also survives restarts).
 struct MidenClientAdapter {
     client: Arc<Mutex<Client<FilesystemKeyStore>>>,
 }
@@ -113,7 +120,7 @@ impl MidenClient for MidenClientAdapter {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(block_num, new_pub, new_priv, committed))]
+    #[tracing::instrument(skip(self), fields(block_num, new_pub, new_priv))]
     async fn sync_state(&mut self) -> Result<SyncResult> {
         let mut client = self.client.lock().await;
         let summary = client
@@ -126,12 +133,13 @@ impl MidenClient for MidenClientAdapter {
         span.record("block_num", summary.block_num.as_u64());
         span.record("new_pub", summary.new_public_notes.len());
         span.record("new_priv", summary.new_private_notes.len());
-        span.record("committed", summary.committed_notes.len());
 
         let mut new_notes: Vec<Note> = Vec::new();
 
-        // 1. Notes the Client inserted into its input-notes table on this sync
-        //    (discovered by tag, not previously tracked).
+        // Notes the Client inserted into its input-notes table on this sync
+        // (tag-discovered, not previously tracked). This is the *only* PSWAP
+        // discovery path — see the struct doc for why the old
+        // `committed_notes` second pass is dead post-split.
         for note_id in summary
             .new_public_notes
             .iter()
@@ -147,33 +155,6 @@ impl MidenClient for MidenClientAdapter {
                 }
                 Err(e) => {
                     tracing::error!(%note_id, error = %e, "get_input_note failed");
-                }
-            }
-        }
-
-        // 2. Tracked notes that became committed on this sync — including the
-        //    solver's own output notes (remainder PSWAPs from partial fills).
-        //    Try `input_note` first (covers the case where the note was both
-        //    received and committed in the same window), fall back to
-        //    `output_note`. The ingest filter drops non-PSWAP notes, so
-        //    paybacks and surplus-move notes here are harmless.
-        for note_id in &summary.committed_notes {
-            if let Ok(Some(record)) = client.get_input_note(*note_id).await {
-                if let Ok(note) = (&record).try_into() {
-                    new_notes.push(note);
-                    continue;
-                }
-            }
-            match client.get_output_note(*note_id).await {
-                Ok(Some(record)) => match Note::try_from(record) {
-                    Ok(note) => new_notes.push(note),
-                    Err(e) => tracing::error!(%note_id, error = %e, "OutputNoteRecord → Note conversion failed"),
-                },
-                Ok(None) => {
-                    tracing::warn!(%note_id, "committed note not in input or output store");
-                }
-                Err(e) => {
-                    tracing::error!(%note_id, error = %e, "get_output_note failed");
                 }
             }
         }
@@ -201,6 +182,10 @@ impl MidenClient for MidenClientAdapter {
 
         let mut client = self.client.lock().await;
         let rpc = client.test_rpc_api();
+        // GENESIS is intentional, not a placeholder: this is an "ever
+        // consumed?" existence check, so it must scan the full nullifier
+        // history. (The node serves this from its nullifier set; the
+        // `from` block only bounds the *response* range, not correctness.)
         let heights = rpc
             .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
             .await

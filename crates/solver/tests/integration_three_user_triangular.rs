@@ -311,32 +311,32 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             )
             .await;
 
-            if wait_result.is_err() {
+            // Verdict without `?`/`assert!` so cleanup always runs (an early
+            // return/panic would orphan the ingest + executor OS threads).
+            let verdict: Result<()> = (|| {
+                wait_result?;
+                let chain_ro = rpc.mock_chain.read();
+                let sol = vault_balance(&chain_ro, solver_id, sol_id);
+                if sol != 1 {
+                    anyhow::bail!("solver should keep 1 SOL surplus (11−10), got {sol}");
+                }
+                let grown = chain_ro.committed_notes().len() - initial_committed;
+                if grown < 3 {
+                    anyhow::bail!("expected ≥3 new payback notes, got {grown}");
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = &verdict {
                 let chain_ro = rpc.mock_chain.read();
                 println!(
-                    "[test] block_num: {}",
-                    chain_ro.latest_block_header().block_num().as_u64()
-                );
-                println!("[test] solver sol: {}", vault_balance(&chain_ro, solver_id, sol_id));
-                println!(
-                    "[test] committed_notes: {} (was {})",
+                    "[test] FAILED: {e}\n[test] block_num={} solver_sol={} committed={} (was {})",
+                    chain_ro.latest_block_header().block_num().as_u64(),
+                    vault_balance(&chain_ro, solver_id, sol_id),
                     chain_ro.committed_notes().len(),
                     initial_committed,
                 );
             }
-            wait_result?;
-
-            let chain_ro = rpc.mock_chain.read();
-            assert_eq!(
-                vault_balance(&chain_ro, solver_id, sol_id),
-                1,
-                "solver should keep 1 SOL surplus (11 offered − 10 consumed)",
-            );
-            assert!(
-                chain_ro.committed_notes().len() >= initial_committed + 3,
-                "expected ≥3 new payback notes, got {}",
-                chain_ro.committed_notes().len() - initial_committed,
-            );
 
             cancel.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
@@ -345,7 +345,7 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             // Reference setup's _user_temp and _user_client to keep them alive
             // for the test's duration — they go out of scope here.
             let _ = setup;
-            Ok(())
+            verdict
         })
         .await
 }
@@ -397,35 +397,36 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
-            let chain_ro = rpc.mock_chain.read();
-            let grown = chain_ro.committed_notes().len() - initial_committed;
-            assert_eq!(
-                grown, 0,
-                "no matches expected with triangular disabled and no pairwise counter-orders; \
-                 committed_notes grew by {grown}",
-            );
-            assert_eq!(
-                vault_balance(&chain_ro, setup.alice_id, setup.eth_id),
-                0,
-                "alice should have received no ETH"
-            );
-            assert_eq!(
-                vault_balance(&chain_ro, setup.bob_id, setup.sol_id),
-                0,
-                "bob should have received no SOL"
-            );
-            assert_eq!(
-                vault_balance(&chain_ro, setup.charlie_id, setup.usdc_id),
-                0,
-                "charlie should have received no USDC"
-            );
+            // Verdict without `assert!` so cleanup always runs (a panicking
+            // assert would orphan the ingest + executor OS threads).
+            let verdict: Result<()> = {
+                let chain_ro = rpc.mock_chain.read();
+                let grown = chain_ro.committed_notes().len() - initial_committed;
+                let alice_eth = vault_balance(&chain_ro, setup.alice_id, setup.eth_id);
+                let bob_sol = vault_balance(&chain_ro, setup.bob_id, setup.sol_id);
+                let charlie_usdc = vault_balance(&chain_ro, setup.charlie_id, setup.usdc_id);
+                drop(chain_ro);
+                if grown != 0 {
+                    Err(anyhow::anyhow!(
+                        "no matches expected (triangular disabled, no pairwise counter-orders); \
+                         committed_notes grew by {grown}"
+                    ))
+                } else if alice_eth != 0 || bob_sol != 0 || charlie_usdc != 0 {
+                    Err(anyhow::anyhow!(
+                        "no payouts expected; alice_eth={alice_eth} bob_sol={bob_sol} \
+                         charlie_usdc={charlie_usdc}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
 
             cancel.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
                 .await;
             drop(solver_temp);
             let _ = setup;
-            Ok(())
+            verdict
         })
         .await
 }

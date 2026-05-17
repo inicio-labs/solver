@@ -294,57 +294,51 @@ async fn three_user_direct_matching() -> Result<()> {
             )
             .await;
 
-            if wait_result.is_err() {
-                println!("[test] wait_for FAILED, dumping state...");
-                if solver_handle.is_finished() {
-                    let r = (&mut solver_handle).await;
-                    println!("[test] solver task finished: {:?}", r);
-                } else {
-                    println!("[test] solver task still running");
+            // Compute the verdict WITHOUT `?`/`assert!` so the cleanup below
+            // always runs. An early return / panicking assert here would skip
+            // `cancel.cancel()` and orphan the ingest + executor OS threads.
+            let verdict: Result<()> = (|| {
+                wait_result?;
+                let chain_ro = rpc.mock_chain.read();
+                let surplus = vault_balance(&chain_ro, solver_id, usdc_id);
+                if surplus != 20 {
+                    anyhow::bail!(
+                        "solver should keep 20 USDC surplus (alice 120 − bob 100), got {surplus}"
+                    );
                 }
+                // alice/bob keep post-mint balances until they consume their
+                // paybacks; charlie's PSWAP is orphaned. Chain must grow by ≥2
+                // (the two payback P2IDs).
+                let grown = chain_ro.committed_notes().len() - initial_committed_count;
+                if grown < 2 {
+                    anyhow::bail!("expected ≥2 new committed notes (alice+bob paybacks), got {grown}");
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = &verdict {
                 let chain_ro = rpc.mock_chain.read();
                 println!(
-                    "[test] block_num: {}",
-                    chain_ro.latest_block_header().block_num().as_u64()
-                );
-                println!("[test] solver usdc:   {}", vault_balance(&chain_ro, solver_id, usdc_id));
-                println!("[test] alice usdc:    {}", vault_balance(&chain_ro, alice_id, usdc_id));
-                println!("[test] bob eth:       {}", vault_balance(&chain_ro, bob_id, eth_id));
-                println!("[test] charlie usdc:  {}", vault_balance(&chain_ro, charlie_id, usdc_id));
-                println!(
-                    "[test] committed_notes: {} (was {})",
+                    "[test] FAILED: {e}\n[test] block_num={} solver_usdc={} alice_usdc={} \
+                     bob_eth={} charlie_usdc={} committed={} (was {})",
+                    chain_ro.latest_block_header().block_num().as_u64(),
+                    vault_balance(&chain_ro, solver_id, usdc_id),
+                    vault_balance(&chain_ro, alice_id, usdc_id),
+                    vault_balance(&chain_ro, bob_id, eth_id),
+                    vault_balance(&chain_ro, charlie_id, usdc_id),
                     chain_ro.committed_notes().len(),
                     initial_committed_count,
                 );
             }
-            wait_result?;
 
-            // 9. Final assertions.
-            let chain_ro = rpc.mock_chain.read();
-            assert_eq!(
-                vault_balance(&chain_ro, solver_id, usdc_id),
-                20,
-                "solver should keep 20 USDC surplus (alice's 120 offered − bob's 100 requested)",
-            );
-            // alice and bob's USDC/ETH balances stay at their post-mint values
-            // until they consume their payback notes. charlie's PSWAP is
-            // orphaned, so his 100 USDC stays locked in his PSWAP note.
-            // Chain must have grown by ≥2 (the two payback P2IDs).
-            assert!(
-                chain_ro.committed_notes().len() >= initial_committed_count + 2,
-                "expected ≥2 new committed notes (alice + bob paybacks), got {}",
-                chain_ro.committed_notes().len() - initial_committed_count,
-            );
-
+            // Always clean up: cancel + bounded join so no OS thread leaks
+            // across test cases, regardless of pass/fail.
             cancel.cancel();
-            // Await start() so it joins the ingest/executor OS threads before
-            // the test ends — no leaked threads across test cases. Bounded so
-            // a stuck join can't hang the suite.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
                 .await;
             drop(user_temp);
             drop(solver_temp);
-            Ok(())
+            verdict
         })
         .await
 }

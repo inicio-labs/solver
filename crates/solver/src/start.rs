@@ -388,10 +388,21 @@ pub async fn start(
                     }
                 };
                 let _ = ingest_ready_tx.send(Ok(()));
+                // If a task exits *unexpectedly* (not via cancel) the main
+                // coordination loop has no other signal — `order_tx` keeps
+                // other live senders, so its `order_rx` never closes and the
+                // matcher would silently run a stale book. Propagate a global
+                // shutdown (`ingest_cancel` is a clone of the root token).
                 tokio::select! {
                     _ = ingest_cancel.cancelled() => {}
-                    _ = &mut h.ingest_handle => {}
-                    _ = &mut h.subscribe_handle => {}
+                    _ = &mut h.ingest_handle => {
+                        tracing::error!("ingest task exited unexpectedly; triggering shutdown");
+                        ingest_cancel.cancel();
+                    }
+                    _ = &mut h.subscribe_handle => {
+                        tracing::error!("subscribe-relay task exited unexpectedly; triggering shutdown");
+                        ingest_cancel.cancel();
+                    }
                 }
                 // Drain inside the runtime: abort + await both tasks so their
                 // `Client` Arc refs are dropped *here* (runtime still entered).
@@ -471,10 +482,19 @@ pub async fn start(
                 });
 
                 let _ = exec_ready_tx.send(Ok(()));
+                // Unexpected exit of either task → propagate a global shutdown
+                // immediately (the `exec_rx`-drop → matcher path only fires on
+                // the *next* batch send, and never if only the sync task dies).
                 tokio::select! {
                     _ = exec_cancel.cancelled() => {}
-                    _ = &mut executor_handle => {}
-                    _ = &mut executor_sync_handle => {}
+                    _ = &mut executor_handle => {
+                        tracing::error!("executor task exited unexpectedly; triggering shutdown");
+                        exec_cancel.cancel();
+                    }
+                    _ = &mut executor_sync_handle => {
+                        tracing::error!("executor-sync task exited unexpectedly; triggering shutdown");
+                        exec_cancel.cancel();
+                    }
                 }
                 // Drain inside the runtime so the executor `Client` Arc refs
                 // drop here (runtime still entered), not in `LocalSet::drop`

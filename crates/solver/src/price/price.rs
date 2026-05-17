@@ -35,6 +35,21 @@ impl PriceClient for MockPriceClient {
     }
 }
 
+/// Forwarding impl so a `Box<dyn PriceClient + Send>` satisfies `P:
+/// PriceClient`. Lets `start` accept an injected (boxed) price client —
+/// production `HttpPriceClient`, tests `MockPriceClient` — without making the
+/// price plumbing (`run_price_feed`, `spawn_core_services`) generic over a
+/// trait object. (`PriceClient: Send` as a supertrait does NOT make bare
+/// `dyn PriceClient` a `Send` type, so `+ Send` is required; and the
+/// `#[async_trait]` Send future borrows `&self` across the await, so the
+/// boxed object must also be `Sync` — both concrete clients are.)
+#[async_trait]
+impl PriceClient for Box<dyn PriceClient + Send + Sync> {
+    async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PriceSnapshot> {
+        (**self).fetch_prices(tokens).await
+    }
+}
+
 /// Run the price fetching loop.
 ///
 /// Periodically polls the price service and broadcasts updates via the watch channel.

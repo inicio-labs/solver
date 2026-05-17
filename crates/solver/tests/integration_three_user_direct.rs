@@ -264,8 +264,23 @@ async fn three_user_direct_matching() -> Result<()> {
             //    on their own OS threads.
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
+            // Inject prices (CoinGecko is unreachable in tests). Direct
+            // matching is rate-based and doesn't gate on USD price, but the
+            // solver still needs a working price client.
+            let price_map: std::collections::HashMap<_, u64> =
+                [(usdc.id(), 100), (eth.id(), 100)].into_iter().collect();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(factory, solver_id, config, solver_cancel).await
+                solver::start(
+                    factory,
+                    move |_sm, _key| {
+                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
+                            as Box<dyn solver::price::PriceClient + Send + Sync>)
+                    },
+                    solver_id,
+                    config,
+                    solver_cancel,
+                )
+                .await
             });
 
             // 8. Wait for the alice↔bob fill to land. We can't observe paybacks

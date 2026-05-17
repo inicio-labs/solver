@@ -174,7 +174,17 @@ mod client_main {
             }
         });
 
-        solver::start(factory, solver_id, config, cancel).await
+        solver::start(
+            factory,
+            |symbol_map, api_key| {
+                Ok(Box::new(solver::price::HttpPriceClient::new(symbol_map, api_key)?)
+                    as Box<dyn solver::price::PriceClient + Send + Sync>)
+            },
+            solver_id,
+            config,
+            cancel,
+        )
+        .await
     }
 }
 

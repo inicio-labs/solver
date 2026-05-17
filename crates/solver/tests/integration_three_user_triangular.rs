@@ -295,8 +295,29 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
+            // Inject prices (CoinGecko unreachable in tests). Uniform 100¢ for
+            // all three legs reproduces the relative valuation the cycle math
+            // was validated under (profitability is scale-invariant under a
+            // uniform price; the SOL-denominated surplus is unchanged).
+            let price_map: std::collections::HashMap<_, u64> = [
+                (setup.usdc_id, 100),
+                (setup.eth_id, 100),
+                (setup.sol_id, 100),
+            ]
+            .into_iter()
+            .collect();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(factory, solver_id, config, solver_cancel).await
+                solver::start(
+                    factory,
+                    move |_sm, _key| {
+                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
+                            as Box<dyn solver::price::PriceClient + Send + Sync>)
+                    },
+                    solver_id,
+                    config,
+                    solver_cancel,
+                )
+                .await
             });
 
             let sol_id = setup.sol_id;
@@ -384,8 +405,29 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
+            // Inject prices (CoinGecko unreachable in tests). Uniform 100¢ for
+            // all three legs reproduces the relative valuation the cycle math
+            // was validated under (profitability is scale-invariant under a
+            // uniform price; the SOL-denominated surplus is unchanged).
+            let price_map: std::collections::HashMap<_, u64> = [
+                (setup.usdc_id, 100),
+                (setup.eth_id, 100),
+                (setup.sol_id, 100),
+            ]
+            .into_iter()
+            .collect();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(factory, solver_id, config, solver_cancel).await
+                solver::start(
+                    factory,
+                    move |_sm, _key| {
+                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
+                            as Box<dyn solver::price::PriceClient + Send + Sync>)
+                    },
+                    solver_id,
+                    config,
+                    solver_cancel,
+                )
+                .await
             });
 
             // Real-time drive: give the pipeline ample wall-clock time to

@@ -37,7 +37,7 @@ use crate::db;
 use crate::executor;
 use crate::ingest::{MidenClient, SyncResult};
 use crate::pipeline::{self, PipelineConfig};
-use crate::price::HttpPriceClient;
+use crate::price::{PriceClient, SharedSymbolMap};
 use crate::types::TokenId;
 
 /// Build a `current_thread` tokio runtime + `LocalSet` and run `fut` to
@@ -225,6 +225,10 @@ impl MidenClient for MidenClientAdapter {
 ///   (readiness, gated on DB reachability + `last successful sync` age).
 pub async fn start(
     factory: Arc<dyn ClientFactory>,
+    make_price_client: impl FnOnce(
+        SharedSymbolMap,
+        Option<String>,
+    ) -> Result<Box<dyn PriceClient + Send + Sync>>,
     solver_id: AccountId,
     config: SolverConfig,
     cancel: CancellationToken,
@@ -247,8 +251,11 @@ pub async fn start(
     //    so initialising with an empty map is fine.
     let symbol_map = Arc::new(RwLock::new(HashMap::new()));
 
-    // 4. Production price client.
-    let price_client = HttpPriceClient::new(symbol_map.clone(), coingecko_api_key)
+    // 4. Price client built via the injected builder (prod = HttpPriceClient
+    //    with this symbol map + API key; tests inject a MockPriceClient).
+    //    `start` keeps ownership of `symbol_map` (shared with admin) and only
+    //    hands a clone to the builder.
+    let price_client = make_price_client(symbol_map.clone(), coingecko_api_key)
         .context("build price client")?;
 
     // 5. Flatten configured pairs → token list with optional symbols.

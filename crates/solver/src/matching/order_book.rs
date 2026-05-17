@@ -1,11 +1,14 @@
 use crate::matching::price_feed::PriceFeed;
 use crate::matching::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub struct OrderBook<F: PriceFeed> {
-    pub orders: HashMap<OrderId, Order>,
+    // Internal mutation must go through `apply_match`, `add_user_order`, `cleanup_if_filled`,
+    // and `remove_order` — direct writes can violate the rate-key / active-count invariants.
+    pub(crate) orders: HashMap<OrderId, Order>,
     /// (offered_token, requested_token) → BTreeMap sorted by rate ascending (best first).
-    pub pair_index: HashMap<(TokenId, TokenId), BTreeMap<RateKey, Vec<OrderId>>>,
+    /// Per-rate orders are a FIFO deque: oldest order fills first (price-time priority).
+    pub(crate) pair_index: HashMap<(TokenId, TokenId), BTreeMap<RateKey, VecDeque<OrderId>>>,
     /// outgoing[A] = {B | order offering A requesting B exists}
     user_adjacency: HashMap<TokenId, HashSet<TokenId>>,
     /// incoming[B] = {A | order offering A requesting B exists}
@@ -58,7 +61,7 @@ impl<F: PriceFeed> OrderBook<F> {
             .or_default()
             .entry(key)
             .or_default()
-            .push(note_id);
+            .push_back(note_id);
 
         *self.active_pair_count.entry((offered_token, requested_token)).or_default() += 1;
 
@@ -102,21 +105,23 @@ impl<F: PriceFeed> OrderBook<F> {
     }
 
     /// Get the best (cheapest) active order for a pair.
+    /// At a given rate, returns the *oldest* order (FIFO / price-time priority).
     pub fn best_order(&mut self, offered: TokenId, requested: TokenId) -> Option<&Order> {
         let btree = self.pair_index.get_mut(&(offered, requested))?;
         let orders = &self.orders;
 
         while let Some((&key, ids)) = btree.iter_mut().next() {
-            while ids.last().map_or(false, |id| {
+            // Lazily drop inactive entries from the front of the FIFO queue.
+            while ids.front().map_or(false, |id| {
                 orders.get(id).map_or(true, |o| !o.is_active())
             }) {
-                ids.pop();
+                ids.pop_front();
             }
             if ids.is_empty() {
                 btree.remove(&key);
                 continue;
             }
-            let best_id = ids.last().unwrap();
+            let best_id = ids.front().unwrap();
             return orders.get(best_id);
         }
 
@@ -150,6 +155,37 @@ impl<F: PriceFeed> OrderBook<F> {
         self.active_pair_count.values().sum()
     }
 
+    // === Matching ===
+
+    /// Apply a match between two orders by id. This is the single production
+    /// path that mutates orders after insertion — `direct_matching` calls it
+    /// instead of cloning/inserting manually. Surplus from the trade is
+    /// credited to protocol balances; fully filled orders are cleaned out of
+    /// the rate index automatically. Returns `None` if either order is
+    /// missing, equal to the other, or the trade isn't profitable.
+    pub fn apply_match(&mut self, a_id: OrderId, b_id: OrderId) -> Option<MatchResult> {
+        if a_id == b_id {
+            return None;
+        }
+        let mut order_a = self.orders.get(&a_id)?.clone();
+        let mut order_b = self.orders.get(&b_id)?.clone();
+        let result = order_a.match_with(&mut order_b)?;
+
+        let (token_a, token_b) = (order_a.offered_token, order_b.offered_token);
+        let (surplus_a, surplus_b) = (result.surplus_offered, result.surplus_requested);
+
+        self.orders.insert(a_id, order_a);
+        self.orders.insert(b_id, order_b);
+
+        self.add_protocol_balance(token_a, surplus_a);
+        self.add_protocol_balance(token_b, surplus_b);
+
+        self.cleanup_if_filled(a_id);
+        self.cleanup_if_filled(b_id);
+
+        Some(result)
+    }
+
     // === Protocol Balance ===
 
     pub fn add_protocol_balance(&mut self, token: TokenId, amount: Amount) {
@@ -170,12 +206,13 @@ impl<F: PriceFeed> OrderBook<F> {
 
     /// Remove an order from pair_index and adjacency maps.
     /// Cleans up empty entries to keep maps lean.
+    /// Uses order-preserving `remove(pos)` so FIFO ordering is intact after cancellations.
     fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: RateKey, order_id: OrderId) {
         let Some(btree) = self.pair_index.get_mut(&pair) else { return };
 
         if let Some(ids) = btree.get_mut(&key) {
-            if let Some(pos) = ids.iter().rposition(|&id| id == order_id) {
-                ids.swap_remove(pos);
+            if let Some(pos) = ids.iter().position(|&id| id == order_id) {
+                ids.remove(pos);
             }
             if ids.is_empty() {
                 btree.remove(&key);

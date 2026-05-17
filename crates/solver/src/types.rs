@@ -13,27 +13,40 @@ pub type OrderId = NoteId;
 pub type Amount = u64;
 
 /// Order lifecycle status.
+///
+/// `Settling` is the interval between submitting an on-chain settlement
+/// transaction and confirming its outcome. Crash recovery resets any
+/// `Settling` rows back to `Active` at boot.
+///
+/// `OnchainNullified` is terminal: ingest or executor observed that the
+/// note's nullifier is on-chain (consumed by another party, or by a
+/// previous solver attempt whose DB bookkeeping we lost). No further
+/// processing — the matcher's hydration query already filters
+/// `status = 'active'`, so terminal rows are excluded automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
     Active,
-    InFlight,
+    Settling,
     Executed,
+    OnchainNullified,
 }
 
 impl OrderStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             OrderStatus::Active => "active",
-            OrderStatus::InFlight => "in_flight",
+            OrderStatus::Settling => "settling",
             OrderStatus::Executed => "executed",
+            OrderStatus::OnchainNullified => "onchain_nullified",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "active" => Some(OrderStatus::Active),
-            "in_flight" => Some(OrderStatus::InFlight),
+            "settling" => Some(OrderStatus::Settling),
             "executed" => Some(OrderStatus::Executed),
+            "onchain_nullified" => Some(OrderStatus::OnchainNullified),
             _ => None,
         }
     }
@@ -57,11 +70,11 @@ impl Order {
 
         let offered_asset = pswap.offered_asset();
         let offered_faucet_id = offered_asset.faucet_id();
-        let offered_amount = offered_asset.amount();
+        let offered_amount: u64 = offered_asset.amount().into();
 
         let requested_asset = pswap.storage().requested_asset();
         let requested_faucet_id = requested_asset.faucet_id();
-        let requested_amount = requested_asset.amount();
+        let requested_amount: u64 = requested_asset.amount().into();
 
         let creator_id = pswap.storage().creator_account_id();
 

@@ -1,0 +1,405 @@
+//! Integration test: three users, three tokens, triangular (3-edge cycle) matching.
+//!
+//! Scenario:
+//!   * Alice offers 10 USDC, wants 10 ETH    (edge USDC → ETH)
+//!   * Bob   offers 10 ETH,  wants 10 SOL    (edge ETH  → SOL)
+//!   * Charlie offers 11 SOL, wants 10 USDC  (edge SOL  → USDC)
+//!
+//! Profitability:
+//!   offered_product   = 10 * 10 * 11 = 1100
+//!   requested_product = 10 * 10 * 10 = 1000
+//!   1100 > 1000 ⇒ profitable cycle.
+//!
+//! No pair has a reciprocal counter-order, so direct (pairwise) matching can't
+//! clear any of these orders. Only the 3-edge cycle matcher can — making this
+//! the right scenario to exercise the `triangular_enabled` toggle.
+//!
+//! Two sub-tests share the setup pattern but run independently:
+//!   1. `triangular_disabled_yields_no_matches` — `triangular_enabled = false`,
+//!      expects no execution txs to land on chain.
+//!   2. `triangular_enabled_clears_cycle` — `triangular_enabled = true`,
+//!      expects 3 paybacks to land and the solver to keep the 1 SOL surplus.
+
+mod common;
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use miden_client::auth::AuthSchemeId;
+use miden_client::note::{NoteAttachment, NoteType};
+use miden_client::testing::common::{
+    insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
+};
+use miden_client::testing::mock::MockRpcApi;
+use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
+use miden_client::Client;
+use miden_client::keystore::FilesystemKeyStore;
+use miden_protocol::account::{AccountId, AccountStorageMode};
+use miden_protocol::asset::FungibleAsset;
+use miden_testing::MockChain;
+use solver::config::{
+    AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig,
+};
+use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
+
+use common::{build_test_client, temp_paths, vault_balance, wait_for};
+
+/// Shared scaffold for both sub-tests. Returns the populated user client,
+/// faucets, user accounts, and the rpc + solver-side temp dir. After this
+/// returns, the chain has block 4 with the 3 PSWAP notes committed and the
+/// user client has NOT been synced past block 3 (so the solver sees them
+/// fresh on its first sync).
+async fn setup_chain_with_three_pswaps() -> Result<TriangularSetup> {
+    let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
+
+    // User Client (test driver): faucets + alice/bob/charlie.
+    let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
+    let mut user_client =
+        build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?;
+    user_client
+        .ensure_genesis_in_place()
+        .await
+        .map_err(|e| anyhow::anyhow!("user genesis: {e}"))?;
+    let user_keystore = FilesystemKeyStore::new(user_keystore_path.clone())
+        .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
+
+    let scheme = AuthSchemeId::Falcon512Poseidon2;
+    let mode = AccountStorageMode::Public;
+
+    let (usdc, _) = insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
+    let (eth, _) = insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
+    let (sol, _) = insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
+
+    let (alice, _) = insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+    let (bob, _) = insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+    let (charlie, _) = insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+
+    // Fund: alice/charlie need offer-side tokens; bob needs ETH.
+    mint_and_consume(&mut user_client, alice.id(), usdc.id(), NoteType::Public).await;
+    rpc.prove_block();
+    user_client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow::anyhow!("sync after alice mint: {e}"))?;
+
+    mint_and_consume(&mut user_client, bob.id(), eth.id(), NoteType::Public).await;
+    rpc.prove_block();
+    user_client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow::anyhow!("sync after bob mint: {e}"))?;
+
+    mint_and_consume(&mut user_client, charlie.id(), sol.id(), NoteType::Public).await;
+    rpc.prove_block();
+    user_client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow::anyhow!("sync after charlie mint: {e}"))?;
+
+    // 3 PSWAP-creation txs forming the cycle USDC → ETH → SOL → USDC.
+    submit_pswap(
+        &mut user_client,
+        alice.id(),
+        FungibleAsset::new(usdc.id(), 10)?,
+        FungibleAsset::new(eth.id(), 10)?,
+    )
+    .await?;
+    submit_pswap(
+        &mut user_client,
+        bob.id(),
+        FungibleAsset::new(eth.id(), 10)?,
+        FungibleAsset::new(sol.id(), 10)?,
+    )
+    .await?;
+    submit_pswap(
+        &mut user_client,
+        charlie.id(),
+        FungibleAsset::new(sol.id(), 11)?,
+        FungibleAsset::new(usdc.id(), 10)?,
+    )
+    .await?;
+    rpc.prove_block();
+    // No user_client.sync_state here — let the solver see the PSWAPs first.
+
+    Ok(TriangularSetup {
+        rpc,
+        _user_client: user_client,
+        _user_temp: user_temp,
+        usdc_id: usdc.id(),
+        eth_id: eth.id(),
+        sol_id: sol.id(),
+        alice_id: alice.id(),
+        bob_id: bob.id(),
+        charlie_id: charlie.id(),
+    })
+}
+
+async fn submit_pswap(
+    client: &mut Client<FilesystemKeyStore>,
+    creator: AccountId,
+    offered: FungibleAsset,
+    requested: FungibleAsset,
+) -> Result<()> {
+    let request = TransactionRequestBuilder::new()
+        .build_pswap_create(
+            &PswapTransactionData::new(creator, offered, requested),
+            NoteType::Public,
+            NoteType::Public,
+            NoteAttachment::default(),
+            client.rng(),
+        )
+        .map_err(|e| anyhow::anyhow!("build_pswap_create: {e}"))?;
+    Box::pin(client.submit_new_transaction(creator, request))
+        .await
+        .map_err(|e| anyhow::anyhow!("submit pswap: {e}"))?;
+    Ok(())
+}
+
+struct TriangularSetup {
+    rpc: Arc<MockRpcApi>,
+    _user_client: Client<FilesystemKeyStore>,
+    _user_temp: TempDir,
+    usdc_id: AccountId,
+    eth_id: AccountId,
+    sol_id: AccountId,
+    alice_id: AccountId,
+    bob_id: AccountId,
+    charlie_id: AccountId,
+}
+
+fn build_solver_config(
+    solver_account_id: AccountId,
+    solver_temp: &TempDir,
+    solver_keystore_path: &std::path::Path,
+    usdc_id: AccountId,
+    eth_id: AccountId,
+    sol_id: AccountId,
+    triangular_enabled: bool,
+) -> SolverConfig {
+    let solver_db = solver_temp.path().join("solver.sqlite3");
+    SolverConfig {
+        rpc: RpcConfig {
+            endpoint: "http://unused".into(),
+            timeout_ms: 1_000,
+        },
+        solver: SolverAccountConfig {
+            account_id: solver_account_id.to_hex(),
+            keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
+            store_path: solver_db.to_string_lossy().into_owned(),
+            read_pool_size: 2,
+        },
+        // Three pairs so each token gets registered for tag subscription.
+        pairs: vec![
+            AssetPairConfig {
+                name: "USDC-ETH".into(),
+                asset_x_faucet_id: usdc_id.to_hex(),
+                asset_x_external_symbol: None,
+                asset_y_faucet_id: eth_id.to_hex(),
+                asset_y_external_symbol: None,
+            },
+            AssetPairConfig {
+                name: "ETH-SOL".into(),
+                asset_x_faucet_id: eth_id.to_hex(),
+                asset_x_external_symbol: None,
+                asset_y_faucet_id: sol_id.to_hex(),
+                asset_y_external_symbol: None,
+            },
+            AssetPairConfig {
+                name: "SOL-USDC".into(),
+                asset_x_faucet_id: sol_id.to_hex(),
+                asset_x_external_symbol: None,
+                asset_y_faucet_id: usdc_id.to_hex(),
+                asset_y_external_symbol: None,
+            },
+        ],
+        engine: EngineConfig {
+            pulse_interval_ms: 200,
+            fetch_interval_ms: 100,
+            price_interval_ms: 60_000,
+            triangular_enabled,
+            admin_port: 0,
+            debug_mode: false,
+            obs_port: 0,
+            readiness_freshness_secs: 60,
+        },
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn triangular_enabled_clears_cycle() -> Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let setup = setup_chain_with_three_pswaps().await?;
+            let rpc = setup.rpc.clone();
+            let initial_committed = rpc.mock_chain.read().committed_notes().len();
+
+            // Solver Client: only the solver wallet is tracked.
+            let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
+            let mut solver_client =
+                build_test_client(rpc.clone(), solver_keystore_path.clone(), solver_store_path)
+                    .await?;
+            solver_client
+                .ensure_genesis_in_place()
+                .await
+                .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
+            let solver_keystore = FilesystemKeyStore::new(solver_keystore_path.clone())
+                .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
+
+            let (solver_account, _) = insert_new_wallet(
+                &mut solver_client,
+                AccountStorageMode::Public,
+                &solver_keystore,
+                AuthSchemeId::Falcon512Poseidon2,
+            )
+            .await?;
+            let solver_id = solver_account.id();
+
+            let config = build_solver_config(
+                solver_id,
+                &solver_temp,
+                &solver_keystore_path,
+                setup.usdc_id,
+                setup.eth_id,
+                setup.sol_id,
+                /* triangular_enabled */ true,
+            );
+
+            let cancel = CancellationToken::new();
+            let solver_cancel = cancel.clone();
+            let _solver_handle = tokio::task::spawn_local(async move {
+                solver::start(solver_client, solver_id, config, solver_cancel).await
+            });
+
+            let sol_id = setup.sol_id;
+            let wait_result = wait_for(&rpc, 120, |chain| {
+                vault_balance(chain, solver_id, sol_id) >= 1
+                    && chain.committed_notes().len() >= initial_committed + 3
+            })
+            .await;
+
+            if wait_result.is_err() {
+                let chain_ro = rpc.mock_chain.read();
+                println!(
+                    "[test] block_num: {}",
+                    chain_ro.latest_block_header().block_num().as_u64()
+                );
+                println!("[test] solver sol: {}", vault_balance(&chain_ro, solver_id, sol_id));
+                println!(
+                    "[test] committed_notes: {} (was {})",
+                    chain_ro.committed_notes().len(),
+                    initial_committed,
+                );
+            }
+            wait_result?;
+
+            let chain_ro = rpc.mock_chain.read();
+            assert_eq!(
+                vault_balance(&chain_ro, solver_id, sol_id),
+                1,
+                "solver should keep 1 SOL surplus (11 offered − 10 consumed)",
+            );
+            assert!(
+                chain_ro.committed_notes().len() >= initial_committed + 3,
+                "expected ≥3 new payback notes, got {}",
+                chain_ro.committed_notes().len() - initial_committed,
+            );
+
+            cancel.cancel();
+            drop(solver_temp);
+            // Reference setup's _user_temp and _user_client to keep them alive
+            // for the test's duration — they go out of scope here.
+            let _ = setup;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn triangular_disabled_yields_no_matches() -> Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let setup = setup_chain_with_three_pswaps().await?;
+            let rpc = setup.rpc.clone();
+            let initial_committed = rpc.mock_chain.read().committed_notes().len();
+
+            let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
+            let mut solver_client =
+                build_test_client(rpc.clone(), solver_keystore_path.clone(), solver_store_path)
+                    .await?;
+            solver_client
+                .ensure_genesis_in_place()
+                .await
+                .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
+            let solver_keystore = FilesystemKeyStore::new(solver_keystore_path.clone())
+                .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
+
+            let (solver_account, _) = insert_new_wallet(
+                &mut solver_client,
+                AccountStorageMode::Public,
+                &solver_keystore,
+                AuthSchemeId::Falcon512Poseidon2,
+            )
+            .await?;
+            let solver_id = solver_account.id();
+
+            let config = build_solver_config(
+                solver_id,
+                &solver_temp,
+                &solver_keystore_path,
+                setup.usdc_id,
+                setup.eth_id,
+                setup.sol_id,
+                /* triangular_enabled */ false,
+            );
+
+            let cancel = CancellationToken::new();
+            let solver_cancel = cancel.clone();
+            let _solver_handle = tokio::task::spawn_local(async move {
+                solver::start(solver_client, solver_id, config, solver_cancel).await
+            });
+
+            // Drive the chain for a generous number of iterations. With
+            // triangular disabled and no pairwise reciprocal counter-orders,
+            // the matcher should never produce a batch — committed_notes
+            // count should stay flat.
+            for _ in 0..30 {
+                tokio::time::advance(std::time::Duration::from_millis(500)).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                rpc.prove_block();
+            }
+
+            let chain_ro = rpc.mock_chain.read();
+            let grown = chain_ro.committed_notes().len() - initial_committed;
+            assert_eq!(
+                grown, 0,
+                "no matches expected with triangular disabled and no pairwise counter-orders; \
+                 committed_notes grew by {grown}",
+            );
+            assert_eq!(
+                vault_balance(&chain_ro, setup.alice_id, setup.eth_id),
+                0,
+                "alice should have received no ETH"
+            );
+            assert_eq!(
+                vault_balance(&chain_ro, setup.bob_id, setup.sol_id),
+                0,
+                "bob should have received no SOL"
+            );
+            assert_eq!(
+                vault_balance(&chain_ro, setup.charlie_id, setup.usdc_id),
+                0,
+                "charlie should have received no USDC"
+            );
+
+            cancel.cancel();
+            drop(solver_temp);
+            let _ = setup;
+            Ok(())
+        })
+        .await
+}

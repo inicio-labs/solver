@@ -5,26 +5,37 @@ edition = "2021"
 
 [features]
 default = []
-client = ["miden-client"]
 testing = []
 
 [dependencies]
 consume-script = { path = "../consume-script" }
-miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
-miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
-miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
-miden-core = "0.22"
+miden-client = { workspace = true }
+miden-protocol.workspace = true
+miden-standards.workspace = true
+miden-core.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 tokio = { version = "1.40", features = ["macros", "time", "sync"] }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 diesel = { version = "2.2", features = ["sqlite", "r2d2"] }
 diesel_migrations = "2.2"
 axum = { version = "0.8", features = ["json"] }
 hex = "0.4"
+subtle = "2.5"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
 
 [dev-dependencies]
-miden-crypto = "0.23"
+miden-crypto.workspace = true
 axum-test = "20"
+wiremock = "0.6"
+miden-client-sqlite-store = { workspace = true }
+miden-testing.workspace = true
+consume-script = { path = "../consume-script" }
+tempfile = "3"
+# test-util is dev-only; enables tokio::time::pause/advance + start_paused on #[tokio::test].
+tokio = { version = "1.40", features = ["test-util"] }

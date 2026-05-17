@@ -88,7 +88,7 @@ fn fuzz_multi_token() {
             assert!(order.requested_filled() > 0, "trial {}: filled order has 0 fill", trial);
             assert!(order.requested_filled() <= order.requested, "trial {}: fill exceeds order", trial);
         }
-        assert!(batch.remaining_orders <= engine.book.orders.len() as u32);
+        assert!(batch.remaining_orders <= engine.book.orders.len() as u64);
     }
     println!("fuzz_multi_token: 50 trials passed");
 }
@@ -179,7 +179,7 @@ fn fuzz_realistic() {
             assert!(order.requested_filled() <= order.requested,
                 "trial {}: fill exceeds order", trial);
         }
-        assert!(batch.remaining_orders <= engine.book.orders.len() as u32);
+        assert!(batch.remaining_orders <= engine.book.orders.len() as u64);
     }
     println!("fuzz_realistic: 100 trials passed");
 }

@@ -107,3 +107,21 @@ fn protocol_balance_saturates_at_zero() {
     book.deduct_protocol_balance(eth(), 2);
     assert_eq!(book.protocol_balances[&eth()], 0);
 }
+
+#[test]
+fn fifo_at_same_rate_returns_older_order_first() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    let older = gen.next();
+    let newer = gen.next();
+    // Two same-rate orders: same offered/requested, inserted in order.
+    book.add_user_order(older, usdc(), eth(), 2000, 1);
+    book.add_user_order(newer, usdc(), eth(), 2000, 1);
+
+    let best = book.best_order(usdc(), eth()).unwrap();
+    assert_eq!(
+        best.id, older,
+        "FIFO: oldest order at the same rate should fill first (price-time priority)"
+    );
+}

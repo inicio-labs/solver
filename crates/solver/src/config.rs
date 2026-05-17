@@ -1,3 +1,8 @@
+//! Configuration types for the solver binary, sourced from `solver.toml`.
+//!
+//! Living in the library so both `solver::start` and `main.rs` can read the
+//! same struct without a reverse dependency from library → binary.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +69,21 @@ pub struct EngineConfig {
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
+    /// Whether to run the Miden client in debug mode. Enables MASM debug
+    /// instrumentation. Useful for testnet diagnostics; MUST be `false` for
+    /// mainnet. Defaults to `false` when omitted from `solver.toml`.
+    #[serde(default)]
+    pub debug_mode: bool,
+    /// TCP port the observability HTTP server binds on `127.0.0.1`. Exposes
+    /// `/health` (liveness) and `/readyz` (readiness). No auth — meant for
+    /// process supervisors and monitoring scrapers. Defaults to 9090.
+    #[serde(default = "default_obs_port")]
+    pub obs_port: u16,
+    /// Readiness threshold in seconds. `/readyz` returns 503 if the time
+    /// since the last successful sync_state exceeds this. Tune for chain
+    /// block time + expected RPC latency. Defaults to 60s.
+    #[serde(default = "default_readiness_freshness_secs")]
+    pub readiness_freshness_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -72,6 +92,14 @@ fn default_true() -> bool {
 
 fn default_admin_port() -> u16 {
     3001
+}
+
+fn default_obs_port() -> u16 {
+    9090
+}
+
+fn default_readiness_freshness_secs() -> u64 {
+    60
 }
 
 impl SolverConfig {

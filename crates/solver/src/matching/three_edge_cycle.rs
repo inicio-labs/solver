@@ -308,8 +308,8 @@ fn simulate_full_cycle<F: PriceFeed>(
 /// Phase 2: pop best, execute, re-evaluate dirty triangles, repeat.
 ///
 /// Inserts filled order IDs into the provided set. Returns number of cycles executed.
-pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u32 {
-    let mut cycles_executed = 0u32;
+pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u64 {
+    let mut cycles_executed = 0u64;
 
     // Phase 1: build
     let mut triangles_by_pair: HashMap<(TokenId, TokenId), Vec<Triangle>> = HashMap::new();
@@ -347,7 +347,11 @@ pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders
             continue;
         }
 
-        execute_cycle(book, &entry, &simulation.fills, filled_orders);
+        if !execute_cycle(book, &entry, &simulation.fills, filled_orders) {
+            // Invariant violation — already logged inside execute_cycle. Skip
+            // this entry; the next heap iteration handles whatever's left.
+            continue;
+        }
         cycles_executed += 1;
 
         // Re-evaluate triangles sharing affected pairs (deduplicated).
@@ -374,25 +378,47 @@ pub fn run_three_edge_cycle<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders
 /// `simulate_cycle` and `fill()` use the same `offered_for()` calculation
 /// (original offered/requested ratio never changes), so simulation surplus
 /// is identical to actual surplus — no need to recompute from fill results.
+///
+/// Returns `true` on success. Returns `false` (after logging) if any of the
+/// three orders has been removed from the book between simulation and
+/// execution — a "should never happen" invariant violation that would
+/// otherwise have been an `.unwrap()` panic. On a `false` return the caller
+/// must not count this as an executed cycle. Note that a partial fill on
+/// `order_ab` is not unwound if a later order is missing; the matcher's
+/// next-tick DB hydration self-corrects the discrepancy.
 fn execute_cycle<F: PriceFeed>(
     book: &mut OrderBook<F>,
     entry: &CycleEntry,
     simulation: &FillResult,
     filled_orders: &mut HashSet<OrderId>,
-) {
+) -> bool {
     // Execute fills: deduct requested_remaining on each order.
-    book.orders
-        .get_mut(&entry.order_ab)
-        .unwrap()
-        .fill(simulation.fill_b);
-    book.orders
-        .get_mut(&entry.order_ca)
-        .unwrap()
-        .fill(simulation.fill_a);
-    book.orders
-        .get_mut(&entry.order_bc)
-        .unwrap()
-        .fill(simulation.fill_c);
+    let Some(order_ab) = book.orders.get_mut(&entry.order_ab) else {
+        tracing::warn!(
+            order_ab = %entry.order_ab,
+            "execute_cycle: order_ab unexpectedly missing — skipping cycle"
+        );
+        return false;
+    };
+    order_ab.fill(simulation.fill_b);
+
+    let Some(order_ca) = book.orders.get_mut(&entry.order_ca) else {
+        tracing::warn!(
+            order_ca = %entry.order_ca,
+            "execute_cycle: order_ca unexpectedly missing — skipping cycle (order_ab already partially filled)"
+        );
+        return false;
+    };
+    order_ca.fill(simulation.fill_a);
+
+    let Some(order_bc) = book.orders.get_mut(&entry.order_bc) else {
+        tracing::warn!(
+            order_bc = %entry.order_bc,
+            "execute_cycle: order_bc unexpectedly missing — skipping cycle (order_ab + order_ca already partially filled)"
+        );
+        return false;
+    };
+    order_bc.fill(simulation.fill_c);
 
     filled_orders.insert(entry.order_ab);
     filled_orders.insert(entry.order_ca);
@@ -407,4 +433,5 @@ fn execute_cycle<F: PriceFeed>(
     book.add_protocol_balance(triangle.token_id_a(), simulation.surplus_a);
     book.add_protocol_balance(triangle.token_id_b(), simulation.surplus_b);
     book.add_protocol_balance(triangle.token_id_c(), simulation.surplus_c);
+    true
 }

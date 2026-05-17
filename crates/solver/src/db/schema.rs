@@ -41,6 +41,7 @@ diesel::table! {
     registered_tokens (token_id) {
         token_id -> Binary,
         created_at -> BigInt,
+        external_symbol -> Nullable<Text>,
     }
 }
 

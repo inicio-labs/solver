@@ -12,6 +12,13 @@ fn calculate_output_amount(offered_total: Amount, requested_total: Amount, fill_
 /// for exact comparison — no floating point, no precision loss.
 ///
 /// Rate = requested / offered. Lower rate = more generous order.
+///
+/// INVARIANT: `rate_key()` depends only on `Order::requested` and
+/// `Order::offered`, both of which are immutable for the lifetime of the
+/// order. Partial fills update `requested_remaining` but never the key, so
+/// it is safe to keep an order in the BTreeMap-keyed index after filling it.
+/// Any future change that makes the rate key depend on a mutable field
+/// MUST also re-index the order in `OrderBook::pair_index`.
 #[derive(Clone, Copy, Debug)]
 pub struct RateKey {
     pub requested: Amount,
@@ -184,6 +191,6 @@ pub struct SettlementBatch {
     /// Set of order IDs that were touched (fully or partially filled).
     pub filled_orders: HashSet<OrderId>,
     pub protocol_balances: Vec<(TokenId, Amount)>,
-    pub cycles_executed: u32,
-    pub remaining_orders: u32,
+    pub cycles_executed: u64,
+    pub remaining_orders: u64,
 }

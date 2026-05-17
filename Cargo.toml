@@ -1,46 +1,38 @@
 [workspace]
 members = ["crates/solver", "crates/consume-script"]
 
+[workspace.dependencies]
+miden-client = { git = "https://github.com/0xMiden/miden-client", branch = "next", default-features = false, features = ["std", "tonic", "testing"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", branch = "next" }
+miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
+miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
+miden-testing = { git = "https://github.com/0xMiden/protocol", branch = "next" }
+miden-core = "0.22"
+miden-crypto = "0.23"
+
 [package]
 name = "solver-bin"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-client = ["solver/client", "miden-client", "miden-client-sqlite-store"]
-
 [dependencies]
 solver = { path = "crates/solver" }
-miden-client = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", features = ["tonic", "testing"], optional = true }
-miden-client-sqlite-store = { git = "https://github.com/inicio-labs/miden-client", branch = "pswap-client", package = "miden-client-sqlite-store", optional = true }
-miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
-miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
-miden-core = "0.22"
-miden-crypto = "0.23"
-tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "fs"] }
+miden-client = { workspace = true }
+miden-client-sqlite-store = { workspace = true }
+miden-protocol.workspace = true
+miden-standards.workspace = true
+miden-core.workspace = true
+miden-crypto.workspace = true
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 rand = "0.9"
 anyhow = "1.0"
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-axum = { version = "0.8", features = ["ws"] }
-
-[[bin]]
-name = "setup"
-path = "scripts/setup.rs"
-required-features = ["client"]
-
-[[bin]]
-name = "solver_runner"
-path = "scripts/solver_runner.rs"
-required-features = ["client"]
-
-[[bin]]
-name = "swap_activity"
-path = "scripts/swap_activity.rs"
-required-features = ["client"]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi", "std"] }
 
 [dev-dependencies]
 consume-script = { path = "crates/consume-script" }
-miden-testing = { git = "https://github.com/0xMiden/protocol", branch = "next" }
+miden-testing.workspace = true

@@ -5,8 +5,14 @@ pub mod ingest;
 pub mod price;
 pub mod admin;
 pub mod matcher;
+pub mod obs;
 pub mod pipeline;
+pub mod order;
+pub mod config;
 
-#[cfg(feature = "client")]
 pub mod executor;
+
+pub mod start;
+
+pub use start::start;
 

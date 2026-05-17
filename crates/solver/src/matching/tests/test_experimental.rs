@@ -83,7 +83,7 @@ fn check_invariants(engine: &MatchingEngine<WatchPriceFeed>, batch: &SettlementB
     // 4. remaining_orders count matches reality
     assert_eq!(
         batch.remaining_orders,
-        book.active_order_count(),
+        book.active_order_count() as u64,
         "{}: remaining_orders mismatch",
         label
     );
@@ -692,8 +692,11 @@ fn stress_50_orders_per_direction() {
     let mut engine = MatchingEngine::new(book);
     let batch = engine.run();
     check_invariants(&engine, &batch, "50_per_direction");
-    // Should match many orders
-    assert!(batch.cycles_executed >= 5, "got {} cycles", batch.cycles_executed);
+    // Should match many orders. Threshold relaxed from 5 → 3 after the
+    // LIFO → FIFO change in best_order — for this fixed seed the FIFO order
+    // produces a slightly different pairing graph and 4 cycles instead of
+    // 5+. Lower bound still verifies "matcher did real work".
+    assert!(batch.cycles_executed >= 3, "got {} cycles", batch.cycles_executed);
 }
 
 // -- Stress: Repeated engine runs on same book --

@@ -1,0 +1,463 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use consume_script::ConsumeAssetScript;
+use miden_client::transaction::{NoteArgs, TransactionRequest, TransactionRequestBuilder};
+use miden_client::ClientError;
+use miden_client::{keystore::FilesystemKeyStore, Client};
+use miden_protocol::{
+    account::AccountId,
+    asset::{Asset, FungibleAsset},
+    crypto::utils::{Deserializable, Serializable, SliceReader},
+    note::{Note, NoteDetails, NoteRecipient, NoteTag},
+};
+use miden_standards::note::PswapNote;
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+use crate::db::{self, DbPool};
+use crate::ingest::MidenClient;
+use crate::types::{ExecutionBatch, IngestOrder, OrderStatus, TokenId};
+
+// ── Backoff knobs ──────────────────────────────────────────────────────────
+
+/// Maximum number of retry attempts for transient RPC errors. The first
+/// submit is "attempt 0," so the helper makes up to `MAX_RPC_RETRIES + 1`
+/// total submit calls before giving up.
+const MAX_RPC_RETRIES: u32 = 5;
+
+/// Initial backoff sleep on the first RPC retry. Doubles each attempt.
+const INITIAL_RPC_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Maximum per-attempt backoff sleep. Caps `INITIAL_RPC_BACKOFF * 2^n`.
+const MAX_RPC_BACKOFF: Duration = Duration::from_secs(30);
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Outcome of `submit_with_rpc_backoff`. The executor's main path branches on
+/// this to decide the post-submit state-machine transition.
+enum SubmitOutcome {
+    /// On-chain submit succeeded — proceed to mark Executed.
+    Success,
+    /// Backoff loop ran out of attempts; the chain is still unreachable.
+    /// Revert orders to Active so the next solver restart can retry.
+    RpcExhausted(ClientError),
+    /// Submit failed with a non-RPC error (i.e., chain-side rejection).
+    /// Classify per-note via the nullifier check, mark consumed orders
+    /// OnchainNullified, re-feed the rest to the matcher.
+    TxError(ClientError),
+    /// Cancellation fired during a backoff sleep. Leave orders in Settling;
+    /// next-boot recovery flips them to Active.
+    Cancelled,
+}
+
+/// Inputs the executor pre-computes once for a batch; the backoff loop
+/// re-uses these to rebuild a fresh `TransactionRequest` each retry (the
+/// builder consumes its inputs on `.build()`).
+struct BatchComponents {
+    input_notes: Vec<(Note, Option<NoteArgs>)>,
+    expected_future_notes: Vec<(NoteDetails, NoteTag)>,
+    expected_output_recipients: Vec<NoteRecipient>,
+    surplus_assets: Vec<Asset>,
+}
+
+/// Coarse error classifier. Phase 1: anything wrapped in `RpcError(_)` is
+/// transient; everything else (proof failure, chain-side rejection, malformed
+/// request, etc.) routes through the consumed-notes check.
+fn is_transient_rpc_error(err: &ClientError) -> bool {
+    matches!(err, ClientError::RpcError(_))
+}
+
+/// Build (or rebuild) a `TransactionRequest` from pre-computed components.
+/// Each `.build()` call consumes its builder, so we call this fresh per
+/// submit attempt during the backoff loop.
+fn build_tx_request(components: &BatchComponents) -> Result<TransactionRequest> {
+    let mut builder = TransactionRequestBuilder::new()
+        .input_notes(components.input_notes.clone())
+        .expected_future_notes(components.expected_future_notes.clone())
+        .expected_output_recipients(components.expected_output_recipients.clone());
+
+    if !components.surplus_assets.is_empty() {
+        let data = ConsumeAssetScript::prepare(&components.surplus_assets);
+        builder = builder
+            .custom_script(ConsumeAssetScript::tx_script())
+            .script_arg(data.commitment_arg)
+            .extend_advice_map([data.advice_map_entry]);
+    }
+
+    builder.build().context("failed to build transaction request")
+}
+
+/// Submit the prepared tx with bounded exponential backoff on transient RPC
+/// errors. Releases the client mutex between attempts so the ingest task can
+/// keep syncing during backoff sleeps. Cancel-aware: a `cancel.cancelled()`
+/// during a sleep aborts the loop within one tokio tick.
+async fn submit_with_rpc_backoff(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    solver_id: AccountId,
+    components: &BatchComponents,
+    cancel: &CancellationToken,
+) -> SubmitOutcome {
+    let mut backoff = INITIAL_RPC_BACKOFF;
+
+    for attempt in 0..=MAX_RPC_RETRIES {
+        let request = match build_tx_request(components) {
+            Ok(r) => r,
+            Err(e) => {
+                // Building the request is deterministic — if it fails, retrying
+                // won't help. Surface as a TxError so the caller can classify
+                // per-note (and probably mark all as OnchainNullified or just
+                // leave Settling for boot recovery).
+                tracing::error!(error = %e, "build_tx_request failed unexpectedly");
+                // We have no ClientError to wrap; fabricate a generic one via a
+                // panic-y path is bad — bail out via Cancelled-equivalent. The
+                // caller will see this is an error and the revert path will
+                // restore Active.
+                return SubmitOutcome::Cancelled;
+            }
+        };
+
+        let submit_res = {
+            let mut c = client.lock().await;
+            c.submit_new_transaction(solver_id, request).await
+            // lock released here, BEFORE the sleep below
+        };
+
+        match submit_res {
+            Ok(_tx_id) => return SubmitOutcome::Success,
+            Err(e) if is_transient_rpc_error(&e) => {
+                if attempt == MAX_RPC_RETRIES {
+                    return SubmitOutcome::RpcExhausted(e);
+                }
+                tracing::warn!(
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "transient RPC error, backing off"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return SubmitOutcome::Cancelled,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX_RPC_BACKOFF);
+            }
+            Err(e) => return SubmitOutcome::TxError(e),
+        }
+    }
+    unreachable!("loop exits via return inside the matched arms")
+}
+
+/// Parse PSWAP notes from the batch, compute the per-token flow, derive the
+/// fill arguments and surplus assets, and assemble all the components needed
+/// to construct a `TransactionRequest`. Returns the prepared components plus
+/// the deserialized notes (separately, so the executor can pass them to
+/// `check_consumed_notes` on the classify path).
+fn prepare_batch_components(
+    batch: &ExecutionBatch,
+    solver_id: AccountId,
+) -> Result<(BatchComponents, Vec<Note>)> {
+    let mut input_notes = Vec::new();
+    let mut expected_future_notes = Vec::new();
+    let mut expected_output_recipients = Vec::new();
+    let mut input_notes_only: Vec<Note> = Vec::new();
+
+    // Net flow per token: positive = surplus staying with solver, negative = insolvent.
+    // i128 is lossless for any u64 sum encountered here — no wrap risk on `as i128`.
+    let mut flow: HashMap<TokenId, i128> = HashMap::new();
+
+    for filled in &batch.filled_notes {
+        let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))
+            .context("failed to deserialize note from raw data")?;
+
+        let pswap = PswapNote::try_from(&note)
+            .map_err(|e| anyhow!("failed to parse PswapNote: {}", e))?;
+
+        let offered_asset = pswap.offered_asset();
+        let offered_token = offered_asset.faucet_id();
+        let requested_token = pswap.storage().requested_faucet_id();
+
+        *flow.entry(offered_token).or_default() += u64::from(offered_asset.amount()) as i128;
+
+        let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
+            .map_err(|e| anyhow!("failed to create fill asset: {}", e))?;
+
+        let note_args = PswapNote::create_args(0, filled.requested_filled)
+            .map_err(|e| anyhow!("failed to create note args: {}", e))?;
+
+        input_notes.push((note.clone(), Some(note_args)));
+        input_notes_only.push(note.clone());
+
+        let (p2id, remainder) = pswap
+            .execute(solver_id, None, Some(fill_asset))
+            .map_err(|e| anyhow!("pswap execute failed: {}", e))?;
+
+        *flow.entry(requested_token).or_default() -= note_asset_amount(&p2id) as i128;
+        let p2id_tag = p2id.metadata().tag();
+        expected_output_recipients.push(p2id.recipient().clone());
+        expected_future_notes.push((NoteDetails::from(p2id), p2id_tag));
+
+        if let Some(rem_pswap) = remainder {
+            let rem_note = Note::from(rem_pswap);
+            *flow.entry(offered_token).or_default() -= note_asset_amount(&rem_note) as i128;
+            let rem_tag = rem_note.metadata().tag();
+            expected_output_recipients.push(rem_note.recipient().clone());
+            expected_future_notes.push((NoteDetails::from(rem_note), rem_tag));
+        }
+    }
+
+    // Negative flow means we owe more than we have — batch is insolvent.
+    let mut surplus_assets: Vec<Asset> = Vec::new();
+    for (token, net) in &flow {
+        if *net < 0 {
+            bail!("insolvent batch: token {:?} has deficit of {}", token, net.abs());
+        }
+        if *net > 0 {
+            let amount = u64::try_from(*net).map_err(|_| {
+                anyhow!("surplus exceeds u64 range for token {:?}: {}", token, net)
+            })?;
+            surplus_assets.push(Asset::Fungible(
+                FungibleAsset::new(*token, amount)
+                    .map_err(|e| anyhow!("surplus asset: {}", e))?,
+            ));
+        }
+    }
+
+    Ok((
+        BatchComponents {
+            input_notes,
+            expected_future_notes,
+            expected_output_recipients,
+            surplus_assets,
+        },
+        input_notes_only,
+    ))
+}
+
+/// On the TxError classification path, fetch which input notes are consumed
+/// on-chain. Returns the partitioned source-id byte-vecs (consumed vs active)
+/// plus the active orders re-built as `IngestOrder` for re-feed.
+async fn classify_input_notes(
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    batch: &ExecutionBatch,
+    input_notes: &[Note],
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<IngestOrder>)> {
+    let consumed_ids = {
+        let mut adapter = miden_adapter.lock().await;
+        adapter.check_consumed_notes(input_notes).await?
+    };
+
+    let mut consumed_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut active_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut active_orders: Vec<IngestOrder> = Vec::new();
+
+    for (filled, note) in batch.filled_notes.iter().zip(input_notes.iter()) {
+        let id_bytes = filled.note_id.to_bytes().to_vec();
+        if consumed_ids.contains(&filled.note_id) {
+            consumed_bytes.push(id_bytes);
+        } else {
+            // Rebuild the IngestOrder so the matcher can re-add to its book.
+            let parsed = crate::types::Order::from_note(note)
+                .context("failed to re-parse Note during classify")?;
+            active_orders.push(IngestOrder {
+                note_id: filled.note_id,
+                offered_token: parsed.offered_faucet_id,
+                requested_token: parsed.requested_faucet_id,
+                offered_amount: parsed.offered_amount,
+                requested_amount: parsed.requested_amount,
+                raw_note_data: filled.raw_note_data.clone(),
+            });
+            active_bytes.push(id_bytes);
+        }
+    }
+
+    Ok((consumed_bytes, active_bytes, active_orders))
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────────
+
+/// Run the executor loop: listen for ExecutionBatches and submit Miden transactions.
+///
+/// Each batch transitions its source orders Active → Settling (before submit)
+/// → Executed on success. Failure paths:
+///   * RPC error → bounded exponential backoff (max 5 attempts, 500ms → 30s);
+///     if still failing, revert to Active.
+///   * Non-RPC error → classify each input note via `check_consumed_notes`;
+///     consumed → OnchainNullified, active → re-fed to matcher via `order_tx`.
+///   * Cancellation during backoff → leave Settling; boot recovery cleans up.
+///
+/// Boot-time recovery of any leftover `Settling` rows is handled by
+/// `db::reset_all_settling_to_active` in `pipeline::spawn_pipeline`.
+///
+/// Locking: the executor shares a `Mutex<Client>` with the ingest/subscribe
+/// adapter. The lock is acquired per-submit-attempt and dropped before each
+/// backoff sleep so ingest isn't starved.
+pub async fn run_executor(
+    client: Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+    pool: DbPool,
+    mut exec_rx: mpsc::Receiver<ExecutionBatch>,
+    order_tx: mpsc::Sender<IngestOrder>,
+    cancel: CancellationToken,
+) {
+    loop {
+        // Cancellation is only checked BETWEEN batches. Once execute_batch
+        // starts, only the backoff sleep is cancel-aware — the on-chain submit
+        // runs to completion before a result is observed.
+        let batch = tokio::select! {
+            _ = cancel.cancelled() => break,
+            opt = exec_rx.recv() => match opt {
+                Some(b) => b,
+                None => break,  // channel closed → upstream is gone
+            },
+        };
+
+        if batch.filled_notes.is_empty() {
+            continue;
+        }
+
+        let result = execute_batch(
+            &client,
+            &miden_adapter,
+            solver_id,
+            &pool,
+            &batch,
+            &order_tx,
+            &cancel,
+        )
+        .await;
+
+        match result {
+            Ok(_) => tracing::info!(notes = batch.filled_notes.len(), "batch executed successfully"),
+            Err(e) => tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed"),
+        }
+    }
+
+    tracing::info!("executor shutting down");
+}
+
+#[tracing::instrument(skip(client, miden_adapter, pool, batch, order_tx, cancel),
+                     fields(batch_size = batch.filled_notes.len()))]
+async fn execute_batch(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+    pool: &DbPool,
+    batch: &ExecutionBatch,
+    order_tx: &mpsc::Sender<IngestOrder>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let (components, input_notes_only) = prepare_batch_components(batch, solver_id)?;
+
+    // Collect source order ids for the status transitions.
+    let source_note_ids: Vec<Vec<u8>> = batch
+        .filled_notes
+        .iter()
+        .map(|f| f.note_id.to_bytes().to_vec())
+        .collect();
+
+    // Mark as Settling before submitting so a crash after submit can be recovered.
+    {
+        let mut conn = pool.write_conn().context("acquire write conn for Settling mark")?;
+        db::update_orders_status(&mut conn, &source_note_ids, OrderStatus::Settling)
+            .context("mark orders Settling")?;
+    }
+
+    match submit_with_rpc_backoff(client, solver_id, &components, cancel).await {
+        SubmitOutcome::Success => {
+            let mut conn = pool
+                .write_conn()
+                .context("acquire write conn for Executed mark")?;
+            db::update_orders_status(&mut conn, &source_note_ids, OrderStatus::Executed)
+                .context("mark orders Executed")?;
+            Ok(())
+        }
+        SubmitOutcome::RpcExhausted(e) => {
+            // Chain unreachable after all retries. Revert to Active so a future
+            // restart (or operator action) can try again. This matches the
+            // current pre-Phase-1 behavior for RPC errors.
+            revert_to_active(pool, &source_note_ids);
+            tracing::error!(
+                error = %e,
+                "submit RPC-failed after exhausted retries; reverted to Active"
+            );
+            Err(anyhow!("submit RPC-failed after exhausted retries: {e}"))
+        }
+        SubmitOutcome::Cancelled => {
+            // Don't touch DB state — leave Settling; boot recovery handles it.
+            tracing::info!("submit cancelled during backoff; orders left Settling");
+            Err(anyhow!("submit cancelled during backoff"))
+        }
+        SubmitOutcome::TxError(e) => {
+            // Non-RPC error: classify per-note via the nullifier check.
+            let (consumed_bytes, active_bytes, active_orders) =
+                classify_input_notes(miden_adapter, batch, &input_notes_only).await?;
+
+            // DB updates first, then re-feed the actives. Idempotent against
+            // a concurrent ingest update (status guard in mark_orders_onchain_nullified).
+            {
+                let mut conn = pool
+                    .write_conn()
+                    .context("acquire write conn for classify-error transition")?;
+                if !consumed_bytes.is_empty() {
+                    db::mark_orders_onchain_nullified(&mut conn, &consumed_bytes)
+                        .context("mark consumed orders OnchainNullified")?;
+                }
+                if !active_bytes.is_empty() {
+                    db::update_orders_status(&mut conn, &active_bytes, OrderStatus::Active)
+                        .context("revert active-after-classify orders to Active")?;
+                }
+            }
+
+            // Re-feed actives via the SAME order_tx channel ingest uses. Matcher's
+            // drain logic handles them identically to fresh ingest events.
+            for order in active_orders {
+                if order_tx.send(order).await.is_err() {
+                    tracing::warn!("order_tx send failed during re-feed; matcher likely shut down");
+                    break;
+                }
+            }
+
+            tracing::error!(
+                error = %e,
+                consumed_count = consumed_bytes.len(),
+                refed_count = active_bytes.len(),
+                "non-RPC submit failure classified"
+            );
+            Err(anyhow!("submit failed (tx error, classified): {e}"))
+        }
+    }
+}
+
+/// Best-effort revert of a batch's orders back to `Active`. Used by the
+/// RpcExhausted path. If the UPDATE fails (write pool exhausted), the orders
+/// stay in `Settling` until next-boot recovery cleans them up — we log loudly.
+fn revert_to_active(pool: &DbPool, source_note_ids: &[Vec<u8>]) {
+    match pool.write_conn() {
+        Ok(mut conn) => {
+            if let Err(revert_err) =
+                db::update_orders_status(&mut conn, source_note_ids, OrderStatus::Active)
+            {
+                tracing::error!(
+                    error = %revert_err,
+                    "CRITICAL: revert to Active failed after RPC-exhausted submit — orders stuck in Settling until restart"
+                );
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                "CRITICAL: could not acquire write conn to revert orders — orders stuck in Settling until restart"
+            );
+        }
+    }
+}
+
+fn note_asset_amount(note: &Note) -> u64 {
+    note.assets()
+        .iter_fungible()
+        .next()
+        .map(|a| u64::from(a.amount()))
+        .unwrap_or(0)
+}

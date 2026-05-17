@@ -195,7 +195,7 @@ fn dust_order_attack() {
     for order in engine.book.orders.values() {
         assert!(order.requested_filled() <= order.requested);
     }
-    assert_eq!(batch.remaining_orders, engine.book.active_order_count());
+    assert_eq!(batch.remaining_orders, engine.book.active_order_count() as u64);
 }
 
 /// Order splitting attack: instead of one 1000-unit order, place 1000 one-unit orders.
@@ -668,6 +668,6 @@ fn fuzz_adversarial_mix_500_trials() {
                 "trial {}: filled order {:?} has 0 fill", trial, oid
             );
         }
-        assert_eq!(batch.remaining_orders, engine.book.active_order_count());
+        assert_eq!(batch.remaining_orders, engine.book.active_order_count() as u64);
     }
 }

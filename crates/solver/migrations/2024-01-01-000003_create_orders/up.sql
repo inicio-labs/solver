@@ -6,5 +6,5 @@ CREATE TABLE orders (
     offered_asset BLOB NOT NULL,
     offered_amount BIGINT NOT NULL,
     timestamp BIGINT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'in_flight', 'executed'))
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'settling', 'executed'))
 );

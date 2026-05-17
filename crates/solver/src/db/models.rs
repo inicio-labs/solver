@@ -57,4 +57,5 @@ pub struct GeneratedNoteRow {
 pub struct RegisteredTokenRow {
     pub token_id: Vec<u8>,
     pub created_at: i64,
+    pub external_symbol: Option<String>,
 }

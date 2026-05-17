@@ -27,8 +27,8 @@ fn collect_matchable_pairs<F: PriceFeed>(book: &OrderBook<F>) -> Vec<(TokenId, T
 
 /// Direct matching: greedy on BTreeMap.
 /// Inserts filled order IDs into the provided set. Returns number of cycles executed.
-pub fn run_direct_matching<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u32 {
-    let mut cycles_executed = 0u32;
+pub fn run_direct_matching<F: PriceFeed>(book: &mut OrderBook<F>, filled_orders: &mut HashSet<OrderId>) -> u64 {
+    let mut cycles_executed = 0u64;
 
     let pairs = collect_matchable_pairs(book);
     for (token_a, token_b) in pairs {
@@ -44,7 +44,7 @@ fn match_user_orders<F: PriceFeed>(
     token_a: TokenId,
     token_b: TokenId,
     filled_orders: &mut HashSet<OrderId>,
-) -> u32 {
+) -> u64 {
     let mut cycles = 0;
 
     loop {
@@ -60,29 +60,13 @@ fn match_user_orders<F: PriceFeed>(
             None => break,
         };
 
-        // Match — clone to avoid double mutable borrow
-        let mut order_a = book.orders[&order_a_id].clone();
-        let mut order_b = book.orders[&order_b_id].clone();
+        // Encapsulated mutation: surplus and cleanup happen inside.
+        if book.apply_match(order_a_id, order_b_id).is_none() {
+            break;
+        }
 
-        let match_result = match order_a.match_with(&mut order_b) {
-            Some(r) => r,
-            None => break,
-        };
-
-        // Write back
-        book.orders.insert(order_a_id, order_a);
-        book.orders.insert(order_b_id, order_b);
-
-        // Track filled orders
         filled_orders.insert(order_a_id);
         filled_orders.insert(order_b_id);
-
-        // Add surplus to protocol balance
-        book.add_protocol_balance(token_a, match_result.surplus_offered);
-        book.add_protocol_balance(token_b, match_result.surplus_requested);
-
-        book.cleanup_if_filled(order_a_id);
-        book.cleanup_if_filled(order_b_id);
 
         cycles += 1;
     }

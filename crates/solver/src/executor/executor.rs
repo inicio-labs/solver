@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::{self, DbPool};
 use crate::ingest::MidenClient;
-use crate::types::{ExecutionBatch, IngestOrder, OrderStatus, TokenId};
+use crate::types::{ExecutionBatch, FilledNote, IngestOrder, OrderStatus, TokenId};
 
 // ── Backoff knobs ──────────────────────────────────────────────────────────
 
@@ -48,8 +48,14 @@ enum SubmitOutcome {
     /// Classify per-note via the nullifier check, mark consumed orders
     /// OnchainNullified, re-feed the rest to the matcher.
     TxError(ClientError),
-    /// Cancellation fired during a backoff sleep. Leave orders in Settling;
-    /// next-boot recovery flips them to Active.
+    /// `build_tx_request` failed deterministically for this batch
+    /// composition. The submit never landed, so every order is still valid:
+    /// revert to Active and re-feed so the live matcher reconsiders them
+    /// (it dropped them on emit and never re-reads the DB mid-run).
+    BuildFailed(String),
+    /// Cancellation token fired during a backoff sleep = graceful shutdown.
+    /// Leave orders in Settling; next-boot recovery flips them to Active
+    /// (do NOT re-feed — the matcher/order_tx are tearing down).
     Cancelled,
 }
 
@@ -106,16 +112,12 @@ async fn submit_with_rpc_backoff(
         let request = match build_tx_request(components) {
             Ok(r) => r,
             Err(e) => {
-                // Building the request is deterministic — if it fails, retrying
-                // won't help. Surface as a TxError so the caller can classify
-                // per-note (and probably mark all as OnchainNullified or just
-                // leave Settling for boot recovery).
-                tracing::error!(error = %e, "build_tx_request failed unexpectedly");
-                // We have no ClientError to wrap; fabricate a generic one via a
-                // panic-y path is bad — bail out via Cancelled-equivalent. The
-                // caller will see this is an error and the revert path will
-                // restore Active.
-                return SubmitOutcome::Cancelled;
+                // Deterministic — retrying won't help, and this is NOT a
+                // shutdown (that's `Cancelled`). Surface as `BuildFailed` so
+                // the caller reverts to Active AND re-feeds the still-valid
+                // orders to the live matcher (the submit never landed).
+                tracing::error!(error = %e, "build_tx_request failed");
+                return SubmitOutcome::BuildFailed(e.to_string());
             }
         };
 
@@ -235,6 +237,45 @@ fn prepare_batch_components(
     ))
 }
 
+/// Rebuild the `IngestOrder` for one filled note so the matcher can re-add
+/// it to its book. Shared by every re-feed path (classify / RpcExhausted /
+/// BuildFailed).
+fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder> {
+    let parsed = crate::types::Order::from_note(note)
+        .context("failed to re-parse Note for re-feed")?;
+    Ok(IngestOrder {
+        note_id: filled.note_id,
+        offered_token: parsed.offered_faucet_id,
+        requested_token: parsed.requested_faucet_id,
+        offered_amount: parsed.offered_amount,
+        requested_amount: parsed.requested_amount,
+        raw_note_data: filled.raw_note_data.clone(),
+    })
+}
+
+/// Rebuild *every* order in the batch (no nullifier filtering). Used by the
+/// RpcExhausted / BuildFailed paths: the submit never landed, so all orders
+/// remain valid and must return to the live matcher.
+fn rebuild_all_orders(batch: &ExecutionBatch, input_notes: &[Note]) -> Result<Vec<IngestOrder>> {
+    batch
+        .filled_notes
+        .iter()
+        .zip(input_notes.iter())
+        .map(|(filled, note)| rebuild_ingest_order(filled, note))
+        .collect()
+}
+
+/// Shutdown-aware re-feed into the matcher via the same channel ingest uses.
+/// Stops early if the matcher channel is closed (it's tearing down).
+async fn refeed_orders(order_tx: &mpsc::Sender<IngestOrder>, orders: Vec<IngestOrder>) {
+    for order in orders {
+        if order_tx.send(order).await.is_err() {
+            tracing::warn!("order_tx send failed during re-feed; matcher likely shut down");
+            break;
+        }
+    }
+}
+
 /// On the TxError classification path, fetch which input notes are consumed
 /// on-chain. Returns the partitioned source-id byte-vecs (consumed vs active)
 /// plus the active orders re-built as `IngestOrder` for re-feed.
@@ -257,17 +298,7 @@ async fn classify_input_notes(
         if consumed_ids.contains(&filled.note_id) {
             consumed_bytes.push(id_bytes);
         } else {
-            // Rebuild the IngestOrder so the matcher can re-add to its book.
-            let parsed = crate::types::Order::from_note(note)
-                .context("failed to re-parse Note during classify")?;
-            active_orders.push(IngestOrder {
-                note_id: filled.note_id,
-                offered_token: parsed.offered_faucet_id,
-                requested_token: parsed.requested_faucet_id,
-                offered_amount: parsed.offered_amount,
-                requested_amount: parsed.requested_amount,
-                raw_note_data: filled.raw_note_data.clone(),
-            });
+            active_orders.push(rebuild_ingest_order(filled, note)?);
             active_bytes.push(id_bytes);
         }
     }
@@ -375,18 +406,44 @@ async fn execute_batch(
             Ok(())
         }
         SubmitOutcome::RpcExhausted(e) => {
-            // Chain unreachable after all retries. Revert to Active so a future
-            // restart (or operator action) can try again. This matches the
-            // current pre-Phase-1 behavior for RPC errors.
+            // Chain unreachable after all retries. The submit never landed, so
+            // every order is still valid. Revert to Active AND re-feed to the
+            // LIVE matcher — it dropped these on emit and never re-reads the
+            // DB mid-run, so a DB-only revert strands them until a restart.
             revert_to_active(pool, &source_note_ids);
+            match rebuild_all_orders(batch, &input_notes_only) {
+                Ok(orders) => refeed_orders(order_tx, orders).await,
+                Err(re) => tracing::error!(
+                    error = %re,
+                    "rebuild for RPC-exhausted re-feed failed; orders recoverable only at next boot"
+                ),
+            }
             tracing::error!(
                 error = %e,
-                "submit RPC-failed after exhausted retries; reverted to Active"
+                "submit RPC-failed after exhausted retries; reverted to Active + re-fed"
             );
             Err(anyhow!("submit RPC-failed after exhausted retries: {e}"))
         }
+        SubmitOutcome::BuildFailed(msg) => {
+            // Deterministic failure for THIS batch composition; the individual
+            // orders remain valid (submit never landed). Revert + re-feed so
+            // the matcher can reconsider (and possibly compose a different
+            // batch) without waiting for a process restart.
+            revert_to_active(pool, &source_note_ids);
+            match rebuild_all_orders(batch, &input_notes_only) {
+                Ok(orders) => refeed_orders(order_tx, orders).await,
+                Err(re) => tracing::error!(
+                    error = %re,
+                    "rebuild for build-failed re-feed failed; orders recoverable only at next boot"
+                ),
+            }
+            tracing::error!(error = %msg, "tx build failed; reverted to Active + re-fed");
+            Err(anyhow!("tx build failed: {msg}"))
+        }
         SubmitOutcome::Cancelled => {
-            // Don't touch DB state — leave Settling; boot recovery handles it.
+            // Genuine shutdown (cancel token fired during backoff). Don't
+            // touch DB state and do NOT re-feed — the matcher/order_tx are
+            // tearing down; boot recovery flips Settling → Active.
             tracing::info!("submit cancelled during backoff; orders left Settling");
             Err(anyhow!("submit cancelled during backoff"))
         }
@@ -413,12 +470,7 @@ async fn execute_batch(
 
             // Re-feed actives via the SAME order_tx channel ingest uses. Matcher's
             // drain logic handles them identically to fresh ingest events.
-            for order in active_orders {
-                if order_tx.send(order).await.is_err() {
-                    tracing::warn!("order_tx send failed during re-feed; matcher likely shut down");
-                    break;
-                }
-            }
+            refeed_orders(order_tx, active_orders).await;
 
             tracing::error!(
                 error = %e,

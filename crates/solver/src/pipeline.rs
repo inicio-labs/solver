@@ -16,9 +16,7 @@ use crate::price::{self, PriceClient, PriceSnapshot, SharedSymbolMap};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
-/// batches, consumed-note notifications). Single source of truth used by
-/// both the single-thread `spawn_pipeline` path and the L2 `create_channels`
-/// path.
+/// batches, consumed-note notifications), used by `create_channels`.
 const PIPELINE_CHANNEL_BUF: usize = 5000;
 /// Admin → subscribe-relay buffer. Low-traffic (infrequent operator actions).
 const SUBSCRIBE_CHANNEL_BUF: usize = 100;
@@ -57,22 +55,6 @@ pub struct PipelineConfig {
     pub last_sync_unix_seconds: Arc<AtomicI64>,
 }
 
-/// Handles returned by spawn_pipeline for graceful shutdown.
-pub struct PipelineHandles {
-    pub ingest_handle: JoinHandle<()>,
-    pub price_handle: JoinHandle<()>,
-    pub matcher_handle: JoinHandle<()>,
-    pub admin_handle: JoinHandle<()>,
-    /// Execution channel receiver — executor consumes from this.
-    pub exec_rx: mpsc::Receiver<ExecutionBatch>,
-    /// `order_tx` sender for the executor to re-feed active orders into the
-    /// matcher after a non-RPC submit error. Same channel ingest uses for
-    /// new orders, so the matcher's drain logic handles both uniformly.
-    pub order_tx: mpsc::Sender<IngestOrder>,
-    /// Call `.cancel()` on this to gracefully stop every spawned task.
-    pub cancel: CancellationToken,
-}
-
 pub async fn subscribe_all_pairs(
     db_pool: &db::DbPool,
     client: &mut dyn MidenClient,
@@ -88,195 +70,13 @@ pub async fn subscribe_all_pairs(
     Ok(())
 }
 
-/// Spawn the pipeline: ingest → matcher → exec_rx.
-///
-/// Returns handles and `exec_rx`. The caller is responsible for wiring
-/// the executor (e.g. `executor::run_executor`) to consume from `exec_rx`.
-pub async fn spawn_pipeline<C, P>(
-    config: PipelineConfig,
-    client: C,
-    price_client: P,
-) -> Result<PipelineHandles>
-where
-    // No `Send` bounds: tasks are spawned via `tokio::task::spawn_local` and
-    // pinned to the calling thread's LocalSet. Caller must run this within a
-    // LocalSet (`local.run_until(...)` or `local.block_on(...)`); otherwise
-    // the spawn_local calls panic.
-    C: MidenClient + 'static,
-    P: PriceClient + 'static,
-{
-    // DB pool is owned by the caller (so the same handle can back HttpPriceClient).
-    let db_pool = config.db_pool;
-
-    // Boot recovery: orders left as `Settling` from a previous run (executor
-    // crashed mid-submit) are reset to `Active` so the matcher reconsiders
-    // them. Safe even if the on-chain submit actually landed — the PSWAP
-    // script rejects double-consumption.
-    {
-        let mut conn = db_pool.write_conn()?;
-        let n = db::reset_all_settling_to_active(&mut conn)?;
-        if n > 0 {
-            tracing::info!(count = n, "boot recovery: reset Settling orders to Active for re-matching");
-        }
-    }
-
-    // Seed initial tokens from config (with their optional external symbols).
-    db::seed_tokens_from_config(&db_pool, &config.initial_tokens)?;
-
-    // Hydrate the shared symbol cache from DB. Covers both the freshly-seeded
-    // tokens and any leftover symbol mappings from a previous run. If the
-    // caller already populated the map, this overwrites it with the
-    // authoritative DB contents.
-    {
-        let loaded = db::load_token_symbols(&db_pool)?;
-        let mut map = crate::price::write_symbol_map(&config.symbol_map);
-        *map = loaded;
-    }
-
-    // Create channels
-    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
-    let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
-    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
-    // Ingest notifies matcher of on-chain consumed notes so the matcher can
-    // drop zombies from its in-memory book. Size 5000 to mirror order_tx.
-    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
-
-    // Shared client for ingest. Admin uses a channel-based subscribe path
-    // instead of a direct client reference, since AdminState must be Send+Sync
-    // for axum and our MidenClient adapter is !Send.
-    let shared_client: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(client));
-
-    // Subscribe to all registered token pairs
-    subscribe_all_pairs(&db_pool, &mut *shared_client.lock().await).await?;
-
-    // Subscribe-task channel: admin handlers send (offered, requested) tuples;
-    // this task pulls them and calls subscribe_pair on the shared client.
-    // Bounded at 100 — admin operations are infrequent so backpressure is fine.
-    let (subscribe_tx, mut subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
-    let subscribe_client = shared_client.clone();
-    let subscribe_cancel = config.cancel.clone();
-    tokio::task::spawn_local(async move {
-        loop {
-            tokio::select! {
-                _ = subscribe_cancel.cancelled() => break,
-                Some((offered, requested)) = subscribe_rx.recv() => {
-                    let mut client = subscribe_client.lock().await;
-                    if let Err(e) = client.subscribe_pair(offered, requested).await {
-                        tracing::warn!(%offered, %requested, error = %e, "subscribe_pair failed");
-                    }
-                }
-                else => break,  // channel closed
-            }
-        }
-    });
-
-    let admin_state = Arc::new(AdminState::new(
-        db_pool.clone(),
-        subscribe_tx,
-        config.symbol_map.clone(),
-    ));
-
-    // Spawn ingest task. `order_tx` is cloned because the executor needs a
-    // sender too (for re-feeding active orders back into the matcher after a
-    // classified non-RPC failure).
-    let ingest_client = shared_client.clone();
-    let ingest_pool = db_pool.clone();
-    let ingest_interval = config.ingest_interval;
-    let ingest_cancel = config.cancel.clone();
-    let ingest_last_sync = config.last_sync_unix_seconds.clone();
-    let order_tx_for_ingest = order_tx.clone();
-    let ingest_handle = tokio::task::spawn_local(async move {
-        ingest::run_ingest(
-            ingest_client,
-            ingest_pool,
-            order_tx_for_ingest,
-            consumed_tx,
-            ingest_interval,
-            ingest_cancel,
-            ingest_last_sync,
-        )
-        .await;
-    });
-
-    // Spawn price feed task — reloads token list from DB each tick.
-    // Price polling is read-only and idempotent; abort on shutdown is safe,
-    // so we keep it on the same cancel signal for symmetry but don't add a
-    // select! in the loop body.
-    let price_pool = db_pool.clone();
-    let price_interval = config.price_interval;
-    let price_cancel = config.cancel.clone();
-    let price_handle = tokio::task::spawn_local(async move {
-        tokio::select! {
-            _ = price::run_price_feed(price_client, price_pool, price_tx, price_interval) => {}
-            _ = price_cancel.cancelled() => {}
-        }
-    });
-
-    // Spawn matcher task. The matcher hydrates its OrderBook from the DB on
-    // startup, closing the "ingest wrote DB but channel send failed" gap.
-    let match_interval = config.match_interval;
-    let matcher_pool = db_pool.clone();
-    let matcher_cancel = config.cancel.clone();
-    let triangular_enabled = config.triangular_enabled;
-    let matcher_handle = tokio::task::spawn_local(async move {
-        matcher::run_matcher(
-            matcher_pool,
-            order_rx,
-            consumed_rx,
-            price_rx,
-            exec_tx,
-            match_interval,
-            triangular_enabled,
-            matcher_cancel,
-        )
-        .await;
-    });
-
-    // Spawn admin server with axum's built-in graceful shutdown.
-    let admin_router = admin_state.router(config.admin_token.map(Arc::new));
-    let admin_port = config.admin_port;
-    let admin_cancel = config.cancel.clone();
-    let admin_handle = tokio::task::spawn_local(async move {
-        let listener =
-            match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        port = admin_port,
-                        error = %e,
-                        "failed to bind admin port; triggering graceful shutdown"
-                    );
-                    admin_cancel.cancel();
-                    return;
-                }
-            };
-        let shutdown_cancel = admin_cancel.clone();
-        if let Err(e) = axum::serve(listener, admin_router)
-            .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
-            .await
-        {
-            tracing::error!(error = %e, "admin server failed; triggering graceful shutdown");
-            admin_cancel.cancel();
-        }
-    });
-
-    Ok(PipelineHandles {
-        ingest_handle,
-        price_handle,
-        matcher_handle,
-        admin_handle,
-        exec_rx,
-        order_tx,
-        cancel: config.cancel,
-    })
-}
-
 // ===========================================================================
-// L2: decomposed pipeline. `spawn_pipeline` above stays as the single-thread
-// composition (used by the unit tests). At L2 the client-bound tasks (ingest,
-// subscribe-relay) live on the ingest OS thread while the `Send` services
-// (matcher, price, admin) stay on the main coordination thread; channels are
-// created once and split between them. All channel payloads are `Send`.
+// Decomposed pipeline (L2). The client-bound tasks (ingest, subscribe-relay)
+// live on the ingest OS thread; the `Send` services (matcher, price, admin)
+// stay on the main coordination thread. Channels are created once and split
+// between them — all channel payloads are `Send`. (The former single-thread
+// `spawn_pipeline`/`PipelineHandles` were removed: production used the
+// decomposed path and they were exercised only by their own unit tests.)
 // ===========================================================================
 
 /// Cross-thread channel endpoints, created once on the main thread and split
@@ -493,7 +293,6 @@ pub async fn spawn_ingest_tasks(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     use miden_protocol::account::AccountId;
     use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
@@ -720,130 +519,6 @@ mod tests {
         let mut client = MockMidenClient::new();
         let result = client.sync_state().await.unwrap();
         assert!(result.new_notes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn spawn_pipeline_starts_successfully() {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let port = 30000 + (std::process::id() % 10000) as u16;
-
-        let config = PipelineConfig {
-            db_pool: db::init_db("file:spawn_pipeline_test?mode=memory&cache=shared", 1).unwrap(),
-            ingest_interval: Duration::from_secs(3600),
-            price_interval: Duration::from_secs(3600),
-            match_interval: Duration::from_secs(3600),
-            initial_tokens: vec![(test_token_a(), None), (test_token_b(), None)],
-            admin_port: port,
-            admin_token: None,
-            symbol_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            triangular_enabled: true,
-            cancel: CancellationToken::new(),
-            last_sync_unix_seconds: Arc::new(AtomicI64::new(0)),
-        };
-
-        let client = MockMidenClient::new();
-        let prices = {
-            let mut p: PriceSnapshot = HashMap::new();
-            p.insert(test_token_a(), 200_000);
-            p.insert(test_token_b(), 100);
-            p
-        };
-        let price_client = MockPriceClient::new(prices);
-
-        let handles = spawn_pipeline(config, client, price_client).await.unwrap();
-
-        assert!(!handles.ingest_handle.is_finished());
-        assert!(!handles.price_handle.is_finished());
-        assert!(!handles.matcher_handle.is_finished());
-        assert!(!handles.admin_handle.is_finished());
-
-        handles.ingest_handle.abort();
-        handles.price_handle.abort();
-        handles.matcher_handle.abort();
-        handles.admin_handle.abort();
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn pipeline_channels_are_functional() {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let port = 31000 + (std::process::id() % 10000) as u16;
-
-        let config = PipelineConfig {
-            db_pool: db::init_db("file:pipeline_channels_test?mode=memory&cache=shared", 1).unwrap(),
-            ingest_interval: Duration::from_secs(3600),
-            price_interval: Duration::from_secs(3600),
-            match_interval: Duration::from_secs(3600),
-            initial_tokens: vec![(test_token_a(), None)],
-            admin_port: port,
-            admin_token: None,
-            symbol_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            triangular_enabled: true,
-            cancel: CancellationToken::new(),
-            last_sync_unix_seconds: Arc::new(AtomicI64::new(0)),
-        };
-
-        let prices = {
-            let mut p: PriceSnapshot = HashMap::new();
-            p.insert(test_token_a(), 500);
-            p
-        };
-
-        let client = MockMidenClient::new();
-        let price_client = MockPriceClient::new(prices);
-
-        let handles = spawn_pipeline(config, client, price_client).await.unwrap();
-
-        assert!(handles.exec_rx.is_empty());
-
-        handles.ingest_handle.abort();
-        handles.price_handle.abort();
-        handles.matcher_handle.abort();
-        handles.admin_handle.abort();
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn pipeline_admin_server_binds_and_responds() {
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let port = 32000 + (std::process::id() % 10000) as u16;
-
-        let config = PipelineConfig {
-            db_pool: db::init_db("file:pipeline_admin_test?mode=memory&cache=shared", 1).unwrap(),
-            ingest_interval: Duration::from_secs(3600),
-            price_interval: Duration::from_secs(3600),
-            match_interval: Duration::from_secs(3600),
-            initial_tokens: vec![(test_token_a(), None)],
-            admin_port: port,
-            admin_token: None,
-            symbol_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            triangular_enabled: true,
-            cancel: CancellationToken::new(),
-            last_sync_unix_seconds: Arc::new(AtomicI64::new(0)),
-        };
-
-        let client = MockMidenClient::new();
-        let price_client = MockPriceClient::new(HashMap::new());
-
-        let handles = spawn_pipeline(config, client, price_client).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let addr = format!("127.0.0.1:{port}");
-        let conn_result = tokio::net::TcpStream::connect(&addr).await;
-        assert!(
-            conn_result.is_ok(),
-            "Admin server should be accepting connections on port {port}"
-        );
-
-        handles.ingest_handle.abort();
-        handles.price_handle.abort();
-        handles.matcher_handle.abort();
-        handles.admin_handle.abort();
-        }).await;
     }
 
     #[tokio::test]

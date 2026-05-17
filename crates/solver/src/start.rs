@@ -247,7 +247,7 @@ pub async fn start(
     }
     let coingecko_api_key = std::env::var("COINGECKO_API_KEY").ok();
 
-    // 3. Shared symbol map. spawn_pipeline hydrates it from DB after seeding,
+    // 3. Shared symbol map. `prepare_db` hydrates it from DB after seeding,
     //    so initialising with an empty map is fine.
     let symbol_map = Arc::new(RwLock::new(HashMap::new()));
 

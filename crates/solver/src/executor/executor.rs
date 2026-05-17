@@ -319,7 +319,7 @@ async fn classify_input_notes(
 ///   * Cancellation during backoff → leave Settling; boot recovery cleans up.
 ///
 /// Boot-time recovery of any leftover `Settling` rows is handled by
-/// `db::reset_all_settling_to_active` in `pipeline::spawn_pipeline`.
+/// `db::reset_all_settling_to_active` in `pipeline::prepare_db`.
 ///
 /// Locking: the executor shares a `Mutex<Client>` with the ingest/subscribe
 /// adapter. The lock is acquired per-submit-attempt and dropped before each

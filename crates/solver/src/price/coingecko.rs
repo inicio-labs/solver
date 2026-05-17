@@ -51,7 +51,11 @@ pub struct HttpPriceClient {
 impl HttpPriceClient {
     /// Construct a client targeting the public CoinGecko API. The `api_key`,
     /// if provided, is sent as the `x-cg-demo-api-key` header (Demo API tier).
-    pub fn new(symbol_map: SharedSymbolMap, api_key: Option<String>) -> Self {
+    ///
+    /// Fallible: building the underlying `reqwest` client can fail if the
+    /// system TLS backend cannot initialise. Surfaced as an error so the
+    /// caller can fail startup cleanly rather than panic+abort.
+    pub fn new(symbol_map: SharedSymbolMap, api_key: Option<String>) -> Result<Self> {
         Self::new_with_base(symbol_map, api_key, COINGECKO_BASE.to_string())
     }
 
@@ -62,16 +66,17 @@ impl HttpPriceClient {
         symbol_map: SharedSymbolMap,
         api_key: Option<String>,
         base: String,
-    ) -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("build reqwest client"),
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("failed to build reqwest client for price feed")?;
+        Ok(Self {
+            http,
             api_key,
             symbol_map,
             base,
-        }
+        })
     }
 }
 
@@ -176,7 +181,8 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
-        );
+        )
+        .expect("build HttpPriceClient");
         let prices = client
             .fetch_prices(&[token_a(), token_b()])
             .await
@@ -203,7 +209,8 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
-        );
+        )
+        .expect("build HttpPriceClient");
         let prices = client
             .fetch_prices(&[token_a(), token_b()])
             .await
@@ -222,7 +229,8 @@ mod tests {
             map,
             None,
             "http://unreachable.invalid/simple/price".to_string(),
-        );
+        )
+        .expect("build HttpPriceClient");
         let prices = client.fetch_prices(&[token_a()]).await.expect("ok");
         assert!(prices.is_empty());
     }
@@ -241,7 +249,8 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
-        );
+        )
+        .expect("build HttpPriceClient");
         let err = client.fetch_prices(&[token_a()]).await.unwrap_err();
         assert!(err.to_string().contains("503"), "got: {err}");
     }
@@ -262,7 +271,8 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
-        );
+        )
+        .expect("build HttpPriceClient");
         let err = client.fetch_prices(&[token_a()]).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("rate-limited"), "got: {msg}");

@@ -263,7 +263,8 @@ pub async fn start(
     let symbol_map = Arc::new(RwLock::new(HashMap::new()));
 
     // 4. Production price client.
-    let price_client = HttpPriceClient::new(symbol_map.clone(), coingecko_api_key);
+    let price_client = HttpPriceClient::new(symbol_map.clone(), coingecko_api_key)
+        .context("build price client")?;
 
     // 5. Flatten configured pairs → token list with optional symbols.
     let mut initial_tokens: Vec<(TokenId, Option<String>)> = Vec::new();

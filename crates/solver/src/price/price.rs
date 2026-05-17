@@ -90,8 +90,8 @@ impl Default for WatchPriceFeed {
 }
 
 impl PriceFeed for WatchPriceFeed {
-    fn usd_price_cents(&self, token: TokenId) -> UsdCents {
-        *self.prices.get(&token).unwrap_or(&1)
+    fn price_cents(&self, token: TokenId) -> Option<UsdCents> {
+        self.prices.get(&token).copied()
     }
 }
 

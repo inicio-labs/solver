@@ -271,9 +271,15 @@ fn simulate_full_cycle<F: PriceFeed>(
         return None;
     }
 
-    let price_a = book.feed.usd_price_cents(order_ab.offered_token);
-    let price_b = book.feed.usd_price_cents(order_ab.requested_token);
-    let price_c = book.feed.usd_price_cents(order_bc.requested_token);
+    // Any leg's token unpriced ⇒ cycle is not matchable (same as a
+    // zero/loss cycle: skip it rather than value it on a bogus default).
+    let (Some(price_a), Some(price_b), Some(price_c)) = (
+        book.feed.price_cents(order_ab.offered_token),
+        book.feed.price_cents(order_ab.requested_token),
+        book.feed.price_cents(order_bc.requested_token),
+    ) else {
+        return None;
+    };
 
     let usd_ab = order_ab.requested_remaining as u128 * price_b as u128;
     let usd_bc = order_bc.requested_remaining as u128 * price_c as u128;

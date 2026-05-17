@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn watch_price_feed_new_returns_empty() {
         let feed = WatchPriceFeed::new();
-        assert_eq!(feed.usd_price_cents(test_token_a()), 1);
+        assert_eq!(feed.price_cents(test_token_a()), None);
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
         let mut feed = WatchPriceFeed::new();
         let token = test_token_a();
         feed.set_price_cents(token, 200_000);
-        assert_eq!(feed.usd_price_cents(token), 200_000);
+        assert_eq!(feed.price_cents(token), Some(200_000));
     }
 
     #[test]
@@ -541,8 +541,26 @@ mod tests {
         prices.insert(token_b, 100);
 
         let feed = WatchPriceFeed::from_map(prices);
-        assert_eq!(feed.usd_price_cents(token_a), 200_000);
-        assert_eq!(feed.usd_price_cents(token_b), 100);
+        assert_eq!(feed.price_cents(token_a), Some(200_000));
+        assert_eq!(feed.price_cents(token_b), Some(100));
+    }
+
+    #[test]
+    fn is_order_profitable_excludes_unpriced_token() {
+        let token_a = test_token_a();
+        let token_b = test_token_b();
+        let mut feed = WatchPriceFeed::new();
+        feed.set_price_cents(token_a, 100);
+
+        // requested side unpriced ⇒ excluded regardless of amounts.
+        assert!(!feed.is_order_profitable(token_a, 1_000_000, token_b, 1));
+        // offered side unpriced ⇒ excluded.
+        assert!(!feed.is_order_profitable(token_b, 1_000_000, token_a, 1));
+
+        // Both priced ⇒ normal profitability comparison resumes.
+        feed.set_price_cents(token_b, 100);
+        assert!(feed.is_order_profitable(token_a, 10, token_b, 10));
+        assert!(!feed.is_order_profitable(token_a, 1, token_b, 10));
     }
 
     #[test]
@@ -550,7 +568,7 @@ mod tests {
         let a = WatchPriceFeed::new();
         let b = WatchPriceFeed::default();
         let token = test_token_a();
-        assert_eq!(a.usd_price_cents(token), b.usd_price_cents(token));
+        assert_eq!(a.price_cents(token), b.price_cents(token));
     }
 
     #[test]
@@ -575,7 +593,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::watch::channel(prices);
         let feed = WatchPriceFeed::from_watch(&rx);
-        assert_eq!(feed.usd_price_cents(token), 42_00);
+        assert_eq!(feed.price_cents(token), Some(42_00));
     }
 
     #[tokio::test]

@@ -933,7 +933,10 @@ fn surplus_usd_conservation_direct() {
 
     // Surplus should match protocol balances (in USD)
     let protocol_usd: u128 = engine.book.protocol_balances.iter()
-        .map(|(&token, &amount)| amount as u128 * feed.usd_price_cents(token) as u128)
+        .map(|(&token, &amount)| {
+            amount as u128
+                * feed.price_cents(token).expect("protocol-balance token priced in test") as u128
+        })
         .sum();
     let expected_surplus = total_released_usd - total_received_usd;
 

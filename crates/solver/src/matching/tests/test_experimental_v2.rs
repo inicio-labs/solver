@@ -258,7 +258,9 @@ fn targeted_cycle_surplus_extraction() {
     // Verify total surplus is reasonable.
     let surplus_usd: u64 = engine.book.protocol_balances.iter()
         .map(|(&tok, &amt)| {
-            amt as u64 * engine.book.feed.usd_price_cents(tok) / 100
+            amt as u64
+                * engine.book.feed.price_cents(tok).expect("protocol-balance token priced in test")
+                / 100
         })
         .sum();
 

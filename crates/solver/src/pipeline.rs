@@ -15,6 +15,14 @@ use crate::matcher;
 use crate::price::{self, PriceClient, PriceSnapshot, SharedSymbolMap};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
+/// Bounded buffer for the high-volume pipeline channels (orders, exec
+/// batches, consumed-note notifications). Single source of truth used by
+/// both the single-thread `spawn_pipeline` path and the L2 `create_channels`
+/// path.
+const PIPELINE_CHANNEL_BUF: usize = 5000;
+/// Admin → subscribe-relay buffer. Low-traffic (infrequent operator actions).
+const SUBSCRIBE_CHANNEL_BUF: usize = 100;
+
 /// Configuration for the pipeline.
 pub struct PipelineConfig {
     /// Pre-initialised DB pool. Caller owns construction so the same pool can
@@ -126,12 +134,12 @@ where
     }
 
     // Create channels
-    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(5000);
+    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
-    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(5000);
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     // Ingest notifies matcher of on-chain consumed notes so the matcher can
     // drop zombies from its in-memory book. Size 5000 to mirror order_tx.
-    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(5000);
+    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
 
     // Shared client for ingest. Admin uses a channel-based subscribe path
     // instead of a direct client reference, since AdminState must be Send+Sync
@@ -144,7 +152,7 @@ where
     // Subscribe-task channel: admin handlers send (offered, requested) tuples;
     // this task pulls them and calls subscribe_pair on the shared client.
     // Bounded at 100 — admin operations are infrequent so backpressure is fine.
-    let (subscribe_tx, mut subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(100);
+    let (subscribe_tx, mut subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let subscribe_client = shared_client.clone();
     let subscribe_cancel = config.cancel.clone();
     tokio::task::spawn_local(async move {
@@ -287,11 +295,11 @@ pub struct PipelineChannels {
 }
 
 pub fn create_channels() -> PipelineChannels {
-    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(5000);
-    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(5000);
+    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
+    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
-    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(5000);
-    let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(100);
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
+    let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     PipelineChannels {
         order_tx,
         order_rx,

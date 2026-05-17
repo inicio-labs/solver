@@ -51,55 +51,72 @@ mod client_main {
             .with_context(|| format!("Failed to parse account ID: {}", hex_str))
     }
 
-    fn rpc_client(config: &SolverConfig) -> Result<Arc<dyn NodeRpcClient>> {
-        let endpoint = Endpoint::try_from(config.rpc.endpoint.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
-        Ok(Arc::new(GrpcClient::new(&endpoint, config.rpc.timeout_ms)))
+    /// Production [`solver::ClientFactory`]. Holds only `Send` config
+    /// (endpoint string, timeout, paths, debug flag) so it can be cloned into
+    /// each client OS thread; `build_*` run on the owning thread and construct
+    /// the RPC client + miden `Client` there, so the `!Send` `Client` and the
+    /// tonic gRPC internals never cross a thread boundary.
+    struct ProdClientFactory {
+        endpoint: String,
+        timeout_ms: u64,
+        debug: bool,
+        ingest_store_path: String,
+        executor_store_path: String,
+        keystore_path: String,
     }
 
-    /// Build the keyless **ingest** client: RPC + its own sqlite store, with
-    /// **no authenticator and no tracked account**. This is the chain-watching
-    /// path (ingest + subscribe-relay) — it never signs, so it holds no keys
-    /// on disk. The `FilesystemKeyStore` type parameter is only a phantom; a
-    /// keystore is never constructed for this client.
-    async fn build_ingest_client(
-        config: &SolverConfig,
-    ) -> Result<Client<FilesystemKeyStore>> {
-        let store_path = PathBuf::from(config.solver.resolved_ingest_store_path());
+    impl ProdClientFactory {
+        fn from_config(config: &SolverConfig) -> Self {
+            Self {
+                endpoint: config.rpc.endpoint.clone(),
+                timeout_ms: config.rpc.timeout_ms,
+                debug: config.engine.debug_mode,
+                ingest_store_path: config.solver.resolved_ingest_store_path(),
+                executor_store_path: config.solver.store_path.clone(),
+                keystore_path: config.solver.keystore_path.clone(),
+            }
+        }
 
-        ClientBuilder::new()
-            .rpc(rpc_client(config)?)
-            .sqlite_store(store_path)
-            .in_debug_mode(config.engine.debug_mode.into())
-            .build()
-            .await
-            .context("Failed to build ingest (keyless) Miden client")
+        fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
+            let endpoint = Endpoint::try_from(self.endpoint.as_str())
+                .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
+            Ok(Arc::new(GrpcClient::new(&endpoint, self.timeout_ms)))
+        }
     }
 
-    /// Build the **executor** client: RPC + sqlite store + `FilesystemKeyStore`
-    /// authenticator. This is the signing path — it owns the solver account's
-    /// keys and submits settlement transactions. The solver account + keys are
-    /// provisioned out-of-band into `store_path`/`keystore_path` by the
-    /// operator (unchanged from the previous single-client setup).
-    async fn build_executor_client(
-        config: &SolverConfig,
-    ) -> Result<Client<FilesystemKeyStore>> {
-        let keystore_path = PathBuf::from(&config.solver.keystore_path);
-        let keystore = Arc::new(
-            FilesystemKeyStore::new(keystore_path)
-                .context("Failed to initialize keystore")?,
-        );
+    #[async_trait::async_trait(?Send)]
+    impl solver::ClientFactory for ProdClientFactory {
+        /// Keyless **ingest** client: RPC + its own sqlite store, **no
+        /// authenticator and no tracked account** — the chain-watching path
+        /// never signs, so it holds no keys on disk. The `FilesystemKeyStore`
+        /// type parameter is only a phantom; no keystore is constructed.
+        async fn build_ingest(&self) -> Result<Client<FilesystemKeyStore>> {
+            ClientBuilder::new()
+                .rpc(self.rpc()?)
+                .sqlite_store(PathBuf::from(&self.ingest_store_path))
+                .in_debug_mode(self.debug.into())
+                .build()
+                .await
+                .context("Failed to build ingest (keyless) Miden client")
+        }
 
-        let store_path = PathBuf::from(&config.solver.store_path);
-
-        ClientBuilder::new()
-            .rpc(rpc_client(config)?)
-            .sqlite_store(store_path)
-            .authenticator(keystore)
-            .in_debug_mode(config.engine.debug_mode.into())
-            .build()
-            .await
-            .context("Failed to build executor Miden client")
+        /// **Executor** client: RPC + sqlite store + `FilesystemKeyStore`
+        /// authenticator. The signing path; the solver account + keys are
+        /// provisioned out-of-band into the store/keystore by the operator.
+        async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>> {
+            let keystore = Arc::new(
+                FilesystemKeyStore::new(PathBuf::from(&self.keystore_path))
+                    .context("Failed to initialize keystore")?,
+            );
+            ClientBuilder::new()
+                .rpc(self.rpc()?)
+                .sqlite_store(PathBuf::from(&self.executor_store_path))
+                .authenticator(keystore)
+                .in_debug_mode(self.debug.into())
+                .build()
+                .await
+                .context("Failed to build executor Miden client")
+        }
     }
 
     /// Resolve the config path. Precedence: `--config <path>` CLI flag, then
@@ -139,12 +156,12 @@ mod client_main {
         let solver_id = parse_account_id(&config.solver.account_id)
             .context("Failed to parse solver account ID")?;
 
-        // Two independent clients: a keyless ingest client (no signing keys on
-        // disk) for the chain-watching path, and a keystore-backed executor
-        // client for settlement. Both built here so a build failure surfaces
-        // as a clean startup error before any task is spawned.
-        let ingest_client = build_ingest_client(&config).await?;
-        let executor_client = build_executor_client(&config).await?;
+        // L2: clients are built on their own OS threads (inside `start`), so
+        // here we only construct a `Send` factory that carries the config
+        // needed to build them. A build failure still surfaces as a clean
+        // startup error via the per-thread readiness gate in `start`.
+        let factory: Arc<dyn solver::ClientFactory> =
+            Arc::new(ProdClientFactory::from_config(&config));
 
         // Cancellation token: triggered by Ctrl-C, passed into solver::start
         // so every pipeline task can shut down cleanly between iterations.
@@ -157,7 +174,7 @@ mod client_main {
             }
         });
 
-        solver::start(ingest_client, executor_client, solver_id, config, cancel).await
+        solver::start(factory, solver_id, config, cancel).await
     }
 }
 

@@ -76,6 +76,75 @@ pub fn temp_paths() -> Result<(TempDir, PathBuf, PathBuf)> {
     Ok((dir, keystore, store))
 }
 
+/// Test [`solver::ClientFactory`] for L2: builds the ingest + executor clients
+/// **on their own threads** against the shared `MockRpcApi`. Holds only Send
+/// config (`Arc<MockRpcApi>` + paths). The solver account/keys must already be
+/// on disk at `executor_store`/`keystore` (provisioned by a throwaway client
+/// in test setup) — the rebuilt executor client reloads them from there, just
+/// as a production restart would.
+pub struct MockClientFactory {
+    pub rpc: Arc<MockRpcApi>,
+    pub ingest_store: PathBuf,
+    pub executor_store: PathBuf,
+    pub keystore: PathBuf,
+}
+
+#[async_trait::async_trait(?Send)]
+impl solver::ClientFactory for MockClientFactory {
+    async fn build_ingest(&self) -> Result<Client<FilesystemKeyStore>> {
+        let mut c = build_test_ingest_client(self.rpc.clone(), self.ingest_store.clone()).await?;
+        c.ensure_genesis_in_place()
+            .await
+            .map_err(|e| anyhow!("ingest genesis: {e}"))?;
+        Ok(c)
+    }
+
+    async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>> {
+        let mut c = build_test_client(
+            self.rpc.clone(),
+            self.keystore.clone(),
+            self.executor_store.clone(),
+        )
+        .await?;
+        c.ensure_genesis_in_place()
+            .await
+            .map_err(|e| anyhow!("executor genesis: {e}"))?;
+        Ok(c)
+    }
+}
+
+/// Real-time analogue of [`wait_for`] for the L2 threaded model. The solver's
+/// ingest/executor threads run on their own real-time runtimes (the test's
+/// `start_paused` virtual clock cannot reach them), so we poll on wall-clock
+/// time instead of driving virtual time. Each iteration: check the predicate,
+/// then `prove_block()` to commit any pending submitted txs, then sleep
+/// `poll`. Bails after `max_iterations`.
+pub async fn wait_for_realtime<F>(
+    rpc: &MockRpcApi,
+    max_iterations: u32,
+    poll: Duration,
+    mut check: F,
+) -> Result<()>
+where
+    F: FnMut(&MockChain) -> bool,
+{
+    for _ in 0..max_iterations {
+        {
+            if check(&rpc.mock_chain.read()) {
+                return Ok(());
+            }
+        }
+        rpc.prove_block();
+        tokio::time::sleep(poll).await;
+    }
+    if check(&rpc.mock_chain.read()) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "wait_for_realtime timed out after {max_iterations} iterations"
+    ))
+}
+
 /// Poll for a chain-state predicate, deterministically driving virtual time
 /// and the chain forward between checks. Returns when `check` is true; bails
 /// after `max_iterations` virtual ticks.

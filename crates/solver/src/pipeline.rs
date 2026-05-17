@@ -263,6 +263,224 @@ where
     })
 }
 
+// ===========================================================================
+// L2: decomposed pipeline. `spawn_pipeline` above stays as the single-thread
+// composition (used by the unit tests). At L2 the client-bound tasks (ingest,
+// subscribe-relay) live on the ingest OS thread while the `Send` services
+// (matcher, price, admin) stay on the main coordination thread; channels are
+// created once and split between them. All channel payloads are `Send`.
+// ===========================================================================
+
+/// Cross-thread channel endpoints, created once on the main thread and split
+/// between the main coordination thread and the client threads.
+pub struct PipelineChannels {
+    pub order_tx: mpsc::Sender<IngestOrder>,
+    pub order_rx: mpsc::Receiver<IngestOrder>,
+    pub consumed_tx: mpsc::Sender<NoteId>,
+    pub consumed_rx: mpsc::Receiver<NoteId>,
+    pub price_tx: watch::Sender<PriceSnapshot>,
+    pub price_rx: watch::Receiver<PriceSnapshot>,
+    pub exec_tx: mpsc::Sender<ExecutionBatch>,
+    pub exec_rx: mpsc::Receiver<ExecutionBatch>,
+    pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
+    pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+}
+
+pub fn create_channels() -> PipelineChannels {
+    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(5000);
+    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(5000);
+    let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(5000);
+    let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(100);
+    PipelineChannels {
+        order_tx,
+        order_rx,
+        consumed_tx,
+        consumed_rx,
+        price_tx,
+        price_rx,
+        exec_tx,
+        exec_rx,
+        subscribe_tx,
+        subscribe_rx,
+    }
+}
+
+/// Boot recovery + token seed + symbol-map hydrate. Touches only the DB (no
+/// miden client), so it runs on the main thread before any client thread.
+pub fn prepare_db(config: &PipelineConfig) -> Result<()> {
+    {
+        let mut conn = config.db_pool.write_conn()?;
+        let n = db::reset_all_settling_to_active(&mut conn)?;
+        if n > 0 {
+            tracing::info!(
+                count = n,
+                "boot recovery: reset Settling orders to Active for re-matching"
+            );
+        }
+    }
+    db::seed_tokens_from_config(&config.db_pool, &config.initial_tokens)?;
+    {
+        let loaded = db::load_token_symbols(&config.db_pool)?;
+        let mut map = crate::price::write_symbol_map(&config.symbol_map);
+        *map = loaded;
+    }
+    Ok(())
+}
+
+/// Handles for the `Send` services spawned on the main coordination thread.
+pub struct CoreHandles {
+    pub matcher_handle: JoinHandle<()>,
+    pub price_handle: JoinHandle<()>,
+    pub admin_handle: JoinHandle<()>,
+}
+
+/// Spawn the `Send` services (price feed, matcher, admin HTTP) on the
+/// CALLER's LocalSet (the main coordination thread). None of these touch a
+/// miden client. `prepare_db` must have been called first.
+pub fn spawn_core_services<P: PriceClient + 'static>(
+    config: &PipelineConfig,
+    price_client: P,
+    order_rx: mpsc::Receiver<IngestOrder>,
+    consumed_rx: mpsc::Receiver<NoteId>,
+    price_tx: watch::Sender<PriceSnapshot>,
+    price_rx: watch::Receiver<PriceSnapshot>,
+    exec_tx: mpsc::Sender<ExecutionBatch>,
+    subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
+) -> CoreHandles {
+    // Price feed.
+    let price_pool = config.db_pool.clone();
+    let price_interval = config.price_interval;
+    let price_cancel = config.cancel.clone();
+    let price_handle = tokio::task::spawn_local(async move {
+        tokio::select! {
+            _ = price::run_price_feed(price_client, price_pool, price_tx, price_interval) => {}
+            _ = price_cancel.cancelled() => {}
+        }
+    });
+
+    // Matcher.
+    let match_interval = config.match_interval;
+    let matcher_pool = config.db_pool.clone();
+    let matcher_cancel = config.cancel.clone();
+    let triangular_enabled = config.triangular_enabled;
+    let matcher_handle = tokio::task::spawn_local(async move {
+        matcher::run_matcher(
+            matcher_pool,
+            order_rx,
+            consumed_rx,
+            price_rx,
+            exec_tx,
+            match_interval,
+            triangular_enabled,
+            matcher_cancel,
+        )
+        .await;
+    });
+
+    // Admin HTTP server.
+    let admin_state = Arc::new(AdminState::new(
+        config.db_pool.clone(),
+        subscribe_tx,
+        config.symbol_map.clone(),
+    ));
+    let admin_router = admin_state.router(config.admin_token.clone().map(Arc::new));
+    let admin_port = config.admin_port;
+    let admin_cancel = config.cancel.clone();
+    let admin_handle = tokio::task::spawn_local(async move {
+        let listener =
+            match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        port = admin_port,
+                        error = %e,
+                        "failed to bind admin port; triggering graceful shutdown"
+                    );
+                    admin_cancel.cancel();
+                    return;
+                }
+            };
+        let shutdown_cancel = admin_cancel.clone();
+        if let Err(e) = axum::serve(listener, admin_router)
+            .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
+            .await
+        {
+            tracing::error!(error = %e, "admin server failed; triggering graceful shutdown");
+            admin_cancel.cancel();
+        }
+    });
+
+    CoreHandles {
+        matcher_handle,
+        price_handle,
+        admin_handle,
+    }
+}
+
+/// Handles for the `!Send` client-bound tasks spawned on the ingest thread.
+pub struct IngestHandles {
+    pub ingest_handle: JoinHandle<()>,
+    pub subscribe_handle: JoinHandle<()>,
+}
+
+/// Spawn the `!Send` client-bound tasks (subscribe-relay + ingest) on the
+/// INGEST thread's LocalSet. Subscribes all configured pairs first (uses the
+/// ingest adapter), then spawns the relay + ingest loops. Must be called from
+/// within the ingest thread's `LocalSet`.
+pub async fn spawn_ingest_tasks(
+    adapter: Arc<Mutex<dyn MidenClient>>,
+    db_pool: db::DbPool,
+    order_tx: mpsc::Sender<IngestOrder>,
+    consumed_tx: mpsc::Sender<NoteId>,
+    mut subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+    ingest_interval: Duration,
+    cancel: CancellationToken,
+    last_sync_unix_seconds: Arc<AtomicI64>,
+) -> Result<IngestHandles> {
+    // Subscribe to all registered token pairs (uses the ingest client).
+    subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
+
+    // Subscribe-relay task: admin (on the main thread) sends (offered,
+    // requested) tuples across the channel; this task applies them via the
+    // ingest client.
+    let subscribe_client = adapter.clone();
+    let subscribe_cancel = cancel.clone();
+    let subscribe_handle = tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                _ = subscribe_cancel.cancelled() => break,
+                Some((offered, requested)) = subscribe_rx.recv() => {
+                    let mut client = subscribe_client.lock().await;
+                    if let Err(e) = client.subscribe_pair(offered, requested).await {
+                        tracing::warn!(%offered, %requested, error = %e, "subscribe_pair failed");
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+
+    // Ingest task.
+    let ingest_handle = tokio::task::spawn_local(async move {
+        ingest::run_ingest(
+            adapter,
+            db_pool,
+            order_tx,
+            consumed_tx,
+            ingest_interval,
+            cancel,
+            last_sync_unix_seconds,
+        )
+        .await;
+    });
+
+    Ok(IngestHandles {
+        ingest_handle,
+        subscribe_handle,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

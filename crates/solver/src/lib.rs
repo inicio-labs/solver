@@ -10,6 +10,9 @@ pub mod pipeline;
 pub mod order;
 pub mod config;
 
+pub mod client_factory;
+pub use client_factory::ClientFactory;
+
 pub mod executor;
 
 pub mod start;

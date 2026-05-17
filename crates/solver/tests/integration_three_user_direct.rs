@@ -36,10 +36,14 @@ use solver::config::{
 use tokio_util::sync::CancellationToken;
 
 use common::{
-    build_test_client, build_test_ingest_client, temp_paths, vault_balance, wait_for,
+    build_test_client, temp_paths, vault_balance, wait_for_realtime, MockClientFactory,
 };
 
-#[tokio::test(start_paused = true)]
+// L2: the solver's ingest/executor clients run on their own OS-thread runtimes,
+// so the test's virtual clock can't drive them — this test runs on real time
+// and polls observable chain state (`wait_for_realtime`) instead of stepping
+// `tokio::time::advance`.
+#[tokio::test]
 async fn three_user_direct_matching() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
@@ -182,39 +186,45 @@ async fn three_user_direct_matching() -> Result<()> {
                 }
             }
 
-            // 5. SOLVER Client: separate store + keystore. Only the solver
-            //    account is tracked here — so user-created PSWAPs flow through
-            //    `summary.new_public_notes` (tag-discovery path).
+            // 5. SOLVER account provisioning. At L2 the executor client is
+            //    built on its own thread by the factory, so we can't hand it a
+            //    pre-built client. Instead a *throwaway* executor client (same
+            //    store + keystore paths the factory will use) creates the
+            //    solver wallet on disk, then is dropped — exactly the
+            //    production model where the operator provisions the account
+            //    and the solver process reloads it on start.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
-            let mut solver_client = build_test_client(
-                rpc.clone(),
-                solver_keystore_path.clone(),
-                solver_store_path,
-            )
-            .await?;
-            solver_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-            let solver_keystore =
-                miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                    .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
-
-            let (solver_account, _) =
-                insert_new_wallet(&mut solver_client, mode, &solver_keystore, scheme).await?;
-            let solver_id = solver_account.id();
+            let solver_id = {
+                let mut solver_client = build_test_client(
+                    rpc.clone(),
+                    solver_keystore_path.clone(),
+                    solver_store_path.clone(),
+                )
+                .await?;
+                solver_client
+                    .ensure_genesis_in_place()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
+                let solver_keystore =
+                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
+                        .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
+                let (solver_account, _) =
+                    insert_new_wallet(&mut solver_client, mode, &solver_keystore, scheme).await?;
+                solver_account.id()
+                // solver_client dropped here: account + key persisted to disk.
+            };
             println!("[test] solver={}", solver_id.to_hex());
 
-            // Keyless INGEST client: same mock chain (rpc), its own store, no
-            // keystore/account. This is the chain-watching path; the executor
-            // client above is the only one that signs.
+            // L2 factory: builds the keyless ingest client + the keystore
+            // executor client on their own threads, all against this same
+            // shared MockRpcApi (one mock chain).
             let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
-            let mut solver_ingest_client =
-                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
-            solver_ingest_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+            let factory: Arc<dyn solver::ClientFactory> = Arc::new(MockClientFactory {
+                rpc: rpc.clone(),
+                ingest_store: solver_ingest_store,
+                executor_store: solver_store_path,
+                keystore: solver_keystore_path.clone(),
+            });
 
             // 6. SolverConfig pointing at a per-test SQLite path.
             let solver_db = solver_temp.path().join("solver.sqlite3");
@@ -249,12 +259,13 @@ async fn three_user_direct_matching() -> Result<()> {
                 },
             };
 
-            // 7. Spawn solver::start consuming the solver Client.
+            // 7. Spawn solver::start with the L2 factory. start() spawns the
+            //    Send services on this LocalSet and the ingest/executor clients
+            //    on their own OS threads.
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
-                    .await
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
             // 8. Wait for the alice↔bob fill to land. We can't observe paybacks
@@ -272,10 +283,15 @@ async fn three_user_direct_matching() -> Result<()> {
             let eth_id = eth.id();
             let usdc_id = usdc.id();
             let initial_committed_count = rpc.mock_chain.read().committed_notes().len();
-            let wait_result = wait_for(&rpc, 120, |chain| {
-                vault_balance(chain, solver_id, usdc_id) >= 20
-                    && chain.committed_notes().len() >= initial_committed_count + 2
-            })
+            let wait_result = wait_for_realtime(
+                &rpc,
+                2000,
+                std::time::Duration::from_millis(100),
+                |chain| {
+                    vault_balance(chain, solver_id, usdc_id) >= 20
+                        && chain.committed_notes().len() >= initial_committed_count + 2
+                },
+            )
             .await;
 
             if wait_result.is_err() {
@@ -321,7 +337,11 @@ async fn three_user_direct_matching() -> Result<()> {
             );
 
             cancel.cancel();
-            let _ = solver_handle;
+            // Await start() so it joins the ingest/executor OS threads before
+            // the test ends — no leaked threads across test cases. Bounded so
+            // a stuck join can't hang the suite.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
+                .await;
             drop(user_temp);
             drop(solver_temp);
             Ok(())

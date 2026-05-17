@@ -44,8 +44,11 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 use common::{
-    build_test_client, build_test_ingest_client, temp_paths, vault_balance, wait_for,
+    build_test_client, temp_paths, vault_balance, wait_for_realtime, MockClientFactory,
 };
+
+// L2: solver clients run on their own OS-thread runtimes; tests run on real
+// time and poll observable chain state instead of stepping virtual time.
 
 /// Shared scaffold for both sub-tests. Returns the populated user client,
 /// faucets, user accounts, and the rpc + solver-side temp dir. After this
@@ -229,7 +232,36 @@ fn build_solver_config(
     }
 }
 
-#[tokio::test(start_paused = true)]
+/// Provision the solver wallet on disk via a throwaway executor client (the
+/// same store + keystore the L2 factory will reload from), then drop it.
+/// Mirrors a production operator provisioning the account before start.
+async fn provision_solver(
+    rpc: &Arc<MockRpcApi>,
+    solver_keystore_path: &std::path::Path,
+    solver_store_path: &std::path::Path,
+) -> Result<AccountId> {
+    let mut c = build_test_client(
+        rpc.clone(),
+        solver_keystore_path.to_path_buf(),
+        solver_store_path.to_path_buf(),
+    )
+    .await?;
+    c.ensure_genesis_in_place()
+        .await
+        .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
+    let ks = FilesystemKeyStore::new(solver_keystore_path.to_path_buf())
+        .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
+    let (acct, _) = insert_new_wallet(
+        &mut c,
+        AccountStorageMode::Public,
+        &ks,
+        AuthSchemeId::Falcon512Poseidon2,
+    )
+    .await?;
+    Ok(acct.id())
+}
+
+#[tokio::test]
 async fn triangular_enabled_clears_cycle() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
@@ -238,35 +270,18 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             let rpc = setup.rpc.clone();
             let initial_committed = rpc.mock_chain.read().committed_notes().len();
 
-            // Solver Client: only the solver wallet is tracked.
+            // Solver account provisioned on disk; the L2 factory rebuilds the
+            // ingest + executor clients on their own threads from these paths.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
-            let mut solver_client =
-                build_test_client(rpc.clone(), solver_keystore_path.clone(), solver_store_path)
-                    .await?;
-            solver_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-            let solver_keystore = FilesystemKeyStore::new(solver_keystore_path.clone())
-                .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
-
-            let (solver_account, _) = insert_new_wallet(
-                &mut solver_client,
-                AccountStorageMode::Public,
-                &solver_keystore,
-                AuthSchemeId::Falcon512Poseidon2,
-            )
-            .await?;
-            let solver_id = solver_account.id();
-
-            // Keyless INGEST client: same mock chain, own store, no keystore.
+            let solver_id =
+                provision_solver(&rpc, &solver_keystore_path, &solver_store_path).await?;
             let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
-            let mut solver_ingest_client =
-                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
-            solver_ingest_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+            let factory: Arc<dyn solver::ClientFactory> = Arc::new(MockClientFactory {
+                rpc: rpc.clone(),
+                ingest_store: solver_ingest_store,
+                executor_store: solver_store_path.clone(),
+                keystore: solver_keystore_path.clone(),
+            });
 
             let config = build_solver_config(
                 solver_id,
@@ -280,16 +295,20 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            let _solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
-                    .await
+            let mut solver_handle = tokio::task::spawn_local(async move {
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
             let sol_id = setup.sol_id;
-            let wait_result = wait_for(&rpc, 120, |chain| {
-                vault_balance(chain, solver_id, sol_id) >= 1
-                    && chain.committed_notes().len() >= initial_committed + 3
-            })
+            let wait_result = wait_for_realtime(
+                &rpc,
+                2000,
+                std::time::Duration::from_millis(100),
+                |chain| {
+                    vault_balance(chain, solver_id, sol_id) >= 1
+                        && chain.committed_notes().len() >= initial_committed + 3
+                },
+            )
             .await;
 
             if wait_result.is_err() {
@@ -320,6 +339,8 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             );
 
             cancel.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
+                .await;
             drop(solver_temp);
             // Reference setup's _user_temp and _user_client to keep them alive
             // for the test's duration — they go out of scope here.
@@ -329,7 +350,7 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
         .await
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn triangular_disabled_yields_no_matches() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
@@ -338,34 +359,18 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
             let rpc = setup.rpc.clone();
             let initial_committed = rpc.mock_chain.read().committed_notes().len();
 
+            // Solver account provisioned on disk; L2 factory rebuilds clients
+            // on their own threads from these paths.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
-            let mut solver_client =
-                build_test_client(rpc.clone(), solver_keystore_path.clone(), solver_store_path)
-                    .await?;
-            solver_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-            let solver_keystore = FilesystemKeyStore::new(solver_keystore_path.clone())
-                .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
-
-            let (solver_account, _) = insert_new_wallet(
-                &mut solver_client,
-                AccountStorageMode::Public,
-                &solver_keystore,
-                AuthSchemeId::Falcon512Poseidon2,
-            )
-            .await?;
-            let solver_id = solver_account.id();
-
-            // Keyless INGEST client: same mock chain, own store, no keystore.
+            let solver_id =
+                provision_solver(&rpc, &solver_keystore_path, &solver_store_path).await?;
             let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
-            let mut solver_ingest_client =
-                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
-            solver_ingest_client
-                .ensure_genesis_in_place()
-                .await
-                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+            let factory: Arc<dyn solver::ClientFactory> = Arc::new(MockClientFactory {
+                rpc: rpc.clone(),
+                ingest_store: solver_ingest_store,
+                executor_store: solver_store_path.clone(),
+                keystore: solver_keystore_path.clone(),
+            });
 
             let config = build_solver_config(
                 solver_id,
@@ -379,21 +384,17 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            let _solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
-                    .await
+            let mut solver_handle = tokio::task::spawn_local(async move {
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
-            // Drive the chain for a generous number of iterations. With
-            // triangular disabled and no pairwise reciprocal counter-orders,
-            // the matcher should never produce a batch — committed_notes
-            // count should stay flat.
-            for _ in 0..30 {
-                tokio::time::advance(std::time::Duration::from_millis(500)).await;
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
+            // Real-time drive: give the pipeline ample wall-clock time to
+            // ingest the 3 PSWAPs and run many matcher pulses. With triangular
+            // disabled and no pairwise reciprocal counter-orders, the matcher
+            // must never emit a batch — committed_notes stays flat.
+            for _ in 0..80 {
                 rpc.prove_block();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             let chain_ro = rpc.mock_chain.read();
@@ -420,6 +421,8 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
             );
 
             cancel.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
+                .await;
             drop(solver_temp);
             let _ = setup;
             Ok(())

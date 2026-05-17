@@ -43,7 +43,9 @@ use solver::config::{
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, vault_balance, wait_for};
+use common::{
+    build_test_client, build_test_ingest_client, temp_paths, vault_balance, wait_for,
+};
 
 /// Shared scaffold for both sub-tests. Returns the populated user client,
 /// faucets, user accounts, and the rpc + solver-side temp dir. After this
@@ -187,6 +189,7 @@ fn build_solver_config(
             account_id: solver_account_id.to_hex(),
             keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
             store_path: solver_db.to_string_lossy().into_owned(),
+            ingest_store_path: None,
             read_pool_size: 2,
         },
         // Three pairs so each token gets registered for tag subscription.
@@ -256,6 +259,15 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             .await?;
             let solver_id = solver_account.id();
 
+            // Keyless INGEST client: same mock chain, own store, no keystore.
+            let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
+            let mut solver_ingest_client =
+                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
+            solver_ingest_client
+                .ensure_genesis_in_place()
+                .await
+                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+
             let config = build_solver_config(
                 solver_id,
                 &solver_temp,
@@ -269,7 +281,8 @@ async fn triangular_enabled_clears_cycle() -> Result<()> {
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
             let _solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_client, solver_id, config, solver_cancel).await
+                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
+                    .await
             });
 
             let sol_id = setup.sol_id;
@@ -345,6 +358,15 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
             .await?;
             let solver_id = solver_account.id();
 
+            // Keyless INGEST client: same mock chain, own store, no keystore.
+            let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
+            let mut solver_ingest_client =
+                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
+            solver_ingest_client
+                .ensure_genesis_in_place()
+                .await
+                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+
             let config = build_solver_config(
                 solver_id,
                 &solver_temp,
@@ -358,7 +380,8 @@ async fn triangular_disabled_yields_no_matches() -> Result<()> {
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
             let _solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_client, solver_id, config, solver_cancel).await
+                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
+                    .await
             });
 
             // Drive the chain for a generous number of iterations. With

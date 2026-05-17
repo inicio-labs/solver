@@ -207,7 +207,8 @@ impl MidenClient for MidenClientAdapter {
 /// - `obs_port`   — auth-free `GET /health` (liveness) and `GET /readyz`
 ///   (readiness, gated on DB reachability + `last successful sync` age).
 pub async fn start(
-    client: Client<FilesystemKeyStore>,
+    ingest_client: Client<FilesystemKeyStore>,
+    executor_client: Client<FilesystemKeyStore>,
     solver_id: AccountId,
     config: SolverConfig,
     cancel: CancellationToken,
@@ -244,13 +245,23 @@ pub async fn start(
         initial_tokens.push((y, pair.asset_y_external_symbol.clone()));
     }
 
-    // 6. Wrap the typed client so the adapter (for ingest/admin) and the
-    //    executor (for submit_new_transaction) can share it. Each task locks
-    //    only briefly when it needs the client — no long-held locks.
-    let shared_client: Arc<Mutex<Client<FilesystemKeyStore>>> = Arc::new(Mutex::new(client));
-    let adapter = MidenClientAdapter {
-        client: shared_client.clone(),
+    // 6. Two independent clients, each behind its own lock:
+    //    - ingest client (keyless): wrapped in a `MidenClientAdapter` and
+    //      handed to the pipeline (ingest + subscribe-relay). Holds no keys.
+    //    - executor client (keystore): wrapped in a `MidenClientAdapter` for
+    //      `check_consumed_notes` + the tagless executor-sync task, and shared
+    //      directly (typed) for `submit_new_transaction`. Each task locks only
+    //      briefly per call — no long-held locks.
+    let ingest_adapter = MidenClientAdapter {
+        client: Arc::new(Mutex::new(ingest_client)),
     };
+
+    let executor_shared: Arc<Mutex<Client<FilesystemKeyStore>>> =
+        Arc::new(Mutex::new(executor_client));
+    let executor_adapter: Arc<Mutex<dyn MidenClient>> =
+        Arc::new(Mutex::new(MidenClientAdapter {
+            client: executor_shared.clone(),
+        }));
 
     // 7. Build the observability state. The shared `last_sync` atomic is
     //    initialised to `now()` here so /readyz is healthy during the boot
@@ -277,7 +288,7 @@ pub async fn start(
     };
 
     // 9. Spawn ingest / matcher / price / admin tasks.
-    let handles = pipeline::spawn_pipeline(pipeline_config, adapter, price_client)
+    let handles = pipeline::spawn_pipeline(pipeline_config, ingest_adapter, price_client)
         .await
         .context("spawn_pipeline")?;
 
@@ -303,20 +314,21 @@ pub async fn start(
     });
 
     // 11. Spawn the executor (via spawn_local since Client is !Send).
-    //     The executor takes `Arc<Mutex<Client>>` (for `submit_new_transaction`)
-    //     and `Arc<Mutex<dyn MidenClient>>` (for `check_consumed_notes` on the
-    //     TxError classify path). Both point to the same underlying Client —
-    //     two handles, one lock, per-attempt acquisition so ingest isn't
-    //     starved during backoff sleeps.
-    let executor_client = shared_client.clone();
-    let executor_adapter = handles.miden_adapter.clone();
+    //     The executor takes the *executor* client `Arc<Mutex<Client>>` (for
+    //     `submit_new_transaction`) and the *executor* adapter
+    //     `Arc<Mutex<dyn MidenClient>>` (for `check_consumed_notes` on the
+    //     TxError classify path). Both point to the executor client — distinct
+    //     from the ingest client the pipeline uses — so the chain-watching and
+    //     signing paths no longer share a client.
     let executor_pool = db_pool.clone();
     let executor_cancel = cancel.clone();
     let executor_order_tx = handles.order_tx.clone();
+    let executor_run_client = executor_shared.clone();
+    let executor_run_adapter = executor_adapter.clone();
     let executor_handle = tokio::task::spawn_local(async move {
         executor::run_executor(
-            executor_client,
-            executor_adapter,
+            executor_run_client,
+            executor_run_adapter,
             solver_id,
             executor_pool,
             handles.exec_rx,
@@ -324,6 +336,33 @@ pub async fn start(
             executor_cancel,
         )
         .await;
+    });
+
+    // 11b. Tagless executor-client sync task. The executor client subscribes
+    //      to no PSWAP tags, so this never discovers notes — its sole job is
+    //      keeping the executor client's chain tip *recent* (the node rejects
+    //      txs whose reference block is older than its acceptance window) and
+    //      reconciling the solver account if a submitted tx is dropped.
+    //      Submitting a tx does NOT pull chain state; the client only
+    //      optimistically applies its *own* tx, so consecutive settlements
+    //      stay consistent without this — but a frozen chain view would
+    //      eventually make every submit fail with a stale reference. Runs off
+    //      the critical path at the ingest fetch cadence; the returned notes
+    //      (always empty here) are discarded.
+    let sync_adapter = executor_adapter.clone();
+    let sync_cancel = cancel.clone();
+    let sync_interval = Duration::from_millis(config.engine.fetch_interval_ms);
+    let executor_sync_handle = tokio::task::spawn_local(async move {
+        loop {
+            tokio::select! {
+                _ = sync_cancel.cancelled() => break,
+                _ = tokio::time::sleep(sync_interval) => {
+                    if let Err(e) = sync_adapter.lock().await.sync_state().await {
+                        tracing::warn!(error = %e, "executor-client tagless sync failed; will retry next tick");
+                    }
+                }
+            }
+        }
     });
 
     // 12. Await shutdown.
@@ -348,6 +387,9 @@ pub async fn start(
         }
         res = executor_handle => {
             tracing::info!(?res, "executor task exited");
+        }
+        res = executor_sync_handle => {
+            tracing::info!(?res, "executor-client sync task exited");
         }
     }
 

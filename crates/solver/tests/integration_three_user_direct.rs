@@ -35,7 +35,9 @@ use solver::config::{
 };
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, vault_balance, wait_for};
+use common::{
+    build_test_client, build_test_ingest_client, temp_paths, vault_balance, wait_for,
+};
 
 #[tokio::test(start_paused = true)]
 async fn three_user_direct_matching() -> Result<()> {
@@ -203,6 +205,17 @@ async fn three_user_direct_matching() -> Result<()> {
             let solver_id = solver_account.id();
             println!("[test] solver={}", solver_id.to_hex());
 
+            // Keyless INGEST client: same mock chain (rpc), its own store, no
+            // keystore/account. This is the chain-watching path; the executor
+            // client above is the only one that signs.
+            let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
+            let mut solver_ingest_client =
+                build_test_ingest_client(rpc.clone(), solver_ingest_store).await?;
+            solver_ingest_client
+                .ensure_genesis_in_place()
+                .await
+                .map_err(|e| anyhow::anyhow!("solver ingest genesis: {e}"))?;
+
             // 6. SolverConfig pointing at a per-test SQLite path.
             let solver_db = solver_temp.path().join("solver.sqlite3");
             let config = SolverConfig {
@@ -214,6 +227,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
                     store_path: solver_db.to_string_lossy().into_owned(),
+                    ingest_store_path: None,
                     read_pool_size: 2,
                 },
                 pairs: vec![AssetPairConfig {
@@ -239,7 +253,8 @@ async fn three_user_direct_matching() -> Result<()> {
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(solver_client, solver_id, config, solver_cancel).await
+                solver::start(solver_ingest_client, solver_client, solver_id, config, solver_cancel)
+                    .await
             });
 
             // 8. Wait for the alice↔bob fill to land. We can't observe paybacks

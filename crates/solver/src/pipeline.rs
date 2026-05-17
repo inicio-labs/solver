@@ -61,10 +61,6 @@ pub struct PipelineHandles {
     /// matcher after a non-RPC submit error. Same channel ingest uses for
     /// new orders, so the matcher's drain logic handles both uniformly.
     pub order_tx: mpsc::Sender<IngestOrder>,
-    /// Shared adapter handle so the executor can call `check_consumed_notes`
-    /// on the classify-after-TxError path. Same `Arc<Mutex<dyn MidenClient>>`
-    /// the ingest task uses — single underlying Client, lock per-call.
-    pub miden_adapter: Arc<Mutex<dyn MidenClient>>,
     /// Call `.cancel()` on this to gracefully stop every spawned task.
     pub cancel: CancellationToken,
 }
@@ -263,7 +259,6 @@ where
         admin_handle,
         exec_rx,
         order_tx,
-        miden_adapter: shared_client,
         cancel: config.cancel,
     })
 }
@@ -287,7 +282,6 @@ mod tests {
     use crate::matching::price_feed::PriceFeed;
     use crate::price::{MockPriceClient, PriceClient, WatchPriceFeed};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     fn test_token_a() -> TokenId {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()

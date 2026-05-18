@@ -66,8 +66,8 @@ impl ProdClientFactory {
             endpoint: config.rpc.endpoint.clone(),
             timeout_ms: config.rpc.timeout_ms,
             debug: config.engine.debug_mode,
-            ingest_store_path: config.solver.resolved_ingest_store_path(),
-            executor_store_path: config.solver.store_path.clone(),
+            ingest_store_path: config.solver.ingest_store_path.clone(),
+            executor_store_path: config.solver.executor_store_path.clone(),
             keystore_path: config.solver.keystore_path.clone(),
         }
     }

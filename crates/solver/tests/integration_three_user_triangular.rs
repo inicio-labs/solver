@@ -191,8 +191,17 @@ fn build_solver_config(
         solver: SolverAccountConfig {
             account_id: solver_account_id.to_hex(),
             keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-            store_path: solver_db.to_string_lossy().into_owned(),
-            ingest_store_path: None,
+            app_db_path: solver_db.to_string_lossy().into_owned(),
+            executor_store_path: solver_temp
+                .path()
+                .join("executor_store.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            ingest_store_path: solver_temp
+                .path()
+                .join("ingest_store.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
             read_pool_size: 2,
         },
         // Three pairs so each token gets registered for tag subscription.

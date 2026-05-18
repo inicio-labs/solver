@@ -234,7 +234,7 @@ pub async fn start(
     cancel: CancellationToken,
 ) -> Result<()> {
     // 1. DB pool (caller-owned so HttpPriceClient + executor can share it).
-    let db_pool = db::init_db(&config.solver.store_path, config.solver.read_pool_size)
+    let db_pool = db::init_db(&config.solver.app_db_path, config.solver.read_pool_size)
         .context("init_db")?;
 
     // 2. Env-sourced secrets.

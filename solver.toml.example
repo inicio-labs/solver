@@ -19,8 +19,12 @@ account_id = "0x<your_solver_account_id_hex>"
 # Filesystem keystore directory holding the solver account's Falcon key.
 # Relative paths resolve against the process working directory.
 keystore_path = "./solver_keystore"
-# SQLite store path for the solver's own pipeline state (orders/notes/etc.).
-store_path = "./store.sqlite3"
+# Three distinct SQLite paths. MIGRATION: the prior single `store_path` is now
+# three explicit required keys — use distinct files for each (sharing one file
+# reintroduces the app-DB/executor-store overload this split removed).
+app_db_path = "./solver_app.sqlite3"              # Diesel app DB (orders/tokens/sync)
+executor_store_path = "./executor_store.sqlite3"  # executor miden-client store (signs)
+ingest_store_path = "./ingest_store.sqlite3"      # keyless ingest miden-client store
 # Concurrent SQLite read connections (matcher hydration, admin queries).
 # Defaults to 4 if omitted.
 read_pool_size = 4

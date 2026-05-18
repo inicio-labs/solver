@@ -24,48 +24,20 @@ pub struct RpcConfig {
 pub struct SolverAccountConfig {
     pub account_id: String,
     pub keystore_path: String,
-    pub store_path: String,
-    /// Filesystem path for the keyless **ingest** client's miden-client
-    /// sqlite store. Kept separate from `store_path` (the executor client's
-    /// store) so the chain-watching path holds no signing keys and the two
-    /// clients sync independently. When omitted, derived from `store_path`
-    /// by inserting an `_ingest` marker before the extension — see
-    /// [`SolverAccountConfig::resolved_ingest_store_path`].
-    #[serde(default)]
-    pub ingest_store_path: Option<String>,
+    /// Diesel/SQLite **application DB** path (orders, notes, tokens, sync
+    /// state). Distinct from the two miden-client stores below.
+    pub app_db_path: String,
+    /// **Executor** miden-client sqlite store path. The signing path; the
+    /// solver account state lives here, its keys in `keystore_path`.
+    pub executor_store_path: String,
+    /// **Keyless ingest** miden-client sqlite store path. The chain-watching
+    /// path holds no signing keys and syncs independently of the executor.
+    /// Must be a different file from `executor_store_path` and `app_db_path`.
+    pub ingest_store_path: String,
     /// Number of concurrent SQLite read connections. Defaults to 4 if omitted.
     /// Bump if the matcher hydration / admin queries become read-contended.
     #[serde(default = "default_read_pool_size")]
     pub read_pool_size: u32,
-}
-
-impl SolverAccountConfig {
-    /// Resolve the ingest (keyless) client's miden-client store path.
-    /// Explicit `ingest_store_path` wins; otherwise it is derived from
-    /// `store_path` by inserting an `_ingest` marker before the extension
-    /// (e.g. `solver_store.sqlite3` → `solver_store_ingest.sqlite3`) so it
-    /// stays a sibling file and remains covered by the gitignore patterns.
-    pub fn resolved_ingest_store_path(&self) -> String {
-        if let Some(p) = &self.ingest_store_path {
-            return p.clone();
-        }
-        let path = std::path::Path::new(&self.store_path);
-        match (
-            path.file_stem().and_then(|s| s.to_str()),
-            path.extension().and_then(|s| s.to_str()),
-        ) {
-            (Some(stem), Some(ext)) => {
-                let name = format!("{stem}_ingest.{ext}");
-                match path.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => {
-                        parent.join(name).to_string_lossy().into_owned()
-                    }
-                    _ => name,
-                }
-            }
-            _ => format!("{}_ingest", self.store_path),
-        }
-    }
 }
 
 fn default_read_pool_size() -> u32 {

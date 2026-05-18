@@ -219,6 +219,8 @@ async fn three_user_direct_matching() -> Result<()> {
             // executor client on their own threads, all against this same
             // shared MockRpcApi (one mock chain).
             let solver_ingest_store = solver_temp.path().join("ingest_store.sqlite3");
+            let executor_store_path = solver_store_path.to_string_lossy().into_owned();
+            let ingest_store_path = solver_ingest_store.to_string_lossy().into_owned();
             let factory: Arc<dyn solver::ClientFactory> = Arc::new(MockClientFactory {
                 rpc: rpc.clone(),
                 ingest_store: solver_ingest_store,
@@ -236,8 +238,9 @@ async fn three_user_direct_matching() -> Result<()> {
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    store_path: solver_db.to_string_lossy().into_owned(),
-                    ingest_store_path: None,
+                    app_db_path: solver_db.to_string_lossy().into_owned(),
+                    executor_store_path,
+                    ingest_store_path,
                     read_pool_size: 2,
                 },
                 pairs: vec![AssetPairConfig {

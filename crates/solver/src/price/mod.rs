@@ -4,7 +4,9 @@
 //! `crate::price::{...}`.
 
 pub mod coingecko;
-pub use coingecko::{read_symbol_map, write_symbol_map, HttpPriceClient, SharedSymbolMap};
+pub use coingecko::{
+    build_http_price_client, read_symbol_map, write_symbol_map, HttpPriceClient, SharedSymbolMap,
+};
 
 mod price;
 pub use price::*;

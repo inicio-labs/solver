@@ -48,6 +48,21 @@ pub struct HttpPriceClient {
     base: String,
 }
 
+/// Construct the production [`PriceClient`] (CoinGecko HTTP) as a boxed
+/// trait object — the exact `Result<Box<dyn PriceClient + Send + Sync>>`
+/// shape `crate::start` expects for price-client dependency injection.
+///
+/// Keeps the `Box`/unsizing/`?` plumbing in the library, next to
+/// `HttpPriceClient`, so the binary's injection site is a single name
+/// (`solver::price::build_http_price_client`) instead of an inline closure
+/// with an explicit trait-object `as` cast.
+pub fn build_http_price_client(
+    symbol_map: SharedSymbolMap,
+    api_key: Option<String>,
+) -> Result<Box<dyn PriceClient + Send + Sync>> {
+    Ok(Box::new(HttpPriceClient::new(symbol_map, api_key)?))
+}
+
 impl HttpPriceClient {
     /// Construct a client targeting the public CoinGecko API. The `api_key`,
     /// if provided, is sent as the `x-cg-demo-api-key` header (Demo API tier).

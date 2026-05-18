@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin::AdminState;
+use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
@@ -53,6 +54,38 @@ pub struct PipelineConfig {
     /// observability `/readyz` endpoint via `obs::ObsState`. Passing the same
     /// `Arc` to both sides makes readiness reflect real ingest progress.
     pub last_sync_unix_seconds: Arc<AtomicI64>,
+}
+
+impl PipelineConfig {
+    /// Assemble from the parsed [`EngineConfig`] plus the caller-owned
+    /// runtime handles. Centralises the millisecond → [`Duration`]
+    /// conversions so that unit mapping lives in exactly one place; every
+    /// field stays mandatory (the struct has no defaults), so a forgotten
+    /// argument is still a compile error at the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        engine: &EngineConfig,
+        db_pool: db::DbPool,
+        initial_tokens: Vec<(TokenId, Option<String>)>,
+        admin_token: Option<String>,
+        symbol_map: SharedSymbolMap,
+        cancel: CancellationToken,
+        last_sync_unix_seconds: Arc<AtomicI64>,
+    ) -> Self {
+        Self {
+            db_pool,
+            ingest_interval: Duration::from_millis(engine.fetch_interval_ms),
+            price_interval: Duration::from_millis(engine.price_interval_ms),
+            match_interval: Duration::from_millis(engine.pulse_interval_ms),
+            initial_tokens,
+            admin_port: engine.admin_port,
+            admin_token,
+            triangular_enabled: engine.triangular_enabled,
+            symbol_map,
+            cancel,
+            last_sync_unix_seconds,
+        }
+    }
 }
 
 pub async fn subscribe_all_pairs(

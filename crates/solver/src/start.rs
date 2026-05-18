@@ -283,19 +283,15 @@ pub async fn start(
     let last_sync_handle = obs_state.last_sync_handle();
 
     // 8. Build the PipelineConfig.
-    let pipeline_config = PipelineConfig {
-        db_pool: db_pool.clone(),
-        ingest_interval: Duration::from_millis(config.engine.fetch_interval_ms),
-        price_interval: Duration::from_millis(config.engine.price_interval_ms),
-        match_interval: Duration::from_millis(config.engine.pulse_interval_ms),
+    let pipeline_config = PipelineConfig::new(
+        &config.engine,
+        db_pool.clone(),
         initial_tokens,
-        admin_port: config.engine.admin_port,
         admin_token,
         symbol_map,
-        triangular_enabled: config.engine.triangular_enabled,
-        cancel: cancel.clone(),
-        last_sync_unix_seconds: last_sync_handle.clone(),
-    };
+        cancel.clone(),
+        last_sync_handle.clone(),
+    );
 
     // 9. Cross-thread channels + DB-only boot work (no client) on this thread.
     let channels = pipeline::create_channels();

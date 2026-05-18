@@ -1,20 +1,15 @@
 use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use miden_client::{
-    builder::ClientBuilder,
-    keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient, NodeRpcClient},
-    Client,
-};
-use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use tokio_util::sync::CancellationToken;
 
 use solver::config::SolverConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+mod client_factory;
+use client_factory::ProdClientFactory;
 
 /// Initialise the global `tracing` subscriber.
 ///
@@ -27,90 +22,28 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// quiet until an operator opts in. Set `RUST_LOG=solver=debug` to expose
 /// per-tick matcher detail.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,solver=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,solver=info"));
 
-    let want_json =
-        env::var("LOG_FORMAT").map(|v| v.eq_ignore_ascii_case("json")).unwrap_or(false);
+    let want_json = env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
 
     if want_json {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().json().with_current_span(true).with_span_list(false))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(false),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().compact())
             .init();
-    }
-}
-
-/// Production [`solver::ClientFactory`]. Holds only `Send` config
-/// (endpoint string, timeout, paths, debug flag) so it can be cloned into
-/// each client OS thread; `build_*` run on the owning thread and construct
-/// the RPC client + miden `Client` there, so the `!Send` `Client` and the
-/// tonic gRPC internals never cross a thread boundary.
-struct ProdClientFactory {
-    endpoint: String,
-    timeout_ms: u64,
-    debug: bool,
-    ingest_store_path: String,
-    executor_store_path: String,
-    keystore_path: String,
-}
-
-impl ProdClientFactory {
-    fn from_config(config: &SolverConfig) -> Self {
-        Self {
-            endpoint: config.rpc.endpoint.clone(),
-            timeout_ms: config.rpc.timeout_ms,
-            debug: config.engine.debug_mode,
-            ingest_store_path: config.solver.ingest_store_path.clone(),
-            executor_store_path: config.solver.executor_store_path.clone(),
-            keystore_path: config.solver.keystore_path.clone(),
-        }
-    }
-
-    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
-        let endpoint = Endpoint::try_from(self.endpoint.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
-        Ok(Arc::new(GrpcClient::new(&endpoint, self.timeout_ms)))
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl solver::ClientFactory for ProdClientFactory {
-    /// Keyless **ingest** client: RPC + its own sqlite store, **no
-    /// authenticator and no tracked account** — the chain-watching path
-    /// never signs, so it holds no keys on disk. The `FilesystemKeyStore`
-    /// type parameter is only a phantom; no keystore is constructed.
-    async fn build_ingest(&self) -> Result<Client<FilesystemKeyStore>> {
-        ClientBuilder::new()
-            .rpc(self.rpc()?)
-            .sqlite_store(PathBuf::from(&self.ingest_store_path))
-            .in_debug_mode(self.debug.into())
-            .build()
-            .await
-            .context("Failed to build ingest (keyless) Miden client")
-    }
-
-    /// **Executor** client: RPC + sqlite store + `FilesystemKeyStore`
-    /// authenticator. The signing path; the solver account + keys are
-    /// provisioned out-of-band into the store/keystore by the operator.
-    async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>> {
-        let keystore = Arc::new(
-            FilesystemKeyStore::new(PathBuf::from(&self.keystore_path))
-                .context("Failed to initialize keystore")?,
-        );
-        ClientBuilder::new()
-            .rpc(self.rpc()?)
-            .sqlite_store(PathBuf::from(&self.executor_store_path))
-            .authenticator(keystore)
-            .in_debug_mode(self.debug.into())
-            .build()
-            .await
-            .context("Failed to build executor Miden client")
     }
 }
 
@@ -132,16 +65,16 @@ fn cli() -> clap::Command {
 }
 
 async fn run() -> Result<()> {
-    // Parses argv; `--help` / `--version` / usage errors print and exit here.
-    let matches = cli().get_matches();
-
     // Init the global tracing subscriber before any other log lines fire.
     init_tracing();
 
-    let config_path = matches
+    // Parses argv; `--help` / `--version` / usage errors print and exit here.
+    let config_path = cli()
+        .get_matches()
         .get_one::<String>("config")
         .expect("`config` always has a default_value")
         .clone();
+
     let config = SolverConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
     let solver_id = AccountId::from_hex(&config.solver.account_id)
@@ -151,8 +84,7 @@ async fn run() -> Result<()> {
     // here we only construct a `Send` factory that carries the config
     // needed to build them. A build failure still surfaces as a clean
     // startup error via the per-thread readiness gate in `start`.
-    let factory: Arc<dyn solver::ClientFactory> =
-        Arc::new(ProdClientFactory::from_config(&config));
+    let factory: Arc<dyn solver::ClientFactory> = Arc::new(ProdClientFactory::from_config(&config));
 
     // Cancellation token: triggered by Ctrl-C, passed into solver::start
     // so every pipeline task can shut down cleanly between iterations.
@@ -167,10 +99,7 @@ async fn run() -> Result<()> {
 
     solver::start(
         factory,
-        |symbol_map, api_key| {
-            Ok(Box::new(solver::price::HttpPriceClient::new(symbol_map, api_key)?)
-                as Box<dyn solver::price::PriceClient + Send + Sync>)
-        },
+        solver::price::build_http_price_client,
         solver_id,
         config,
         cancel,

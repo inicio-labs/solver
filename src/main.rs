@@ -45,11 +45,6 @@ fn init_tracing() {
     }
 }
 
-fn parse_account_id(hex_str: &str) -> Result<AccountId> {
-    AccountId::from_hex(hex_str)
-        .with_context(|| format!("Failed to parse account ID: {}", hex_str))
-}
-
 /// Production [`solver::ClientFactory`]. Holds only `Send` config
 /// (endpoint string, timeout, paths, debug flag) so it can be cloned into
 /// each client OS thread; `build_*` run on the owning thread and construct
@@ -152,8 +147,8 @@ async fn run() -> Result<()> {
     let config_path = resolve_config_path(&args);
     let config = SolverConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
-    let solver_id = parse_account_id(&config.solver.account_id)
-        .context("Failed to parse solver account ID")?;
+    let solver_id = AccountId::from_hex(&config.solver.account_id)
+        .with_context(|| format!("invalid solver account_id {:?}", config.solver.account_id))?;
 
     // L2: clients are built on their own OS threads (inside `start`), so
     // here we only construct a `Send` factory that carries the config

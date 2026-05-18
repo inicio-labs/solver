@@ -1,15 +1,22 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use miden_client::keystore::FilesystemKeyStore;
+use miden_client::note::NoteType;
+use miden_client::Client;
+use miden_protocol::asset::FungibleAsset;
+use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::client_factory::ClientFactory;
 use crate::db::models::{NoteRow, OrderRow};
 use crate::db::{self, DbPool};
 use crate::types::Order as PipelineOrder;
@@ -219,6 +226,241 @@ async fn ingest_once(
     );
 
     Ok(())
+}
+
+/// Adapter that wraps the real `miden_client::Client` behind our `MidenClient`
+/// trait abstraction. The same trait is implemented by `MockMidenClient` for
+/// tests; this adapter makes the typed Client interchangeable in production.
+///
+/// Locking strategy: we hold `Arc<Mutex<Client>>` so the executor (which needs
+/// the typed Client for `submit_new_transaction`) and ingest/admin (which go
+/// through this adapter) can both share the same underlying instance without
+/// fighting over ownership.
+///
+/// Note discovery (post the keyless-ingest / keystore-executor split):
+/// PSWAPs come from a single `SyncSummary` source —
+///   * `new_public_notes` ∪ `new_private_notes` — notes the screener
+///     inserted into the input-notes table on this sync (tag-discovered,
+///     not previously tracked).
+///
+/// The **ingest client is keyless and tracks no accounts**, so it has no
+/// `output_notes` table and its `committed_notes` never carries the
+/// solver's own notes. Solver-produced **remainder PSWAPs** (from partial
+/// fills) are `Public` and tag-matched, so the ingest client re-discovers
+/// them here via `new_public_notes` on the sync after the executor's
+/// settle commits — exactly like any externally-created PSWAP. (The old
+/// single-client model needed a second `committed_notes` pass because the
+/// solver client owned the account and its remainder surfaced as its own
+/// committed output note; that pass is dead post-split and was removed.)
+/// The **executor client** subscribes no tags, so its `sync_state`
+/// discovers nothing — it runs only to keep the chain tip / solver
+/// account fresh; its returned notes are discarded by the sync task.
+///
+/// Dedup: the adapter is intentionally stateless. `new_public_notes` /
+/// `new_private_notes` are edge-triggered (a note appears on exactly one
+/// sync — the one whose block range covers its inclusion block — and
+/// never again, since ranges advance and are non-overlapping). Any
+/// residual double-emit is absorbed durably downstream: `ingest_once`
+/// forwards an order to the matcher only when `insert_notes_batch`
+/// reports it as newly inserted (the `orders` primary key is the dedup
+/// authority, which also survives restarts).
+pub(crate) struct MidenClientAdapter {
+    pub(crate) client: Arc<Mutex<Client<FilesystemKeyStore>>>,
+}
+
+#[async_trait(?Send)]
+impl MidenClient for MidenClientAdapter {
+    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> Result<()> {
+        // PSWAP discovery tags only depend on faucet IDs; the amounts in the
+        // FungibleAsset args to `create_tag` are placeholders.
+        let offered_asset = FungibleAsset::new(offered, 1)
+            .map_err(|e| anyhow!("invalid offered asset for tag: {e}"))?;
+        let requested_asset = FungibleAsset::new(requested, 1)
+            .map_err(|e| anyhow!("invalid requested asset for tag: {e}"))?;
+        let tag = PswapNote::create_tag(NoteType::Public, &offered_asset, &requested_asset);
+
+        let mut client = self.client.lock().await;
+        client
+            .add_note_tag(tag)
+            .await
+            .map_err(|e| anyhow!("add_note_tag failed: {e}"))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(block_num, new_pub, new_priv))]
+    async fn sync_state(&mut self) -> Result<SyncResult> {
+        let mut client = self.client.lock().await;
+        let summary = client
+            .sync_state()
+            .await
+            .map_err(|e| anyhow!("sync_state failed: {e}"))?;
+
+        // Populate span fields so structured logs carry sync stats.
+        let span = tracing::Span::current();
+        span.record("block_num", summary.block_num.as_u64());
+        span.record("new_pub", summary.new_public_notes.len());
+        span.record("new_priv", summary.new_private_notes.len());
+
+        let mut new_notes: Vec<Note> = Vec::new();
+
+        // Notes the Client inserted into its input-notes table on this sync
+        // (tag-discovered, not previously tracked). This is the *only* PSWAP
+        // discovery path — see the struct doc for why the old
+        // `committed_notes` second pass is dead post-split.
+        for note_id in summary
+            .new_public_notes
+            .iter()
+            .chain(summary.new_private_notes.iter())
+        {
+            match client.get_input_note(*note_id).await {
+                Ok(Some(record)) => match (&record).try_into() {
+                    Ok(note) => new_notes.push(note),
+                    Err(e) => tracing::error!(%note_id, error = %e, "InputNoteRecord → Note conversion failed"),
+                },
+                Ok(None) => {
+                    tracing::warn!(%note_id, "note reported by sync but not in input-notes store");
+                }
+                Err(e) => {
+                    tracing::error!(%note_id, error = %e, "get_input_note failed");
+                }
+            }
+        }
+
+        Ok(SyncResult {
+            block_num: summary.block_num.as_u64(),
+            new_notes,
+            consumed_notes: summary.consumed_notes.clone(),
+        })
+    }
+
+    async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>> {
+        if notes.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        // Map nullifier → NoteId so we can recover the IDs from the RPC response.
+        let mut nullifier_to_id = HashMap::new();
+        let mut nullifiers = BTreeSet::new();
+        for note in notes {
+            let nullifier = note.nullifier();
+            nullifier_to_id.insert(nullifier, note.id());
+            nullifiers.insert(nullifier);
+        }
+
+        let mut client = self.client.lock().await;
+        let rpc = client.test_rpc_api();
+        // GENESIS is intentional, not a placeholder: this is an "ever
+        // consumed?" existence check, so it must scan the full nullifier
+        // history. (The node serves this from its nullifier set; the
+        // `from` block only bounds the *response* range, not correctness.)
+        let heights = rpc
+            .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
+            .await
+            .map_err(|e| anyhow!("get_nullifier_commit_heights failed: {e}"))?;
+        drop(client);
+
+        let mut consumed = HashSet::new();
+        for (nullifier, maybe_height) in heights {
+            if maybe_height.is_some() {
+                if let Some(id) = nullifier_to_id.get(&nullifier) {
+                    consumed.insert(*id);
+                }
+            }
+        }
+        Ok(consumed)
+    }
+}
+
+/// Spawn the keyless **ingest** OS thread: own `current_thread` runtime +
+/// `LocalSet`; builds the ingest client on-thread (so the `!Send` `Client`
+/// never crosses a thread boundary), then runs subscribe-relay + ingest.
+///
+/// Returns the joinable thread handle plus a `oneshot::Receiver` that yields
+/// `Ok(())` once the client is built and the tasks are spawned, or the
+/// build/subscribe error — so a startup failure surfaces at the caller's
+/// readiness gate instead of dying silently in a detached thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_ingest_thread(
+    factory: Arc<dyn ClientFactory>,
+    db_pool: DbPool,
+    cancel: CancellationToken,
+    order_tx: mpsc::Sender<IngestOrder>,
+    consumed_tx: mpsc::Sender<NoteId>,
+    subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+    ingest_interval: Duration,
+    last_sync: Arc<AtomicI64>,
+) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
+    let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<Result<()>>();
+    let ingest_factory = factory;
+    let ingest_db = db_pool;
+    let ingest_cancel = cancel;
+    let ingest_order_tx = order_tx;
+    let ingest_consumed_tx = consumed_tx;
+    let ingest_subscribe_rx = subscribe_rx;
+    let ingest_last_sync: Arc<AtomicI64> = last_sync;
+    let ingest_thread = thread::Builder::new()
+        .name("ingest-client".into())
+        .spawn(move || {
+            crate::start::run_on_local_runtime("ingest-client", async move {
+                let client = match ingest_factory.build_ingest().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ingest_ready_tx.send(Err(e.context("build_ingest")));
+                        return;
+                    }
+                };
+                let adapter: Arc<Mutex<dyn MidenClient>> =
+                    Arc::new(Mutex::new(MidenClientAdapter {
+                        client: Arc::new(Mutex::new(client)),
+                    }));
+                let mut h = match crate::pipeline::spawn_ingest_tasks(
+                    adapter,
+                    ingest_db,
+                    ingest_order_tx,
+                    ingest_consumed_tx,
+                    ingest_subscribe_rx,
+                    ingest_interval,
+                    ingest_cancel.clone(),
+                    ingest_last_sync,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = ingest_ready_tx.send(Err(e.context("spawn_ingest_tasks")));
+                        return;
+                    }
+                };
+                let _ = ingest_ready_tx.send(Ok(()));
+                // If a task exits *unexpectedly* (not via cancel) the main
+                // coordination loop has no other signal — `order_tx` keeps
+                // other live senders, so its `order_rx` never closes and the
+                // matcher would silently run a stale book. Propagate a global
+                // shutdown (`ingest_cancel` is a clone of the root token).
+                tokio::select! {
+                    _ = ingest_cancel.cancelled() => {}
+                    _ = &mut h.ingest_handle => {
+                        tracing::error!("ingest task exited unexpectedly; triggering shutdown");
+                        ingest_cancel.cancel();
+                    }
+                    _ = &mut h.subscribe_handle => {
+                        tracing::error!("subscribe-relay task exited unexpectedly; triggering shutdown");
+                        ingest_cancel.cancel();
+                    }
+                }
+                // Drain inside the runtime: abort + await both tasks so their
+                // `Client` Arc refs are dropped *here* (runtime still entered).
+                // Otherwise `LocalSet::drop` after `block_on` returns would
+                // force-drop the `!Send` Client with no runtime context, whose
+                // Drop then panics ("panic in a destructor during cleanup").
+                h.ingest_handle.abort();
+                h.subscribe_handle.abort();
+                let _ = h.ingest_handle.await;
+                let _ = h.subscribe_handle.await;
+            });
+        })
+        .context("spawn ingest thread")?;
+    Ok((ingest_thread, ingest_ready_rx))
 }
 
 #[cfg(test)]

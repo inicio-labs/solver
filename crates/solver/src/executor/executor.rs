@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,11 +15,12 @@ use miden_protocol::{
     note::{Note, NoteDetails, NoteRecipient, NoteTag},
 };
 use miden_standards::note::PswapNote;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::client_factory::ClientFactory;
 use crate::db::{self, DbPool};
-use crate::ingest::MidenClient;
+use crate::ingest::{MidenClient, MidenClientAdapter};
 use crate::types::{ExecutionBatch, FilledNote, IngestOrder, OrderStatus, TokenId};
 
 // ── Backoff knobs ──────────────────────────────────────────────────────────
@@ -512,4 +514,112 @@ fn note_asset_amount(note: &Note) -> u64 {
         .next()
         .map(|a| u64::from(a.amount()))
         .unwrap_or(0)
+}
+
+/// Spawn the keystore **executor** OS thread: own `current_thread` runtime +
+/// `LocalSet`; builds the executor client on-thread (so the `!Send` `Client`
+/// never crosses a thread boundary), then runs the executor + the tagless
+/// executor-sync task. The sync task discovers no notes (no tag
+/// subscriptions); it only keeps the executor client's reference block recent
+/// off the critical path (the node rejects txs whose reference block is older
+/// than its acceptance window). Submitting does NOT pull chain state — the
+/// client optimistically applies its own tx — so consecutive settlements stay
+/// consistent without a sync between them.
+///
+/// Returns the joinable thread handle plus a `oneshot::Receiver` that yields
+/// `Ok(())` once the client is built and the tasks are spawned, or the build
+/// error — so a startup failure surfaces at the caller's readiness gate
+/// instead of dying silently in a detached thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_executor_thread(
+    factory: Arc<dyn ClientFactory>,
+    db_pool: DbPool,
+    cancel: CancellationToken,
+    solver_id: AccountId,
+    exec_rx: mpsc::Receiver<ExecutionBatch>,
+    refeed_tx: mpsc::Sender<IngestOrder>,
+    sync_interval: Duration,
+) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
+    let (exec_ready_tx, exec_ready_rx) = oneshot::channel::<Result<()>>();
+    let exec_factory = factory;
+    let exec_db = db_pool;
+    let exec_cancel = cancel;
+    let exec_refeed_tx = refeed_tx;
+    let exec_sync_interval = sync_interval;
+    let executor_thread = thread::Builder::new()
+        .name("executor-client".into())
+        .spawn(move || {
+            crate::start::run_on_local_runtime("executor-client", async move {
+                let client = match exec_factory.build_executor().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = exec_ready_tx.send(Err(e.context("build_executor")));
+                        return;
+                    }
+                };
+                let executor_shared: Arc<Mutex<Client<FilesystemKeyStore>>> =
+                    Arc::new(Mutex::new(client));
+                let executor_adapter: Arc<Mutex<dyn MidenClient>> =
+                    Arc::new(Mutex::new(MidenClientAdapter {
+                        client: executor_shared.clone(),
+                    }));
+
+                let run_client = executor_shared.clone();
+                let run_adapter = executor_adapter.clone();
+                let run_cancel = exec_cancel.clone();
+                let mut executor_handle = tokio::task::spawn_local(async move {
+                    run_executor(
+                        run_client,
+                        run_adapter,
+                        solver_id,
+                        exec_db,
+                        exec_rx,
+                        exec_refeed_tx,
+                        run_cancel,
+                    )
+                    .await;
+                });
+
+                let sync_adapter = executor_adapter.clone();
+                let sync_cancel = exec_cancel.clone();
+                let mut executor_sync_handle = tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::select! {
+                            _ = sync_cancel.cancelled() => break,
+                            _ = tokio::time::sleep(exec_sync_interval) => {
+                                if let Err(e) = sync_adapter.lock().await.sync_state().await {
+                                    tracing::warn!(error = %e, "executor-client tagless sync failed; will retry next tick");
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let _ = exec_ready_tx.send(Ok(()));
+                // Unexpected exit of either task → propagate a global shutdown
+                // immediately (the `exec_rx`-drop → matcher path only fires on
+                // the *next* batch send, and never if only the sync task dies).
+                tokio::select! {
+                    _ = exec_cancel.cancelled() => {}
+                    _ = &mut executor_handle => {
+                        tracing::error!("executor task exited unexpectedly; triggering shutdown");
+                        exec_cancel.cancel();
+                    }
+                    _ = &mut executor_sync_handle => {
+                        tracing::error!("executor-sync task exited unexpectedly; triggering shutdown");
+                        exec_cancel.cancel();
+                    }
+                }
+                // Drain inside the runtime so the executor `Client` Arc refs
+                // drop here (runtime still entered), not in `LocalSet::drop`
+                // after `block_on` returns (which would panic in the `!Send`
+                // Client's destructor with no runtime context).
+                executor_handle.abort();
+                executor_sync_handle.abort();
+                let _ = executor_handle.await;
+                let _ = executor_sync_handle.await;
+            });
+        })
+        .context("spawn executor thread")?;
+    Ok((executor_thread, exec_ready_rx))
 }

@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ fn init_tracing() {
         .unwrap_or_else(|_| EnvFilter::new("info,solver=info"));
 
     let want_json =
-        std::env::var("LOG_FORMAT").map(|v| v.eq_ignore_ascii_case("json")).unwrap_or(false);
+        env::var("LOG_FORMAT").map(|v| v.eq_ignore_ascii_case("json")).unwrap_or(false);
 
     if want_json {
         tracing_subscriber::registry()
@@ -113,38 +114,34 @@ impl solver::ClientFactory for ProdClientFactory {
     }
 }
 
-/// Resolve the config path. Precedence: `--config <path>` CLI flag, then
-/// `$SOLVER_CONFIG` env var, then `"solver.toml"` in the current working
-/// directory.
-fn resolve_config_path(args: &[String]) -> String {
-    args.iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1).cloned())
-        .or_else(|| std::env::var("SOLVER_CONFIG").ok())
-        .unwrap_or_else(|| "solver.toml".to_string())
-}
-
-fn print_help() {
-    println!("Usage: solver-bin [--config <path>]");
-    println!();
-    println!("Options:");
-    println!("  --config <path>   Path to the TOML config file.");
-    println!("                    Default: $SOLVER_CONFIG, or 'solver.toml' if unset.");
-    println!("  -h, --help        Show this help.");
+/// CLI surface: a single optional `--config <PATH>`. Precedence is
+/// clap-native — explicit flag > `$SOLVER_CONFIG` env > the `solver.toml`
+/// default. `--help`/`--version` are auto-generated; an unknown flag or
+/// `--config` with no value is a clap usage error (non-zero exit).
+fn cli() -> clap::Command {
+    clap::Command::new("solver-bin")
+        .version(env!("CARGO_PKG_VERSION"))
+        .arg(
+            clap::Arg::new("config")
+                .long("config")
+                .value_name("PATH")
+                .env("SOLVER_CONFIG")
+                .default_value("solver.toml")
+                .help("Path to the TOML config file"),
+        )
 }
 
 async fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return Ok(());
-    }
+    // Parses argv; `--help` / `--version` / usage errors print and exit here.
+    let matches = cli().get_matches();
 
     // Init the global tracing subscriber before any other log lines fire.
     init_tracing();
 
-    let config_path = resolve_config_path(&args);
+    let config_path = matches
+        .get_one::<String>("config")
+        .expect("`config` always has a default_value")
+        .clone();
     let config = SolverConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
     let solver_id = AccountId::from_hex(&config.solver.account_id)

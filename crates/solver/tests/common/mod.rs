@@ -111,6 +111,40 @@ impl solver::ClientFactory for MockClientFactory {
             .map_err(|e| anyhow!("executor genesis: {e}"))?;
         Ok(c)
     }
+
+    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
+        let r: Arc<dyn NodeRpcClient> = self.rpc.clone();
+        Ok(r)
+    }
+}
+
+/// Factory whose `build_ingest` succeeds (keyless client) but `build_executor`
+/// always fails — exercises the L2 startup-failure path: the executor
+/// readiness `oneshot` carries `Err`, so `start()` must cancel, join *both*
+/// client OS threads, and return a clean error (no hang, no SIGABRT).
+pub struct FailingExecutorFactory {
+    pub rpc: Arc<MockRpcApi>,
+    pub ingest_store: PathBuf,
+}
+
+#[async_trait::async_trait(?Send)]
+impl solver::ClientFactory for FailingExecutorFactory {
+    async fn build_ingest(&self) -> Result<Client<FilesystemKeyStore>> {
+        let mut c = build_test_ingest_client(self.rpc.clone(), self.ingest_store.clone()).await?;
+        c.ensure_genesis_in_place()
+            .await
+            .map_err(|e| anyhow!("ingest genesis: {e}"))?;
+        Ok(c)
+    }
+
+    async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>> {
+        Err(anyhow!("injected executor build failure (startup-failure test)"))
+    }
+
+    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
+        let r: Arc<dyn NodeRpcClient> = self.rpc.clone();
+        Ok(r)
+    }
 }
 
 /// Real-time analogue of [`wait_for`] for the L2 threaded model. The solver's

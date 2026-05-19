@@ -14,9 +14,12 @@
 //! (`Arc<dyn ClientFactory>`) is still `Send + Sync` via the supertrait
 //! bounds, so it crosses the thread boundary cleanly.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use miden_client::keystore::FilesystemKeyStore;
+use miden_client::rpc::NodeRpcClient;
 use miden_client::Client;
 
 #[async_trait(?Send)]
@@ -30,4 +33,15 @@ pub trait ClientFactory: Send + Sync + 'static {
     /// `FilesystemKeyStore` authenticator. The signing path; the solver
     /// account + keys are provisioned into the store/keystore out-of-band.
     async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>>;
+
+    /// Build a standalone RPC client for the **same node** the clients use.
+    ///
+    /// Used by the executor's zombie-note classification path
+    /// (`MidenClientAdapter::check_consumed_notes`) to query nullifier commit
+    /// heights directly, instead of reaching a `Client`'s internal RPC via
+    /// the `#[cfg(feature = "testing")]`-gated `Client::test_rpc_api()`
+    /// accessor — which previously forced the production build to enable
+    /// miden-client's `testing` feature. Synchronous: constructing a gRPC
+    /// client / cloning a mock handle does no I/O.
+    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>>;
 }

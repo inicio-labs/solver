@@ -60,6 +60,24 @@ fn match_user_orders<F: PriceFeed>(
             None => break,
         };
 
+        // Audit C2: the direct path must consult the price feed, exactly
+        // like the triangular path does. Triangular's gate is "every leg's
+        // token is priced, else skip the cycle" (price_feed.rs doctrine: a
+        // missing price means "not matchable", never a bogus default); its
+        // USD value-safety is the cycle surplus ≥ 0. The direct analogue:
+        // require BOTH tokens of this pair to be priced here, and rely on
+        // `apply_match`/`match_with`'s per-token surplus logic for the
+        // value-safety of the executed amounts — that non-loss invariant is
+        // exactly what the 10k-trial settlement-solvency test proves, and is
+        // the direct counterpart of triangular's surplus ≥ 0. (Gating each
+        // order on `is_order_profitable` instead is wrong: it rejects normal
+        // spread orders where one side asks more USD than it offers.)
+        if book.feed.price_cents(token_a).is_none()
+            || book.feed.price_cents(token_b).is_none()
+        {
+            break;
+        }
+
         // Encapsulated mutation: surplus and cleanup happen inside.
         if book.apply_match(order_a_id, order_b_id).is_none() {
             break;

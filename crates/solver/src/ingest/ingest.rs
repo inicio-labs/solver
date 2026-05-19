@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
+use miden_client::rpc::NodeRpcClient;
 use miden_client::Client;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
@@ -71,24 +72,30 @@ pub async fn run_ingest(
     last_sync_unix_seconds: Arc<AtomicI64>,
 ) {
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            res = ingest_once(&client, &pool, &order_tx, &consumed_tx) => {
-                match res {
-                    Ok(()) => {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        last_sync_unix_seconds.store(now, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "ingest iteration failed");
-                    }
-                }
+        // Finish-the-unit shutdown: `ingest_once` is deliberately NOT wrapped
+        // in `select!`, so a started iteration always runs to completion and
+        // the consumed-notes DB write + channel sends for this sync are atomic
+        // (no reliance on `ingest_once` being drop-safe). Cancellation is
+        // observed *between* iterations by the bottom `select!`, which breaks
+        // on `cancel` whether it fired during the preceding `ingest_once` or
+        // during the idle wait. Worst-case shutdown delay is one `ingest_once`,
+        // bounded by the per-call RPC timeout (`rpc.timeout_ms`).
+        match ingest_once(&client, &pool, &order_tx, &consumed_tx).await {
+            Ok(()) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                last_sync_unix_seconds.store(now, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ingest iteration failed");
             }
         }
-        // Sleep at end so the first tick fires immediately, not after `interval`.
+        // The idle wait stays cancellable (and stays at the end so the first
+        // tick fires immediately, not after `interval`). This is where a
+        // shutdown almost always lands, since the loop is asleep most of the
+        // time — so cancellation is still effectively instant in practice.
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
@@ -105,7 +112,11 @@ async fn ingest_once(
     order_tx: &mpsc::Sender<IngestOrder>,
     consumed_tx: &mpsc::Sender<NoteId>,
 ) -> Result<()> {
-    let SyncResult { block_num, new_notes, consumed_notes } = {
+    let SyncResult {
+        block_num,
+        new_notes,
+        consumed_notes,
+    } = {
         let mut c = client.lock().await;
         c.sync_state().await?
     };
@@ -120,8 +131,7 @@ async fn ingest_once(
             .collect();
         {
             let mut conn = pool.write_conn()?;
-            let updated =
-                db::mark_orders_onchain_nullified(&mut conn, &consumed_bytes)?;
+            let updated = db::mark_orders_onchain_nullified(&mut conn, &consumed_bytes)?;
             if updated > 0 {
                 tracing::warn!(
                     count = updated,
@@ -154,7 +164,6 @@ async fn ingest_once(
                 continue;
             }
         };
-
 
         let note_id_bytes = note.id().to_bytes().to_vec();
 
@@ -266,6 +275,13 @@ async fn ingest_once(
 /// authority, which also survives restarts).
 pub(crate) struct MidenClientAdapter {
     pub(crate) client: Arc<Mutex<Client<FilesystemKeyStore>>>,
+    /// Standalone RPC handle for the same node, used by
+    /// `check_consumed_notes` for the nullifier existence query. Held
+    /// separately so we never reach the `Client`'s internal RPC via the
+    /// `#[cfg(feature = "testing")]` `Client::test_rpc_api()` accessor —
+    /// that test helper previously forced the production build to enable
+    /// miden-client's `testing` feature.
+    pub(crate) rpc: Arc<dyn NodeRpcClient>,
 }
 
 #[async_trait(?Send)]
@@ -315,7 +331,9 @@ impl MidenClient for MidenClientAdapter {
             match client.get_input_note(*note_id).await {
                 Ok(Some(record)) => match (&record).try_into() {
                     Ok(note) => new_notes.push(note),
-                    Err(e) => tracing::error!(%note_id, error = %e, "InputNoteRecord → Note conversion failed"),
+                    Err(e) => {
+                        tracing::error!(%note_id, error = %e, "InputNoteRecord → Note conversion failed")
+                    }
                 },
                 Ok(None) => {
                     tracing::warn!(%note_id, "note reported by sync but not in input-notes store");
@@ -347,17 +365,19 @@ impl MidenClient for MidenClientAdapter {
             nullifiers.insert(nullifier);
         }
 
-        let mut client = self.client.lock().await;
-        let rpc = client.test_rpc_api();
         // GENESIS is intentional, not a placeholder: this is an "ever
         // consumed?" existence check, so it must scan the full nullifier
         // history. (The node serves this from its nullifier set; the
         // `from` block only bounds the *response* range, not correctness.)
-        let heights = rpc
+        // Uses the dedicated `self.rpc` handle — NOT `client.test_rpc_api()`
+        // — so production no longer depends on miden-client's `testing`
+        // feature. No `client` lock is taken: this query goes straight to
+        // the node, independent of `Client` state.
+        let heights = self
+            .rpc
             .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
             .await
             .map_err(|e| anyhow!("get_nullifier_commit_heights failed: {e}"))?;
-        drop(client);
 
         let mut consumed = HashSet::new();
         for (nullifier, maybe_height) in heights {
@@ -409,9 +429,17 @@ pub(crate) fn spawn_ingest_thread(
                         return;
                     }
                 };
+                let rpc = match ingest_factory.rpc() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = ingest_ready_tx.send(Err(e.context("build ingest rpc")));
+                        return;
+                    }
+                };
                 let adapter: Arc<Mutex<dyn MidenClient>> =
                     Arc::new(Mutex::new(MidenClientAdapter {
                         client: Arc::new(Mutex::new(client)),
+                        rpc,
                     }));
                 let mut h = match crate::pipeline::spawn_ingest_tasks(
                     adapter,

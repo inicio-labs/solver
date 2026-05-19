@@ -33,6 +33,10 @@ tracing = "0.1"
 miden-crypto.workspace = true
 axum-test = "20"
 wiremock = "0.6"
+# Re-enable miden-client's `testing` feature for the TEST build only (the
+# integration tests use `miden_client::testing::mock::MockRpcApi`). With
+# resolver = "2" this never reaches the production lib/bin build.
+miden-client = { workspace = true, features = ["testing"] }
 miden-client-sqlite-store = { workspace = true }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }

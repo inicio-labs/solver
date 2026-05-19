@@ -1,8 +1,14 @@
 [workspace]
 members = ["crates/solver", "crates/consume-script"]
+resolver = "2"
 
 [workspace.dependencies]
-miden-client = { git = "https://github.com/0xMiden/miden-client", branch = "next", default-features = false, features = ["std", "tonic", "testing"] }
+# NOTE: no "testing" feature here — that gates miden-client's test helpers
+# (e.g. `Client::test_rpc_api`, `miden_client::testing::mock`). Production
+# code must not depend on it. Crates that need it for *tests* re-enable it in
+# their own `[dev-dependencies]` (see crates/solver). resolver = "2" keeps the
+# dev-only feature from leaking into the production build.
+miden-client = { git = "https://github.com/0xMiden/miden-client", branch = "next", default-features = false, features = ["std", "tonic"] }
 miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", branch = "next" }
 miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
 miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }

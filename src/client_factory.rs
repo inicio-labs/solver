@@ -37,12 +37,6 @@ impl ProdClientFactory {
             keystore_path: config.solver.keystore_path.clone(),
         }
     }
-
-    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
-        let endpoint = Endpoint::try_from(self.endpoint.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
-        Ok(Arc::new(GrpcClient::new(&endpoint, self.timeout_ms)))
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -77,5 +71,14 @@ impl solver::ClientFactory for ProdClientFactory {
             .build()
             .await
             .context("Failed to build executor Miden client")
+    }
+
+    /// Standalone gRPC client at the configured endpoint — the same node the
+    /// ingest/executor clients talk to. Lets the zombie-note classification
+    /// path query nullifier commit heights without `Client::test_rpc_api()`.
+    fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
+        let endpoint = Endpoint::try_from(self.endpoint.as_str())
+            .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
+        Ok(Arc::new(GrpcClient::new(&endpoint, self.timeout_ms)))
     }
 }

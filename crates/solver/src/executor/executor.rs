@@ -557,11 +557,19 @@ pub(crate) fn spawn_executor_thread(
                         return;
                     }
                 };
+                let exec_rpc = match exec_factory.rpc() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = exec_ready_tx.send(Err(e.context("build executor rpc")));
+                        return;
+                    }
+                };
                 let executor_shared: Arc<Mutex<Client<FilesystemKeyStore>>> =
                     Arc::new(Mutex::new(client));
                 let executor_adapter: Arc<Mutex<dyn MidenClient>> =
                     Arc::new(Mutex::new(MidenClientAdapter {
                         client: executor_shared.clone(),
+                        rpc: exec_rpc,
                     }));
 
                 let run_client = executor_shared.clone();

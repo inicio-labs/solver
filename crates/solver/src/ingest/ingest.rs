@@ -481,10 +481,22 @@ pub(crate) fn spawn_ingest_thread(
                 // Otherwise `LocalSet::drop` after `block_on` returns would
                 // force-drop the `!Send` Client with no runtime context, whose
                 // Drop then panics ("panic in a destructor during cleanup").
+                //
+                // The `is_finished()` guard is load-bearing: if the `select!`
+                // above ended via a `&mut h.*_handle` arm, that handle was
+                // already polled to completion there. A `JoinHandle` is a
+                // one-shot future — awaiting it again panics with "JoinHandle
+                // polled after completion". So only `.await` the handles the
+                // `select!` did NOT already drive to completion; `abort()` on a
+                // finished task is a harmless no-op.
                 h.ingest_handle.abort();
                 h.subscribe_handle.abort();
-                let _ = h.ingest_handle.await;
-                let _ = h.subscribe_handle.await;
+                if !h.ingest_handle.is_finished() {
+                    let _ = h.ingest_handle.await;
+                }
+                if !h.subscribe_handle.is_finished() {
+                    let _ = h.subscribe_handle.await;
+                }
             });
         })
         .context("spawn ingest thread")?;

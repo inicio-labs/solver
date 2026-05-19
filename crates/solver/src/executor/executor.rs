@@ -622,10 +622,22 @@ pub(crate) fn spawn_executor_thread(
                 // drop here (runtime still entered), not in `LocalSet::drop`
                 // after `block_on` returns (which would panic in the `!Send`
                 // Client's destructor with no runtime context).
+                //
+                // The `is_finished()` guard is load-bearing: if the `select!`
+                // above ended via a `&mut *_handle` arm, that handle was
+                // already polled to completion there. A `JoinHandle` is a
+                // one-shot future — awaiting it again panics with "JoinHandle
+                // polled after completion". So only `.await` the handles the
+                // `select!` did NOT already drive to completion; `abort()` on a
+                // finished task is a harmless no-op.
                 executor_handle.abort();
                 executor_sync_handle.abort();
-                let _ = executor_handle.await;
-                let _ = executor_sync_handle.await;
+                if !executor_handle.is_finished() {
+                    let _ = executor_handle.await;
+                }
+                if !executor_sync_handle.is_finished() {
+                    let _ = executor_sync_handle.await;
+                }
             });
         })
         .context("spawn executor thread")?;

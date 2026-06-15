@@ -1,0 +1,16 @@
+[package]
+name = "mock-mirror"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+miden-client = { workspace = true }
+miden-client-sqlite-store = { workspace = true }
+miden-protocol.workspace = true
+miden-standards.workspace = true
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["rt", "macros", "time", "signal"] }
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/solver", "crates/consume-script"]
+members = ["crates/solver", "crates/consume-script", "crates/mock-mirror"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -1,0 +1,50 @@
+# Mock PSWAP mirroring service — testnet harness config.
+# Copy to mock.toml and fill in. Run: `mock-mirror mock.toml`.
+#
+# Setup assumptions (provisioned out-of-band, like the solver's account):
+#   * the mock account exists in `store_path` + its key in `keystore_path`;
+#   * every faucet listed under [[inventory]] is CONTROLLED by the mock
+#     (its account + key present in the same store/keystore) so the mock can
+#     mint top-ups.
+
+[rpc]
+endpoint = "http://<testnet-node>:57291"
+timeout_ms = 10000
+
+[mock]
+account_id = "0x<mock_account_id_hex>"
+keystore_path = "./mock_keystore"
+store_path = "./mock_store.sqlite3"
+
+[settings]
+# Solver's account — denylisted so the mock never mirrors solver-created notes.
+# (The mock's own account is always denied too.)
+solver_account_id = "0x<solver_account_id_hex>"
+# Solver's edge per mirror, in basis points (30 = 0.30%). Must be 1..10000.
+spread_bps = 30
+# Chance an order is mirrored as a HALF fill (leaves a remainder) vs full fill.
+partial_fill_probability = 0.2
+# Max counter-orders created per tick (safety valve against draining the pool).
+max_mirrors_per_tick = 20
+sync_interval_ms = 3000
+# Seed for the reproducible full-vs-partial coin flip.
+seed = 42
+# Hard guardrail: must be true to run against a mainnet endpoint. Keep false.
+allow_mainnet = false
+
+# One [[pairs]] block per market the mock makes (both directions subscribed).
+[[pairs]]
+token_a_faucet_id = "0x<faucet_a_hex>"
+token_b_faucet_id = "0x<faucet_b_hex>"
+
+# One [[inventory]] block per token the mock keeps funded. When the mock's
+# balance drops below `low_water`, it mints `topup` from that faucet.
+[[inventory]]
+faucet_id = "0x<faucet_a_hex>"
+low_water = 1000000
+topup = 10000000
+
+[[inventory]]
+faucet_id = "0x<faucet_b_hex>"
+low_water = 1000000
+topup = 10000000

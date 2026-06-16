@@ -38,6 +38,7 @@ swapp_test_state.json
 *_store.sqlite3
 
 # Per-deployment runtime config (carries env-specific account IDs / paths).
-# Commit solver.toml.example instead; real config is supplied per deployment
-# via this file (gitignored), --config <path>, or the SOLVER_CONFIG env var.
+# Commit the *.example instead; the real config is supplied per deployment via
+# these (gitignored) files, --config <path>, or the SOLVER_CONFIG env var.
 /solver.toml
+/mock.toml

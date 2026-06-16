@@ -2651,6 +2651,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-mirror"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "miden-client",
+ "miden-client-sqlite-store",
+ "miden-protocol",
+ "miden-standards",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

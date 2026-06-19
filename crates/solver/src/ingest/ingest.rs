@@ -55,6 +55,11 @@ pub trait MidenClient {
     /// executor after a non-RPC submit error to identify which input notes
     /// are zombies vs. which are still legitimately active.
     async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>>;
+
+    /// Fetch a public fungible faucet's on-chain metadata `(decimals, ticker)`
+    /// by id. Returns `None` if the account isn't a public faucet / doesn't
+    /// exist. Keyless — no signing, no pre-tracking.
+    async fn fetch_token_metadata(&mut self, faucet_id: TokenId) -> Result<Option<(u8, String)>>;
 }
 
 /// Run the note ingestion loop.
@@ -237,6 +242,7 @@ async fn ingest_once(
     Ok(())
 }
 
+
 /// Adapter that wraps the real `miden_client::Client` behind our `MidenClient`
 /// trait abstraction. The same trait is implemented by `MockMidenClient` for
 /// tests; this adapter makes the typed Client interchangeable in production.
@@ -389,6 +395,15 @@ impl MidenClient for MidenClientAdapter {
         }
         Ok(consumed)
     }
+
+    async fn fetch_token_metadata(&mut self, faucet_id: TokenId) -> Result<Option<(u8, String)>> {
+        let client = self.client.lock().await;
+        let meta = client
+            .fetch_remote_token_metadata(faucet_id)
+            .await
+            .map_err(|e| anyhow!("fetch_remote_token_metadata failed: {e}"))?;
+        Ok(meta.map(|m| (m.decimals, m.symbol)))
+    }
 }
 
 /// Spawn the keyless **ingest** OS thread: own `current_thread` runtime +
@@ -517,6 +532,9 @@ pub mod tests {
         /// Set of note IDs that should be reported as consumed by
         /// `check_consumed_notes`. Persistent — represents on-chain state.
         consumed_set: HashSet<NoteId>,
+        /// Canned on-chain metadata returned by `fetch_token_metadata`
+        /// (`None` = the faucet has no public metadata).
+        token_metadata: Option<(u8, String)>,
     }
 
     impl MockMidenClient {
@@ -526,7 +544,13 @@ pub mod tests {
                 block: 0,
                 pending_consumed: Vec::new(),
                 consumed_set: HashSet::new(),
+                token_metadata: None,
             }
+        }
+
+        /// Stage the `(decimals, ticker)` that `fetch_token_metadata` returns.
+        pub fn set_token_metadata(&mut self, decimals: u8, ticker: &str) {
+            self.token_metadata = Some((decimals, ticker.to_string()));
         }
 
         pub fn add_notes(&mut self, notes: Vec<Note>, block: u64) {
@@ -575,6 +599,10 @@ pub mod tests {
                 .map(|n| n.id())
                 .filter(|id| self.consumed_set.contains(id))
                 .collect())
+        }
+
+        async fn fetch_token_metadata(&mut self, _faucet_id: TokenId) -> Result<Option<(u8, String)>> {
+            Ok(self.token_metadata.clone())
         }
     }
 }

@@ -101,6 +101,58 @@ pub struct EngineConfig {
     /// changes. Pairs still map tokens → ids via `asset_*_external_symbol`.
     #[serde(default)]
     pub price_api_base_url: Option<String>,
+
+    // ── Public price-query HTTP API (wallets fetch token prices) ──────────────
+    // Distinct from `price_api_base_url` above, which is the UPSTREAM source we
+    // call; these configure the endpoint we SERVE. It runs on its own OS thread.
+    /// Port the price-query API binds. Default 8080.
+    #[serde(default = "default_price_query_port")]
+    pub price_query_port: u16,
+    /// Bind address. Default `"127.0.0.1"` (loopback). Set `"0.0.0.0"` to expose
+    /// publicly — front it with a reverse proxy / rate limiter.
+    #[serde(default = "default_price_query_bind")]
+    pub price_query_bind: String,
+    /// Max concurrent in-flight requests; excess is shed with `503`. Default 128.
+    #[serde(default = "default_price_query_max_inflight")]
+    pub price_query_max_inflight: usize,
+    /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default 50.
+    #[serde(default = "default_price_query_max_batch")]
+    pub price_query_max_batch: usize,
+    /// Per-request timeout in ms. Default 3000.
+    #[serde(default = "default_price_query_timeout_ms")]
+    pub price_query_timeout_ms: u64,
+    /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`
+    /// (mirrors CoinGecko's `precision`). One value applied to the price; distinct
+    /// from a token's on-chain decimals. Default `"full"`. Overridable per request.
+    #[serde(default = "default_price_precision")]
+    pub price_precision: String,
+    /// Quote currency (CoinGecko `vs_currencies`). Default `"usd"`. Must be a
+    /// CoinGecko-supported vs_currency (usd/eur/btc/…), NOT a coin like `"usdt"`.
+    #[serde(default = "default_price_vs_currency")]
+    pub price_vs_currency: String,
+    /// Max age (secs) of the last SUCCESSFUL price refresh before the price-query
+    /// API treats prices as stale (→ `503` unless `?allow_stale=true`). Default 30.
+    /// Set ≥ 2 × (price_interval_ms / 1000).
+    #[serde(default = "default_price_staleness_secs")]
+    pub price_staleness_secs: u64,
+}
+
+/// Resolved price precision (decimal places of the price NUMBER): `Full` or a
+/// fixed `0..=18`. Mirrors CoinGecko's `precision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PricePrecision {
+    Full,
+    Fixed(u8),
+}
+
+impl PricePrecision {
+    /// Parse `"full"` (case-insensitive) or an integer `0..=18`.
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("full") {
+            return Some(Self::Full);
+        }
+        s.parse::<u8>().ok().filter(|n| *n <= 18).map(Self::Fixed)
+    }
 }
 
 fn default_true() -> bool {
@@ -119,11 +171,53 @@ fn default_readiness_freshness_secs() -> u64 {
     60
 }
 
+fn default_price_query_port() -> u16 {
+    8080
+}
+fn default_price_query_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_price_query_max_inflight() -> usize {
+    128
+}
+fn default_price_query_max_batch() -> usize {
+    50
+}
+fn default_price_query_timeout_ms() -> u64 {
+    3000
+}
+fn default_price_precision() -> String {
+    "full".to_string()
+}
+fn default_price_vs_currency() -> String {
+    "usd".to_string()
+}
+fn default_price_staleness_secs() -> u64 {
+    30
+}
+
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        toml::from_str(&content).context("Failed to parse config file")
+        let config: SolverConfig =
+            toml::from_str(&content).context("Failed to parse config file")?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate fields that have constrained domains (fail fast at boot).
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            PricePrecision::parse(&self.engine.price_precision).is_some(),
+            "engine.price_precision must be \"full\" or an integer 0..=18, got {:?}",
+            self.engine.price_precision
+        );
+        anyhow::ensure!(
+            !self.engine.price_vs_currency.trim().is_empty(),
+            "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
+        );
+        Ok(())
     }
 
     pub fn save(&self, path: &str) -> Result<()> {

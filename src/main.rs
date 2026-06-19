@@ -109,8 +109,14 @@ async fn run() -> Result<()> {
     if config.engine.price_api_base_url.is_some() {
         tracing::info!(base = %price_base, "price feed pointed at custom base URL");
     }
+    let price_vs_currency = config.engine.price_vs_currency.clone();
     let make_price_client = move |symbol_map, api_key| {
-        solver::price::build_http_price_client_with_base(symbol_map, api_key, price_base)
+        solver::price::build_http_price_client_with_base(
+            symbol_map,
+            api_key,
+            price_base,
+            price_vs_currency,
+        )
     };
 
     solver::start(factory, make_price_client, solver_id, config, cancel).await

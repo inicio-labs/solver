@@ -1,4 +1,5 @@
 use anyhow::Result;
+use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::NoteId;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
@@ -13,7 +14,7 @@ use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
-use crate::price::{self, PriceClient, PriceSnapshot, SharedSymbolMap};
+use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -93,6 +94,13 @@ pub async fn subscribe_all_pairs(
     client: &mut dyn MidenClient,
 ) -> anyhow::Result<()> {
     let tokens = db::load_registered_tokens(db_pool)?;
+    // Cache each registered token's on-chain metadata once, at boot. Config
+    // `[[pairs]]` are seeded into the DB before this runs (`prepare_db`), so this
+    // is the registration point for config tokens — the runtime (admin) path is
+    // handled by the subscribe relay below.
+    for token in &tokens {
+        ensure_token_metadata(client, db_pool, *token).await;
+    }
     for i in 0..tokens.len() {
         for j in 0..tokens.len() {
             if i != j {
@@ -101,6 +109,62 @@ pub async fn subscribe_all_pairs(
         }
     }
     Ok(())
+}
+
+/// Fetch a token's on-chain metadata (decimals, ticker) from the node and cache
+/// it in `registered_tokens` — but only the first time, since decimals are an
+/// immutable faucet property. Idempotent (a no-op once `decimals` is set) and
+/// best-effort: on any RPC/DB error it logs and leaves the row NULL, so the next
+/// registration touching this token (or a restart) retries. Must run on the
+/// ingest thread — the only place the `!Send` Miden client lives.
+async fn ensure_token_metadata(
+    client: &mut dyn MidenClient,
+    pool: &db::DbPool,
+    token: TokenId,
+) {
+    let key = token.to_bytes();
+
+    // Already cached? Check first so we never re-hit the RPC for a known token
+    // (the admin path replays a token across every pair it forms).
+    match pool.write_conn() {
+        Ok(mut conn) => match db::get_registered_token(&mut conn, &key) {
+            Ok(Some(row)) if row.decimals.is_some() => return, // already have it
+            Ok(Some(_)) => {}                                  // registered, still missing → fetch
+            Ok(None) => return,                                // not registered → nothing to annotate
+            Err(e) => {
+                tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed");
+            return;
+        }
+    }
+
+    match client.fetch_token_metadata(token).await {
+        Ok(Some((decimals, ticker))) => match pool.write_conn() {
+            Ok(mut conn) => {
+                if let Err(e) = db::set_token_metadata(
+                    &mut conn,
+                    &key,
+                    Some(i32::from(decimals)),
+                    Some(&ticker),
+                ) {
+                    tracing::warn!(%token, error = %e, "ensure_token_metadata: persist failed");
+                } else {
+                    tracing::info!(%token, decimals, ticker = %ticker, "fetched on-chain token metadata");
+                }
+            }
+            Err(e) => tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed"),
+        },
+        Ok(None) => {
+            tracing::debug!(%token, "no on-chain metadata (private/non-faucet); will retry on next registration")
+        }
+        Err(e) => {
+            tracing::warn!(%token, error = %e, "fetch_token_metadata failed; will retry on next registration")
+        }
+    }
 }
 
 // ===========================================================================
@@ -121,6 +185,9 @@ pub struct PipelineChannels {
     pub consumed_rx: mpsc::Receiver<NoteId>,
     pub price_tx: watch::Sender<PriceSnapshot>,
     pub price_rx: watch::Receiver<PriceSnapshot>,
+    /// Full-precision price side-channel — consumed only by the price-query API.
+    pub precise_tx: watch::Sender<PreciseSnapshot>,
+    pub precise_rx: watch::Receiver<PreciseSnapshot>,
     pub exec_tx: mpsc::Sender<ExecutionBatch>,
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
@@ -131,6 +198,7 @@ pub fn create_channels() -> PipelineChannels {
     let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
     let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
+    let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     PipelineChannels {
@@ -140,6 +208,8 @@ pub fn create_channels() -> PipelineChannels {
         consumed_rx,
         price_tx,
         price_rx,
+        precise_tx,
+        precise_rx,
         exec_tx,
         exec_rx,
         subscribe_tx,
@@ -186,16 +256,18 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     consumed_rx: mpsc::Receiver<NoteId>,
     price_tx: watch::Sender<PriceSnapshot>,
     price_rx: watch::Receiver<PriceSnapshot>,
+    precise_tx: watch::Sender<PreciseSnapshot>,
+    last_price_update: Arc<AtomicI64>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
 ) -> CoreHandles {
-    // Price feed.
+    // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
     let price_pool = config.db_pool.clone();
     let price_interval = config.price_interval;
     let price_cancel = config.cancel.clone();
     let price_handle = tokio::task::spawn_local(async move {
         tokio::select! {
-            _ = price::run_price_feed(price_client, price_pool, price_tx, price_interval) => {}
+            _ = price::run_price_feed(price_client, price_pool, price_tx, precise_tx, last_price_update, price_interval) => {}
             _ = price_cancel.cancelled() => {}
         }
     });
@@ -284,8 +356,11 @@ pub async fn spawn_ingest_tasks(
 
     // Subscribe-relay task: admin (on the main thread) sends (offered,
     // requested) tuples across the channel; this task applies them via the
-    // ingest client.
+    // ingest client. It is also the registration point where a newly-registered
+    // token's on-chain metadata is fetched (once) — admin can't, since the
+    // `!Send` client lives on this thread.
     let subscribe_client = adapter.clone();
+    let subscribe_pool = db_pool.clone();
     let subscribe_cancel = cancel.clone();
     let subscribe_handle = tokio::task::spawn_local(async move {
         loop {
@@ -296,6 +371,10 @@ pub async fn spawn_ingest_tasks(
                     if let Err(e) = client.subscribe_pair(offered, requested).await {
                         tracing::warn!(%offered, %requested, error = %e, "subscribe_pair failed");
                     }
+                    // Cache on-chain metadata for any token new to us (no-op if
+                    // already known).
+                    ensure_token_metadata(&mut *client, &subscribe_pool, offered).await;
+                    ensure_token_metadata(&mut *client, &subscribe_pool, requested).await;
                 }
                 else => break,
             }
@@ -448,8 +527,9 @@ mod tests {
         let client = MockPriceClient::new(prices.clone());
         let result = client.fetch_prices(&[token_a, token_b]).await.unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[&token_a], 200_000);
-        assert_eq!(result[&token_b], 100);
+        // MockPriceClient stores cents as full-precision USD (cents / 100).
+        assert_eq!(result[&token_a].usd, 2000.0);
+        assert_eq!(result[&token_b].usd, 1.0);
     }
 
     #[tokio::test]
@@ -461,7 +541,7 @@ mod tests {
 
         let client = MockPriceClient::new(prices);
         let result = client.fetch_prices(&[]).await.unwrap();
-        assert_eq!(result[&token_a], 500);
+        assert_eq!(result[&token_a].usd, 5.0);
     }
 
     #[test]
@@ -565,5 +645,33 @@ mod tests {
         let mut mock_client = MockMidenClient::new();
         let result = subscribe_all_pairs(&pool, &mut mock_client).await;
         assert!(result.is_ok());
+    }
+
+    /// Metadata is fetched + cached at registration (the subscribe pass), not on
+    /// an ingest tick.
+    #[tokio::test]
+    async fn subscribe_all_pairs_caches_on_chain_metadata() {
+        let pool = test_db_pool();
+        let token_a = test_token_a();
+        let token_b = test_token_b();
+        db::seed_tokens_from_config(&pool, &[(token_a, None), (token_b, None)]).unwrap();
+
+        // Freshly seeded rows carry no metadata yet.
+        let key_a = token_a.to_bytes();
+        {
+            let mut conn = pool.read_conn().unwrap();
+            let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+            assert!(row.decimals.is_none() && row.ticker.is_none());
+        }
+
+        // Subscribing (the boot registration point) fetches + persists it once.
+        let mut mock_client = MockMidenClient::new();
+        mock_client.set_token_metadata(8, "MTA");
+        subscribe_all_pairs(&pool, &mut mock_client).await.unwrap();
+
+        let mut conn = pool.read_conn().unwrap();
+        let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+        assert_eq!(row.decimals, Some(8));
+        assert_eq!(row.ticker.as_deref(), Some("MTA"));
     }
 }

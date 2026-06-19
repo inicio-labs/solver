@@ -91,6 +91,14 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     obs_port: 0,
                     readiness_freshness_secs: 60,
                     price_api_base_url: None,
+                    price_query_port: 8080,
+                    price_query_bind: "127.0.0.1".to_string(),
+                    price_query_max_inflight: 128,
+                    price_query_max_batch: 50,
+                    price_query_timeout_ms: 3000,
+                    price_precision: "full".to_string(),
+                    price_vs_currency: "usd".to_string(),
+                    price_staleness_secs: 30,
                 },
             };
 

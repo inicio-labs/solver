@@ -142,6 +142,11 @@ pub async fn start(
     let channels = pipeline::create_channels();
     pipeline::prepare_db(&pipeline_config).context("prepare_db")?;
 
+    // Last successful price-refresh timestamp (shared: bumped by the price feed,
+    // read by the price-query API for staleness). Init to 0 so the API reports
+    // stale until the first real fetch (no fabricated-fresh empty snapshot).
+    let last_price_update = Arc::new(std::sync::atomic::AtomicI64::new(0));
+
     // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's
     //     LocalSet — the main coordination thread.
     let core = pipeline::spawn_core_services(
@@ -151,6 +156,8 @@ pub async fn start(
         channels.consumed_rx,
         channels.price_tx,
         channels.price_rx,
+        channels.precise_tx,
+        last_price_update.clone(),
         channels.exec_tx,
         channels.subscribe_tx,
     );
@@ -202,6 +209,28 @@ pub async fn start(
         Duration::from_millis(config.engine.fetch_interval_ms),
     )?;
 
+    // 13b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +
+    //      multi-thread runtime so wallet traffic can't starve settlement. Reads
+    //      the precise price side-channel + DB; never touches a `!Send` client.
+    let price_api_cfg = crate::price_api::PriceApiConfig {
+        bind: config.engine.price_query_bind.clone(),
+        port: config.engine.price_query_port,
+        max_inflight: config.engine.price_query_max_inflight,
+        max_batch: config.engine.price_query_max_batch,
+        timeout_ms: config.engine.price_query_timeout_ms,
+        vs_currency: config.engine.price_vs_currency.clone(),
+        precision: config.engine.price_precision.clone(),
+        staleness_secs: config.engine.price_staleness_secs,
+        price_interval_ms: config.engine.price_interval_ms,
+    };
+    let (price_api_thread, price_api_ready_rx) = crate::price_api::spawn_price_api_thread(
+        price_api_cfg,
+        channels.precise_rx,
+        db_pool.clone(),
+        last_price_update,
+        cancel.clone(),
+    )?;
+
     // 14. Startup gate: both client threads must report ready (client built +
     //     tasks spawned) before startup is considered successful. Any build /
     //     subscribe failure -> cancel everything, join, return the error.
@@ -216,6 +245,11 @@ pub async fn start(
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("executor thread exited before signalling readiness")),
         }
+        match price_api_ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(anyhow!("price-api thread exited before signalling readiness")),
+        }
         Ok(())
     }
     .await;
@@ -225,11 +259,12 @@ pub async fn start(
         let _ = tokio::task::spawn_blocking(move || {
             let _ = ingest_thread.join();
             let _ = executor_thread.join();
+            let _ = price_api_thread.join();
         })
         .await;
         return Err(e).context("startup failed");
     }
-    tracing::info!("both client threads ready; solver running");
+    tracing::info!("ingest + executor + price-api threads ready; solver running");
 
     // 15. Await shutdown: cancellation, or any main-thread Send service
     //     exiting. The client threads are joined in step 16.
@@ -260,6 +295,9 @@ pub async fn start(
         }
         if let Err(e) = executor_thread.join() {
             tracing::error!(?e, "executor thread panicked");
+        }
+        if let Err(e) = price_api_thread.join() {
+            tracing::error!(?e, "price-api thread panicked");
         }
     })
     .await;

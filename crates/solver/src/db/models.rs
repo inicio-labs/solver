@@ -58,4 +58,9 @@ pub struct RegisteredTokenRow {
     pub token_id: Vec<u8>,
     pub created_at: i64,
     pub external_symbol: Option<String>,
+    /// On-chain token decimals, fetched from the faucet once at registration
+    /// (NULL until known). `Integer` (i32) since a `u8` fits trivially.
+    pub decimals: Option<i32>,
+    /// On-chain token symbol/ticker (e.g. "USDC"), fetched with `decimals`.
+    pub ticker: Option<String>,
 }

@@ -164,7 +164,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             let solver_db = solver_temp.path().join("solver.sqlite3");
             let solver_db_path = solver_db.to_string_lossy().into_owned();
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000 },
+                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),

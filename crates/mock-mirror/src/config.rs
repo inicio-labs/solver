@@ -27,6 +27,12 @@ pub struct RpcCfg {
     /// Network the endpoint belongs to: `devnet` | `testnet` | `mainnet`. Drives
     /// the bech32 address prefix (`mdev` / `mtst` / `mm`) when printing addresses.
     pub network: String,
+    /// Optional remote transaction-prover URL (e.g.
+    /// `https://tx-prover.devnet.miden.io`). When set, the mock offloads proving
+    /// of its counter-order txs to it instead of proving locally. Omit to prove
+    /// locally.
+    #[serde(default)]
+    pub prover_endpoint: Option<String>,
 }
 
 impl RpcCfg {

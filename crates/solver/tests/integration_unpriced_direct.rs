@@ -126,7 +126,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
             });
             let solver_db = solver_temp.path().join("solver.sqlite3");
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000 },
+                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),

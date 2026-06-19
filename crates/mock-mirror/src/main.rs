@@ -15,6 +15,7 @@
 
 mod config;
 mod mirror;
+mod ops;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,9 +29,11 @@ use miden_client::auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
-use miden_client::Client;
+use miden_client::{Client, RemoteTransactionProver};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use miden_protocol::address::Address;
+use miden_protocol::account::AccountId;
+use miden_protocol::address::{Address, NetworkId};
+use miden_protocol::asset::FungibleAsset;
 use rand::RngCore;
 use tracing_subscriber::EnvFilter;
 
@@ -44,6 +47,20 @@ async fn run() -> Result<()> {
     // args: `mock-mirror [provision|run] [config]`. A bare path (no subcommand)
     // is treated as `run <path>` for back-compat.
     let args: Vec<String> = std::env::args().collect();
+
+    // Stateless / ops subcommands handled before the config-driven run/provision.
+    match args.get(1).map(String::as_str) {
+        // `addr <id>...` — convert bech32 (mdev…/mtst…/mm…) ↔ hex. No config.
+        Some("addr") => return addr_convert(&args[2..]),
+        // `claim <config>` — consume minted notes into the account's vault.
+        Some("claim") => return run_claim(&args[2..]).await,
+        // `pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt>`.
+        Some("pswap") => return run_pswap(&args[2..]).await,
+        // `balance <config> <faucet_hex>...` — print vault balances.
+        Some("balance") => return run_balance(&args[2..]).await,
+        _ => {}
+    }
+
     let (cmd, path): (&str, String) = match args.get(1).map(String::as_str) {
         Some("provision") => ("provision", args.get(2).cloned().unwrap_or_else(default_config)),
         Some("run") => ("run", args.get(2).cloned().unwrap_or_else(default_config)),
@@ -66,6 +83,76 @@ fn default_config() -> String {
     "mock.toml".to_string()
 }
 
+/// Load the configured account id + a built client.
+async fn account_and_client(config: &str) -> Result<(AccountId, Client<FilesystemKeyStore>)> {
+    let cfg = MockConfig::load(config).with_context(|| format!("load {config}"))?;
+    let account = AccountId::from_hex(
+        cfg.mock.account_id.as_deref().context("mock.account_id required")?,
+    )
+    .context("parse mock.account_id")?;
+    let (client, _keystore) = build_client(&cfg).await?;
+    Ok((account, client))
+}
+
+/// `claim <config>` — consume the faucet's mint notes into the account's vault.
+async fn run_claim(a: &[String]) -> Result<()> {
+    let config = a.first().context("usage: mock-mirror claim <config>")?;
+    let (account, mut client) = account_and_client(config).await?;
+    let n = ops::claim(&mut client, account).await?;
+    println!("claimed {n} note(s) into {}", account.to_hex());
+    Ok(())
+}
+
+/// `pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt>`.
+async fn run_pswap(a: &[String]) -> Result<()> {
+    let usage = "usage: mock-mirror pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt>";
+    let config = a.first().context(usage)?;
+    let offer_faucet = AccountId::from_hex(a.get(1).context(usage)?).context("offer_faucet")?;
+    let offer_amt: u64 = a.get(2).context(usage)?.parse().context("offer_amt")?;
+    let req_faucet = AccountId::from_hex(a.get(3).context(usage)?).context("req_faucet")?;
+    let req_amt: u64 = a.get(4).context(usage)?.parse().context("req_amt")?;
+
+    let (account, mut client) = account_and_client(config).await?;
+    let offered = FungibleAsset::new(offer_faucet, offer_amt).map_err(|e| anyhow::anyhow!("offered: {e}"))?;
+    let requested = FungibleAsset::new(req_faucet, req_amt).map_err(|e| anyhow::anyhow!("requested: {e}"))?;
+    ops::create_pswap(&mut client, account, offered, requested).await?;
+    println!(
+        "PSWAP created from {}: offer {offer_amt} of {} / request {req_amt} of {}",
+        account.to_hex(),
+        offer_faucet.to_hex(),
+        req_faucet.to_hex()
+    );
+    Ok(())
+}
+
+/// `balance <config> <faucet_hex>...` — print vault balances.
+async fn run_balance(a: &[String]) -> Result<()> {
+    let config = a.first().context("usage: mock-mirror balance <config> <faucet_hex>...")?;
+    let faucets: Vec<AccountId> = a[1..]
+        .iter()
+        .map(|s| AccountId::from_hex(s).with_context(|| format!("parse faucet {s}")))
+        .collect::<Result<_>>()?;
+    let (account, mut client) = account_and_client(config).await?;
+    println!("account {}", account.to_hex());
+    ops::balances(&mut client, account, &faucets).await
+}
+
+/// Convert account ids between bech32 and hex (both directions).
+fn addr_convert(ids: &[String]) -> Result<()> {
+    for s in ids {
+        if let Ok((net, id)) = AccountId::from_bech32(s) {
+            println!("{s}  ->  hex {}  (network {net:?})", id.to_hex());
+        } else if let Ok(id) = AccountId::from_hex(s) {
+            let dev = Address::new(id).encode(NetworkId::Devnet);
+            let test = Address::new(id).encode(NetworkId::Testnet);
+            println!("{s}  ->  devnet {dev}  |  testnet {test}");
+        } else {
+            println!("{s}  ->  ERROR: not a valid bech32 or hex account id");
+        }
+    }
+    Ok(())
+}
+
 /// Build the account-tracking client (RPC + sqlite store + filesystem keystore).
 /// Returns the keystore handle too, since key registration during provisioning
 /// needs the same instance handed to the builder.
@@ -78,13 +165,14 @@ async fn build_client(
     let keystore = Arc::new(
         FilesystemKeyStore::new(PathBuf::from(&cfg.mock.keystore_path)).context("open keystore")?,
     );
-    let client = ClientBuilder::new()
+    let mut builder = ClientBuilder::new()
         .rpc(rpc)
         .sqlite_store(PathBuf::from(&cfg.mock.store_path))
-        .authenticator(keystore.clone())
-        .build()
-        .await
-        .context("build miden client")?;
+        .authenticator(keystore.clone());
+    if let Some(url) = &cfg.rpc.prover_endpoint {
+        builder = builder.prover(Arc::new(RemoteTransactionProver::new(url.clone())));
+    }
+    let client = builder.build().await.context("build miden client")?;
     Ok((client, keystore))
 }
 

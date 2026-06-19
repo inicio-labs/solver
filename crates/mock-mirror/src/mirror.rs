@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
+use miden_client::store::NoteFilter;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client::Client;
 use miden_protocol::account::AccountId;
@@ -135,6 +136,16 @@ async fn tick(
 ) -> Result<()> {
     let summary = client.sync_state().await.map_err(|e| anyhow!("sync_state: {e}"))?;
 
+    // 0. AUTO-CLAIM incoming P2ID notes (funding + trade proceeds) into the
+    //    vault — but NOT PSWAP notes (those are user orders we counter, and the
+    //    solver consumes them). If we claimed anything, skip the rest this tick
+    //    so the consume tx commits before we spend that inventory in a counter.
+    let claimed = claim_incoming(client, mock_id).await?;
+    if claimed > 0 {
+        tracing::info!(claimed, "auto-claimed incoming notes; posting counters next tick");
+        return Ok(());
+    }
+
     // 1. MIRROR — collect new user orders, build all counters, submit one tx.
     let mut specs: Vec<(FungibleAsset, FungibleAsset)> = Vec::new();
     for note_id in summary.new_public_notes.iter().chain(summary.new_private_notes.iter()) {
@@ -234,6 +245,38 @@ fn build_counter_notes(
         notes.push(pswap.into());
     }
     Ok(notes)
+}
+
+/// Consume incoming **P2ID** notes (funding mints + trade-proceeds paybacks)
+/// into the account's vault. Deliberately SKIPS PSWAP notes: those are the user
+/// orders the mirror counters (and the solver consumes) — consuming them here
+/// would steal/short-circuit them. Returns how many were consumed. Assumes the
+/// client was just synced.
+async fn claim_incoming(client: &mut MockClient, account: AccountId) -> Result<usize> {
+    let mut notes: Vec<Note> = Vec::new();
+    for record in client
+        .get_input_notes(NoteFilter::Committed)
+        .await
+        .map_err(|e| anyhow!("get_input_notes: {e}"))?
+    {
+        let note: Note = record.try_into().map_err(|_| anyhow!("input-note record -> Note"))?;
+        if note.recipient().script().root() == PswapNote::script_root() {
+            continue; // a user PSWAP order — counter it, never consume it
+        }
+        notes.push(note);
+    }
+    if notes.is_empty() {
+        return Ok(0);
+    }
+    let count = notes.len();
+    let request = TransactionRequestBuilder::new()
+        .build_consume_notes(notes)
+        .map_err(|e| anyhow!("build consume: {e}"))?;
+    client
+        .submit_new_transaction(account, request)
+        .await
+        .map_err(|e| anyhow!("submit consume: {e}"))?;
+    Ok(count)
 }
 
 async fn subscribe_pairs(client: &mut MockClient, cfg: &MockConfig) -> Result<()> {

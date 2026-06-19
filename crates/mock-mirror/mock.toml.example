@@ -11,6 +11,8 @@ timeout_ms = 10000
 # Network: devnet | testnet | mainnet. Sets the bech32 address prefix
 # (mdev / mtst / mm) when provision prints the account address.
 network = "devnet"
+# Remote prover (offload proving; essential on small hosts). Omit to prove locally.
+prover_endpoint = "https://tx-prover.devnet.miden.io"
 
 [mock]
 # Filled in by `mock-mirror provision` (it prints this). Leave unset to provision.

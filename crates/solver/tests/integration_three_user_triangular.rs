@@ -187,6 +187,7 @@ fn build_solver_config(
         rpc: RpcConfig {
             endpoint: "http://unused".into(),
             timeout_ms: 1_000,
+            prover_endpoint: None,
         },
         solver: SolverAccountConfig {
             account_id: solver_account_id.to_hex(),

@@ -60,8 +60,10 @@ begin
     # Since we control the test, let's embed num_assets as the FIRST Felt in the advice data,
     # and adjust the hash accordingly.
 
-    # Pop num_assets from advice stack (first element of the advice data)
-    adv_push.1
+    # Pop num_assets from advice stack (first element of the advice data).
+    # NOTE: miden-assembly 0.23 removed the `adv_push.N` immediate form; bare
+    # `adv_push` pushes a single element (use it N times for N elements).
+    adv_push
     # => [num_assets, COMMITMENT_KEY, pad...]
 
     # Assert > 0

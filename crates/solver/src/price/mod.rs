@@ -5,7 +5,8 @@
 
 pub mod coingecko;
 pub use coingecko::{
-    build_http_price_client, read_symbol_map, write_symbol_map, HttpPriceClient, SharedSymbolMap,
+    build_http_price_client, build_http_price_client_with_base, read_symbol_map, write_symbol_map,
+    HttpPriceClient, SharedSymbolMap, COINGECKO_BASE,
 };
 
 mod price;

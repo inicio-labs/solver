@@ -259,6 +259,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    price_api_base_url: None,
                 },
             };
 

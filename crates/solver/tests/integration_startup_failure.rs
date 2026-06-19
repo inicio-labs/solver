@@ -90,6 +90,7 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    price_api_base_url: None,
                 },
             };
 

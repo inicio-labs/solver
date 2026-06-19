@@ -151,6 +151,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    price_api_base_url: None,
                 },
             };
 

@@ -43,5 +43,7 @@ miden-protocol = { workspace = true, features = ["testing"] }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }
 tempfile = "3"
+# Adversarial property-based fuzzing of the matching math (pentest).
+proptest = "1"
 # test-util is dev-only; enables tokio::time::pause/advance + start_paused on #[tokio::test].
 tokio = { version = "1.40", features = ["test-util"] }

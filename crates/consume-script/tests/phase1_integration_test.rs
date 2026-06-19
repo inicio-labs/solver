@@ -202,7 +202,7 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     let usdc_surplus: u64 = added
         .iter()
         .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(f.amount()),
+            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
             _ => None,
         })
         .sum();
@@ -211,7 +211,7 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     let eth_surplus: u64 = added
         .iter()
         .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == eth_faucet.id() => Some(f.amount()),
+            Asset::Fungible(f) if f.faucet_id() == eth_faucet.id() => Some(u64::from(f.amount())),
             _ => None,
         })
         .sum();

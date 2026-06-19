@@ -16,7 +16,7 @@ use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::testing::common::insert_new_wallet;
 use miden_client::testing::mock::MockRpcApi;
-use miden_protocol::account::AccountStorageMode;
+use miden_protocol::account::AccountType;
 use miden_testing::MockChain;
 use solver::config::{EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
@@ -48,7 +48,7 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("FilesystemKeyStore::new: {e}"))?;
                 let (acct, _) = insert_new_wallet(
                     &mut sc,
-                    AccountStorageMode::Public,
+                    AccountType::Public,
                     &ks,
                     AuthSchemeId::Falcon512Poseidon2,
                 )

@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
-use miden_client::note::{NoteAttachment, NoteType};
+use miden_client::note::NoteType;
 use miden_client::testing::common::{
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
-use miden_protocol::account::AccountStorageMode;
+use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
 use solver::config::{
@@ -65,7 +65,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
 
             let scheme = AuthSchemeId::Falcon512Poseidon2;
-            let mode = AccountStorageMode::Public;
+            let mode = AccountType::Public;
 
             let (usdc, _) =
                 insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
@@ -125,7 +125,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     ),
                     NoteType::Public,
                     NoteType::Public,
-                    NoteAttachment::default(),
+                    None,
                     user_client.rng(),
                 )
                 .map_err(|e| anyhow::anyhow!("alice build_pswap_create: {e}"))?;
@@ -142,7 +142,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     ),
                     NoteType::Public,
                     NoteType::Public,
-                    NoteAttachment::default(),
+                    None,
                     user_client.rng(),
                 )
                 .map_err(|e| anyhow::anyhow!("bob build_pswap_create: {e}"))?;
@@ -159,7 +159,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     ),
                     NoteType::Public,
                     NoteType::Public,
-                    NoteAttachment::default(),
+                    None,
                     user_client.rng(),
                 )
                 .map_err(|e| anyhow::anyhow!("charlie build_pswap_create: {e}"))?;

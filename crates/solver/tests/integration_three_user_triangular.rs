@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
-use miden_client::note::{NoteAttachment, NoteType};
+use miden_client::note::NoteType;
 use miden_client::testing::common::{
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
@@ -34,7 +34,7 @@ use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_client::Client;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_protocol::account::{AccountId, AccountStorageMode};
+use miden_protocol::account::{AccountId, AccountType};
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
 use solver::config::{
@@ -70,7 +70,7 @@ async fn setup_chain_with_three_pswaps() -> Result<TriangularSetup> {
         .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
 
     let scheme = AuthSchemeId::Falcon512Poseidon2;
-    let mode = AccountStorageMode::Public;
+    let mode = AccountType::Public;
 
     let (usdc, _) = insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
     let (eth, _) = insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
@@ -151,7 +151,7 @@ async fn submit_pswap(
             &PswapTransactionData::new(creator, offered, requested),
             NoteType::Public,
             NoteType::Public,
-            NoteAttachment::default(),
+            None,
             client.rng(),
         )
         .map_err(|e| anyhow::anyhow!("build_pswap_create: {e}"))?;
@@ -262,7 +262,7 @@ async fn provision_solver(
         .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
     let (acct, _) = insert_new_wallet(
         &mut c,
-        AccountStorageMode::Public,
+        AccountType::Public,
         &ks,
         AuthSchemeId::Falcon512Poseidon2,
     )

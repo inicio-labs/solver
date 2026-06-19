@@ -10,20 +10,19 @@ mod test_debug_surplus;
 
 use miden_protocol::account::AccountId;
 use miden_protocol::note::NoteId;
-use miden_protocol::Felt;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_3,
-    ACCOUNT_ID_NETWORK_FUNGIBLE_FAUCET,
+    ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET,
 };
 
 /// Create a deterministic NoteId from a u64 seed.
 fn make_note_id(seed: u64) -> NoteId {
-    let w1 = [Felt::new(seed), Felt::new(seed + 1), Felt::new(seed + 2), Felt::new(seed + 3)];
-    let w2 = [Felt::new(seed + 4), Felt::new(seed + 5), Felt::new(seed + 6), Felt::new(seed + 7)];
-    NoteId::new(w1.into(), w2.into())
+    // `NoteId::new` now needs a details commitment + metadata; for a unique,
+    // deterministic test id a hex-encoded Word is the simplest fabrication.
+    NoteId::try_from_hex(&format!("0x{seed:064x}")).expect("valid note id hex")
 }
 
 /// Sequential NoteId counter for tests. Returns a unique NoteId each call.
@@ -54,5 +53,5 @@ fn btc() -> AccountId {
 }
 
 fn matic() -> AccountId {
-    ACCOUNT_ID_NETWORK_FUNGIBLE_FAUCET.try_into().unwrap()
+    ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET.try_into().unwrap()
 }

@@ -139,7 +139,7 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     let usdc_added: u64 = added
         .iter()
         .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(f.amount()),
+            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
             _ => None,
         })
         .sum();

@@ -55,8 +55,10 @@ impl ConsumeAssetScript {
         let num_assets = assets.len() as u64;
         let mut advice_felts: Vec<Felt> = Vec::with_capacity(1 + assets.len() * 8);
 
-        // First element: number of assets (read by the MASM script via adv_push.1)
-        advice_felts.push(Felt::new(num_assets));
+        // First element: number of assets (read by the MASM script via adv_push.1).
+        // `Felt::new` is fallible since miden-core 0.23; an asset count trivially
+        // fits in the field, so this never errors.
+        advice_felts.push(Felt::new(num_assets).expect("asset count fits in the field"));
 
         for asset in assets {
             let key_word = asset.to_key_word();

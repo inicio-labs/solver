@@ -3,18 +3,25 @@ members = ["crates/solver", "crates/consume-script"]
 resolver = "2"
 
 [workspace.dependencies]
-# NOTE: no "testing" feature here — that gates miden-client's test helpers
-# (e.g. `Client::test_rpc_api`, `miden_client::testing::mock`). Production
-# code must not depend on it. Crates that need it for *tests* re-enable it in
-# their own `[dev-dependencies]` (see crates/solver). resolver = "2" keeps the
-# dev-only feature from leaking into the production build.
-miden-client = { git = "https://github.com/0xMiden/miden-client", branch = "next", default-features = false, features = ["std", "tonic"] }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", branch = "next" }
-miden-protocol = { git = "https://github.com/0xMiden/protocol", branch = "next", default-features = false, features = ["testing"] }
-miden-standards = { git = "https://github.com/0xMiden/protocol", branch = "next" }
-miden-testing = { git = "https://github.com/0xMiden/protocol", branch = "next" }
-miden-core = "0.22"
-miden-crypto = "0.23"
+# Pinned to the released v0.15.2 client tag + the protocol 0.15.3 it depends on
+# (miden-client v0.15.2's manifest declares miden-protocol = "0.15.3"). The
+# client is only published as a git tag (not on crates.io); the protocol crates
+# ARE on crates.io at 0.15.3 and must be used from there so they unify with the
+# client's own protocol dependency. (v0.15.2 is the client release that fixes
+# the v0.15.1↔0.15.3 TransportNote mismatch.)
+#
+# NO "testing" feature on the production miden-client/miden-protocol deps — it
+# gates miden-client's `test_rpc_api` and protocol test utilities. Tests
+# re-enable it in `[dev-dependencies]` (see crates/solver); resolver = "2" keeps
+# it out of the production build.
+miden-client = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2" }
+miden-protocol = { version = "0.15.3", default-features = false }
+miden-standards = "0.15.3"
+miden-testing = "0.15.3"
+# VM layer that protocol 0.15.3 uses (miden-client v0.15.2 → miden-processor 0.23).
+miden-core = "0.23"
+miden-crypto = "0.25"
 
 [package]
 name = "solver-bin"

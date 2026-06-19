@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
-use miden_client::note::{NoteAttachment, NoteType};
+use miden_client::note::NoteType;
 use miden_client::testing::common::{
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
-use miden_protocol::account::AccountStorageMode;
+use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
 use solver::config::{
@@ -52,7 +52,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 miden_client::keystore::FilesystemKeyStore::new(user_keystore_path.clone())
                     .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
             let scheme = AuthSchemeId::Falcon512Poseidon2;
-            let mode = AccountStorageMode::Public;
+            let mode = AccountType::Public;
 
             // `foo` is the UNPRICED token; `eth` is priced.
             let (foo, _) =
@@ -88,7 +88,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                         ),
                         NoteType::Public,
                         NoteType::Public,
-                        NoteAttachment::default(),
+                        None,
                         user_client.rng(),
                     )
                     .map_err(|e| anyhow::anyhow!("build_pswap_create: {e}"))?;

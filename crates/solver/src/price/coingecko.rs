@@ -34,7 +34,10 @@ pub fn write_symbol_map(m: &SharedSymbolMap) -> RwLockWriteGuard<'_, HashMap<Tok
     m.write().unwrap_or_else(|e| e.into_inner())
 }
 
-const COINGECKO_BASE: &str = "https://api.coingecko.com/api/v3/simple/price";
+/// Default public CoinGecko "simple price" endpoint. Override per-deployment via
+/// `[engine].price_api_base_url` (e.g. a self-hosted or mock price service for
+/// devnet/local) — see [`HttpPriceClient::new_with_base`].
+pub const COINGECKO_BASE: &str = "https://api.coingecko.com/api/v3/simple/price";
 
 #[derive(Deserialize)]
 struct CgPriceEntry {
@@ -63,6 +66,18 @@ pub fn build_http_price_client(
     Ok(Box::new(HttpPriceClient::new(symbol_map, api_key)?))
 }
 
+/// Like [`build_http_price_client`] but with an explicit base URL — point the
+/// **real** production price path at a self-hosted or mock CoinGecko-compatible
+/// endpoint (devnet/local) instead of the public API. A `None`/default base
+/// just yields the public CoinGecko client.
+pub fn build_http_price_client_with_base(
+    symbol_map: SharedSymbolMap,
+    api_key: Option<String>,
+    base: String,
+) -> Result<Box<dyn PriceClient + Send + Sync>> {
+    Ok(Box::new(HttpPriceClient::new_with_base(symbol_map, api_key, base)?))
+}
+
 impl HttpPriceClient {
     /// Construct a client targeting the public CoinGecko API. The `api_key`,
     /// if provided, is sent as the `x-cg-demo-api-key` header (Demo API tier).
@@ -74,9 +89,11 @@ impl HttpPriceClient {
         Self::new_with_base(symbol_map, api_key, COINGECKO_BASE.to_string())
     }
 
-    /// Test-only constructor that lets the caller override the API base URL
-    /// so tests can point at a wiremock server.
-    #[doc(hidden)]
+    /// Construct a client targeting a custom CoinGecko-compatible base URL —
+    /// e.g. a self-hosted or **mock** price service for devnet/local runs where
+    /// the public API has no listing and no key is available. `new` defaults to
+    /// [`COINGECKO_BASE`]. The endpoint must answer
+    /// `GET {base}?ids=<csv>&vs_currencies=usd` with `{"<id>":{"usd":<f64>}}`.
     pub fn new_with_base(
         symbol_map: SharedSymbolMap,
         api_key: Option<String>,

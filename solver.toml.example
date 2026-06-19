@@ -65,3 +65,11 @@ admin_port = 3001
 # Defaults to 60s. Bump if chain block time + RPC latency exceeds 60s
 # under normal conditions.
 # readiness_freshness_secs = 60
+
+# Override the price-API base URL. Defaults to the public CoinGecko endpoint.
+# The solver always uses its normal HttpPriceClient — only the URL changes, and
+# pairs still map tokens -> ids via asset_*_external_symbol. For devnet/local
+# where the faucet tokens aren't listed and no COINGECKO_API_KEY is available,
+# run the mock CoinGecko service (`cargo run -p mock-price`) and point here.
+# Leave commented to use the public CoinGecko API. Do NOT pin a mock on mainnet.
+# price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"

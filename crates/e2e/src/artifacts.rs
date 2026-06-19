@@ -117,6 +117,9 @@ price_interval_ms = 5000
 triangular_enabled = true
 admin_port = 3001
 obs_port = 9090
+# Devnet test tokens aren't on public CoinGecko, so point the price client at
+# the local mock service: run `cargo run -p mock-price` in another terminal first.
+price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
 "#,
             rpc = self.rpc_endpoint,
             solver = self.solver_account_id,

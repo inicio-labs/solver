@@ -1,0 +1,24 @@
+[package]
+name = "mock-price"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone mock CoinGecko "simple price" service. Deliberately tiny (no miden
+# deps) so it builds in seconds and can be deployed on its own next to a faucet
+# app. Point the solver's `[engine].price_api_base_url` at it for devnet/local.
+
+[[bin]]
+name = "mock-price"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["json"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }

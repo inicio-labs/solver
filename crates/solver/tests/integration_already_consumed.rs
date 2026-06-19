@@ -189,6 +189,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    price_api_base_url: None,
                 },
             };
 

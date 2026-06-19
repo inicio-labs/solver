@@ -141,12 +141,25 @@ fn try_build_entry<F: PriceFeed>(
     let order_bc = &book.orders[&id_bc];
     let order_ca = &book.orders[&id_ca];
 
-    // Profitability check (u128 — no overflow)
-    let lhs = order_ab.offered as u128 * order_bc.offered as u128 * order_ca.offered as u128;
-    let rhs =
-        order_ab.requested as u128 * order_bc.requested as u128 * order_ca.requested as u128;
-    if lhs <= rhs {
-        return None;
+    // Profitability check. The triple product of three u64 amounts can exceed
+    // u128 (overflows once each amount passes ~cube-root(2^128) ≈ 7e12, i.e.
+    // ~70k tokens at 8 decimals), so use CHECKED multiplication: only
+    // short-circuit as unprofitable when BOTH products are computable AND
+    // lhs <= rhs. On overflow we fall through to `simulate_full_cycle`, whose
+    // surplus math is bounded (fills <= requested) and which gates on
+    // `surplus_usd > 0` — so correctness is preserved; this was only a fast
+    // pre-filter. (Previously `a * b * c` panicked in debug / wrapped in
+    // release for large attacker-controlled amounts.)
+    let lhs = (order_ab.offered as u128)
+        .checked_mul(order_bc.offered as u128)
+        .and_then(|p| p.checked_mul(order_ca.offered as u128));
+    let rhs = (order_ab.requested as u128)
+        .checked_mul(order_bc.requested as u128)
+        .and_then(|p| p.checked_mul(order_ca.requested as u128));
+    if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+        if lhs <= rhs {
+            return None;
+        }
     }
 
     let simulation = simulate_full_cycle(book, id_ab, id_bc, id_ca)?;
@@ -299,9 +312,13 @@ fn simulate_full_cycle<F: PriceFeed>(
 
     let fills = simulate_cycle(order_ab, order_bc, order_ca, &bottleneck)?;
 
-    let surplus_usd = fills.surplus_a as u128 * price_a as u128
-        + fills.surplus_b as u128 * price_b as u128
-        + fills.surplus_c as u128 * price_c as u128;
+    // Saturating: surplus*price can be large under extreme amounts/prices and
+    // this value is only a ranking priority, so clamping at u128::MAX is safe
+    // and avoids an overflow panic (debug) / wraparound (release).
+    let surplus_usd = (fills.surplus_a as u128)
+        .saturating_mul(price_a as u128)
+        .saturating_add((fills.surplus_b as u128).saturating_mul(price_b as u128))
+        .saturating_add((fills.surplus_c as u128).saturating_mul(price_c as u128));
 
     Some(CycleSimulation { fills, surplus_usd })
 }

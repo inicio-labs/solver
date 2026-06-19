@@ -93,6 +93,14 @@ pub struct EngineConfig {
     /// block time + expected RPC latency. Defaults to 60s.
     #[serde(default = "default_readiness_freshness_secs")]
     pub readiness_freshness_secs: u64,
+    /// Override the price-API base URL. Defaults to the public CoinGecko
+    /// endpoint. Point this at a self-hosted or **mock** CoinGecko-compatible
+    /// service (e.g. `http://127.0.0.1:8089/api/v3/simple/price`) for devnet /
+    /// local runs where the faucet tokens aren't listed and no key is available.
+    /// The solver uses its normal `HttpPriceClient` either way — only the URL
+    /// changes. Pairs still map tokens → ids via `asset_*_external_symbol`.
+    #[serde(default)]
+    pub price_api_base_url: Option<String>,
 }
 
 fn default_true() -> bool {

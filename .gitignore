@@ -41,3 +41,7 @@ swapp_test_state.json
 # Commit solver.toml.example instead; real config is supplied per deployment
 # via this file (gitignored), --config <path>, or the SOLVER_CONFIG env var.
 /solver.toml
+
+# e2e harness runtime state (stores, keystores, provisioned ids, generated
+# config). The crate code lives under crates/e2e/ and IS tracked.
+/e2e/

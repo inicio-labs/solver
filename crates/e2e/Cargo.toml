@@ -1,0 +1,40 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone end-to-end harness for exercising the solver against a live Miden
+# devnet. Kept OUT of the solver/consume-script crates on purpose: it provisions
+# real on-chain accounts (a solver wallet + two fungible faucets), can fund the
+# solver and create opposing PSWAP orders, and can run the solver in-process and
+# assert end-to-end settlement. None of this is part of the production build or
+# the solver's own unit/integration tests.
+
+[[bin]]
+name = "e2e"
+path = "src/main.rs"
+
+[dependencies]
+# Full miden-client (std + tonic via the workspace pin) — gives us
+# ClientBuilder::for_devnet() (devnet RPC + remote prover) and the account /
+# faucet / mint / pswap builders.
+miden-client = { workspace = true }
+miden-client-sqlite-store = { workspace = true }
+miden-protocol.workspace = true
+miden-standards.workspace = true
+
+# The solver library — `run` boots the real pipeline in-process via solver::start.
+solver = { path = "../solver" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }

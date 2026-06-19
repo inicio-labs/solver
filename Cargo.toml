@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/solver", "crates/consume-script"]
+members = ["crates/solver", "crates/consume-script", "crates/e2e"]
 resolver = "2"
 
 [workspace.dependencies]

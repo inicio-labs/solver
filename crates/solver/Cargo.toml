@@ -15,7 +15,7 @@ miden-standards.workspace = true
 miden-core.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
-tokio = { version = "1.40", features = ["macros", "time", "sync"] }
+tokio = { version = "1.40", features = ["macros", "time", "sync", "rt-multi-thread", "net"] }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -23,6 +23,10 @@ toml = "0.8"
 diesel = { version = "2.2", features = ["sqlite", "r2d2"] }
 diesel_migrations = "2.2"
 axum = { version = "0.8", features = ["json"] }
+# Public price-API protections: request timeout + response cache header.
+# (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's
+# DefaultBodyLimit — no extra crates needed for those.)
+tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header"] }
 hex = "0.4"
 subtle = "2.5"
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }

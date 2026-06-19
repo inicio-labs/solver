@@ -274,10 +274,52 @@ pub fn register_token(
             token_id: token_id.to_vec(),
             created_at: now,
             external_symbol: external_symbol.map(|s| s.to_string()),
+            // Fetched on-chain after registration (see ingest); NULL until known.
+            decimals: None,
+            ticker: None,
         })
         .execute(conn)?;
 
     Ok(inserted > 0)
+}
+
+/// Persist a token's on-chain metadata (decimals + ticker), fetched once from
+/// the faucet account. Returns true if a registered row was updated.
+pub fn set_token_metadata(
+    conn: &mut SqliteConnection,
+    token_id: &[u8],
+    decimals: Option<i32>,
+    ticker: Option<&str>,
+) -> Result<bool> {
+    let updated = diesel::update(
+        registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)),
+    )
+    .set((
+        registered_tokens::decimals.eq(decimals),
+        registered_tokens::ticker.eq(ticker.map(|s| s.to_string())),
+    ))
+    .execute(conn)?;
+    Ok(updated > 0)
+}
+
+/// Fetch one registered token row by id (for the price API: registered? +
+/// decimals/ticker). Returns `None` if the faucet is not registered.
+pub fn get_registered_token(
+    conn: &mut SqliteConnection,
+    token_id: &[u8],
+) -> Result<Option<RegisteredTokenRow>> {
+    let row = registered_tokens::table
+        .filter(registered_tokens::token_id.eq(token_id))
+        .select(RegisteredTokenRow::as_select())
+        .first(conn)
+        .optional()?;
+    Ok(row)
+}
+
+/// Pool-level convenience for the price API: fetch one token row via a read conn.
+pub fn fetch_token_row(pool: &DbPool, token_id: &[u8]) -> Result<Option<RegisteredTokenRow>> {
+    let mut conn = pool.read_conn()?;
+    get_registered_token(&mut conn, token_id)
 }
 
 /// Update a token's external_symbol (e.g. via admin API). Returns true if a

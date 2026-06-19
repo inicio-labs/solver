@@ -6,6 +6,7 @@ pub mod price;
 pub mod admin;
 pub mod matcher;
 pub mod obs;
+pub mod price_api;
 pub mod pipeline;
 pub mod order;
 pub mod config;

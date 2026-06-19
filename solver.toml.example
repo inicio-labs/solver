@@ -73,3 +73,17 @@ admin_port = 3001
 # run the mock CoinGecko service (`cargo run -p mock-price`) and point here.
 # Leave commented to use the public CoinGecko API. Do NOT pin a mock on mainnet.
 # price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
+
+# ── Public price-query API (wallets fetch token prices) ──────────────────────
+# Read-only HTTP endpoint, runs on its own thread. GET /v1/price/{faucet_id} and
+# GET /v1/prices?ids=a,b → {faucet_id, ticker, vs_currency, price, precision,
+# decimals, as_of, stale, source}. Decimals + ticker are fetched on-chain.
+# price_query_port = 8080
+# price_query_bind = "127.0.0.1"     # "0.0.0.0" to expose publicly (front w/ a proxy)
+# price_query_max_inflight = 128     # concurrent requests; excess → 503
+# price_query_max_batch = 50         # max ids per /v1/prices request
+# price_query_timeout_ms = 3000
+# price_precision = "full"           # decimals of the PRICE number: "full" or 0..=18
+#                                    # (per-request override: ?precision=). NOT the token's decimals.
+# price_vs_currency = "usd"          # CoinGecko vs_currency (usd/eur/...; NOT "usdt")
+# price_staleness_secs = 30          # older than this → 503 (use ?allow_stale=true to override)

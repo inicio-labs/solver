@@ -273,6 +273,38 @@ crossing orders between them automatically.
 
 ---
 
+## Price-query API
+
+A **public, read-only** HTTP endpoint for wallets to fetch a token's current
+price by faucet id (for swap UIs). It runs on its **own OS thread** (isolated
+from the fund-handling matcher), serves only **registered** tokens, and is
+bound to `127.0.0.1` by default (`price_query_bind`).
+
+```bash
+GET /v1/price/{faucet_id}?precision=&allow_stale=
+GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, … }
+```
+```jsonc
+// GET /v1/price/0x8fe0…?precision=4
+{ "faucet_id":"0x8fe0…", "ticker":"USDC", "vs_currency":"usd",
+  "price":"1.0000",      // price of ONE WHOLE token; value a base-unit amount via (units / 10^decimals) * price
+  "precision":"4",       // decimals of the PRICE number (config `price_precision` or ?precision=full|0-18)
+  "decimals":8,          // the TOKEN's on-chain decimals (fetched on-chain; null until known) — distinct from `precision`
+  "as_of":1781896971, "stale":false, "source":"coingecko" }
+```
+- **404** unknown faucet · **503** registered-but-no-price, or stale (older than
+  `price_staleness_secs`; pass `?allow_stale=true` to get a 200 with `stale:true`)
+  · **400** bad faucet id / precision / over-`price_query_max_batch`.
+- Prices come from the same feed the matcher uses (CoinGecko or the `mock-price`
+  service via `price_api_base_url`); `decimals`/`ticker` are fetched on-chain
+  **once, when a token is registered** (config tokens at boot, admin-added tokens
+  via the subscribe relay), then cached — never re-polled. Quote currency is
+  `price_vs_currency` (default `usd`; not `usdt`).
+- Versioned under `/v1` so a future model lands as `/v2` without breaking clients.
+- See the `[engine]` price-query knobs in `solver.toml.example`.
+
+---
+
 ## Testing
 
 ```bash
@@ -283,8 +315,31 @@ cargo test -p consume-script       # MASM script compiles + behaves
   (proptest) checks the matcher never makes the solver lose funds and never
   panics on arbitrary amounts. See the assessment in
   [docs/security/pentest-2026-06-19.md](docs/security/pentest-2026-06-19.md).
+- **Price-query API** (`crates/solver/src/price_api/tests.rs`, `axum-test`,
+  `cargo test -p solver --release price_api`): 12 cases exercising the public
+  surface end-to-end against a real temp-file DB —
+  - **Registered-vs-priced:** unregistered faucet → `404`; registered but no
+    price yet → `503` (not a misleading 404).
+  - **Faithful price:** a sub-$1 value (`0.0034`) is preserved at `full`, never
+    rounded to `0.00`.
+  - **Precision (mirrors CoinGecko):** `?precision=2` formats to 2 dp; `0` → an
+    integer; `18` is accepted; `19`, `-1`, and garbage → `400`; omitting the
+    param falls back to the configured `price_precision` default.
+  - **Token decimals & ticker:** served from the on-chain-fetched DB columns
+    (populated once at registration); `null` (never a fabricated default) until
+    that fetch lands.
+  - **Staleness fails closed:** an old snapshot → `503`, unless
+    `?allow_stale=true` (then `200` with `"stale":true`).
+  - **Batch (`/v1/prices`):** returns a map, caps the id count (`> max_batch` →
+    `400`), and omits unknown/unpriced ids CoinGecko-style (empty `ids` → empty map).
+  - **Surface hardening:** malformed faucet id → `400` with a JSON error body;
+    routes are `/v1`-scoped (no prefix → `404`) and GET-only (`POST` → `405`);
+    `vs_currency` is config-driven and echoed back.
 - **Live devnet end-to-end:** see [crates/e2e/README.md](crates/e2e/README.md)
-  (`provision → load → run`, verifies on-chain settlement).
+  (`provision → load → run`, verifies on-chain settlement). The price API was
+  also verified live on devnet — the ingest thread fetched MTA's on-chain
+  `decimals=8`/`ticker=MTA`, and `GET /v1/price/<MTA>?precision=4` returned the
+  served price with those fields.
 
 ---
 

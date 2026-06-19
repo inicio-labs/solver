@@ -42,6 +42,8 @@ diesel::table! {
         token_id -> Binary,
         created_at -> BigInt,
         external_symbol -> Nullable<Text>,
+        decimals -> Nullable<Integer>,
+        ticker -> Nullable<Text>,
     }
 }
 

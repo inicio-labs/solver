@@ -1,12 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use crate::matching::price_feed::UsdCents;
-use crate::price::{PriceClient, PriceSnapshot};
+use crate::price::{PriceClient, PriceData, PreciseSnapshot};
 use crate::types::TokenId;
 
 /// Shared, in-memory faucet-id → external-symbol mapping. Hydrated from DB
@@ -39,16 +37,14 @@ pub fn write_symbol_map(m: &SharedSymbolMap) -> RwLockWriteGuard<'_, HashMap<Tok
 /// devnet/local) — see [`HttpPriceClient::new_with_base`].
 pub const COINGECKO_BASE: &str = "https://api.coingecko.com/api/v3/simple/price";
 
-#[derive(Deserialize)]
-struct CgPriceEntry {
-    usd: f64,
-}
-
 pub struct HttpPriceClient {
     http: reqwest::Client,
     api_key: Option<String>,
     symbol_map: SharedSymbolMap,
     base: String,
+    /// CoinGecko `vs_currencies` (quote currency), e.g. `"usd"`. Also the key of
+    /// the per-id price object in the response.
+    vs_currency: String,
 }
 
 /// Construct the production [`PriceClient`] (CoinGecko HTTP) as a boxed
@@ -66,16 +62,17 @@ pub fn build_http_price_client(
     Ok(Box::new(HttpPriceClient::new(symbol_map, api_key)?))
 }
 
-/// Like [`build_http_price_client`] but with an explicit base URL — point the
-/// **real** production price path at a self-hosted or mock CoinGecko-compatible
-/// endpoint (devnet/local) instead of the public API. A `None`/default base
-/// just yields the public CoinGecko client.
+/// Like [`build_http_price_client`] but with an explicit base URL + quote
+/// currency — point the **real** production price path at a self-hosted or mock
+/// CoinGecko-compatible endpoint (devnet/local). `vs_currency` is CoinGecko's
+/// `vs_currencies` (e.g. `"usd"`).
 pub fn build_http_price_client_with_base(
     symbol_map: SharedSymbolMap,
     api_key: Option<String>,
     base: String,
+    vs_currency: String,
 ) -> Result<Box<dyn PriceClient + Send + Sync>> {
-    Ok(Box::new(HttpPriceClient::new_with_base(symbol_map, api_key, base)?))
+    Ok(Box::new(HttpPriceClient::new_with_base(symbol_map, api_key, base, vs_currency)?))
 }
 
 impl HttpPriceClient {
@@ -86,18 +83,19 @@ impl HttpPriceClient {
     /// system TLS backend cannot initialise. Surfaced as an error so the
     /// caller can fail startup cleanly rather than panic+abort.
     pub fn new(symbol_map: SharedSymbolMap, api_key: Option<String>) -> Result<Self> {
-        Self::new_with_base(symbol_map, api_key, COINGECKO_BASE.to_string())
+        Self::new_with_base(symbol_map, api_key, COINGECKO_BASE.to_string(), "usd".to_string())
     }
 
-    /// Construct a client targeting a custom CoinGecko-compatible base URL —
-    /// e.g. a self-hosted or **mock** price service for devnet/local runs where
-    /// the public API has no listing and no key is available. `new` defaults to
-    /// [`COINGECKO_BASE`]. The endpoint must answer
-    /// `GET {base}?ids=<csv>&vs_currencies=usd` with `{"<id>":{"usd":<f64>}}`.
+    /// Construct a client targeting a custom CoinGecko-compatible base URL +
+    /// quote currency — e.g. a self-hosted or **mock** price service for
+    /// devnet/local. `new` defaults to [`COINGECKO_BASE`] + `"usd"`. The endpoint
+    /// must answer `GET {base}?ids=<csv>&vs_currencies=<vs>&precision=full` with
+    /// `{"<id>":{"<vs>":<f64>}}`.
     pub fn new_with_base(
         symbol_map: SharedSymbolMap,
         api_key: Option<String>,
         base: String,
+        vs_currency: String,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -108,13 +106,14 @@ impl HttpPriceClient {
             api_key,
             symbol_map,
             base,
+            vs_currency,
         })
     }
 }
 
 #[async_trait]
 impl PriceClient for HttpPriceClient {
-    async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PriceSnapshot> {
+    async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PreciseSnapshot> {
         // 1. Snapshot the shared mapping under the read lock. Cloning the
         //    matched entries (small HashMap) avoids holding the lock across
         //    the awaited HTTP call.
@@ -126,13 +125,17 @@ impl PriceClient for HttpPriceClient {
                 .collect()
         };
         if requested.is_empty() {
-            return Ok(PriceSnapshot::new());
+            return Ok(PreciseSnapshot::new());
         }
 
-        // 2. Build the CoinGecko request.
+        // 2. Build the request. `precision=full` so we keep CoinGecko's complete
+        //    value (it otherwise default-rounds); `vs_currencies` is configurable.
         let ids: Vec<&str> = requested.values().map(|s| s.as_str()).collect();
         let ids_csv = ids.join(",");
-        let url = format!("{}?ids={ids_csv}&vs_currencies=usd", self.base);
+        let url = format!(
+            "{}?ids={ids_csv}&vs_currencies={}&precision=full",
+            self.base, self.vs_currency
+        );
 
         let mut req = self.http.get(&url);
         if let Some(key) = &self.api_key {
@@ -155,15 +158,19 @@ impl PriceClient for HttpPriceClient {
         if !status.is_success() {
             return Err(anyhow!("coingecko returned status {}", status));
         }
-        let body: HashMap<String, CgPriceEntry> =
+        // Response shape: { "<id>": { "<vs_currency>": <f64> }, ... }
+        let body: HashMap<String, HashMap<String, f64>> =
             resp.json().await.context("parse coingecko response")?;
 
-        // 3. Map symbols back to TokenIds and convert USD → cents.
-        let mut out = PriceSnapshot::new();
+        // 3. Map symbols back to TokenIds; keep the full-precision value. Drop any
+        //    non-finite / negative value at the edge so it reads as "unpriced"
+        //    (excluded from matching) rather than corrupting it.
+        let mut out = PreciseSnapshot::new();
         for (token, symbol) in &requested {
-            if let Some(entry) = body.get(symbol.as_str()) {
-                let cents = (entry.usd * 100.0).round() as u64;
-                out.insert(*token, cents as UsdCents);
+            if let Some(usd) = body.get(symbol.as_str()).and_then(|m| m.get(&self.vs_currency)) {
+                if usd.is_finite() && *usd >= 0.0 {
+                    out.insert(*token, PriceData { usd: *usd });
+                }
             }
         }
         Ok(out)
@@ -213,6 +220,7 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
+            "usd".to_string(),
         )
         .expect("build HttpPriceClient");
         let prices = client
@@ -220,8 +228,8 @@ mod tests {
             .await
             .expect("ok");
 
-        assert_eq!(prices.get(&token_a()).copied(), Some(100));
-        assert_eq!(prices.get(&token_b()).copied(), Some(394_217));
+        assert_eq!(prices.get(&token_a()).map(|d| d.usd), Some(1.0));
+        assert_eq!(prices.get(&token_b()).map(|d| d.usd), Some(3942.17));
     }
 
     #[tokio::test]
@@ -241,6 +249,7 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
+            "usd".to_string(),
         )
         .expect("build HttpPriceClient");
         let prices = client
@@ -261,6 +270,7 @@ mod tests {
             map,
             None,
             "http://unreachable.invalid/simple/price".to_string(),
+            "usd".to_string(),
         )
         .expect("build HttpPriceClient");
         let prices = client.fetch_prices(&[token_a()]).await.expect("ok");
@@ -281,6 +291,7 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
+            "usd".to_string(),
         )
         .expect("build HttpPriceClient");
         let err = client.fetch_prices(&[token_a()]).await.unwrap_err();
@@ -303,6 +314,7 @@ mod tests {
             map,
             None,
             format!("{}/simple/price", server.uri()),
+            "usd".to_string(),
         )
         .expect("build HttpPriceClient");
         let err = client.fetch_prices(&[token_a()]).await.unwrap_err();

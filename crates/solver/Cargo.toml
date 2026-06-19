@@ -26,7 +26,7 @@ axum = { version = "0.8", features = ["json"] }
 # Public price-API protections: request timeout + response cache header.
 # (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's
 # DefaultBodyLimit — no extra crates needed for those.)
-tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header"] }
+tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header", "cors"] }
 hex = "0.4"
 subtle = "2.5"
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }

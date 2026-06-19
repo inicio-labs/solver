@@ -1,0 +1,59 @@
+# mock.toml — mock PSWAP mirror config. Copy to mock.toml and fill in.
+#
+#   mock-mirror provision mock.toml   # creates the mock account, prints its address
+#   # → fund the printed mdev… address from your faucet, set account_id below
+#   mock-mirror run mock.toml         # runs the mirror loop
+
+[rpc]
+# Devnet node gRPC endpoint (must be the SAME network as your faucets).
+endpoint = "https://rpc.devnet.miden.io"
+timeout_ms = 10000
+# Network: devnet | testnet | mainnet. Sets the bech32 address prefix
+# (mdev / mtst / mm) when provision prints the account address.
+network = "devnet"
+
+[mock]
+# Filled in by `mock-mirror provision` (it prints this). Leave unset to provision.
+# account_id = "0x<printed by provision>"
+keystore_path = "./mirror_keystore"
+store_path = "./mirror_store.sqlite3"
+# Optional: provision also exports a portable .mac (account + key) here.
+account_file = "./mirror_account.mac"
+
+[settings]
+# The solver's account id — denylisted so the mock never mirrors the solver's
+# own notes (the mock's own notes are always denied too).
+solver_account_id = "0x<solver_account_id_hex>"
+# Solver's edge per mirror, in basis points (30 = 0.30%). Range 1..10000.
+spread_bps = 30
+# Probability [0.0,1.0] a given order is mirrored as a HALF fill (leaves a remainder).
+partial_fill_probability = 0.2
+# Cap on counter-orders created per tick.
+max_mirrors_per_tick = 20
+sync_interval_ms = 3000
+# Seed for the reproducible full-vs-partial coin flip.
+seed = 42
+# Guardrail: must be true to run against a mainnet RPC. This is a test harness.
+allow_mainnet = false
+
+# One [[pairs]] per market to make. Both directions are subscribed. Use the
+# faucet ids (hex) of your tokens. Example: quote everything in IUSDT.
+[[pairs]]
+token_a_faucet_id = "0x<IBTC_faucet_hex>"
+token_b_faucet_id = "0x<IUSDT_faucet_hex>"
+[[pairs]]
+token_a_faucet_id = "0x<IETH_faucet_hex>"
+token_b_faucet_id = "0x<IUSDT_faucet_hex>"
+[[pairs]]
+token_a_faucet_id = "0x<IMIDEN_faucet_hex>"
+token_b_faucet_id = "0x<IUSDT_faucet_hex>"
+
+# Optional warn-only inventory monitoring. The mock does NOT self-mint — fund it
+# externally (mint the public faucet to its address). A balance below low_water
+# just logs a "fund me" warning.
+[[inventory]]
+faucet_id = "0x<IUSDT_faucet_hex>"
+low_water = 1000000000
+[[inventory]]
+faucet_id = "0x<IBTC_faucet_hex>"
+low_water = 100000000

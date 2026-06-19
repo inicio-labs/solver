@@ -87,6 +87,7 @@ authoritative — the chain nullifier is the source of truth).
 | `crates/consume-script` | the MASM "consume-asset" tx script (sweeps surplus into the solver vault). |
 | `crates/e2e` | standalone devnet end-to-end harness (provision/fund/load/run). See [crates/e2e/README.md](crates/e2e/README.md). |
 | `crates/mock-price` | standalone mock CoinGecko price service (devnet/local pricing). Tiny, no miden deps. |
+| `crates/mock-mirror` | devnet liquidity harness: posts favorable PSWAP counter-orders so the solver matches. See [crates/mock-mirror/README.md](crates/mock-mirror/README.md). |
 
 ---
 
@@ -300,6 +301,9 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
   **once, when a token is registered** (config tokens at boot, admin-added tokens
   via the subscribe relay), then cached — never re-polled. Quote currency is
   `price_vs_currency` (default `usd`; not `usdt`).
+- **CORS** is enabled (any origin, GET) so browser wallets / extensions can
+  fetch it cross-origin. Front it with HTTPS in production — browsers block
+  `http://` calls from an `https://` page (mixed content).
 - Versioned under `/v1` so a future model lands as `/v2` without breaking clients.
 - See the `[engine]` price-query knobs in `solver.toml.example`.
 

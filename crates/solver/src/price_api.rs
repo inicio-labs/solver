@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -31,6 +31,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{oneshot, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -284,6 +285,11 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .route("/prices", get(get_prices))
         .with_state(state);
 
+    // Public read-only price data → permissive CORS so browser wallets /
+    // extensions can fetch it cross-origin. Any origin, GET only (the API is
+    // GET-only); preflight OPTIONS is handled by this layer.
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]);
+
     Router::new()
         .nest("/v1", v1)
         // Outer protections (applied to all routes):
@@ -294,6 +300,9 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         ))
         .layer(DefaultBodyLimit::max(4 * 1024))
         .layer(from_fn_with_state(sem, concurrency_guard))
+        // CORS is outermost: it answers preflight + tags every response
+        // (including 503/timeout) without consuming a concurrency permit.
+        .layer(cors)
 }
 
 /// Spawn the price-query server on its OWN OS thread + multi-thread runtime.

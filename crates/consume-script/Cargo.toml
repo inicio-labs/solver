@@ -1,0 +1,16 @@
+[package]
+name = "consume-script"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+miden-protocol.workspace = true
+miden-standards.workspace = true
+miden-crypto.workspace = true
+miden-core.workspace = true
+
+[dev-dependencies]
+miden-testing.workspace = true
+solver = { path = "../solver", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+anyhow = "1.0"

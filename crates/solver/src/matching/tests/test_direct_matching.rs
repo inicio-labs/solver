@@ -1,0 +1,141 @@
+use crate::matching::direct_matching::run_direct_matching;
+use crate::matching::order_book::OrderBook;
+use crate::price::WatchPriceFeed;
+use std::collections::HashSet;
+use super::{eth, usdc, sol, NoteIdGen};
+
+fn make_feed() -> WatchPriceFeed {
+    let mut feed = WatchPriceFeed::new();
+    feed.set_price_cents(eth(), 2000);
+    feed.set_price_cents(usdc(), 1);
+    feed
+}
+
+#[test]
+fn basic_match() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
+
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
+    assert!(cycles > 0);
+    assert_eq!(filled.len(), 2);
+    assert_eq!(book.active_order_count(), 0);
+}
+
+#[test]
+fn no_match_at_oracle() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 2000);
+
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
+    assert_eq!(cycles, 0);
+}
+
+#[test]
+fn multiple_matches() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 20000, 10);
+    book.add_user_order(gen.next(), usdc(), eth(), 40000, 20);
+    book.add_user_order(gen.next(), eth(), usdc(), 10, 16000);
+    book.add_user_order(gen.next(), eth(), usdc(), 20, 32000);
+
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
+    assert!(cycles >= 2);
+    assert_eq!(filled.len(), 4);
+}
+
+#[test]
+fn partial_fill() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 20000, 10);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
+
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
+    assert!(!filled.is_empty());
+    assert!(book.active_order_count() >= 1, "larger order should remain partially filled");
+}
+
+#[test]
+fn one_sided_no_match() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
+    assert_eq!(cycles, 0);
+}
+
+#[test]
+fn surplus_to_protocol_balance() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
+
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
+    let usdc_balance = book.protocol_balances.get(&usdc()).copied().unwrap_or(0);
+    assert!(usdc_balance > 0, "surplus should be in protocol balance");
+}
+
+#[test]
+fn multiple_pairs() {
+    let mut feed = WatchPriceFeed::new();
+    feed.set_price_cents(eth(), 2000);
+    feed.set_price_cents(usdc(), 1);
+    feed.set_price_cents(sol(), 150);
+
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
+    book.add_user_order(gen.next(), eth(), usdc(), 1, 1600);
+    book.add_user_order(gen.next(), usdc(), sol(), 150, 1);
+    book.add_user_order(gen.next(), sol(), usdc(), 1, 120);
+
+    let mut filled = HashSet::new();
+    let cycles = run_direct_matching(&mut book, &mut filled);
+    assert!(cycles >= 2);
+}
+
+#[test]
+fn filled_order_details() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    let order_a_id = gen.next();
+    book.add_user_order(order_a_id, usdc(), eth(), 2000, 1);
+    let order_b_id = gen.next();
+    book.add_user_order(order_b_id, eth(), usdc(), 1, 1600);
+
+    let mut filled = HashSet::new();
+    run_direct_matching(&mut book, &mut filled);
+
+    assert!(filled.contains(&order_a_id));
+    assert!(filled.contains(&order_b_id));
+
+    // Check order state directly from book
+    let order_a = &book.orders[&order_a_id];
+    assert!(order_a.is_completely_filled());
+    assert_eq!(order_a.requested_filled(), 1); // filled all 1 ETH requested
+
+    let order_b = &book.orders[&order_b_id];
+    assert!(order_b.is_completely_filled());
+    assert_eq!(order_b.requested_filled(), 1600); // filled all 1600 USDC requested
+}

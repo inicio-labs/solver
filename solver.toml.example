@@ -1,0 +1,67 @@
+# solver.toml — runtime configuration template.
+#
+# Copy this file to `solver.toml` (which is gitignored) and fill in the
+# environment-specific values, OR point the binary at any path via the
+# `--config <path>` flag or the `SOLVER_CONFIG` env var.
+#
+#   cp solver.toml.example solver.toml   # then edit the placeholders below
+
+[rpc]
+# Miden node gRPC endpoint. The public testnet endpoint is shown as a sane
+# default; use your own node for production.
+endpoint = "https://rpc.testnet.miden.io"
+timeout_ms = 10000
+
+[solver]
+# Hex account ID of the solver's on-chain account. REQUIRED — replace with
+# your solver account. (Placeholder; the binary will fail to start with this.)
+account_id = "0x<your_solver_account_id_hex>"
+# Filesystem keystore directory holding the solver account's Falcon key.
+# Relative paths resolve against the process working directory.
+keystore_path = "./solver_keystore"
+# Three distinct SQLite paths. MIGRATION: the prior single `store_path` is now
+# three explicit required keys — use distinct files for each (sharing one file
+# reintroduces the app-DB/executor-store overload this split removed).
+app_db_path = "./solver_app.sqlite3"              # Diesel app DB (orders/tokens/sync)
+executor_store_path = "./executor_store.sqlite3"  # executor miden-client store (signs)
+ingest_store_path = "./ingest_store.sqlite3"      # keyless ingest miden-client store
+# Concurrent SQLite read connections (matcher hydration, admin queries).
+# Defaults to 4 if omitted.
+read_pool_size = 4
+
+# One [[pairs]] block per trading pair the solver should watch. faucet IDs
+# and external symbols are network-specific — replace the placeholders.
+[[pairs]]
+name = "USDT-ETH"
+asset_x_faucet_id = "0x<asset_x_faucet_id_hex>"
+asset_x_external_symbol = "tether"
+asset_y_faucet_id = "0x<asset_y_faucet_id_hex>"
+asset_y_external_symbol = "ethereum"
+
+[engine]
+pulse_interval_ms = 5000
+fetch_interval_ms = 3000
+# 5s polling will exhaust the CoinGecko Demo free tier (10K/mo) in ~5 days.
+# After that, fetches will 429 and the matcher will operate on the last good
+# price snapshot until the budget resets. For sustained production, either
+# bump this interval, switch providers, or upgrade to a paid CoinGecko tier.
+price_interval_ms = 5000
+# Whether the triangular (3-cycle) matching phase runs. Set to false to
+# disable the O(T³) enumeration if you have many registered tokens and only
+# need direct (pairwise) matching. Defaults to true if omitted.
+triangular_enabled = true
+# Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
+admin_port = 3001
+# Run the Miden client in debug mode (MASM debug instrumentation).
+# Useful on testnet for diagnosing transaction execution. MUST be false on
+# mainnet. Defaults to false when omitted.
+# debug_mode = false
+# Observability HTTP server port (binds 127.0.0.1 only). Exposes
+# `/health` (liveness — always 200) and `/readyz` (readiness — 200 if DB is
+# reachable AND last sync < readiness_freshness_secs ago). No auth.
+# Defaults to 9090.
+# obs_port = 9090
+# How fresh the last successful sync must be for /readyz to return 200.
+# Defaults to 60s. Bump if chain block time + RPC latency exceeds 60s
+# under normal conditions.
+# readiness_freshness_secs = 60

@@ -1,0 +1,53 @@
+[workspace]
+members = ["crates/solver", "crates/consume-script"]
+resolver = "2"
+
+[workspace.dependencies]
+# Pinned to the released v0.15.2 client tag + the protocol 0.15.3 it depends on
+# (miden-client v0.15.2's manifest declares miden-protocol = "0.15.3"). The
+# client is only published as a git tag (not on crates.io); the protocol crates
+# ARE on crates.io at 0.15.3 and must be used from there so they unify with the
+# client's own protocol dependency. (v0.15.2 is the client release that fixes
+# the v0.15.1↔0.15.3 TransportNote mismatch.)
+#
+# NO "testing" feature on the production miden-client/miden-protocol deps — it
+# gates miden-client's `test_rpc_api` and protocol test utilities. Tests
+# re-enable it in `[dev-dependencies]` (see crates/solver); resolver = "2" keeps
+# it out of the production build.
+miden-client = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2" }
+miden-protocol = { version = "0.15.3", default-features = false }
+miden-standards = "0.15.3"
+miden-testing = "0.15.3"
+# VM layer that protocol 0.15.3 uses (miden-client v0.15.2 → miden-processor 0.23).
+miden-core = "0.23"
+miden-crypto = "0.25"
+
+[package]
+name = "solver-bin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solver = { path = "crates/solver" }
+miden-client = { workspace = true }
+miden-client-sqlite-store = { workspace = true }
+miden-protocol.workspace = true
+miden-standards.workspace = true
+miden-core.workspace = true
+miden-crypto.workspace = true
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+rand = "0.9"
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "env"] }
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi", "std"] }
+
+[dev-dependencies]
+consume-script = { path = "crates/consume-script" }
+miden-testing.workspace = true

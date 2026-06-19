@@ -1,0 +1,57 @@
+mod test_types;
+mod test_order_book;
+mod test_direct_matching;
+mod test_three_edge_cycle;
+mod test_engine;
+mod test_fuzz;
+mod test_experimental;
+mod test_experimental_v2;
+mod test_debug_surplus;
+
+use miden_protocol::account::AccountId;
+use miden_protocol::note::NoteId;
+use miden_protocol::testing::account_id::{
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_3,
+    ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET,
+};
+
+/// Create a deterministic NoteId from a u64 seed.
+fn make_note_id(seed: u64) -> NoteId {
+    // `NoteId::new` now needs a details commitment + metadata; for a unique,
+    // deterministic test id a hex-encoded Word is the simplest fabrication.
+    NoteId::try_from_hex(&format!("0x{seed:064x}")).expect("valid note id hex")
+}
+
+/// Sequential NoteId counter for tests. Returns a unique NoteId each call.
+struct NoteIdGen(u64);
+impl NoteIdGen {
+    fn new() -> Self { Self(1000) }
+    fn next(&mut self) -> NoteId {
+        let id = make_note_id(self.0);
+        self.0 += 100;
+        id
+    }
+}
+
+fn eth() -> AccountId {
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
+}
+
+fn usdc() -> AccountId {
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()
+}
+
+fn sol() -> AccountId {
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap()
+}
+
+fn btc() -> AccountId {
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_3.try_into().unwrap()
+}
+
+fn matic() -> AccountId {
+    ACCOUNT_ID_PRIVATE_FUNGIBLE_FAUCET.try_into().unwrap()
+}

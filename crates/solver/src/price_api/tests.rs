@@ -264,3 +264,16 @@ async fn routing_is_v1_scoped_and_get_only() {
     let r3 = h.server.post(&format!("/v1/price/{}", faucet_a().to_hex())).await;
     assert_eq!(r3.status_code(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn cors_header_present_for_browser_clients() {
+    // A browser wallet / extension fetches cross-origin → the response must
+    // carry Access-Control-Allow-Origin, else the browser blocks it.
+    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[(faucet_a(), 1.0)], now());
+    let r = h.server.get(&url(faucet_a(), "")).await;
+    assert_eq!(r.status_code(), StatusCode::OK);
+    let acao = r
+        .maybe_header("access-control-allow-origin")
+        .expect("CORS allow-origin header present");
+    assert_eq!(acao.to_str().unwrap(), "*");
+}

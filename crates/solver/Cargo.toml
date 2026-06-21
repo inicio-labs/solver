@@ -26,7 +26,7 @@ axum = { version = "0.8", features = ["json"] }
 # Public price-API protections: request timeout + response cache header.
 # (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's
 # DefaultBodyLimit — no extra crates needed for those.)
-tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header"] }
+tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header", "cors"] }
 hex = "0.4"
 subtle = "2.5"
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
@@ -47,6 +47,9 @@ miden-protocol = { workspace = true, features = ["testing"] }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }
 tempfile = "3"
+# Surfaces the solver's tracing logs in integration tests (e.g. the executor's
+# exact failure assertion) under `--nocapture`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Adversarial property-based fuzzing of the matching math (pentest).
 proptest = "1"
 # test-util is dev-only; enables tokio::time::pause/advance + start_paused on #[tokio::test].

@@ -12,7 +12,7 @@ use miden_protocol::{
     account::AccountId,
     asset::{Asset, FungibleAsset},
     crypto::utils::{Deserializable, Serializable, SliceReader},
-    note::{Note, NoteDetails, NoteRecipient, NoteTag},
+    note::{Note, NoteRecipient},
 };
 use miden_standards::note::PswapNote;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -66,7 +66,6 @@ enum SubmitOutcome {
 /// builder consumes its inputs on `.build()`).
 struct BatchComponents {
     input_notes: Vec<(Note, Option<NoteArgs>)>,
-    expected_future_notes: Vec<(NoteDetails, NoteTag)>,
     expected_output_recipients: Vec<NoteRecipient>,
     surplus_assets: Vec<Asset>,
 }
@@ -84,7 +83,6 @@ fn is_transient_rpc_error(err: &ClientError) -> bool {
 fn build_tx_request(components: &BatchComponents) -> Result<TransactionRequest> {
     let mut builder = TransactionRequestBuilder::new()
         .input_notes(components.input_notes.clone())
-        .expected_future_notes(components.expected_future_notes.clone())
         .expected_output_recipients(components.expected_output_recipients.clone());
 
     if !components.surplus_assets.is_empty() {
@@ -163,7 +161,6 @@ fn prepare_batch_components(
     solver_id: AccountId,
 ) -> Result<(BatchComponents, Vec<Note>)> {
     let mut input_notes = Vec::new();
-    let mut expected_future_notes = Vec::new();
     let mut expected_output_recipients = Vec::new();
     let mut input_notes_only: Vec<Note> = Vec::new();
 
@@ -198,16 +195,20 @@ fn prepare_batch_components(
             .map_err(|e| anyhow!("pswap execute failed: {}", e))?;
 
         *flow.entry(requested_token).or_default() -= note_asset_amount(&p2id) as i128;
-        let p2id_tag = p2id.metadata().tag();
+        // Payback + remainder settle to the order CREATOR, not the solver. Declare them
+        // as expected OUTPUT RECIPIENTS only — NEVER as expected future notes. This mirrors
+        // `miden-client::build_pswap_consume`, which deliberately does the same and warns
+        // that registering them as future notes "would leave stale, un-consumable notes in
+        // the consumer's store": the future-note record is built from `NoteDetails` (which
+        // carries NO attachments), and a PSWAP note's id commits to its attachments — so it
+        // would land attachment-stripped, and the kernel later rejects the re-consume with
+        // `InputNoteNotInBlock`.
         expected_output_recipients.push(p2id.recipient().clone());
-        expected_future_notes.push((NoteDetails::from(p2id), p2id_tag));
 
         if let Some(rem_pswap) = remainder {
             let rem_note = Note::from(rem_pswap);
             *flow.entry(offered_token).or_default() -= note_asset_amount(&rem_note) as i128;
-            let rem_tag = rem_note.metadata().tag();
             expected_output_recipients.push(rem_note.recipient().clone());
-            expected_future_notes.push((NoteDetails::from(rem_note), rem_tag));
         }
     }
 
@@ -231,7 +232,6 @@ fn prepare_batch_components(
     Ok((
         BatchComponents {
             input_notes,
-            expected_future_notes,
             expected_output_recipients,
             surplus_assets,
         },
@@ -306,6 +306,123 @@ async fn classify_input_notes(
     }
 
     Ok((consumed_bytes, active_bytes, active_orders))
+}
+
+/// DIAGNOSTIC (temporary): on a tx failure, dump EVERYTHING about the batch consume.
+/// For each note being consumed: id / details-commitment / serial / nullifier / assets /
+/// attachments / offered+requested; whether its nullifier is already consumed on-chain;
+/// whether it exists in our executor store (looked up by id AND by details-commitment, to
+/// catch a row stored under a DIFFERENT id); and an explicit MATCH of the store copy vs the
+/// note we're actually consuming (state, commitment, attachments). Then the COMPLETE VM/tx
+/// error — Display + full nested Debug + the whole source chain. Nothing truncated.
+async fn log_batch_consume_diagnostics(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    notes: &[Note],
+    error: &ClientError,
+) {
+    // On-chain "ever consumed?" nullifier check for the whole set, one query.
+    let consumed_set = {
+        let mut a = miden_adapter.lock().await;
+        a.check_consumed_notes(notes).await.unwrap_or_default()
+    };
+    // Store records: by-id lookup, plus a full scan to catch a row stored under a DIFFERENT id.
+    let by_id = {
+        let ids: Vec<_> = notes.iter().map(|n| n.id()).collect();
+        let c = client.lock().await;
+        c.get_input_notes(miden_client::store::NoteFilter::List(ids)).await.unwrap_or_default()
+    };
+    let all_store = {
+        let c = client.lock().await;
+        c.get_input_notes(miden_client::store::NoteFilter::All).await.unwrap_or_default()
+    };
+
+    tracing::error!(note_count = notes.len(), "================ BATCH CONSUME DIAGNOSTICS ================");
+
+    for (i, note) in notes.iter().enumerate() {
+        let id = note.id();
+        let commitment_hex = note.details_commitment().to_hex();
+        let pswap = PswapNote::try_from(note).ok();
+        let (offered, requested) = match &pswap {
+            Some(p) => (
+                format!("{:?}", p.offered_asset()),
+                format!(
+                    "faucet={} amount={}",
+                    p.storage().requested_faucet_id(),
+                    p.storage().requested_asset().amount().as_u64()
+                ),
+            ),
+            None => ("<non-PSWAP (p2id payback?)>".to_string(), "<n/a>".to_string()),
+        };
+
+        // (1) The note we are TRYING TO CONSUME (rebuilt from the order-book raw bytes).
+        tracing::error!(
+            idx = i,
+            note_id = %id,
+            details_commitment = %commitment_hex,
+            serial_number = ?note.serial_num(),
+            nullifier = %note.nullifier(),
+            nullifier_consumed_onchain = consumed_set.contains(&id),
+            attachments_count = note.attachments().num_attachments(),
+            attachments = ?note.attachments(),
+            assets = ?note.assets(),
+            offered = %offered,
+            requested = %requested,
+            "CONSUMING NOTE"
+        );
+
+        // (2) In our store under the SAME id?  (3) ... or under a DIFFERENT id but same details?
+        let by_id_hit = by_id.iter().find(|r| r.id() == Some(id));
+        let by_commitment_hit =
+            all_store.iter().find(|r| r.details_commitment().to_hex() == commitment_hex);
+        match (by_id_hit, by_commitment_hit) {
+            (Some(r), _) => {
+                let attachments_match = r.attachments() == note.attachments();
+                let verdict =
+                    if attachments_match { "IDENTICAL" } else { "*** ATTACHMENTS MISMATCH ***" };
+                tracing::error!(
+                    note_id = %id,
+                    store_state = ?r.state(),
+                    store_details_commitment = %r.details_commitment().to_hex(),
+                    store_attachments_count = r.attachments().num_attachments(),
+                    store_attachments = ?r.attachments(),
+                    store_inclusion_proof = ?r.inclusion_proof(),
+                    attachments_match,
+                    verdict,
+                    "  -> IN STORE (found by id): store copy vs consumed note"
+                );
+            }
+            (None, Some(r)) => tracing::error!(
+                consumed_note_id = %id,
+                store_note_id = ?r.id(),
+                store_state = ?r.state(),
+                consumed_attachments_count = note.attachments().num_attachments(),
+                store_attachments_count = r.attachments().num_attachments(),
+                consumed_attachments = ?note.attachments(),
+                store_attachments = ?r.attachments(),
+                store_inclusion_proof = ?r.inclusion_proof(),
+                "  -> *** ID DRIFT: store has this note under a DIFFERENT id (same details) — body differs ***"
+            ),
+            (None, None) => tracing::error!(
+                note_id = %id,
+                "  -> NOT IN STORE (neither by id nor by details) -> consumed UNAUTHENTICATED"
+            ),
+        }
+    }
+
+    // (4) THE WHOLE VM / TX ERROR — every word.
+    tracing::error!("================ FULL VM / TX ERROR (Display) ================");
+    tracing::error!("{}", error);
+    tracing::error!("================ FULL VM / TX ERROR (pretty Debug, complete nested) ================");
+    tracing::error!("{:#?}", error);
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    let mut depth = 0u32;
+    while let Some(s) = src {
+        tracing::error!(depth, "  caused by: {}", s);
+        src = s.source();
+        depth += 1;
+    }
+    tracing::error!("================ END BATCH CONSUME DIAGNOSTICS ================");
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────
@@ -450,6 +567,11 @@ async fn execute_batch(
             Err(anyhow!("submit cancelled during backoff"))
         }
         SubmitOutcome::TxError(e) => {
+            // DIAGNOSTIC: full per-note dump (id/serial/nullifier/attachments/offered+
+            // requested), on-chain nullifier check, store-existence + store-vs-consumed
+            // MATCH, and the COMPLETE VM/tx error — nothing truncated.
+            log_batch_consume_diagnostics(client, miden_adapter, &input_notes_only, &e).await;
+
             // Non-RPC error: classify per-note via the nullifier check.
             let (consumed_bytes, active_bytes, active_orders) =
                 classify_input_notes(miden_adapter, batch, &input_notes_only).await?;
@@ -475,7 +597,7 @@ async fn execute_batch(
             refeed_orders(order_tx, active_orders).await;
 
             tracing::error!(
-                error = %e,
+                error = ?e,
                 consumed_count = consumed_bytes.len(),
                 refed_count = active_bytes.len(),
                 "non-RPC submit failure classified"

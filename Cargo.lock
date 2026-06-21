@@ -3014,6 +3014,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-mirror"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "miden-client",
+ "miden-client-sqlite-store",
+ "miden-protocol",
+ "miden-standards",
+ "rand 0.9.4",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mock-price"
 version = "0.1.0"
 dependencies = [
@@ -4639,6 +4656,7 @@ dependencies = [
  "toml 0.8.23",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
 ]
 

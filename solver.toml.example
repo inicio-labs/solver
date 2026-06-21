@@ -11,6 +11,8 @@
 # default; use your own node for production.
 endpoint = "https://rpc.testnet.miden.io"
 timeout_ms = 10000
+# Remote prover URL (offload proof gen). Omit to prove locally. Recommended on small hosts.
+# prover_endpoint = "https://tx-prover.devnet.miden.io"
 
 [solver]
 # Hex account ID of the solver's on-chain account. REQUIRED — replace with

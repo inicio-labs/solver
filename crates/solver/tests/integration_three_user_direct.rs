@@ -234,6 +234,7 @@ async fn three_user_direct_matching() -> Result<()> {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
                     timeout_ms: 1_000,
+                    prover_endpoint: None,
                 },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),

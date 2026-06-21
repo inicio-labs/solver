@@ -18,6 +18,13 @@ pub struct SolverConfig {
 pub struct RpcConfig {
     pub endpoint: String,
     pub timeout_ms: u64,
+    /// Optional remote transaction-prover URL (e.g.
+    /// `https://tx-prover.devnet.miden.io`). When set, the executor offloads
+    /// proof generation to it instead of proving locally — essential on small
+    /// hosts where local STARK proving is too slow / memory-heavy. Omit to
+    /// prove locally.
+    #[serde(default)]
+    pub prover_endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -6,7 +6,7 @@ use miden_client::{
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
     rpc::{Endpoint, GrpcClient, NodeRpcClient},
-    Client,
+    Client, RemoteTransactionProver,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 
@@ -24,6 +24,7 @@ pub(crate) struct ProdClientFactory {
     ingest_store_path: String,
     executor_store_path: String,
     keystore_path: String,
+    prover_endpoint: Option<String>,
 }
 
 impl ProdClientFactory {
@@ -35,6 +36,7 @@ impl ProdClientFactory {
             ingest_store_path: config.solver.ingest_store_path.clone(),
             executor_store_path: config.solver.executor_store_path.clone(),
             keystore_path: config.solver.keystore_path.clone(),
+            prover_endpoint: config.rpc.prover_endpoint.clone(),
         }
     }
 }
@@ -63,14 +65,17 @@ impl solver::ClientFactory for ProdClientFactory {
             FilesystemKeyStore::new(PathBuf::from(&self.keystore_path))
                 .context("Failed to initialize keystore")?,
         );
-        ClientBuilder::new()
+        let mut builder = ClientBuilder::new()
             .rpc(self.rpc()?)
             .sqlite_store(PathBuf::from(&self.executor_store_path))
             .authenticator(keystore)
-            .in_debug_mode(self.debug.into())
-            .build()
-            .await
-            .context("Failed to build executor Miden client")
+            .in_debug_mode(self.debug.into());
+        // Offload proving to a remote prover when configured (the executor is
+        // the only client that proves; ingest never submits transactions).
+        if let Some(url) = &self.prover_endpoint {
+            builder = builder.prover(Arc::new(RemoteTransactionProver::new(url.clone())));
+        }
+        builder.build().await.context("Failed to build executor Miden client")
     }
 
     /// Standalone gRPC client at the configured endpoint — the same node the

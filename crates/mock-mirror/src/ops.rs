@@ -46,16 +46,19 @@ pub async fn claim(client: &mut C, account: AccountId) -> Result<usize> {
     Ok(count)
 }
 
-/// Create a **public** PSWAP from `account`: offer `offered`, request `requested`.
+/// Create a **public** PSWAP from `account` (so the solver's keyless ingest
+/// discovers it): offer `offered`, request `requested`. `payback` controls the
+/// note type of the asset returned to the maker (Public or Private).
 pub async fn create_pswap(
     client: &mut C,
     account: AccountId,
     offered: FungibleAsset,
     requested: FungibleAsset,
+    payback: NoteType,
 ) -> Result<()> {
     let data = PswapTransactionData::new(account, offered, requested);
     let request = TransactionRequestBuilder::new()
-        .build_pswap_create(&data, NoteType::Public, NoteType::Public, None, client.rng())
+        .build_pswap_create(&data, NoteType::Public, payback, None, client.rng())
         .map_err(|e| anyhow!("build pswap-create: {e}"))?;
     client
         .submit_new_transaction(account, request)

@@ -6,12 +6,15 @@ the token's **on-chain decimals** — enough to render a swap quote unambiguousl
 ## Base URL
 
 ```
-http://35.175.40.181:8080        # devnet, current (HTTP)
+https://35-175-40-181.sslip.io        # devnet — HTTPS, browser-ready (use this)
+http://35.175.40.181:8080             # same API over plain HTTP (server-side / curl only)
 ```
 
-> HTTPS (`https://<subdomain>`) is being set up — switch the base URL to it once
-> live. Browsers block `http://` calls from an `https://` page (mixed content),
-> so for an HTTPS frontend use the HTTPS base URL when ready.
+> Use the **HTTPS** URL from any browser dApp — it has a real Let's Encrypt cert,
+> so there's no mixed-content block from an `https://` page. (`sslip.io` is just a
+> DNS hostname that resolves to the box IP; a custom domain can replace it later.)
+> The plain-HTTP `:8080` URL works for server-to-server / curl but an HTTPS page
+> will block it as mixed content.
 
 **CORS:** enabled (any origin, `GET`) — browser `fetch()` / extensions work.
 

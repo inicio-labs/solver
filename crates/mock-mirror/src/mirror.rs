@@ -136,13 +136,21 @@ async fn tick(
 ) -> Result<()> {
     let summary = client.sync_state().await.map_err(|e| anyhow!("sync_state: {e}"))?;
 
-    // 0. AUTO-CLAIM incoming P2ID notes (funding + trade proceeds) into the
-    //    vault — but NOT PSWAP notes (those are user orders we counter, and the
-    //    solver consumes them). If we claimed anything, skip the rest this tick
-    //    so the consume tx commits before we spend that inventory in a counter.
-    let claimed = claim_incoming(client, mock_id).await?;
-    if claimed > 0 {
-        tracing::info!(claimed, "auto-claimed incoming notes; posting counters next tick");
+    // MIRRORING TAKES PRIORITY OVER CLAIMING. `new_public_notes` is
+    // EDGE-TRIGGERED — an order shows up only on the sync it first arrives, so we
+    // MUST counter it this tick or it's lost. Claiming reads the *persistent*
+    // `Committed` filter, so it can safely wait for an idle tick. Doing both in
+    // one tick would also risk a same-account nonce clash (claim tx vs counter
+    // tx). So: if this sync brought new notes, go straight to mirroring; only
+    // claim incoming P2ID notes (funding + trade proceeds) on idle ticks.
+    let has_new_notes =
+        !summary.new_public_notes.is_empty() || !summary.new_private_notes.is_empty();
+    if !has_new_notes {
+        match claim_incoming(client, mock_id).await {
+            Ok(n) if n > 0 => tracing::info!(claimed = n, "auto-claimed incoming notes"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "auto-claim failed; will retry"),
+        }
         return Ok(());
     }
 

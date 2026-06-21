@@ -28,6 +28,7 @@ use miden_client::account::{
 use miden_client::auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
+use miden_client::note::NoteType;
 use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
 use miden_client::{Client, RemoteTransactionProver};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
@@ -103,21 +104,28 @@ async fn run_claim(a: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt>`.
+/// `pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt> [public|private]`.
+/// The trailing arg sets the PAYBACK note type (default public); the PSWAP order
+/// itself is always public so the solver can discover it.
 async fn run_pswap(a: &[String]) -> Result<()> {
-    let usage = "usage: mock-mirror pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt>";
+    let usage = "usage: mock-mirror pswap <config> <offer_faucet> <offer_amt> <req_faucet> <req_amt> [public|private]";
     let config = a.first().context(usage)?;
     let offer_faucet = AccountId::from_hex(a.get(1).context(usage)?).context("offer_faucet")?;
     let offer_amt: u64 = a.get(2).context(usage)?.parse().context("offer_amt")?;
     let req_faucet = AccountId::from_hex(a.get(3).context(usage)?).context("req_faucet")?;
     let req_amt: u64 = a.get(4).context(usage)?.parse().context("req_amt")?;
+    let payback = match a.get(5).map(String::as_str) {
+        Some("private") => NoteType::Private,
+        Some("public") | None => NoteType::Public,
+        Some(other) => anyhow::bail!("payback type must be public|private, got {other:?}"),
+    };
 
     let (account, mut client) = account_and_client(config).await?;
     let offered = FungibleAsset::new(offer_faucet, offer_amt).map_err(|e| anyhow::anyhow!("offered: {e}"))?;
     let requested = FungibleAsset::new(req_faucet, req_amt).map_err(|e| anyhow::anyhow!("requested: {e}"))?;
-    ops::create_pswap(&mut client, account, offered, requested).await?;
+    ops::create_pswap(&mut client, account, offered, requested, payback).await?;
     println!(
-        "PSWAP created from {}: offer {offer_amt} of {} / request {req_amt} of {}",
+        "PSWAP created from {}: offer {offer_amt} of {} / request {req_amt} of {} (payback {payback:?})",
         account.to_hex(),
         offer_faucet.to_hex(),
         req_faucet.to_hex()

@@ -47,6 +47,9 @@ miden-protocol = { workspace = true, features = ["testing"] }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }
 tempfile = "3"
+# Surfaces the solver's tracing logs in integration tests (e.g. the executor's
+# exact failure assertion) under `--nocapture`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Adversarial property-based fuzzing of the matching math (pentest).
 proptest = "1"
 # test-util is dev-only; enables tokio::time::pause/advance + start_paused on #[tokio::test].

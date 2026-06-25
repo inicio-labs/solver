@@ -353,6 +353,24 @@ pub fn load_token_symbols(pool: &DbPool) -> Result<HashMap<TokenId, String>> {
     Ok(out)
 }
 
+/// Load on-chain decimals for all registered tokens that have them. Tokens whose
+/// decimals haven't been fetched yet (`NULL`) are omitted — the router's
+/// `select_notes` excludes any note whose token decimals are unknown, so a
+/// missing entry just means that token isn't routed externally until fetched.
+pub fn load_token_decimals(pool: &DbPool) -> Result<HashMap<TokenId, u8>> {
+    let mut conn = pool.read_conn()?;
+    let rows = get_registered_tokens(&mut conn)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let Some(decimals) = row.decimals else { continue };
+        let Ok(decimals) = u8::try_from(decimals) else { continue };
+        let token = TokenId::read_from(&mut SliceReader::new(&row.token_id))
+            .map_err(|e| anyhow::anyhow!("invalid token in DB: {e}"))?;
+        out.insert(token, decimals);
+    }
+    Ok(out)
+}
+
 /// Returns true if deleted, false if not found.
 pub fn unregister_token(conn: &mut SqliteConnection, token_id: &[u8]) -> Result<bool> {
     let deleted = diesel::delete(
@@ -405,6 +423,31 @@ mod tests {
         let mut conn = pool.write_conn().unwrap();
         let block = get_last_fetched_block(&mut conn).unwrap();
         assert_eq!(block, 0);
+    }
+
+    #[test]
+    fn load_token_decimals_returns_only_known() {
+        use miden_protocol::crypto::utils::Serializable;
+        use miden_protocol::testing::account_id::{
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        };
+        // A temp FILE (not :memory:) so the separate read/write pools share
+        // state — `load_token_decimals` reads via the read pool.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pool = init_db(tmp.path().to_str().unwrap(), 1).unwrap();
+        let a: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+        let b: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        let (a_bytes, b_bytes) = (a.to_bytes(), b.to_bytes());
+        {
+            let mut conn = pool.write_conn().unwrap();
+            register_token(&mut conn, &a_bytes, None).unwrap();
+            register_token(&mut conn, &b_bytes, None).unwrap();
+            // Only `a` gets decimals fetched; `b` stays NULL.
+            set_token_metadata(&mut conn, &a_bytes, Some(8), Some("A")).unwrap();
+        }
+        let map = load_token_decimals(&pool).unwrap();
+        assert_eq!(map.get(&a), Some(&8u8));
+        assert!(!map.contains_key(&b), "token with NULL decimals is omitted");
     }
 
     #[test]

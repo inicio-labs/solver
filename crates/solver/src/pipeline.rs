@@ -15,6 +15,7 @@ use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
+use crate::router::{Handover, QuotesSnapshot};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -192,6 +193,12 @@ pub struct PipelineChannels {
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+    /// Standing DEX quotes: router → matcher (latest-wins).
+    pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
+    pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
+    /// Selected notes: matcher → router (delivered to DEXes over websocket).
+    pub handover_tx: mpsc::Sender<Handover>,
+    pub handover_rx: mpsc::Receiver<Handover>,
 }
 
 pub fn create_channels() -> PipelineChannels {
@@ -201,6 +208,8 @@ pub fn create_channels() -> PipelineChannels {
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
+    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
+    let (handover_tx, handover_rx) = mpsc::channel::<Handover>(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
         order_tx,
         order_rx,
@@ -214,6 +223,10 @@ pub fn create_channels() -> PipelineChannels {
         exec_rx,
         subscribe_tx,
         subscribe_rx,
+        quotes_tx,
+        quotes_rx,
+        handover_tx,
+        handover_rx,
     }
 }
 
@@ -260,6 +273,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     last_price_update: Arc<AtomicI64>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
+    router_hooks: Option<matcher::RouterHooks>,
 ) -> CoreHandles {
     // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
     let price_pool = config.db_pool.clone();
@@ -286,6 +300,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
             exec_tx,
             match_interval,
             triangular_enabled,
+            router_hooks,
             matcher_cancel,
         )
         .await;

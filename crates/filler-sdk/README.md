@@ -11,6 +11,41 @@ quotes, and receive **handovers** — serialized PSWAP notes you consume on-chai
 > — protocol reference, quoting/decimal semantics, a complete reference filler, and an
 > FAQ. This README is the quickstart.
 
+## Integration in 5 steps
+
+1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer token the operator issued you.
+2. **Subscribe** to the pairs you can fill.
+3. **Quote** a standing `{price, quantity}` per pair; refresh before the TTL.
+4. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill.
+5. **Consume on-chain** — decode the note and self-consume with your own client/gas.
+
+## How the solver talks to your DEX
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as Your DEX<br/>(pswap-filler-sdk)
+    participant R as Solver router<br/>(websocket thread)
+    participant M as Matcher<br/>(in-memory order book)
+    participant C as Miden chain
+
+    D->>R: connect /v1/rfq (Authorization: Bearer)
+    R-->>D: AuthOk
+    D->>R: Subscribe { pairs }
+    D->>R: Quote { pair, price, quantity }
+    Note right of D: standing — refresh before the TTL
+    R->>M: quotes_tx (watch) — latest quotes
+    Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
+    M->>M: park the note (out of internal matching)
+    M->>R: handover_tx (try_send)
+    R-->>D: Handover { note_id, fill_amount, note_hex, fill_price }
+    D->>D: decode_note + your policy check
+    D->>C: consume the note on-chain (your gas, your keys)
+    C-->>M: nullifier observed → consumed_rx
+    M->>M: drop the note (settled)
+    Note over D,M: not consumed within the in-flight TTL?<br/>the matcher unparks and re-routes it
+```
+
 ## Why this is a separate crate
 
 Add **only** `pswap-filler-sdk`. You do **not** depend on the solver, its

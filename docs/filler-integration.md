@@ -28,16 +28,46 @@ Three facts make this simpler than a normal RFQ/AMM integration:
    The solver matches its idle notes against your standing quote and pushes you the
    ones that clear it.
 
-```
-  you ──SUBSCRIBE{pairs}──▶ solver router        (pairs you can fill)
-  you ──QUOTE{pair,price,quantity}──▶ router      (standing; refresh before TTL)
-                          router ──HANDOVER{note_id, fill_amount, note_hex, fill_price}──▶ you
-  you: decode note → check terms → consume on-chain (your client, your gas)
-  solver observes the on-chain fill → drops the note from its book
+### Integration in 5 steps
+
+1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer
+   token the operator issued you (§3).
+2. **Subscribe** to the pairs you can fill (§4).
+3. **Quote** a standing `{price, quantity}` per pair; refresh it before the TTL (§4).
+4. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill (§5).
+5. **Consume on-chain** — decode the note and self-consume with your own client/gas (§5).
+
+That's the whole integration surface. Everything below is detail on each step.
+
+### How the solver talks to your DEX
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as Your DEX<br/>(pswap-filler-sdk)
+    participant R as Solver router<br/>(websocket thread)
+    participant M as Matcher<br/>(in-memory order book)
+    participant C as Miden chain
+
+    D->>R: connect /v1/rfq (Authorization: Bearer)
+    R-->>D: AuthOk
+    D->>R: Subscribe { pairs }
+    D->>R: Quote { pair, price, quantity }
+    Note right of D: standing — refresh before the TTL
+    R->>M: quotes_tx (watch) — latest quotes
+    Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
+    M->>M: park the note (out of internal matching)
+    M->>R: handover_tx (try_send)
+    R-->>D: Handover { note_id, fill_amount, note_hex, fill_price }
+    D->>D: decode_note + your policy check
+    D->>C: consume the note on-chain (your gas, your keys)
+    C-->>M: nullifier observed → consumed_rx
+    M->>M: drop the note (settled)
+    Note over D,M: not consumed within the in-flight TTL?<br/>the matcher unparks and re-routes it
 ```
 
-If you never consume a handed-over note, nothing breaks: after an in-flight TTL the
-solver simply reactivates it and matches it elsewhere.
+If you never consume a handed-over note, nothing breaks: after the in-flight TTL the
+solver reactivates it and matches it elsewhere.
 
 ---
 

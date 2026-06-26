@@ -97,10 +97,14 @@ reusing the book's own index machinery rather than inventing a parallel flag pat
   popped id no longer in `parked` is a consumed tombstone, skipped. It re-indexes the
   surviving struct via the existing add path (note rejoins the back of its rate FIFO —
   fair; it was "away") and returns `(id, dex)` so the matcher releases the reservation.
-- **Exactly two exits from PARKED:** (a) **consume** — the DEX self-consumes →
-  `consumed_rx` → drop from `orders` (settled); (b) **no-show** — not consumed within
-  `router_inflight_ttl_ms` → reactivation re-indexes it (matchable + re-routable, but
-  not re-offered to the same DEX). The TTL is the only unpark trigger.
+- **Exits from PARKED:** (a) **consume** — the DEX self-consumes → `consumed_rx` → drop
+  from `orders` (settled); (b) **no-show** — not consumed within `router_inflight_ttl_ms`
+  → reactivation re-indexes it (matchable + re-routable, but **not** re-offered to the
+  same DEX); (c) **rollback** — if the handover `try_send` is dropped (full/closed
+  channel), the note never reached the DEX, so it is **immediately unparked**
+  (`OrderBook::unpark`) with its reservation released and **no** re-offer penalty — a
+  dropped delivery costs nothing. The DEX-no-show penalty in (b) applies only to notes
+  that were actually delivered.
 - **One park-aware conditional:** the `consumed_rx` removal of an *already-parked* note
   must not decrement the counter again (it was decremented at park) — just drop it from
   `orders`. `add_user_order` is idempotent on note id as general defence.
@@ -227,7 +231,8 @@ it can't constrain a DEX's miden version.
 5. **Verify readiness** — on boot, `start.rs` gates on the router's bind readiness
    oneshot; a router that can't bind fails startup loudly.
 6. **Watch** — handover/quote activity is logged; a `handover_tx` full/closed drop is
-   counted, not fatal.
+   logged and the batch is **rolled back** (notes unparked, reservations released, so
+   they stay eligible next tick) — not fatal.
 
 ---
 

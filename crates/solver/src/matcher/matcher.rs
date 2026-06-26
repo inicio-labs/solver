@@ -248,10 +248,24 @@ fn external_pass(
         let n = items.len();
         match r.handover_tx.try_send(Handover { items }) {
             Ok(()) => tracing::info!(count = n, "routed unmatched notes to DEXes"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "handover channel full/closed; dropping (notes reactivate via TTL)"
-            ),
+            Err(e) => {
+                // The DEX never received these, so roll the batch back: unpark each
+                // note and release its reservation. A dropped handover is then a
+                // no-op (the notes stay eligible next tick, to the same DEX) rather
+                // than a no-re-offer penalty earned on TTL reactivation for a note
+                // the DEX never saw.
+                let reason = e.to_string();
+                let dropped = e.into_inner();
+                for item in &dropped.items {
+                    engine.book.unpark(item.note_id);
+                    release_reservation(reserved, reservations, item.note_id);
+                }
+                tracing::warn!(
+                    count = n,
+                    reason = %reason,
+                    "handover not sent; rolled back park so notes stay eligible"
+                );
+            }
         }
     }
 }
@@ -714,12 +728,14 @@ mod tests {
             .unwrap();
     }
 
-    /// Backpressure: a **full** handover channel must not stall the external pass.
-    /// The selected note is still parked (so TTL reactivation recovers it) and a
-    /// reservation is recorded — the handover is dropped, never blocked. Exercises
-    /// the `try_send` Full branch (`matcher.rs:249`).
+    /// Backpressure rollback: when the handover channel is **full**, the external
+    /// pass must not stall — and the dropped batch is **rolled back** (notes
+    /// unparked, reservations released), so a note the DEX never received is not
+    /// penalized. It stays immediately eligible: once the channel drains, a retry
+    /// re-routes it to that **same** DEX. Exercises the `try_send` Full branch and
+    /// the rollback in `external_pass`.
     #[test]
-    fn full_handover_channel_drops_handover_but_still_parks_note() {
+    fn full_handover_channel_rolls_back_so_dropped_note_stays_eligible() {
         use crate::db::{init_db, register_token, set_token_metadata};
         use miden_protocol::crypto::utils::Serializable;
 
@@ -742,9 +758,8 @@ mod tests {
         let (_qtx, quotes_rx) =
             watch::channel(Arc::new(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)]));
 
-        // Capacity-1 handover channel, pre-filled → the matcher's next try_send is Full.
-        // Keep `_handover_rx` alive so the channel is Full (not Closed).
-        let (handover_tx, _handover_rx) = mpsc::channel::<Handover>(1);
+        // Capacity-1 handover channel, pre-filled → the first try_send is Full.
+        let (handover_tx, mut handover_rx) = mpsc::channel::<Handover>(1);
         handover_tx.try_send(Handover { items: vec![] }).unwrap();
 
         let hooks = RouterHooks {
@@ -762,24 +777,28 @@ mod tests {
         let mut reservations = HashMap::new();
         let no_reoffer = HashMap::new();
 
-        // Full channel — must return without blocking or panicking.
+        // (1) Full channel → the handover is dropped and ROLLED BACK: not parked,
+        //     back in internal matching, reservation released. No hang, no penalty.
         external_pass(
-            &mut engine,
-            &raw,
-            &pool,
-            &price_rx,
-            &mut reserved,
-            &mut reservations,
-            &no_reoffer,
-            &hooks,
-            1_000,
+            &mut engine, &raw, &pool, &price_rx,
+            &mut reserved, &mut reservations, &no_reoffer, &hooks, 1_000,
         );
+        assert!(!engine.book.is_parked(id), "dropped handover rolled back — note not left parked");
+        assert_eq!(engine.book.active_order_count(), 1, "note is eligible again");
+        assert!(!reservations.contains_key(&id), "reservation released on rollback");
 
-        // Selected + PARKED despite the dropped delivery — out of internal matching,
-        // with a reservation, so TTL reactivation (not a hang) is what recovers it.
-        assert!(engine.book.is_parked(id), "note parked despite the dropped handover");
-        assert_eq!(engine.book.active_order_count(), 0, "parked note left internal matching");
-        assert!(reservations.contains_key(&id), "reservation recorded for the parked pick");
+        // (2) Drain the channel, retry → the note re-routes to the SAME DEX and is
+        //     delivered. The drop cost it nothing.
+        let _ = handover_rx.try_recv(); // free the slot
+        external_pass(
+            &mut engine, &raw, &pool, &price_rx,
+            &mut reserved, &mut reservations, &no_reoffer, &hooks, 2_000,
+        );
+        assert!(engine.book.is_parked(id), "after the drop the note re-routes to the same DEX");
+        assert!(reservations.contains_key(&id), "reservation recorded on the successful retry");
+        let delivered = handover_rx.try_recv().expect("handover delivered on retry");
+        assert_eq!(delivered.items.len(), 1);
+        assert_eq!(delivered.items[0].note_id, id);
     }
 
     fn harness_db() -> (tempfile::NamedTempFile, DbPool) {

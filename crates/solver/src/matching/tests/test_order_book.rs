@@ -172,6 +172,32 @@ fn unpark_on_ttl_restores_to_index() {
 }
 
 #[test]
+fn unpark_immediate_rollback_restores_and_leaves_tombstone() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    let id = gen.next();
+    book.add_user_order(id, usdc(), eth(), 2000, 1);
+    book.park(id, DEX_A, 1_000);
+    assert_eq!(book.active_order_count(), 0);
+
+    // Immediate rollback (a handover that was never delivered): returns the DEX
+    // and restores the note to the index now — no TTL wait, no penalty.
+    assert_eq!(book.unpark(id), Some(DEX_A));
+    assert!(!book.is_parked(id));
+    assert_eq!(book.active_order_count(), 1, "back in the index immediately");
+    assert!(book.best_order(usdc(), eth()).is_some());
+
+    // The stale park_queue entry is a tombstone: a later TTL sweep skips it, so
+    // the unparked note is not re-woken (and never earns a no-re-offer block).
+    assert!(book.reactivate_parked_older_than(1, 9_999).is_empty(), "tombstone skipped");
+    assert_eq!(book.active_order_count(), 1, "still exactly one active note");
+
+    // Unparking a note that isn't parked is a no-op.
+    assert_eq!(book.unpark(id), None);
+}
+
+#[test]
 fn consume_of_parked_note_no_double_decrement() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);

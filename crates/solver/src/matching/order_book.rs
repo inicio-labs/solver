@@ -195,6 +195,20 @@ impl<F: PriceFeed> OrderBook<F> {
         reactivated
     }
 
+    /// Immediately unpark a specific note — the **rollback** of a `park` whose
+    /// handover was never delivered (e.g. a `try_send` into a full channel).
+    /// Re-adds it to the rate index and drops it from `parked`; the now-stale
+    /// `park_queue` entry becomes a harmless tombstone, skipped by the next
+    /// `reactivate_parked_older_than`. Returns the DEX it had been parked for, or
+    /// `None` if it wasn't parked. Unlike TTL reactivation this carries **no**
+    /// "don't re-offer to that DEX" signal — the note was never actually offered,
+    /// so it stays fully eligible, including to that same DEX.
+    pub fn unpark(&mut self, id: OrderId) -> Option<DexId> {
+        let (dex, _) = self.parked.remove(&id)?;
+        self.reindex(id);
+        Some(dex)
+    }
+
     /// Re-add a parked note's **existing** struct to the rate index — does NOT
     /// rebuild the `Order`, so any fill state is preserved (unlike
     /// `add_user_order`, which resets `requested_remaining`). The note rejoins

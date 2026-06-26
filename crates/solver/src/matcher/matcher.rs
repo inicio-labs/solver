@@ -583,6 +583,137 @@ mod tests {
             .await;
     }
 
+    /// FULL LOOP through the public SDK and the real router thread: a DEX
+    /// (`FillerClient`) connects, subscribes, and posts an **RFQ quote**; an
+    /// unmatched **order** sits in the matcher; the real `run_matcher` external
+    /// pass selects it, and the **handover travels all the way back to the SDK**
+    /// as a `FillerEvent::Handover`. This is the end-to-end the hand-injected
+    /// `integration_filler_sdk` test does NOT cover: SDK quote → router →
+    /// matcher select → router → SDK handover, nothing mocked in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sdk_quote_and_order_route_through_real_matcher_back_to_sdk() {
+        use crate::db::{init_db, register_token, set_token_metadata};
+        use crate::router::{spawn_router_thread, RouterConfig};
+        use miden_protocol::crypto::utils::Serializable;
+        use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+
+        // DB with both tokens priced + decimalled (export gates need both).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pool = init_db(tmp.path().to_str().unwrap(), 2).unwrap();
+        {
+            let mut conn = pool.write_conn().unwrap();
+            register_token(&mut conn, &imiden().to_bytes(), None).unwrap();
+            register_token(&mut conn, &iusdt().to_bytes(), None).unwrap();
+            set_token_metadata(&mut conn, &imiden().to_bytes(), Some(8), None).unwrap();
+            set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
+        }
+
+        let (order_tx, order_rx) = mpsc::channel(16);
+        let (_consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
+        let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
+        let (exec_tx, _exec_rx) = mpsc::channel(16);
+        // The router owns quotes_tx (publishes DEX quotes) + handover_rx (delivers
+        // handovers); the matcher owns quotes_rx + handover_tx. Real wiring.
+        let (quotes_tx, quotes_rx) = watch::channel(Arc::new(Vec::new()));
+        let (handover_tx, handover_rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        let mut prices = PriceSnapshot::new();
+        prices.insert(imiden(), 200);
+        prices.insert(iusdt(), 100);
+        price_tx.send(prices).unwrap();
+
+        // Real router thread on an ephemeral port.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let cfg = RouterConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            max_connections: 8,
+            max_msg_bytes: 16384,
+            quote_ttl_ms: 20_000,
+            auth_tokens: vec!["dex-tok".into()],
+        };
+        let (router_thread, ready) =
+            spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+        ready.await.unwrap().expect("router bound");
+
+        // An unmatched order: offer 1.1 IMIDEN ($2.20) for 2 IUSDT ($2.00) — +10%
+        // generous, so it clears a price-2 quote at 100 bps edge.
+        let id = nid(4242);
+        order_tx
+            .send(IngestOrder {
+                note_id: id,
+                offered_token: imiden(),
+                requested_token: iusdt(),
+                offered_amount: 110_000_000,
+                requested_amount: 2_000_000,
+                raw_note_data: vec![0xC0, 0xFF, 0xEE],
+            })
+            .await
+            .unwrap();
+
+        let hooks = RouterHooks {
+            quotes_rx,
+            handover_tx,
+            inflight_ttl_ms: 60_000,
+            min_edge_bps: 100,
+            max_dev_bps: 200,
+        };
+        let url = format!("ws://127.0.0.1:{port}/v1/rfq");
+        let pair = PairSpec { offered: imiden().to_hex(), requested: iusdt().to_hex() };
+
+        // Matcher is current-thread + LocalSet in production — mirror that.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let task = tokio::task::spawn_local(run_matcher(
+                    pool,
+                    order_rx,
+                    consumed_rx,
+                    price_rx,
+                    exec_tx,
+                    Duration::from_millis(10),
+                    false,
+                    Some(hooks),
+                    cancel.clone(),
+                ));
+
+                // The DEX connects via the SDK and posts an RFQ quote.
+                let mut client = FillerClient::connect(&url, "dex-tok").await.expect("connect");
+                assert_eq!(client.next_event().await, Some(FillerEvent::AuthOk));
+                client.subscribe(vec![pair.clone()]).unwrap();
+                client.quote(&pair, "2", 1_000_000_000, None).unwrap();
+
+                // The matcher selects the order; the handover returns to the SDK.
+                let handover = loop {
+                    let ev = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+                        .await
+                        .expect("handover within timeout")
+                        .expect("event present");
+                    match ev {
+                        FillerEvent::Handover(h) => break h,
+                        FillerEvent::Disconnected => panic!("disconnected before handover"),
+                        _ => continue, // ignore any Ask/Error noise
+                    }
+                };
+                assert_eq!(handover.note_id, id.to_string(), "the order we fed");
+                assert_eq!(handover.fill_amount, 2_000_000, "full requested amount");
+                assert_eq!(handover.fill_price, "2", "the DEX's quoted price, echoed");
+                assert_eq!(handover.note_hex, "c0ffee", "exact serialized note bytes");
+
+                drop(client); // let the router's graceful shutdown complete
+                cancel.cancel();
+                let _ = task.await;
+            })
+            .await;
+
+        tokio::task::spawn_blocking(move || router_thread.join().unwrap())
+            .await
+            .unwrap();
+    }
+
     fn harness_db() -> (tempfile::NamedTempFile, DbPool) {
         use crate::db::{init_db, register_token, set_token_metadata};
         use miden_protocol::crypto::utils::Serializable;

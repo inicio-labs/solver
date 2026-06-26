@@ -186,7 +186,6 @@ while let Some(ev) = client.next_event().await {
             // h.fill_price  : String  — the price to fill at (your quoted X, echoed)
             handle_handover(h).await?;
         }
-        FillerEvent::Ask { .. } => { /* solver re-advertised the pairs it wants */ }
         FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
         FillerEvent::Disconnected => break,   // reconnect (see §7)
         FillerEvent::AuthOk => {}
@@ -342,7 +341,6 @@ all of this for you; this section is for debugging or a non-Rust client.
 | `type` | fields | meaning |
 |---|---|---|
 | `auth_ok` | — | handshake accepted (first frame) |
-| `ask` | `pairs: [{offered, requested}]` | pairs the solver wants quotes for |
 | `handover` | `note_id: string`, `fill_amount: u64`, `note_hex: string`, `fill_price: string` | a note to fill, at `fill_price` |
 | `error` | `code: string`, `msg: string` | a message was rejected (e.g. bad price) |
 
@@ -364,8 +362,8 @@ Example quote frame:
 
 ## 9. FAQ / gotchas
 
-**Do I send an Ask or request per order?** No. You post a standing quote; the solver
-pushes matching notes. `Ask` is informational (the pairs the solver wants).
+**Do I request per order?** No. You post a standing quote; the solver pushes matching
+notes. You never reply per order.
 
 **My quote is "valid" but I get no handovers.** The solver only exports a note when (a)
 your quote price clears the note's fixed rate, (b) the note also beats oracle mid by the

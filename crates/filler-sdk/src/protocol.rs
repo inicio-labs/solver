@@ -17,7 +17,7 @@ pub struct PairSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// Pairs the DEX can fill (for `Ask` targeting; quotes still gate per pair).
+    /// Pairs the DEX can fill; quotes still gate per pair.
     Subscribe { pairs: Vec<PairSpec> },
     /// A standing quote for one pair. Resend before expiry to refresh.
     Quote {
@@ -39,9 +39,6 @@ pub enum ClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
     AuthOk,
-    Ask {
-        pairs: Vec<PairSpec>,
-    },
     Handover {
         note_id: String,
         fill_amount: u64,

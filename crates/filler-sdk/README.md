@@ -97,7 +97,6 @@ async fn main() -> anyhow::Result<()> {
                 //   let args  = pswap_filler_sdk::consume::consume_args(h.fill_amount)?;
                 //   // ... feed `note` + `args` into your own miden-client tx ...
             }
-            FillerEvent::Ask { .. } => {}
             FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
             FillerEvent::Disconnected => break,
         }

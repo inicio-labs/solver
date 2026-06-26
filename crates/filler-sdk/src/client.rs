@@ -22,8 +22,6 @@
 //! }
 //! ```
 
-use std::time::Duration;
-
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -55,8 +53,6 @@ pub struct Handover {
 pub enum FillerEvent {
     /// Handshake accepted — the connection is live.
     AuthOk,
-    /// The router's standing request: pairs it wants quotes for.
-    Ask { pairs: Vec<PairSpec> },
     /// A note to fill. Decode `note_hex` and self-consume on-chain.
     Handover(Handover),
     /// A structured error from the router (e.g. a malformed quote was rejected).
@@ -70,7 +66,6 @@ impl From<ServerMsg> for FillerEvent {
     fn from(m: ServerMsg) -> Self {
         match m {
             ServerMsg::AuthOk => FillerEvent::AuthOk,
-            ServerMsg::Ask { pairs } => FillerEvent::Ask { pairs },
             ServerMsg::Handover { note_id, fill_amount, note_hex, fill_price } => {
                 FillerEvent::Handover(Handover { note_id, fill_amount, note_hex, fill_price })
             }
@@ -170,15 +165,6 @@ impl FillerClient {
     /// (after a final [`FillerEvent::Disconnected`]).
     pub async fn next_event(&mut self) -> Option<FillerEvent> {
         self.events.recv().await
-    }
-
-    /// Like [`next_event`](Self::next_event) but gives up after `timeout`,
-    /// returning `Ok(None)` on timeout (the connection stays open).
-    pub async fn next_event_timeout(&mut self, timeout: Duration) -> Result<Option<FillerEvent>> {
-        match tokio::time::timeout(timeout, self.events.recv()).await {
-            Ok(ev) => Ok(ev),
-            Err(_) => Ok(None),
-        }
     }
 
     // ── Convenience pass-throughs to the sender ──────────────────────────────

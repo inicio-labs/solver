@@ -59,9 +59,6 @@ pub enum FillerEvent {
     Ask { pairs: Vec<PairSpec> },
     /// A note to fill. Decode `note_hex` and self-consume on-chain.
     Handover(Handover),
-    /// A previously handed-over note is no longer available (settled internally
-    /// or otherwise withdrawn) — stop trying to consume it.
-    Withdrawn { note_id: String },
     /// A structured error from the router (e.g. a malformed quote was rejected).
     Error { code: String, msg: String },
     /// The socket closed (by either side) or errored. Terminal: the event
@@ -77,7 +74,6 @@ impl From<ServerMsg> for FillerEvent {
             ServerMsg::Handover { note_id, fill_amount, note_hex, fill_price } => {
                 FillerEvent::Handover(Handover { note_id, fill_amount, note_hex, fill_price })
             }
-            ServerMsg::Withdrawn { note_id } => FillerEvent::Withdrawn { note_id },
             ServerMsg::Error { code, msg } => FillerEvent::Error { code, msg },
         }
     }
@@ -272,10 +268,6 @@ mod tests {
                 note_hex: "ab".into(),
                 fill_price: "2.05".into(),
             })
-        );
-        assert_eq!(
-            FillerEvent::from(ServerMsg::Withdrawn { note_id: "n".into() }),
-            FillerEvent::Withdrawn { note_id: "n".into() }
         );
     }
 

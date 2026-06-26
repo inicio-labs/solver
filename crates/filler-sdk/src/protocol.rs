@@ -53,9 +53,6 @@ pub enum ServerMsg {
         /// note's intrinsic on-chain rate.
         fill_price: String,
     },
-    Withdrawn {
-        note_id: String,
-    },
     Error {
         code: String,
         msg: String,

@@ -186,9 +186,6 @@ while let Some(ev) = client.next_event().await {
             // h.fill_price  : String  — the price to fill at (your quoted X, echoed)
             handle_handover(h).await?;
         }
-        FillerEvent::Withdrawn { note_id } => {
-            // Stop trying to consume this note — it settled internally or was pulled.
-        }
         FillerEvent::Ask { .. } => { /* solver re-advertised the pairs it wants */ }
         FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
         FillerEvent::Disconnected => break,   // reconnect (see §7)
@@ -347,7 +344,6 @@ all of this for you; this section is for debugging or a non-Rust client.
 | `auth_ok` | — | handshake accepted (first frame) |
 | `ask` | `pairs: [{offered, requested}]` | pairs the solver wants quotes for |
 | `handover` | `note_id: string`, `fill_amount: u64`, `note_hex: string`, `fill_price: string` | a note to fill, at `fill_price` |
-| `withdrawn` | `note_id: string` | stop trying to consume this note |
 | `error` | `code: string`, `msg: string` | a message was rejected (e.g. bad price) |
 
 `pair` is `{ "offered": "0x<hex account id>", "requested": "0x<hex account id>" }`.

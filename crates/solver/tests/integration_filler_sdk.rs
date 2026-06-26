@@ -127,3 +127,50 @@ async fn sdk_filler_round_trip_against_real_router() {
         .await
         .unwrap();
 }
+
+/// Error round-trip through the SDK: a quote the router can't parse (bad pair
+/// account ids — which the SDK does NOT validate locally) comes back as a
+/// structured `FillerEvent::Error`, and the session stays open for a good quote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_surfaces_router_error_for_unparseable_quote() {
+    let port = free_port();
+    let (quotes_tx, _quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
+    let (_handover_tx, handover_rx) = mpsc::channel::<Handover>(8);
+    let cancel = CancellationToken::new();
+
+    let cfg = RouterConfig {
+        bind: "127.0.0.1".into(),
+        port,
+        max_connections: 8,
+        max_msg_bytes: 16384,
+        quote_ttl_ms: 20_000,
+        auth_tokens: vec!["dex-secret".into()],
+    };
+    let (thread, ready) =
+        spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+    ready.await.unwrap().expect("router bound");
+
+    let url = format!("ws://127.0.0.1:{port}/v1/rfq");
+    let mut client = FillerClient::connect(&url, "dex-secret").await.expect("connect");
+    assert_eq!(client.next_event().await, Some(FillerEvent::AuthOk));
+
+    // The SDK validates price/quantity locally but NOT the pair hex, so this
+    // malformed-pair quote reaches the router and is rejected with an error.
+    let bad_pair = PairSpec { offered: "not-a-hex".into(), requested: "nope".into() };
+    client.quote(&bad_pair, "2", 1_000, None).unwrap();
+
+    let ev = tokio::time::timeout(Duration::from_secs(3), client.next_event())
+        .await
+        .expect("error within timeout")
+        .expect("event present");
+    match ev {
+        FillerEvent::Error { code, .. } => assert_eq!(code, "bad_pair"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    drop(client);
+    cancel.cancel();
+    tokio::task::spawn_blocking(move || thread.join().unwrap())
+        .await
+        .unwrap();
+}

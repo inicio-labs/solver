@@ -776,4 +776,52 @@ mod tests {
         assert!(ma.to_text().unwrap().contains("\"note_hex\":\"01\""), "DEX A got its note");
         assert!(mb.to_text().unwrap().contains("\"note_hex\":\"02\""), "DEX B got its note");
     }
+
+    /// DoS guard: a message larger than `max_msg_bytes` closes *that* connection
+    /// (the server enforces `ws.max_message_size`) without taking down the router —
+    /// a second client connects and authenticates fine afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ws_oversized_message_closes_only_that_connection() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let (quotes_tx, _rx) = watch::channel(Arc::new(Vec::new()));
+        let cfg = RouterConfig {
+            bind: "127.0.0.1".into(),
+            port: 0,
+            max_connections: 8,
+            max_msg_bytes: 128, // tiny cap
+            quote_ttl_ms: 20_000,
+            auth_tokens: vec!["t".into()],
+        };
+        let state = RouterState::new(cfg, quotes_tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+
+        let url = format!("ws://{addr}/v1/rfq?token=t");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+        assert!(ws.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+
+        // A message far larger than the 128-byte cap.
+        let _ = ws.send(WsMessage::Text("x".repeat(8192).into())).await;
+
+        // The server rejects the oversized frame and drops the connection: the
+        // client's stream ends (Close / Err / None) instead of hanging.
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+                Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break true,
+                Ok(Some(Ok(_))) => continue, // ignore any other frame
+                Err(_) => break false,       // timed out → still open (would be a leak)
+            }
+        };
+        assert!(closed, "oversized message must close the connection");
+
+        // The router itself is unharmed: a fresh client still connects + authenticates.
+        let (mut ws2, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        assert!(ws2.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+    }
 }

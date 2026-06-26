@@ -714,6 +714,74 @@ mod tests {
             .unwrap();
     }
 
+    /// Backpressure: a **full** handover channel must not stall the external pass.
+    /// The selected note is still parked (so TTL reactivation recovers it) and a
+    /// reservation is recorded — the handover is dropped, never blocked. Exercises
+    /// the `try_send` Full branch (`matcher.rs:249`).
+    #[test]
+    fn full_handover_channel_drops_handover_but_still_parks_note() {
+        use crate::db::{init_db, register_token, set_token_metadata};
+        use miden_protocol::crypto::utils::Serializable;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let pool = init_db(tmp.path().to_str().unwrap(), 2).unwrap();
+        {
+            let mut conn = pool.write_conn().unwrap();
+            register_token(&mut conn, &imiden().to_bytes(), None).unwrap();
+            register_token(&mut conn, &iusdt().to_bytes(), None).unwrap();
+            set_token_metadata(&mut conn, &imiden().to_bytes(), Some(8), None).unwrap();
+            set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
+        }
+
+        let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
+        let mut prices = PriceSnapshot::new();
+        prices.insert(imiden(), 200);
+        prices.insert(iusdt(), 100);
+        price_tx.send(prices).unwrap();
+
+        let (_qtx, quotes_rx) =
+            watch::channel(Arc::new(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)]));
+
+        // Capacity-1 handover channel, pre-filled → the matcher's next try_send is Full.
+        // Keep `_handover_rx` alive so the channel is Full (not Closed).
+        let (handover_tx, _handover_rx) = mpsc::channel::<Handover>(1);
+        handover_tx.try_send(Handover { items: vec![] }).unwrap();
+
+        let hooks = RouterHooks {
+            quotes_rx,
+            handover_tx,
+            inflight_ttl_ms: 60_000,
+            min_edge_bps: 100,
+            max_dev_bps: 200,
+        };
+
+        let id = nid(99);
+        let (book, raw) = book_with_order(id, 110_000_000, 2_000_000);
+        let mut engine = MatchingEngine::new(book).with_triangular_enabled(false);
+        let mut reserved = HashMap::new();
+        let mut reservations = HashMap::new();
+        let no_reoffer = HashMap::new();
+
+        // Full channel — must return without blocking or panicking.
+        external_pass(
+            &mut engine,
+            &raw,
+            &pool,
+            &price_rx,
+            &mut reserved,
+            &mut reservations,
+            &no_reoffer,
+            &hooks,
+            1_000,
+        );
+
+        // Selected + PARKED despite the dropped delivery — out of internal matching,
+        // with a reservation, so TTL reactivation (not a hang) is what recovers it.
+        assert!(engine.book.is_parked(id), "note parked despite the dropped handover");
+        assert_eq!(engine.book.active_order_count(), 0, "parked note left internal matching");
+        assert!(reservations.contains_key(&id), "reservation recorded for the parked pick");
+    }
+
     fn harness_db() -> (tempfile::NamedTempFile, DbPool) {
         use crate::db::{init_db, register_token, set_token_metadata};
         use miden_protocol::crypto::utils::Serializable;

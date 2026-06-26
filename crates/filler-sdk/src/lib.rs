@@ -34,7 +34,6 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let mut client = FillerClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
 //!     let pair = PairSpec { offered: imiden_hex, requested: iusdt_hex };
-//!     client.subscribe(vec![pair.clone()])?;
 //!     client.quote(&pair, "2.00", 1_000_000, None)?; // refresh before the TTL
 //!
 //!     while let Some(ev) = client.next_event().await {

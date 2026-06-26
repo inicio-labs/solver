@@ -28,14 +28,13 @@ Three facts make this simpler than a normal RFQ/AMM integration:
    The solver matches its idle notes against your standing quote and pushes you the
    ones that clear it.
 
-### Integration in 5 steps
+### Integration in 4 steps
 
 1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer
    token the operator issued you (§3).
-2. **Subscribe** to the pairs you can fill (§4).
-3. **Quote** a standing `{price, quantity}` per pair; refresh it before the TTL (§4).
-4. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill (§5).
-5. **Consume on-chain** — decode the note and self-consume with your own client/gas (§5).
+2. **Quote** a standing `{price, quantity}` per pair; refresh it before the TTL (§4).
+3. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill (§5).
+4. **Consume on-chain** — decode the note and self-consume with your own client/gas (§5).
 
 That's the whole integration surface. Everything below is detail on each step.
 
@@ -51,7 +50,6 @@ sequenceDiagram
 
     D->>R: connect /v1/rfq (Authorization: Bearer)
     R-->>D: AuthOk
-    D->>R: Subscribe { pairs }
     D->>R: Quote { pair, price, quantity }
     Note right of D: standing — refresh before the TTL
     R->>M: quotes_tx (watch) — latest quotes
@@ -121,7 +119,7 @@ assert!(matches!(client.next_event().await, Some(FillerEvent::AuthOk)));
 
 ---
 
-## 4. Subscribe & quote
+## 4. Quote
 
 ```rust
 use pswap_filler_sdk::PairSpec;
@@ -129,7 +127,6 @@ use pswap_filler_sdk::PairSpec;
 // Hex account ids, in the note's (offered, requested) orientation.
 let pair = PairSpec { offered: imiden_hex.into(), requested: iusdt_hex.into() };
 
-client.subscribe(vec![pair.clone()])?;            // pairs you can fill
 client.quote(&pair, "2.00", 1_000_000, None)?;    // standing quote
 ```
 
@@ -138,10 +135,8 @@ client.quote(&pair, "2.00", 1_000_000, None)?;    // standing quote
 A `PairSpec` is two **hex account ids** (faucet ids) in **`(offered, requested)`**
 orientation — the same orientation as the note. `offered` is the token the note pays
 *out* (and you receive); `requested` is the token the note wants *in* (and you pay).
-A pair and its reverse are distinct: `(IMIDEN, IUSDT)` ≠ `(IUSDT, IMIDEN)`.
-
-`subscribe` declares which pairs you can fill. Quotes still gate per pair — subscribing
-without quoting gets you nothing.
+A pair and its reverse are distinct: `(IMIDEN, IUSDT)` ≠ `(IUSDT, IMIDEN)`. The pair
+you quote is the pair you fill — there is no separate registration step.
 
 ### Quotes (the important part)
 
@@ -272,7 +267,6 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => { eprintln!("connect failed: {e}; retrying in 5s"); sleep5().await; continue; }
         };
 
-        client.subscribe(vec![pair.clone()])?;
         client.quote(&pair, "2.00", 1_000_000, None)?;
 
         // Refresh the quote every ~10s (TTL/2) from a cloned sender.
@@ -309,18 +303,14 @@ timer task to refresh quotes while the main task drains events.
 
 ## 7. Operational notes
 
-- **Reconnect on `Disconnected`.** Quotes do not survive a disconnect; re-subscribe and
-  re-quote after reconnecting (the loop above does this). Back off on repeated connect
-  failures.
+- **Reconnect on `Disconnected`.** Quotes do not survive a disconnect; re-quote after
+  reconnecting (the loop above does this). Back off on repeated connect failures.
 - **Idempotent handovers.** Dedupe by `note_id` — a reactivated note can be offered
   again (though not to the DEX that already held it, in the same in-flight window).
-- **Message size.** The server caps inbound messages (default 16 KiB). Quotes/subscribes
-  are tiny; this won't bite normal use.
-- **One connection, many pairs.** Subscribe and quote as many pairs as you fill over a
-  single socket. Multiple connections with the same token also work and are routed
-  independently.
-- **Timeouts.** `next_event_timeout(Duration)` returns `Ok(None)` on timeout without
-  closing the connection — handy for driving your own keepalive cadence.
+- **Message size.** The server caps inbound messages (default 16 KiB). Quotes are tiny;
+  this won't bite normal use.
+- **One connection, many pairs.** Quote as many pairs as you fill over a single socket.
+  Multiple connections with the same token also work and are routed independently.
 
 ---
 
@@ -333,7 +323,6 @@ all of this for you; this section is for debugging or a non-Rust client.
 
 | `type` | fields | meaning |
 |---|---|---|
-| `subscribe` | `pairs: [{offered, requested}]` | pairs you can fill |
 | `quote` | `pair: {offered, requested}`, `price: string`, `quantity: u64`, `valid_for_ms?: u64` | standing quote; resend to refresh |
 
 ### Server → client

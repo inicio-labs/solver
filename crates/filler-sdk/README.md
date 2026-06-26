@@ -11,13 +11,12 @@ quotes, and receive **handovers** — serialized PSWAP notes you consume on-chai
 > — protocol reference, quoting/decimal semantics, a complete reference filler, and an
 > FAQ. This README is the quickstart.
 
-## Integration in 5 steps
+## Integration in 4 steps
 
 1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer token the operator issued you.
-2. **Subscribe** to the pairs you can fill.
-3. **Quote** a standing `{price, quantity}` per pair; refresh before the TTL.
-4. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill.
-5. **Consume on-chain** — decode the note and self-consume with your own client/gas.
+2. **Quote** a standing `{price, quantity}` per pair; refresh before the TTL.
+3. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill.
+4. **Consume on-chain** — decode the note and self-consume with your own client/gas.
 
 ## How the solver talks to your DEX
 
@@ -31,7 +30,6 @@ sequenceDiagram
 
     D->>R: connect /v1/rfq (Authorization: Bearer)
     R-->>D: AuthOk
-    D->>R: Subscribe { pairs }
     D->>R: Quote { pair, price, quantity }
     Note right of D: standing — refresh before the TTL
     R->>M: quotes_tx (watch) — latest quotes
@@ -78,7 +76,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Pairs are hex account ids in the note's (offered, requested) orientation.
     let pair = PairSpec { offered: imiden_hex, requested: iusdt_hex };
-    client.subscribe(vec![pair.clone()])?;
 
     // Standing quote: price is requested-per-offered, per WHOLE token, as a
     // decimal string. Refresh it before the server's quote TTL to keep it live.

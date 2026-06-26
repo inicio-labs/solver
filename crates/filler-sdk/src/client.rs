@@ -10,7 +10,6 @@
 //!
 //! let mut client = FillerClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
 //! let pair = PairSpec { offered: imiden_hex, requested: iusdt_hex };
-//! client.subscribe(vec![pair.clone()])?;            // pairs I can fill
 //! client.quote(&pair, "2.00", 1_000_000, None)?;    // standing quote; refresh before TTL
 //!
 //! while let Some(ev) = client.next_event().await {
@@ -88,12 +87,6 @@ impl FillerSender {
         self.tx.send(msg).map_err(|_| anyhow!("router connection closed"))
     }
 
-    /// Declare the pairs this filler can fill. Quotes still gate which orders
-    /// are actually offered, per pair.
-    pub fn subscribe(&self, pairs: Vec<PairSpec>) -> Result<()> {
-        self.send(ClientMsg::Subscribe { pairs })
-    }
-
     /// Post (or refresh) a standing quote for one pair.
     ///
     /// `price` is requested-token per offered-token, **per whole token**, as a
@@ -167,12 +160,7 @@ impl FillerClient {
         self.events.recv().await
     }
 
-    // ── Convenience pass-throughs to the sender ──────────────────────────────
-
-    /// See [`FillerSender::subscribe`].
-    pub fn subscribe(&self, pairs: Vec<PairSpec>) -> Result<()> {
-        self.sender.subscribe(pairs)
-    }
+    // ── Convenience pass-through to the sender ───────────────────────────────
 
     /// See [`FillerSender::quote`].
     pub fn quote(
@@ -270,18 +258,10 @@ mod tests {
 
         // Valid quote is queued as a ClientMsg::Quote.
         s.quote(&pair, "2.05", 1000, Some(5000)).unwrap();
-        match rx.try_recv().unwrap() {
-            ClientMsg::Quote { price, quantity, valid_for_ms, .. } => {
-                assert_eq!(price, "2.05");
-                assert_eq!(quantity, 1000);
-                assert_eq!(valid_for_ms, Some(5000));
-            }
-            other => panic!("expected quote, got {other:?}"),
-        }
-
-        // Subscribe is queued as ClientMsg::Subscribe.
-        s.subscribe(vec![pair]).unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), ClientMsg::Subscribe { .. }));
+        let ClientMsg::Quote { price, quantity, valid_for_ms, .. } = rx.try_recv().unwrap();
+        assert_eq!(price, "2.05");
+        assert_eq!(quantity, 1000);
+        assert_eq!(valid_for_ms, Some(5000));
     }
 
     #[tokio::test]
@@ -289,6 +269,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<ClientMsg>();
         let s = FillerSender { tx };
         drop(rx); // pump gone
-        assert!(s.subscribe(vec![]).is_err());
+        let pair = PairSpec { offered: "0xaa".into(), requested: "0xbb".into() };
+        assert!(s.quote(&pair, "2", 1, None).is_err());
     }
 }

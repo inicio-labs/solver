@@ -201,7 +201,7 @@ the solver for the protocol types finds nothing locally; they're in the SDK.)
 
 Messages: `subscribe{pairs}` · `quote{pair, price, quantity, valid_for_ms?}` (client→)
 and `auth_ok` · `ask{pairs}` · `handover{note_id, fill_amount, note_hex, fill_price}` ·
-`withdrawn{note_id}` · `error{code, msg}` (→client). Auth is `Authorization: Bearer`
+`error{code, msg}` (→client). Auth is `Authorization: Bearer`
 (or `?token=` for browsers), checked constant-time at the upgrade. Price is `requested`
 per `offered`, per whole token, decimal string. Full field-by-field reference and a
 reference filler are in [filler-integration.md](filler-integration.md).

@@ -198,6 +198,9 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     price_precision: "full".to_string(),
                     price_vs_currency: "usd".to_string(),
                     price_staleness_secs: 30,
+                    swap_proving_estimate_ms: 2000,
+                    swap_block_time_ms: 6000,
+                    swap_offmarket_tolerance_bps: 50,
                 },
             };
 

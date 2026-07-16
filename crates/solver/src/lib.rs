@@ -10,6 +10,7 @@ pub mod price_api;
 pub mod pipeline;
 pub mod order;
 pub mod config;
+pub mod swap_eta;
 
 pub mod client_factory;
 pub use client_factory::ClientFactory;

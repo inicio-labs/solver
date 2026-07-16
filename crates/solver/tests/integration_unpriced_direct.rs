@@ -160,6 +160,9 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                     price_precision: "full".to_string(),
                     price_vs_currency: "usd".to_string(),
                     price_staleness_secs: 30,
+                    swap_proving_estimate_ms: 2000,
+                    swap_block_time_ms: 6000,
+                    swap_offmarket_tolerance_bps: 50,
                 },
             };
 

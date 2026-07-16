@@ -110,6 +110,10 @@ pub struct FilledNote {
     pub note_id: OrderId,
     pub requested_filled: Amount,
     pub raw_note_data: Vec<u8>,
+    /// Unix secs the matcher first observed this order (stamped in-memory, not
+    /// from the DB). Carried to the executor so it can record the settlement
+    /// duration (`settled − arrival`) for the in-memory swap-eta window.
+    pub arrival_unix: u64,
 }
 
 /// A batch of matched orders to be executed together.

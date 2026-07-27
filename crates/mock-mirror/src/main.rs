@@ -19,6 +19,7 @@ mod ops;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use miden_client::account::component::BasicWallet;
@@ -178,7 +179,12 @@ async fn build_client(
         .sqlite_store(PathBuf::from(&cfg.mock.store_path))
         .authenticator(keystore.clone());
     if let Some(url) = &cfg.rpc.prover_endpoint {
-        builder = builder.prover(Arc::new(RemoteTransactionProver::new(url.clone())));
+        // Raise the prover timeout above the miden-client 10s default: a busy
+        // public testnet prover routinely takes longer, and a spurious timeout
+        // is what strands an un-countered order.
+        let prover = RemoteTransactionProver::new(url.clone())
+            .with_timeout(Duration::from_millis(cfg.rpc.prover_timeout_ms));
+        builder = builder.prover(Arc::new(prover));
     }
     let client = builder.build().await.context("build miden client")?;
     Ok((client, keystore))

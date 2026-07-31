@@ -1,20 +1,23 @@
 //! Async websocket client for the solver's RFQ router — the turnkey integration
 //! path for an external DEX ("filler").
 //!
-//! A [`FillerClient`] owns one authenticated connection. A background pump task
+//! A [`FillerClient`] owns one authenticated connection. A background task
 //! reads server frames into an event queue and writes your outbound messages to
-//! the socket, so the two directions never block each other:
+//! the socket, so the two directions never block each other. Messages are miden
+//! **binary** frames (see [`crate::protocol`]).
 //!
 //! ```ignore
 //! use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+//! use miden_protocol::asset::FungibleAsset;
 //!
 //! let mut client = FillerClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
-//! let pair = PairSpec { offered: imiden_hex, requested: iusdt_hex };
-//! client.quote(&pair, "2.00", 1_000_000, None)?;    // standing quote; refresh before TTL
+//! client.subscribe(vec![PairSpec { offered: imiden, requested: iusdt }])?;
+//! // standing quote: give up to 1_000_000 iMIDEN for 2_000_000 iUSDT (rate + size); refresh before TTL
+//! client.quote(FungibleAsset::new(imiden, 1_000_000)?, FungibleAsset::new(iusdt, 2_000_000)?, None)?;
 //!
 //! while let Some(ev) = client.next_event().await {
 //!     match ev {
-//!         FillerEvent::Handover(h) => { /* decode + self-consume on-chain */ }
+//!         FillerEvent::Handover(h) => { /* consume h.note on-chain at h.fill_price */ }
 //!         FillerEvent::Disconnected => break,
 //!         _ => {}
 //!     }
@@ -23,36 +26,42 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use miden_protocol::asset::FungibleAsset;
+use miden_protocol::crypto::utils::{Deserializable, Serializable};
+use miden_protocol::note::Note;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::protocol::{parse_decimal_price, ClientMsg, PairSpec, ServerMsg};
+use crate::protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};
 
-/// A note handed over by the solver for the filler to consume on-chain.
-///
-/// `note_hex` is the hex-encoded serialized PSWAP note. With the `consume`
-/// feature, [`crate::consume::decode_note`] turns it back into a miden note and
-/// [`crate::consume::PswapTerms`] reads its swap terms.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A note handed over by the solver for the filler to consume on-chain, at the
+/// matched price. `note` is a decoded miden [`Note`]; read its swap terms with
+/// [`miden_standards::note::PswapNote::try_from`] and build consume args with
+/// [`crate::consume::consume_args`].
+#[derive(Debug, Clone)]
 pub struct Handover {
-    pub note_id: String,
+    /// The PSWAP note to consume.
+    pub note: Note,
+    /// Requested-token base units to fill.
     pub fill_amount: u64,
-    pub note_hex: String,
-    /// The price the solver requires this note be filled at (your own quoted
-    /// price, echoed back) — requested-per-offered, per whole token, as a decimal
-    /// string. Fill the note at this price, independent of its intrinsic rate.
-    pub fill_price: String,
+    /// The price the match used (your own quote, echoed) — `num/den` =
+    /// requested-per-offered. Fill at this rate.
+    pub fill_price: PriceRatio,
 }
 
 /// An event surfaced from the router connection. The first event after a
 /// successful [`FillerClient::connect`] is always [`FillerEvent::AuthOk`]; the
 /// last is always [`FillerEvent::Disconnected`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum FillerEvent {
     /// Handshake accepted — the connection is live.
     AuthOk,
-    /// A note to fill. Decode `note_hex` and self-consume on-chain.
+    /// Reserved: the router's request for quotes on these pairs (not currently
+    /// emitted — the live flow is quote-driven).
+    Ask { pairs: Vec<PairSpec> },
+    /// A note to fill. Consume `note` on-chain at `fill_price`.
     Handover(Handover),
     /// A structured error from the router (e.g. a malformed quote was rejected).
     Error { code: String, msg: String },
@@ -65,8 +74,9 @@ impl From<ServerMsg> for FillerEvent {
     fn from(m: ServerMsg) -> Self {
         match m {
             ServerMsg::AuthOk => FillerEvent::AuthOk,
-            ServerMsg::Handover { note_id, fill_amount, note_hex, fill_price } => {
-                FillerEvent::Handover(Handover { note_id, fill_amount, note_hex, fill_price })
+            ServerMsg::Ask { pairs } => FillerEvent::Ask { pairs },
+            ServerMsg::Handover { note, fill_amount, fill_price } => {
+                FillerEvent::Handover(Handover { note, fill_amount, fill_price })
             }
             ServerMsg::Error { code, msg } => FillerEvent::Error { code, msg },
         }
@@ -75,7 +85,7 @@ impl From<ServerMsg> for FillerEvent {
 
 /// The send half of a connection. Cheaply cloneable, so it can be moved into
 /// other tasks (e.g. a timer that refreshes quotes) while the main task drains
-/// events. Sends are non-blocking: they queue onto the pump task.
+/// events. Sends are non-blocking: they queue onto the connection task.
 #[derive(Clone)]
 pub struct FillerSender {
     tx: mpsc::UnboundedSender<ClientMsg>,
@@ -87,33 +97,26 @@ impl FillerSender {
         self.tx.send(msg).map_err(|_| anyhow!("router connection closed"))
     }
 
-    /// Post (or refresh) a standing quote for one pair.
-    ///
-    /// `price` is requested-token per offered-token, **per whole token**, as a
-    /// decimal string (e.g. `"2.05"`); it is validated locally before sending,
-    /// so a malformed price errors here instead of round-tripping to a server
-    /// `Error`. `quantity` is the max requested-token quantity (base units) the
-    /// filler will take. `valid_for_ms` optionally shortens validity below the
-    /// server's quote TTL.
+    /// Declare the pairs this filler can fill. Quotes still gate which orders are
+    /// actually offered, per pair.
+    pub fn subscribe(&self, pairs: Vec<PairSpec>) -> Result<()> {
+        self.send(ClientMsg::Subscribe { pairs })
+    }
+
+    /// Post (or refresh) a standing quote: give up to `offered` for `requested`.
+    /// The two assets carry both the rate and the max size (like a PSWAP note);
+    /// their faucet ids imply the pair. `valid_for_ms` optionally shortens
+    /// validity below the server's quote TTL.
     pub fn quote(
         &self,
-        pair: &PairSpec,
-        price: &str,
-        quantity: u64,
+        offered: FungibleAsset,
+        requested: FungibleAsset,
         valid_for_ms: Option<u64>,
     ) -> Result<()> {
-        if parse_decimal_price(price).is_none() {
-            bail!("invalid price {price:?}: expected a non-negative decimal like \"2.05\"");
+        if u64::from(offered.amount()) == 0 || u64::from(requested.amount()) == 0 {
+            bail!("quote amounts must be > 0");
         }
-        if quantity == 0 {
-            bail!("quantity must be > 0");
-        }
-        self.send(ClientMsg::Quote {
-            pair: pair.clone(),
-            price: price.to_string(),
-            quantity,
-            valid_for_ms,
-        })
+        self.send(ClientMsg::Quote { offered, requested, valid_for_ms })
     }
 }
 
@@ -132,10 +135,9 @@ impl FillerClient {
         let mut req = url
             .into_client_request()
             .with_context(|| format!("invalid router url: {url}"))?;
-        let bearer = format!("Bearer {token}");
         req.headers_mut().insert(
-            "Authorization",
-            bearer.parse().context("token has invalid header characters")?,
+            AUTHORIZATION,
+            format!("Bearer {token}").parse().context("token has invalid header characters")?,
         );
 
         let (socket, _resp) = tokio_tungstenite::connect_async(req)
@@ -144,7 +146,7 @@ impl FillerClient {
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<ClientMsg>();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<FillerEvent>();
-        tokio::spawn(pump(socket, out_rx, ev_tx));
+        tokio::spawn(run_connection(socket, out_rx, ev_tx));
 
         Ok(Self { sender: FillerSender { tx: out_tx }, events: ev_rx })
     }
@@ -160,24 +162,28 @@ impl FillerClient {
         self.events.recv().await
     }
 
-    // ── Convenience pass-through to the sender ───────────────────────────────
+    // ── Convenience pass-throughs to the sender ──────────────────────────────
+
+    /// See [`FillerSender::subscribe`].
+    pub fn subscribe(&self, pairs: Vec<PairSpec>) -> Result<()> {
+        self.sender.subscribe(pairs)
+    }
 
     /// See [`FillerSender::quote`].
     pub fn quote(
         &self,
-        pair: &PairSpec,
-        price: &str,
-        quantity: u64,
+        offered: FungibleAsset,
+        requested: FungibleAsset,
         valid_for_ms: Option<u64>,
     ) -> Result<()> {
-        self.sender.quote(pair, price, quantity, valid_for_ms)
+        self.sender.quote(offered, requested, valid_for_ms)
     }
 }
 
-/// Background task: writes queued outbound messages to the socket and reads
-/// server frames into the event queue. Ends on socket close/error, emitting a
-/// final [`FillerEvent::Disconnected`].
-async fn pump(
+/// Background task: writes queued outbound messages to the socket (miden-binary
+/// frames) and reads server frames into the event queue. Ends on socket
+/// close/error, emitting a final [`FillerEvent::Disconnected`].
+async fn run_connection(
     socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -187,24 +193,19 @@ async fn pump(
     let (mut sink, mut stream) = socket.split();
     loop {
         tokio::select! {
-            // Outbound: serialize and write. A serialization failure is a bug,
-            // not a wire condition — skip the message rather than tear down.
+            // Outbound: miden-serialize to a binary frame and write.
             out = out_rx.recv() => match out {
                 Some(msg) => {
-                    let txt = match serde_json::to_string(&msg) {
-                        Ok(t) => t,
-                        Err(e) => { tracing::error!(error = %e, "serialize ClientMsg"); continue; }
-                    };
-                    if sink.send(Message::Text(txt.into())).await.is_err() {
+                    if sink.send(Message::Binary(msg.to_bytes().into())).await.is_err() {
                         break;
                     }
                 }
                 None => break, // all senders dropped → close
             },
-            // Inbound: decode and forward as an event.
+            // Inbound: miden-deserialize a binary frame and forward as an event.
             item = stream.next() => match item {
-                Some(Ok(Message::Text(t))) => {
-                    match serde_json::from_str::<ServerMsg>(t.as_str()) {
+                Some(Ok(Message::Binary(b))) => {
+                    match ServerMsg::read_from_bytes(&b) {
                         Ok(m) => {
                             if ev_tx.send(FillerEvent::from(m)).is_err() {
                                 break; // receiver dropped
@@ -214,7 +215,7 @@ async fn pump(
                     }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {} // ignore binary/ping/pong
+                Some(Ok(_)) => {} // ignore text/ping/pong
             },
         }
     }
@@ -227,49 +228,34 @@ mod tests {
 
     #[test]
     fn server_msg_maps_to_event() {
-        assert_eq!(FillerEvent::from(ServerMsg::AuthOk), FillerEvent::AuthOk);
-        let h = ServerMsg::Handover {
-            note_id: "0x1".into(),
-            fill_amount: 9,
-            note_hex: "ab".into(),
-            fill_price: "2.05".into(),
-        };
-        assert_eq!(
-            FillerEvent::from(h),
-            FillerEvent::Handover(Handover {
-                note_id: "0x1".into(),
-                fill_amount: 9,
-                note_hex: "ab".into(),
-                fill_price: "2.05".into(),
-            })
-        );
+        // Variants without a miden Note need no fixtures.
+        assert!(matches!(FillerEvent::from(ServerMsg::AuthOk), FillerEvent::AuthOk));
+        assert!(matches!(
+            FillerEvent::from(ServerMsg::Ask { pairs: vec![] }),
+            FillerEvent::Ask { .. }
+        ));
+        match FillerEvent::from(ServerMsg::Error { code: "x".into(), msg: "y".into() }) {
+            FillerEvent::Error { code, msg } => {
+                assert_eq!(code, "x");
+                assert_eq!(msg, "y");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn sender_validates_before_sending() {
+    async fn subscribe_queues_a_client_msg() {
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let s = FillerSender { tx };
-        let pair = PairSpec { offered: "0xaa".into(), requested: "0xbb".into() };
-
-        // Bad price / zero quantity rejected locally — nothing is queued.
-        assert!(s.quote(&pair, "abc", 10, None).is_err());
-        assert!(s.quote(&pair, "2.0", 0, None).is_err());
-        assert!(rx.try_recv().is_err());
-
-        // Valid quote is queued as a ClientMsg::Quote.
-        s.quote(&pair, "2.05", 1000, Some(5000)).unwrap();
-        let ClientMsg::Quote { price, quantity, valid_for_ms, .. } = rx.try_recv().unwrap();
-        assert_eq!(price, "2.05");
-        assert_eq!(quantity, 1000);
-        assert_eq!(valid_for_ms, Some(5000));
+        s.subscribe(vec![]).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), ClientMsg::Subscribe { .. }));
     }
 
     #[tokio::test]
     async fn send_after_close_errors() {
         let (tx, rx) = mpsc::unbounded_channel::<ClientMsg>();
         let s = FillerSender { tx };
-        drop(rx); // pump gone
-        let pair = PairSpec { offered: "0xaa".into(), requested: "0xbb".into() };
-        assert!(s.quote(&pair, "2", 1, None).is_err());
+        drop(rx); // connection task gone
+        assert!(s.subscribe(vec![]).is_err());
     }
 }

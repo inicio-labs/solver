@@ -1,84 +1,194 @@
-//! Websocket RFQ wire protocol (JSON, `type`-tagged) — the shared contract
-//! between the solver's router and a filler. Both message enums derive
-//! `Serialize + Deserialize` so each side can encode what it sends and decode
-//! what it receives. This module is dependency-free apart from serde.
+//! Binary RFQ wire protocol — the shared contract between the solver's router
+//! and a filler.
+//!
+//! Messages serialize with miden's `Serializable`/`Deserializable` (compact
+//! binary) and travel over WebSocket **binary** frames, so miden types
+//! (`AccountId`, `FungibleAsset`, `Note`) go on the wire natively — no serde, no
+//! hex, no string parsing. The router and this SDK both build on this module, so
+//! the two sides can never drift.
 
-use serde::{Deserialize, Serialize};
+use miden_protocol::account::AccountId;
+use miden_protocol::asset::FungibleAsset;
+use miden_protocol::crypto::utils::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
+};
+use miden_protocol::note::Note;
 
-/// A trading pair as hex account ids, in the note's `(offered, requested)`
+/// A trading pair as faucet account ids, in the note's `(offered, requested)`
 /// orientation.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairSpec {
-    pub offered: String,
-    pub requested: String,
+    pub offered: AccountId,
+    pub requested: AccountId,
 }
 
+impl Serializable for PairSpec {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.offered.write_into(target);
+        self.requested.write_into(target);
+    }
+}
+
+impl Deserializable for PairSpec {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        Ok(PairSpec {
+            offered: AccountId::read_from(source)?,
+            requested: AccountId::read_from(source)?,
+        })
+    }
+}
+
+/// A price as an exact rational `num / den` (requested-token per offered-token).
+/// Integer-native — no decimal strings, no float on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceRatio {
+    pub num: u64,
+    pub den: u64,
+}
+
+impl Serializable for PriceRatio {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.num.write_into(target);
+        self.den.write_into(target);
+    }
+}
+
+impl Deserializable for PriceRatio {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        Ok(PriceRatio {
+            num: u64::read_from(source)?,
+            den: u64::read_from(source)?,
+        })
+    }
+}
+
+// ── Client → server ──────────────────────────────────────────────────────────
+
 /// Messages a DEX (client) sends to the router.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
-    /// A standing quote for one pair. Resend before expiry to refresh.
+    /// Pairs the DEX can fill (for `Ask` targeting; quotes still gate per pair).
+    Subscribe { pairs: Vec<PairSpec> },
+    /// A standing quote: the DEX will give up to `offered` for `requested`. The
+    /// two assets carry both the rate (their ratio) and the max size, exactly
+    /// like a PSWAP note. Resend before expiry to refresh.
     Quote {
-        pair: PairSpec,
-        /// Price = requested-token per offered-token, per WHOLE token, as a
-        /// decimal string (e.g. "2.05"). Parsed to an exact rational — never a
-        /// float on the wire.
-        price: String,
-        /// Max requested-token quantity (base units) the DEX will take.
-        quantity: u64,
+        offered: FungibleAsset,
+        requested: FungibleAsset,
         /// Optional shorter validity (ms); capped at the server's quote TTL.
-        #[serde(default)]
         valid_for_ms: Option<u64>,
     },
 }
 
-/// Messages the router sends to a DEX.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
-    AuthOk,
-    Handover {
-        note_id: String,
-        fill_amount: u64,
-        /// Hex-encoded serialized PSWAP note for the DEX to consume on-chain.
-        note_hex: String,
-        /// The price the solver requires this note be filled at — the DEX's own
-        /// quoted price echoed back (requested-per-offered, per whole token), as
-        /// a decimal string. "Fill this note at `fill_price`," independent of the
-        /// note's intrinsic on-chain rate.
-        fill_price: String,
-    },
-    Error {
-        code: String,
-        msg: String,
-    },
+impl ClientMsg {
+    const SUBSCRIBE: u8 = 0;
+    const QUOTE: u8 = 1;
 }
 
-/// Parse a non-negative decimal price string (e.g. "2.05", "100", "0.999") into
-/// an exact rational `(num, den)` = value, where `value = num / den`. Returns
-/// `None` on malformed input; both parts are always > 0 on success.
-pub fn parse_decimal_price(s: &str) -> Option<(u128, u128)> {
-    let s = s.trim();
-    if s.is_empty() || s.starts_with('-') {
-        return None;
+impl Serializable for ClientMsg {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        match self {
+            ClientMsg::Subscribe { pairs } => {
+                target.write_u8(ClientMsg::SUBSCRIBE);
+                pairs.write_into(target);
+            }
+            ClientMsg::Quote { offered, requested, valid_for_ms } => {
+                target.write_u8(ClientMsg::QUOTE);
+                offered.write_into(target);
+                requested.write_into(target);
+                valid_for_ms.write_into(target);
+            }
+        }
     }
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-        || frac_part.len() > 30
-    {
-        return None;
+}
+
+impl Deserializable for ClientMsg {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        match source.read_u8()? {
+            ClientMsg::SUBSCRIBE => {
+                Ok(ClientMsg::Subscribe { pairs: Vec::<PairSpec>::read_from(source)? })
+            }
+            ClientMsg::QUOTE => Ok(ClientMsg::Quote {
+                offered: FungibleAsset::read_from(source)?,
+                requested: FungibleAsset::read_from(source)?,
+                valid_for_ms: Option::<u64>::read_from(source)?,
+            }),
+            tag => Err(DeserializationError::InvalidValue(format!("unknown ClientMsg tag {tag}"))),
+        }
     }
-    let digits = format!("{int_part}{frac_part}");
-    let num: u128 = digits.parse().ok()?;
-    let den: u128 = 10u128.checked_pow(frac_part.len() as u32)?;
-    if num == 0 || den == 0 {
-        return None;
+}
+
+// ── Server → client ──────────────────────────────────────────────────────────
+
+/// Messages the router sends to a DEX.
+#[derive(Debug, Clone)]
+pub enum ServerMsg {
+    /// Handshake accepted; the connection is live.
+    AuthOk,
+    /// Reserved: the router asking the DEX to quote these pairs (pull model).
+    /// Not currently emitted — the live flow is quote-driven (push).
+    Ask { pairs: Vec<PairSpec> },
+    /// A note to consume on-chain, at the matched price.
+    Handover {
+        /// The PSWAP note to consume — typed, not hex.
+        note: Note,
+        /// Requested-token base units to fill.
+        fill_amount: u64,
+        /// The price the match used (the DEX's own quote, echoed) — fill at this
+        /// rate. `num/den` = requested-per-offered.
+        fill_price: PriceRatio,
+    },
+    /// A structured error (e.g. a malformed quote was rejected).
+    Error { code: String, msg: String },
+}
+
+impl ServerMsg {
+    const AUTH_OK: u8 = 0;
+    const ASK: u8 = 1;
+    const HANDOVER: u8 = 2;
+    const ERROR: u8 = 3;
+}
+
+impl Serializable for ServerMsg {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        match self {
+            ServerMsg::AuthOk => target.write_u8(ServerMsg::AUTH_OK),
+            ServerMsg::Ask { pairs } => {
+                target.write_u8(ServerMsg::ASK);
+                pairs.write_into(target);
+            }
+            ServerMsg::Handover { note, fill_amount, fill_price } => {
+                target.write_u8(ServerMsg::HANDOVER);
+                note.write_into(target);
+                fill_amount.write_into(target);
+                fill_price.write_into(target);
+            }
+            ServerMsg::Error { code, msg } => {
+                target.write_u8(ServerMsg::ERROR);
+                code.write_into(target);
+                msg.write_into(target);
+            }
+        }
     }
-    Some((num, den))
+}
+
+impl Deserializable for ServerMsg {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        match source.read_u8()? {
+            ServerMsg::AUTH_OK => Ok(ServerMsg::AuthOk),
+            ServerMsg::ASK => Ok(ServerMsg::Ask { pairs: Vec::<PairSpec>::read_from(source)? }),
+            ServerMsg::HANDOVER => Ok(ServerMsg::Handover {
+                note: Note::read_from(source)?,
+                fill_amount: u64::read_from(source)?,
+                fill_price: PriceRatio::read_from(source)?,
+            }),
+            ServerMsg::ERROR => Ok(ServerMsg::Error {
+                code: String::read_from(source)?,
+                msg: String::read_from(source)?,
+            }),
+            tag => Err(DeserializationError::InvalidValue(format!("unknown ServerMsg tag {tag}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -86,63 +196,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decimal_price_parsing() {
-        assert_eq!(parse_decimal_price("2"), Some((2, 1)));
-        assert_eq!(parse_decimal_price("2.05"), Some((205, 100)));
-        assert_eq!(parse_decimal_price("0.999"), Some((999, 1000)));
-        assert_eq!(parse_decimal_price("100.0"), Some((1000, 10)));
-        assert_eq!(parse_decimal_price(""), None);
-        assert_eq!(parse_decimal_price("-1"), None);
-        assert_eq!(parse_decimal_price("0"), None);
-        assert_eq!(parse_decimal_price("1.2.3"), None);
-        assert_eq!(parse_decimal_price("abc"), None);
+    fn client_msg_binary_round_trip() {
+        // Subscribe with an empty pair list exercises the tag + Vec framing
+        // without needing miden asset fixtures.
+        let sub = ClientMsg::Subscribe { pairs: vec![] };
+        let back = ClientMsg::read_from_bytes(&sub.to_bytes()).unwrap();
+        assert_eq!(sub, back);
     }
 
     #[test]
-    fn client_and_server_msgs_round_trip() {
-        // ClientMsg serializes (client side) and deserializes (server side).
-        let q = ClientMsg::Quote {
-            pair: PairSpec { offered: "0xaa".into(), requested: "0xbb".into() },
-            price: "2.5".into(),
-            quantity: 1000,
-            valid_for_ms: Some(5000),
-        };
-        let j = serde_json::to_string(&q).unwrap();
-        assert!(j.contains("\"type\":\"quote\""));
-        let _back: ClientMsg = serde_json::from_str(&j).unwrap();
-
-        // ServerMsg serializes (server side) and deserializes (client side).
-        let h = ServerMsg::Handover {
-            note_id: "0x1".into(),
-            fill_amount: 7,
-            note_hex: "ab".into(),
-            fill_price: "2.05".into(),
-        };
-        let j = serde_json::to_string(&h).unwrap();
-        assert!(j.contains("\"type\":\"handover\""));
-        assert!(j.contains("\"fill_price\":\"2.05\""));
-        let back: ServerMsg = serde_json::from_str(&j).unwrap();
-        assert!(matches!(back, ServerMsg::Handover { fill_amount: 7, .. }));
+    fn price_ratio_round_trip() {
+        let p = PriceRatio { num: 205, den: 100 };
+        assert_eq!(p, PriceRatio::read_from_bytes(&p.to_bytes()).unwrap());
     }
 
-    use proptest::prelude::*;
-
-    proptest! {
-        /// Arbitrary input (any unicode string) must never panic the parser.
-        #[test]
-        fn prop_parse_decimal_price_never_panics(s in ".*") {
-            let _ = parse_decimal_price(&s);
+    #[test]
+    fn server_error_round_trips_and_tag_dispatches() {
+        let e = ServerMsg::Error { code: "bad_quote".into(), msg: "nope".into() };
+        match ServerMsg::read_from_bytes(&e.to_bytes()).unwrap() {
+            ServerMsg::Error { code, msg } => {
+                assert_eq!(code, "bad_quote");
+                assert_eq!(msg, "nope");
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
+        // AuthOk is a bare tag.
+        assert!(matches!(
+            ServerMsg::read_from_bytes(&ServerMsg::AuthOk.to_bytes()).unwrap(),
+            ServerMsg::AuthOk
+        ));
+    }
 
-        /// Any well-formed non-zero decimal parses to a positive rational.
-        #[test]
-        fn prop_well_formed_decimals_parse(int in 0u64..=1_000_000, frac_digits in 0usize..=6) {
-            let frac = "0".repeat(frac_digits);
-            let s = if frac_digits == 0 { int.to_string() } else { format!("{int}.{frac}9") };
-            let parsed = parse_decimal_price(&s);
-            prop_assert!(parsed.is_some(), "well-formed decimal {s} should parse");
-            let (num, den) = parsed.unwrap();
-            prop_assert!(num > 0 && den > 0);
-        }
+    #[test]
+    fn unknown_tag_is_error_not_panic() {
+        assert!(ClientMsg::read_from_bytes(&[99]).is_err());
+        assert!(ServerMsg::read_from_bytes(&[99]).is_err());
     }
 }

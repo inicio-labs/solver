@@ -3794,12 +3794,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "hex",
  "miden-protocol",
  "miden-standards",
- "proptest",
- "serde",
- "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tracing",

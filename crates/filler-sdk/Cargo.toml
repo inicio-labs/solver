@@ -2,31 +2,20 @@
 name = "pswap-filler-sdk"
 version = "0.1.0"
 edition = "2021"
-description = "Client SDK for external DEXes ('fillers') to receive and fill Miden PSWAP orders routed by the solver's RFQ websocket. Depend on THIS crate only — none of the solver's internals."
+description = "Client SDK for external DEXes ('fillers') to receive and fill Miden PSWAP orders routed by the solver's RFQ websocket. Speaks the router's miden-binary protocol; independent of the solver's internals (no db / http / matcher)."
 license = "MIT"
 
-[features]
-default = []
-# Turnkey on-chain helpers: decode the handed-over note into a miden `Note` and
-# read its PSWAP terms. Pulls in the miden crates. OMIT this feature if you
-# already have your own miden-client setup and just want the bytes — the default
-# build has ZERO miden / solver dependencies.
-consume = ["dep:miden-protocol", "dep:miden-standards", "dep:hex"]
-
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 tokio = { version = "1.40", features = ["rt", "macros", "sync", "time", "net"] }
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 anyhow = "1.0"
 tracing = "0.1"
-
-# Only compiled when the `consume` feature is enabled.
-hex = { version = "0.4", optional = true }
-miden-protocol = { workspace = true, optional = true }
-miden-standards = { workspace = true, optional = true }
+# The wire protocol is miden's own binary serialization, so miden types travel
+# natively (AccountId / FungibleAsset / Note). Still independent of the solver
+# crate and of `miden-client` — the filler runs the consume tx with its own client.
+miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
 
 [dev-dependencies]
-proptest = "1"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }

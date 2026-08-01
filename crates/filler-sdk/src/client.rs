@@ -387,6 +387,18 @@ async fn supervise(
             }
         };
 
+        // Discard anything that queued during the outage — those quotes were
+        // priced before the drop, so flushing them now would put a **stale**
+        // price on the wire. Only fresh quotes (serve_quotes' next tick, or a
+        // manual re-post on `Reconnected`) should reach the router.
+        let mut stale = 0u32;
+        while out_rx.try_recv().is_ok() {
+            stale += 1;
+        }
+        if stale > 0 {
+            tracing::debug!(stale, "dropped quotes queued during the outage");
+        }
+
         // Live again — tell the caller so it can re-post quotes.
         tracing::info!("router link re-established");
         let _ = ev_tx.send(LpEvent::Reconnected);
@@ -465,6 +477,10 @@ async fn reader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn server_msg_maps_to_event() {
@@ -559,5 +575,232 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(matches!(rx.try_recv().unwrap(), ClientMsg::Quote { .. }));
         handle.abort();
+    }
+
+    // ── Resilience: an in-process mock router the SDK connects to ────────────
+
+    struct MockRouter {
+        url: String,
+        received: Arc<Mutex<Vec<ClientMsg>>>,
+        connections: Arc<AtomicUsize>,
+    }
+
+    /// Spin up a real (in-process) router. The first `drop_first` accepted
+    /// connections send `AuthOk` then drop the socket — an unstable link.
+    /// Every later connection stays open and records the quotes it receives.
+    async fn mock_router(drop_first: usize) -> MockRouter {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/rfq", listener.local_addr().unwrap());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+
+        let recv = received.clone();
+        let conns = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let idx = conns.fetch_add(1, Ordering::SeqCst);
+                let recv = recv.clone();
+                tokio::spawn(async move {
+                    let Ok(ws) = accept_async(stream).await else { return };
+                    let (mut sink, mut stream) = ws.split();
+                    let _ = sink.send(Message::Binary(ServerMsg::AuthOk.to_bytes().into())).await;
+                    if idx < drop_first {
+                        return; // drop the socket → the client's reader sees the link fail
+                    }
+                    while let Some(Ok(msg)) = stream.next().await {
+                        if let Message::Binary(b) = msg {
+                            if let Ok(cm) = ClientMsg::read_from_bytes(&b) {
+                                recv.lock().unwrap().push(cm);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        MockRouter { url, received, connections }
+    }
+
+    fn quote_offer_amounts(msgs: &[ClientMsg]) -> Vec<u64> {
+        msgs.iter()
+            .map(|m| match m {
+                ClientMsg::Quote { offered, .. } => u64::from(offered.amount()),
+            })
+            .collect()
+    }
+
+    /// Q1 (reader `break` on a dead stream), Q2 (no panic), Q3 (reconnect), and
+    /// the typed-error/logging ask: a dropped link surfaces `Reconnecting` with a
+    /// **typed** `LpError`, then `Reconnected`, and the router sees a 2nd socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnects_after_a_drop() {
+        let router = mock_router(1).await; // conn #0 drops; conn #1+ is stable
+        let mut client = LpClient::connect(&router.url, "tok").await.unwrap();
+
+        assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
+
+        let mut typed_error_surfaced = false;
+        let mut reconnected = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(3), client.next_event()).await {
+                Ok(Some(LpEvent::Reconnecting { error, attempt })) => {
+                    assert!(attempt >= 1);
+                    // The reader's `break` produced a typed, non-empty error.
+                    assert!(!error.to_string().is_empty(), "empty error surfaced");
+                    assert!(matches!(error, LpError::Transport(_) | LpError::Closed(_)));
+                    typed_error_surfaced = true;
+                }
+                Ok(Some(LpEvent::Reconnected)) => {
+                    reconnected = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("event stream ended unexpectedly"),
+                Err(_) => panic!("timed out waiting to reconnect"),
+            }
+        }
+        assert!(typed_error_surfaced, "expected Reconnecting with a typed LpError");
+        assert!(reconnected, "SDK should reconnect after a drop");
+        assert!(router.connections.load(Ordering::SeqCst) >= 2, "router should see a 2nd socket");
+    }
+
+    /// North star — the SDK must never crash. Force three consecutive drops and
+    /// assert the supervisor task rides them out (no panic), reconnects each time,
+    /// lands on a stable link, and the client is still usable afterward.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn survives_repeated_drops_without_crashing() {
+        let router = mock_router(3).await; // conns #0..2 drop; #3 is stable
+        let mut client = LpClient::connect(&router.url, "tok").await.unwrap();
+
+        let mut reconnects = 0;
+        for _ in 0..60 {
+            match tokio::time::timeout(Duration::from_secs(6), client.next_event()).await {
+                Ok(Some(LpEvent::Reconnected)) => {
+                    reconnects += 1;
+                    if router.connections.load(Ordering::SeqCst) >= 4 {
+                        break; // reached the stable connection
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("stream ended — the SDK gave up unexpectedly"),
+                Err(_) => panic!("timed out mid-reconnect"),
+            }
+        }
+        assert!(reconnects >= 3, "should reconnect through every drop, got {reconnects}");
+        assert!(router.connections.load(Ordering::SeqCst) >= 4);
+
+        // Still alive and usable — no panic took the supervisor down.
+        let (a, b) = sample_faucets();
+        let ok = client
+            .quote(FungibleAsset::new(a, 1).unwrap(), FungibleAsset::new(b, 1).unwrap(), None)
+            .is_ok();
+        assert!(ok, "client should still accept sends after recovering");
+    }
+
+    /// Priority — never send a stale quote. A quote enqueued during the outage
+    /// (priced before the drop) must be discarded on reconnect, not flushed to the
+    /// router; only a fresh post-reconnect quote should arrive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_stale_quote_flushed_after_reconnect() {
+        let router = mock_router(1).await; // conn #0 drops; conn #1 is stable
+        let mut client = LpClient::connect(&router.url, "tok").await.unwrap();
+        let (a, b) = sample_faucets();
+
+        assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
+
+        // Wait for the drop → we're now in backoff, with no live socket draining
+        // the outbound queue.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), client.next_event()).await {
+                Ok(Some(LpEvent::Reconnecting { .. })) => break,
+                Ok(Some(_)) => {}
+                _ => panic!("expected Reconnecting"),
+            }
+        }
+        // Enqueue a STALE quote (offered=111) during the outage — it can only
+        // buffer, since there is no live socket to write it.
+        client
+            .quote(FungibleAsset::new(a, 111).unwrap(), FungibleAsset::new(b, 1).unwrap(), None)
+            .unwrap();
+
+        // Wait until live again — by now the SDK has drained the stale backlog.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), client.next_event()).await {
+                Ok(Some(LpEvent::Reconnected)) => break,
+                Ok(Some(_)) => {}
+                _ => panic!("expected Reconnected"),
+            }
+        }
+        // Post a FRESH quote (offered=999) now that we're live.
+        client
+            .quote(FungibleAsset::new(a, 999).unwrap(), FungibleAsset::new(b, 1).unwrap(), None)
+            .unwrap();
+
+        // Let the writer deliver to the stable connection.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let offered = quote_offer_amounts(&router.received.lock().unwrap());
+        assert!(!offered.contains(&111), "stale quote (111) reached the router: {offered:?}");
+        assert!(offered.contains(&999), "fresh quote (999) should be delivered: {offered:?}");
+    }
+
+    // A minimal global tracing subscriber that records event messages, so a test
+    // can assert the SDK actually *logs* drops/reconnects (no extra dependency).
+    struct MsgCapture(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for MsgCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    static LOG_BUF: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+    fn install_log_capture() -> Arc<Mutex<Vec<String>>> {
+        let buf = LOG_BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
+        let _ = tracing::subscriber::set_global_default(MsgCapture(buf.clone())); // once
+        buf
+    }
+
+    /// Logging ask — a drop and its recovery are logged (the typed `LpError` rides
+    /// on the `Reconnecting` event, asserted above; here we prove the boundary logs
+    /// fire too).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_and_recovery_are_logged() {
+        let logs = install_log_capture();
+        let router = mock_router(1).await;
+        let mut client = LpClient::connect(&router.url, "tok").await.unwrap();
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(3), client.next_event()).await {
+                Ok(Some(LpEvent::Reconnected)) => break,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        let text = logs.lock().unwrap().join("\n");
+        assert!(text.contains("router link dropped"), "missing drop log; got:\n{text}");
+        assert!(text.contains("re-established"), "missing reconnect log; got:\n{text}");
     }
 }

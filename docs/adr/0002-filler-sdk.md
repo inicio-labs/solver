@@ -23,18 +23,18 @@ Ship **`pswap-filler-sdk`** as a standalone crate inside the solver repo:
 1. **Separate crate, depended on one-way.** The solver depends on the SDK; the SDK
    never depends on the solver. A DEX adds only `pswap-filler-sdk` — no solver crate,
    no `miden-client`, no db/http.
-2. **The SDK owns the wire protocol.** `protocol` (`ClientMsg`/`ServerMsg`/`PairSpec`/
-   `PriceRatio`) lives in the SDK; the solver's router imports it from there. One
-   definition ⇒ the two sides cannot drift.
+2. **The SDK owns the wire protocol.** `protocol` (`ClientMsg`/`ServerMsg`/`PairSpec`)
+   lives in the SDK; the solver's router imports it from there. One definition ⇒ the
+   two sides cannot drift.
 3. **Miden-native binary wire.** Messages serialize with miden's `Serializable`/
    `Deserializable` over WebSocket **binary** frames, so miden types (`AccountId`,
    `FungibleAsset`, `Note`) travel natively — no serde, no hex, no decimal-string
    prices. The SDK depends on `miden-protocol`/`miden-standards`, but stays independent
    of the solver crate and of `miden-client`.
 4. **Typed handover.** `ServerMsg::Handover` carries a decoded `Note` (not hex bytes) +
-   a `PriceRatio` `fill_price`. On-chain helpers (`consume_args`, re-exported
-   `PswapNote`) are always available — no feature gate. The DEX runs the consume
-   transaction with its own client/keystore/gas.
+   `fill_amount`. The note enforces its own on-chain rate, so those two fully specify
+   the fill. On-chain helpers (`consume_args`, re-exported `PswapNote`) are always
+   available — no feature gate. The DEX runs the consume tx with its own client/gas.
 5. **Hands-free push.** `LpClient::serve_quotes(pairs, refresh, price_fn)` keeps a
    fresh quote live per pair: it calls the pricing fn each tick and re-sends, so quotes
    never expire (keepalive) and never go stale-by-omission. The connection is
@@ -82,7 +82,8 @@ miden's own format, and hands the filler a typed `Note`.
   (Rust or WASM).
 - We give up cross-version decoupling from a filler's own miden build — acceptable
   because fillers are versioned with the solver.
-- `fill_price` is a `num/den` ratio (the matcher echoes the matched quote price); it is
-  the binding fill rate for the overfill path and rides alongside the note today.
+- A handover is `note` + `fill_amount` only. The note enforces its own on-chain rate, so
+  no separate price rides along; if the overfill path later makes the binding fill rate
+  differ from the note's intrinsic rate, re-add an echoed price then.
 - Verified: `cargo test -p pswap-filler-sdk` green; the crate builds independent of the
   solver crate and `miden-client`.

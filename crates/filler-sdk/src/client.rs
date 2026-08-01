@@ -21,7 +21,7 @@
 //!
 //! while let Some(ev) = client.next_event().await {
 //!     match ev {
-//!         LpEvent::Handover(h) => { /* consume h.note on-chain at h.fill_price */ }
+//!         LpEvent::Handover(h) => { /* consume h.note on-chain (it enforces its rate) */ }
 //!         LpEvent::Reconnecting { error, .. } => tracing::warn!(%error, "router link lost; retrying"),
 //!         LpEvent::Disconnected { reason } => { tracing::error!(%reason, "gave up"); break }
 //!         _ => {}
@@ -43,7 +43,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};
+use crate::protocol::{ClientMsg, PairSpec, ServerMsg};
 
 /// The concrete websocket stream type (TCP, optionally TLS-wrapped).
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -90,19 +90,17 @@ impl fmt::Display for LpError {
 
 impl std::error::Error for LpError {}
 
-/// A note handed over by the solver for the LP to consume on-chain, at the
-/// matched price. `note` is a decoded miden [`Note`]; read its swap terms with
+/// A note handed over by the solver for the LP to consume on-chain. `note` is a
+/// decoded miden [`Note`]; read its swap terms with
 /// [`miden_standards::note::PswapNote::try_from`] and build consume args with
-/// [`crate::consume::consume_args`].
+/// [`crate::consume::consume_args`]. The note enforces its own on-chain rate, so
+/// `note` + `fill_amount` fully specify the fill.
 #[derive(Debug, Clone)]
 pub struct Handover {
     /// The PSWAP note to consume.
     pub note: Note,
     /// Requested-token base units to fill.
     pub fill_amount: u64,
-    /// The price the match used (your own quote, echoed) — `num/den` =
-    /// requested-per-offered. Fill at this rate.
-    pub fill_price: PriceRatio,
 }
 
 /// An event surfaced from the router connection. The first event after a
@@ -122,7 +120,7 @@ pub enum LpEvent {
     /// Reserved: the router's request for quotes on these pairs (not currently
     /// emitted — the live flow is quote-driven).
     Ask { pairs: Vec<PairSpec> },
-    /// A note to fill. Consume `note` on-chain at `fill_price`.
+    /// A note to fill. Consume `note` on-chain (it enforces its own rate).
     Handover(Handover),
     /// The router rejected a message we sent (non-fatal — the link stays up).
     Error(LpError),
@@ -143,8 +141,8 @@ impl From<ServerMsg> for LpEvent {
         match m {
             ServerMsg::AuthOk => LpEvent::AuthOk,
             ServerMsg::Ask { pairs } => LpEvent::Ask { pairs },
-            ServerMsg::Handover { note, fill_amount, fill_price } => {
-                LpEvent::Handover(Handover { note, fill_amount, fill_price })
+            ServerMsg::Handover { note, fill_amount } => {
+                LpEvent::Handover(Handover { note, fill_amount })
             }
             ServerMsg::Error { code, msg } => LpEvent::Error(LpError::Protocol { code, msg }),
         }

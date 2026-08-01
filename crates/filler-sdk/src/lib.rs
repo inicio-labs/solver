@@ -46,7 +46,7 @@
 //!         match ev {
 //!             LpEvent::Handover(h) => {
 //!                 let pswap = PswapNote::try_from(&h.note)?;   // what am I getting / paying?
-//!                 // ... your risk check against `pswap` and `h.fill_price` ...
+//!                 // ... your risk check against `pswap` (the note's fixed terms) ...
 //!                 let _args = consume_args(0, h.fill_amount)?; // then self-consume on-chain
 //!             }
 //!             LpEvent::Disconnected { reason } => break,       // SDK gave up (e.g. bad token)
@@ -63,4 +63,4 @@ pub mod protocol;
 
 // Ergonomic top-level re-exports — the common path needs only these.
 pub use client::{Handover, LpClient, LpError, LpEvent, LpSender, QuoteTask};
-pub use protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};
+pub use protocol::{ClientMsg, PairSpec, ServerMsg};

@@ -48,7 +48,7 @@ sequenceDiagram
     Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
     M->>M: park the note (out of internal matching)
     M->>R: handover_tx (try_send)
-    R-->>D: Handover { note, fill_amount, fill_price }
+    R-->>D: Handover { note, fill_amount }
     D->>D: PswapNote::try_from(&note) + your policy check
     D->>C: consume the note on-chain (your gas, your keys)
     C-->>M: nullifier observed → consumed_rx
@@ -152,16 +152,15 @@ use pswap_filler_sdk::consume::{consume_args, PswapNote};
 while let Some(ev) = client.next_event().await {
     match ev {
         LpEvent::Handover(h) => {
-            // h.note        : Note       — the PSWAP note to consume (decoded)
-            // h.fill_amount : u64        — requested-token base units to fill
-            // h.fill_price  : PriceRatio — { num, den }, requested-per-offered (your matched quote)
+            // h.note        : Note — the PSWAP note to consume (decoded)
+            // h.fill_amount : u64  — requested-token base units to fill
             let pswap = PswapNote::try_from(&h.note)?;   // what you receive / pay
             // pswap.offered_asset()               — you RECEIVE this
             // pswap.storage().requested_asset()   — you PAY this (pro-rata for a partial fill)
             // pswap.storage().creator_account_id()— maker the requested asset settles back to
 
-            // Your policy check: is the note's rate good for you, given live prices and
-            // inventory (cross-check against h.fill_price)? You decide — the rate is fixed.
+            // Your policy check: is the note's fixed rate good for you, given live prices
+            // and inventory? You decide — the rate is fixed on-chain.
 
             let args = consume_args(0, h.fill_amount)?;  // (account_fill, note_fill) → Word
             // ... feed h.note + args into YOUR miden-client transaction (below) ...
@@ -174,11 +173,11 @@ while let Some(ev) = client.next_event().await {
 }
 ```
 
-- **`fill_price`** is a `PriceRatio { num, den }` (requested-per-offered) — **your own
-  matched quote, echoed**: *"fill this note at `num/den`."* Cross-check it against your
-  live price. (Forward-looking: a PSWAP note enforces its own fixed rate on-chain today,
-  so `consume_args` fills at that rate and `fill_price` equals or beats it; it becomes
-  the *binding* rate when the overfill protocol change ships — read it now to be ready.)
+- **The note carries the rate.** A PSWAP note enforces its own fixed rate on-chain, so
+  `h.note` + `h.fill_amount` fully specify the fill — there is no separate price field.
+  Read the terms off `PswapNote` and decide with your own live price. (If the overfill
+  protocol later makes the binding fill rate differ from the note's intrinsic rate, an
+  echoed price will be re-added then.)
 - **`consume_args(account_fill, note_fill)`** builds the note args for a fill.
   `note_fill` is requested-token base units from the note (partial fills allowed —
   `fill_amount` may be below the note's requested amount); `account_fill` is the
@@ -238,7 +237,7 @@ the decoded structs, not the frames.)
 
 **Server → client** (`ServerMsg`):
 - `AuthOk` — handshake accepted (first frame).
-- `Handover { note: Note, fill_amount: u64, fill_price: PriceRatio }` — a note to fill.
+- `Handover { note: Note, fill_amount: u64 }` — a note to fill (the note carries its rate).
 - `Error { code: String, msg: String }` — a message was rejected.
 - `Ask { pairs }` — reserved (a future pull/quote-on-demand mode); not emitted today.
 

@@ -38,30 +38,6 @@ impl Deserializable for PairSpec {
     }
 }
 
-/// A price as an exact rational `num / den` (requested-token per offered-token).
-/// Integer-native — no decimal strings, no float on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PriceRatio {
-    pub num: u64,
-    pub den: u64,
-}
-
-impl Serializable for PriceRatio {
-    fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        self.num.write_into(target);
-        self.den.write_into(target);
-    }
-}
-
-impl Deserializable for PriceRatio {
-    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
-        Ok(PriceRatio {
-            num: u64::read_from(source)?,
-            den: u64::read_from(source)?,
-        })
-    }
-}
-
 // ── Client → server ──────────────────────────────────────────────────────────
 
 /// Messages a DEX (client) sends to the router. A standing quote is the only
@@ -125,15 +101,13 @@ pub enum ServerMsg {
     /// Reserved: the router asking the DEX to quote these pairs (pull model).
     /// Not currently emitted — the live flow is quote-driven (push).
     Ask { pairs: Vec<PairSpec> },
-    /// A note to consume on-chain, at the matched price.
+    /// A note to consume on-chain. The note enforces its own rate, so `note` +
+    /// `fill_amount` fully specify the fill.
     Handover {
         /// The PSWAP note to consume — typed, not hex.
         note: Note,
         /// Requested-token base units to fill.
         fill_amount: u64,
-        /// The price the match used (the DEX's own quote, echoed) — fill at this
-        /// rate. `num/den` = requested-per-offered.
-        fill_price: PriceRatio,
     },
     /// A structured error (e.g. a malformed quote was rejected).
     Error { code: String, msg: String },
@@ -154,11 +128,10 @@ impl Serializable for ServerMsg {
                 target.write_u8(ServerMsg::ASK);
                 pairs.write_into(target);
             }
-            ServerMsg::Handover { note, fill_amount, fill_price } => {
+            ServerMsg::Handover { note, fill_amount } => {
                 target.write_u8(ServerMsg::HANDOVER);
                 note.write_into(target);
                 fill_amount.write_into(target);
-                fill_price.write_into(target);
             }
             ServerMsg::Error { code, msg } => {
                 target.write_u8(ServerMsg::ERROR);
@@ -177,7 +150,6 @@ impl Deserializable for ServerMsg {
             ServerMsg::HANDOVER => Ok(ServerMsg::Handover {
                 note: Note::read_from(source)?,
                 fill_amount: u64::read_from(source)?,
-                fill_price: PriceRatio::read_from(source)?,
             }),
             ServerMsg::ERROR => Ok(ServerMsg::Error {
                 code: String::read_from(source)?,
@@ -205,12 +177,6 @@ mod tests {
         };
         let back = ClientMsg::read_from_bytes(&q.to_bytes()).unwrap();
         assert_eq!(q, back);
-    }
-
-    #[test]
-    fn price_ratio_round_trip() {
-        let p = PriceRatio { num: 205, den: 100 };
-        assert_eq!(p, PriceRatio::read_from_bytes(&p.to_bytes()).unwrap());
     }
 
     #[test]

@@ -38,7 +38,7 @@ sequenceDiagram
     Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
     M->>M: park the note (out of internal matching)
     M->>R: handover_tx (try_send)
-    R-->>D: Handover { note, fill_amount, fill_price }
+    R-->>D: Handover { note, fill_amount }
     D->>D: PswapNote::try_from(&note) + your policy check
     D->>C: consume the note on-chain (your gas, your keys)
     C-->>M: nullifier observed → consumed_rx
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         match ev {
             LpEvent::Handover(h) => {
                 let pswap = PswapNote::try_from(&h.note)?;      // what am I getting / paying?
-                // ... your risk check against `pswap` and `h.fill_price` ...
+                // ... your risk check against `pswap` (the note's fixed terms) ...
                 let _args = consume_args(0, h.fill_amount)?;    // then self-consume on-chain
             }
             LpEvent::Error(e) => eprintln!("router error: {e}"),  // typed LpError
@@ -102,5 +102,5 @@ async fn main() -> anyhow::Result<()> {
 
 - **Auth** — `Authorization: Bearer <token>` (the SDK sets this). A wrong token fails at the upgrade.
 - **Quotes are standing** — `serve_quotes` keeps them fresh (keepalive + your live price each tick). A disconnect purges your quotes, but the connection auto-reconnects (backoff + re-auth) and `serve_quotes` resumes pushing. There's no subscribe step — **the quote is the registration** (its faucet ids imply the pair); re-post on `Reconnected` if you quote manually.
-- **Amounts, not prices** — a quote is two `FungibleAsset`s (`offered`/`requested`); their ratio is the rate, like a PSWAP note. `fill_price` on a handover is a `num/den` ratio (your matched quote, echoed).
+- **Amounts, not prices** — a quote is two `FungibleAsset`s (`offered`/`requested`); their ratio is the rate, like a PSWAP note. A handover carries the `note` (which enforces its own on-chain rate) plus `fill_amount`.
 - **Handover = a decoded `Note`** — you self-consume on-chain; the solver never holds your keys or pays your gas.

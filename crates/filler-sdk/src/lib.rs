@@ -22,23 +22,30 @@
 //!
 //! ## Quick start
 //!
+//! Subscribe + provide a pricing fn + handle handovers — that's the whole push
+//! integration. [`serve_quotes`](client::FillerClient::serve_quotes) keeps a
+//! fresh quote live for each pair (keepalive + no stale-by-omission); you just
+//! return the current `(offered_amount, requested_amount)` when asked.
+//!
 //! ```ignore
+//! use std::time::Duration;
 //! use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
 //! use pswap_filler_sdk::consume::{consume_args, PswapNote};
-//! use miden_protocol::asset::FungibleAsset;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let mut client = FillerClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
-//!     client.subscribe(vec![PairSpec { offered: imiden, requested: iusdt }])?;
-//!     // give up to 1 iMIDEN for 2 iUSDT (rate + size); refresh before the TTL.
-//!     client.quote(FungibleAsset::new(imiden, 1_000_000)?, FungibleAsset::new(iusdt, 2_000_000)?, None)?;
+//!     let _q = client.serve_quotes(
+//!         vec![PairSpec { offered: imiden, requested: iusdt }],
+//!         Duration::from_secs(10),                 // ~half the router's quote TTL
+//!         |_pair| Some((1_000_000, 2_000_000)),    // your live price: (offer, request) base units
+//!     )?;
 //!
 //!     while let Some(ev) = client.next_event().await {
 //!         match ev {
 //!             FillerEvent::Handover(h) => {
 //!                 let pswap = PswapNote::try_from(&h.note)?;   // what am I getting / paying?
-//!                 // ... your pricing/risk check against `pswap` and `h.fill_price` ...
+//!                 // ... your risk check against `pswap` and `h.fill_price` ...
 //!                 let _args = consume_args(0, h.fill_amount)?; // then self-consume on-chain
 //!             }
 //!             FillerEvent::Disconnected => break,
@@ -54,5 +61,5 @@ pub mod consume;
 pub mod protocol;
 
 // Ergonomic top-level re-exports — the common path needs only these.
-pub use client::{FillerClient, FillerEvent, FillerSender, Handover};
+pub use client::{FillerClient, FillerEvent, FillerSender, Handover, QuoteTask};
 pub use protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};

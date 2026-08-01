@@ -24,6 +24,8 @@
 //! }
 //! ```
 
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use miden_protocol::asset::FungibleAsset;
@@ -178,6 +180,73 @@ impl FillerClient {
     ) -> Result<()> {
         self.sender.quote(offered, requested, valid_for_ms)
     }
+
+    /// The minimal push integration: subscribe to `pairs` and keep a **fresh**
+    /// standing quote live for each, hands-free.
+    ///
+    /// The SDK calls `price(pair)` on every `refresh` tick to get the current
+    /// `(offered_amount, requested_amount)` (base units, on the pair's
+    /// `offered`/`requested` faucets) and sends it. So your quotes never expire
+    /// (keepalive) **and** never go stale-by-omission — the SDK always pushes
+    /// whatever `price` returns *now*. Return `None` from `price` to skip a pair
+    /// this tick. Set `refresh` to ~half the router's quote TTL.
+    ///
+    /// Provide a pricing fn here and handle handovers from
+    /// [`next_event`](Self::next_event) — that's the whole integration. The
+    /// quoting loop runs until the connection drops; keep the returned
+    /// [`QuoteTask`] (or drop it to detach) and call [`QuoteTask::abort`] to stop
+    /// early. `price` must be cheap/non-blocking — it runs inline on the task.
+    pub fn serve_quotes<F>(
+        &self,
+        pairs: Vec<PairSpec>,
+        refresh: Duration,
+        price: F,
+    ) -> Result<QuoteTask>
+    where
+        F: Fn(&PairSpec) -> Option<(u64, u64)> + Send + 'static,
+    {
+        self.subscribe(pairs.clone())?;
+        let handle = tokio::spawn(quote_loop(self.sender(), pairs, refresh, price));
+        Ok(QuoteTask(handle))
+    }
+}
+
+/// Handle to the background quoting loop started by
+/// [`FillerClient::serve_quotes`]. The loop runs until the connection drops.
+/// Dropping this handle detaches the loop (it keeps quoting); call
+/// [`abort`](Self::abort) to stop it explicitly.
+pub struct QuoteTask(tokio::task::JoinHandle<()>);
+
+impl QuoteTask {
+    /// Stop the quoting loop.
+    pub fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+/// Re-send a fresh quote for every pair on each `refresh` tick, pricing each via
+/// `price`. Ends when the connection drops (a send error).
+async fn quote_loop<F>(sender: FillerSender, pairs: Vec<PairSpec>, refresh: Duration, price: F)
+where
+    F: Fn(&PairSpec) -> Option<(u64, u64)>,
+{
+    loop {
+        for pair in &pairs {
+            let Some((offered_amount, requested_amount)) = price(pair) else { continue };
+            match (
+                FungibleAsset::new(pair.offered, offered_amount),
+                FungibleAsset::new(pair.requested, requested_amount),
+            ) {
+                (Ok(offered), Ok(requested)) => {
+                    if sender.quote(offered, requested, None).is_err() {
+                        return; // connection gone → stop
+                    }
+                }
+                _ => tracing::warn!("serve_quotes: invalid quote amounts for a pair; skipping"),
+            }
+        }
+        tokio::time::sleep(refresh).await;
+    }
 }
 
 /// Background task: writes queued outbound messages to the socket (miden-binary
@@ -257,5 +326,38 @@ mod tests {
         let s = FillerSender { tx };
         drop(rx); // connection task gone
         assert!(s.subscribe(vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn quote_loop_pushes_fresh_and_refreshes() {
+        use miden_protocol::account::AccountId;
+        // Real testnet faucet ids (valid fungible faucets — no test feature needed).
+        let a = AccountId::from_hex("0x4a03c1843860c9b17582c021d563ae").unwrap();
+        let b = AccountId::from_hex("0x2458e5446128e6b150b75b8ebd9ce1").unwrap();
+        let pair = PairSpec { offered: a, requested: b };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let handle = tokio::spawn(quote_loop(
+            FillerSender { tx },
+            vec![pair],
+            Duration::from_millis(20),
+            |_p| Some((100, 200)), // priced live each tick
+        ));
+
+        // Quotes immediately, with the priced amounts on the pair's faucets.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match rx.try_recv().unwrap() {
+            ClientMsg::Quote { offered, requested, .. } => {
+                assert_eq!(u64::from(offered.amount()), 100);
+                assert_eq!(u64::from(requested.amount()), 200);
+                assert_eq!(offered.faucet_id(), a);
+                assert_eq!(requested.faucet_id(), b);
+            }
+            other => panic!("expected Quote, got {other:?}"),
+        }
+        // And keeps refreshing on the next tick.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(matches!(rx.try_recv().unwrap(), ClientMsg::Quote { .. }));
+        handle.abort();
     }
 }

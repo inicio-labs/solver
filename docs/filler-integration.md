@@ -3,7 +3,10 @@
 **Audience:** external DEXes ("fillers") integrating with a Miden PSWAP solver to
 receive and fill order flow it can't cross internally.
 **SDK:** [`pswap-filler-sdk`](../crates/filler-sdk) (Rust). **Transport:** one
-websocket. **Auth:** a bearer token the solver operator issues you.
+websocket (miden-binary frames). **Auth:** a bearer token the operator issues you.
+
+The SDK's rustdoc (`cargo doc -p pswap-filler-sdk --open`) is the API reference;
+this guide covers the semantics you can't read off the types.
 
 ---
 
@@ -11,32 +14,21 @@ websocket. **Auth:** a bearer token the solver operator issues you.
 
 The solver runs an internal order book of PSWAP notes (on-chain swap orders). When
 it can't cross an order against another user — e.g. an `IMIDEN→IUSDT` order with no
-opposing `IUSDT→IMIDEN` — that note is **idle liquidity**. Instead of letting it sit,
-the solver offers it to you.
+opposing `IUSDT→IMIDEN` — that note is **idle liquidity**, and it offers it to you.
 
 Three facts make this simpler than a normal RFQ/AMM integration:
 
 1. **Terms are fixed on-chain.** A PSWAP note already encodes its rate (offer `X`,
-   request `Y`). You can only fill it *at that rate or better for the maker, never
-   worse*. So there is **no price negotiation** — your "quote" is just you declaring
-   *how much* you'll take and *at what price you stop being interested*.
-2. **A "handover" is just bytes, not custody.** The solver sends you the note's id +
-   serialized bytes. You consume it **on-chain, on your own gas, with your own keys**.
-   The solver never holds your funds and never signs for you.
-3. **Standing quotes, not request/response.** You post a quote once and refresh it
-   before it expires. You are *not* asked per-order and you do *not* reply per-order.
-   The solver matches its idle notes against your standing quote and pushes you the
-   ones that clear it.
-
-### Integration in 4 steps
-
-1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer
-   token the operator issued you (§3).
-2. **Quote** a standing `{price, quantity}` per pair; refresh it before the TTL (§4).
-3. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill (§5).
-4. **Consume on-chain** — decode the note and self-consume with your own client/gas (§5).
-
-That's the whole integration surface. Everything below is detail on each step.
+   request `Y`). You fill it *at that rate or better for the maker, never worse*. So
+   there is **no price negotiation** — your "quote" just declares *how much* you'll
+   take and *at what rate you stop being interested*.
+2. **A "handover" is a note, not custody.** The solver sends you the decoded `Note`.
+   You consume it **on-chain, on your own gas, with your own keys**. The solver never
+   holds your funds and never signs for you.
+3. **Standing quotes, not request/response.** You keep a quote live and refresh it
+   before it expires; you are *not* asked per-order. The solver matches its idle notes
+   against your standing quote and pushes you the ones that clear it. (The SDK's
+   `serve_quotes` handles the refresh for you.)
 
 ### How the solver talks to your DEX
 
@@ -50,14 +42,14 @@ sequenceDiagram
 
     D->>R: connect /v1/rfq (Authorization: Bearer)
     R-->>D: AuthOk
-    D->>R: Quote { pair, price, quantity }
-    Note right of D: standing — refresh before the TTL
+    D->>R: Quote { offered, requested }
+    Note right of D: standing — serve_quotes refreshes before the TTL
     R->>M: quotes_tx (watch) — latest quotes
     Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
     M->>M: park the note (out of internal matching)
     M->>R: handover_tx (try_send)
-    R-->>D: Handover { note_id, fill_amount, note_hex, fill_price }
-    D->>D: decode_note + your policy check
+    R-->>D: Handover { note, fill_amount, fill_price }
+    D->>D: PswapNote::try_from(&note) + your policy check
     D->>C: consume the note on-chain (your gas, your keys)
     C-->>M: nullifier observed → consumed_rx
     M->>M: drop the note (settled)
@@ -78,28 +70,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
 
-### Feature flags
-
-| feature | adds | pulls in |
-|---|---|---|
-| *(default)* | `FillerClient` + the wire `protocol` | serde, tokio, tungstenite — **no miden** |
-| `consume` | `consume::{decode_note, PswapTerms, consume_args}` | `miden-protocol`, `miden-standards` (**not** `miden-client`) |
-
-Enable `consume` **only** if you want the SDK to decode the note and read its terms
-for you. If you already run a miden stack and just want the raw bytes, stay on the
-default build — it has zero miden dependencies, so the SDK never constrains your
-miden version.
-
-```toml
-pswap-filler-sdk = { git = "...", package = "pswap-filler-sdk", features = ["consume"] }
-```
-
-You bring your own `miden-client` for the actual consume transaction either way — the
-SDK deliberately does not pull it in, so it can't conflict with yours.
+The SDK pulls `miden-protocol` / `miden-standards` (the binary protocol carries miden
+types natively). It does **not** pull the solver crate or `miden-client` — you bring
+your own client for the consume transaction, so nothing conflicts with your stack.
 
 ---
 
-## 3. Connect & authenticate
+## 3. Connect
 
 ```rust
 use pswap_filler_sdk::{FillerClient, FillerEvent};
@@ -108,275 +85,186 @@ let mut client = FillerClient::connect("ws://solver-host:8090/v1/rfq", "your-tok
 assert!(matches!(client.next_event().await, Some(FillerEvent::AuthOk)));
 ```
 
-- The SDK sends `Authorization: Bearer <token>` on the upgrade. A **wrong or missing
-  token fails the connection** (HTTP 401) — `connect` returns `Err`, no session opens.
+- The SDK sends `Authorization: Bearer <token>` on the upgrade. A **wrong/missing token
+  fails the connection** (HTTP 401) — `connect` returns `Err`, no session opens.
 - On success the **first event is always `AuthOk`**; the **last is always
   `Disconnected`**.
-- The default port is **8090**, path **`/v1/rfq`**. Confirm host/port/token with the
-  operator.
-- Tokens are bearer secrets — treat them like API keys. Anyone holding one sees your
-  pair's idle order flow, so don't share or log them.
+- Default port **8090**, path **`/v1/rfq`**. Tokens are bearer secrets — treat them like
+  API keys; don't share or log them.
 
 ---
 
 ## 4. Quote
 
+The one-call, hands-free path is `serve_quotes` — subscribe + keep a fresh quote live
+per pair:
+
 ```rust
+use std::time::Duration;
 use pswap_filler_sdk::PairSpec;
 
-// Hex account ids, in the note's (offered, requested) orientation.
-let pair = PairSpec { offered: imiden_hex.into(), requested: iusdt_hex.into() };
-
-client.quote(&pair, "2.00", 1_000_000, None)?;    // standing quote
+let _q = client.serve_quotes(
+    vec![PairSpec { offered: imiden, requested: iusdt }],   // AccountIds, (offered, requested)
+    Duration::from_secs(10),                                // ~half the router's quote TTL
+    |_pair| Some((1_000_000, 2_000_000)),                   // your live price (base units)
+)?;
 ```
 
-### Pairs
+The SDK calls your pricing fn **every tick** for the current amounts and re-sends the
+quote — so it never expires (keepalive) **and** never goes stale-by-omission (it always
+pushes what your fn returns *now*). Return `None` to skip a pair this tick. Drop the
+returned `QuoteTask` to detach, or `abort()` to stop.
 
-A `PairSpec` is two **hex account ids** (faucet ids) in **`(offered, requested)`**
-orientation — the same orientation as the note. `offered` is the token the note pays
-*out* (and you receive); `requested` is the token the note wants *in* (and you pay).
-A pair and its reverse are distinct: `(IMIDEN, IUSDT)` ≠ `(IUSDT, IMIDEN)`. The pair
-you quote is the pair you fill — there is no separate registration step.
+For manual control you can also `client.quote(offered, requested, valid_for_ms)` with
+`FungibleAsset`s directly, or send from a cloned `client.sender()`.
 
-### Quotes (the important part)
+### What a quote means (base units, not a human price)
 
-```rust
-client.quote(&pair, price /* &str */, quantity /* u64 */, valid_for_ms /* Option<u64> */)?;
-```
+A quote is two amounts on the pair's faucets: **`offered`** (base units of the pair's
+`offered` token — what you *receive*) and **`requested`** (base units of the `requested`
+token — what you *pay*).
 
-- **`price`** — `requested`-token per `offered`-token, **per whole token**, as a
-  decimal string (e.g. `"2.00"`). This is the **worst price you'll accept**: the solver
-  only hands you notes whose on-chain rate is at least this generous to you. Validated
-  client-side, so a malformed price errors locally instead of round-tripping.
-- **`quantity`** — the **max `requested`-token amount (base units)** you'll take across
-  all fills against this quote. The solver packs notes up to this budget.
-- **`valid_for_ms`** — optional; shortens validity below the server's quote TTL. `None`
-  uses the server TTL (default 20 s).
+- **Their ratio is your rate** — the worst price you'll accept. The solver only hands
+  you notes whose fixed on-chain rate is at least this generous to you.
+- **The amounts are your max size** — the solver packs notes up to them.
 
-**Quotes are standing.** Post once; **refresh before expiry** (a good keepalive is
-≈ TTL/2). A stale quote is silently ignored by the matcher. Disconnecting purges your
-quotes immediately.
+> **Work in base units — the token's on-chain units, exactly like a PSWAP note.** Do
+> **not** compute a "human price per whole token" or pre-scale by decimals — you did
+> that in the old string-price protocol; you don't now. A quote is structurally a PSWAP
+> counter-order: "I give `offered` for `requested`." The solver compares base-unit
+> ratios directly (and applies each token's decimals only for its oracle off-market
+> check — see [external-liquidity-routing.md](external-liquidity-routing.md)).
 
-> ### Price units — read this twice
-> Price is **per whole token, `requested` per `offered`** — the human price, not a
-> base-unit ratio. If IMIDEN is \$2 and IUSDT is \$1, the parity price for
-> `(IMIDEN, IUSDT)` is `"2.0"` regardless of either token's decimals. Do **not**
-> pre-scale by decimals; the solver applies decimals itself. (Internally it compares
-> exact integers using each token's on-chain decimals — see
-> [external-liquidity-routing.md](external-liquidity-routing.md) §"Export predicate".)
+`PairSpec { offered, requested }` and its reverse are distinct pairs. The pair you quote
+is the pair you fill — no separate registration.
 
 ---
 
 ## 5. Receive handovers & consume
 
-Loop on events. A `Handover` is a note for you to fill:
-
 ```rust
+use pswap_filler_sdk::consume::{consume_args, PswapNote};
+
 while let Some(ev) = client.next_event().await {
     match ev {
         FillerEvent::Handover(h) => {
-            // h.note_id     : String  — the note's id (for your logs / dedupe)
-            // h.fill_amount : u64     — requested-token base units to fill
-            // h.note_hex    : String  — hex-encoded serialized PSWAP note
-            // h.fill_price  : String  — the price to fill at (your quoted X, echoed)
-            handle_handover(h).await?;
+            // h.note        : Note       — the PSWAP note to consume (decoded)
+            // h.fill_amount : u64        — requested-token base units to fill
+            // h.fill_price  : PriceRatio — { num, den }, requested-per-offered (your matched quote)
+            let pswap = PswapNote::try_from(&h.note)?;   // what you receive / pay
+            // pswap.offered_asset()               — you RECEIVE this
+            // pswap.storage().requested_asset()   — you PAY this (pro-rata for a partial fill)
+            // pswap.storage().creator_account_id()— maker the requested asset settles back to
+
+            // Your policy check: is the note's rate good for you, given live prices and
+            // inventory (cross-check against h.fill_price)? You decide — the rate is fixed.
+
+            let args = consume_args(0, h.fill_amount)?;  // (account_fill, note_fill) → Word
+            // ... feed h.note + args into YOUR miden-client transaction (below) ...
         }
         FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
-        FillerEvent::Disconnected => break,   // reconnect (see §7)
-        FillerEvent::AuthOk => {}
+        FillerEvent::Disconnected => break,   // reconnect (see §6)
+        _ => {}
     }
 }
 ```
 
-### `fill_price` — the price to fill at
-
-`fill_price` is **your own quoted price `X`, echoed back** (requested-per-offered, per
-whole token): the solver is saying *"fill this note at `X`."* It's a string so it stays
-exact (e.g. `"2.00"`) — parse it with `parse_decimal_price` if you need the rational.
-
-> **Forward-looking, be aware.** Today a PSWAP note enforces its own fixed rate
-> on-chain, and `consume_args` fills at that rate — so right now `fill_price` is the
-> agreed price/floor for your records and equals (or is more generous than) the note's
-> rate. It becomes the *binding* fill rate once the **overfill** protocol change ships
-> (a note that lets the consumer settle above its intrinsic rate). Design your handler
-> to read `fill_price` now so you're ready when that lands.
-
-### Decoding & checking terms (feature `consume`)
-
-```rust
-use pswap_filler_sdk::consume::{decode_note, PswapTerms, consume_args};
-
-let note  = decode_note(&h.note_hex)?;          // hex → miden Note
-let terms = PswapTerms::from_note(&note)?;      // what you receive / pay
-// terms.offered_faucet / offered_amount  — you RECEIVE this
-// terms.requested_faucet / requested_amount — you PAY this (pro-rata for partial)
-// terms.creator — the maker the requested asset settles back to
-
-// Your policy check: is terms.offered_amount / terms.requested_amount good for you,
-// given live prices and your inventory? You decide — the note's rate is fixed.
-
-let args = consume_args(h.fill_amount)?;        // note args for a (partial) fill
-```
-
-`fill_amount` may be **less than** `requested_amount` (a partial fill). `consume_args`
-builds the note args for exactly that fill; pass the full `requested_amount` for a
-complete fill.
+- **`fill_price`** is a `PriceRatio { num, den }` (requested-per-offered) — **your own
+  matched quote, echoed**: *"fill this note at `num/den`."* Cross-check it against your
+  live price. (Forward-looking: a PSWAP note enforces its own fixed rate on-chain today,
+  so `consume_args` fills at that rate and `fill_price` equals or beats it; it becomes
+  the *binding* rate when the overfill protocol change ships — read it now to be ready.)
+- **`consume_args(account_fill, note_fill)`** builds the note args for a fill.
+  `note_fill` is requested-token base units from the note (partial fills allowed —
+  `fill_amount` may be below the note's requested amount); `account_fill` is the
+  account-side amount (`0` for a pure note-side fill).
 
 ### Self-consume on-chain (your code, your client)
 
-The SDK stops at decode + args — running the transaction is yours, because it needs
-your keystore and gas. With `miden-client` that is roughly:
+The SDK stops at the note + args — running the transaction is yours (your keystore, your
+gas). With `miden-client` that is roughly:
 
 ```rust
-// PSEUDO — uses YOUR miden-client setup, not the SDK:
+// PSEUDO — uses YOUR miden-client, not the SDK:
 // let request = TransactionRequestBuilder::new()
-//     .with_authenticated_input_notes([(note, Some(args))])
+//     .input_notes([(h.note, Some(args))])
 //     .build()?;
 // let tx = your_client.new_transaction(your_account_id, request).await?;
 // your_client.submit_transaction(tx).await?;
 ```
 
 The note's payback (the requested asset) settles to the **creator**; the offered asset
-lands in **your** account. Once your consume confirms on-chain, the solver's ingest
-sees the nullifier and drops the note from its book — no message back from you needed.
+lands in **your** account. Once your consume confirms on-chain, the solver's ingest sees
+the nullifier and drops the note — no message back from you needed.
 
 ### If you don't fill
 
-A handover is an *offer*, not an obligation. Ignore it and after
-`router_inflight_ttl_ms` (default 30 s) the solver reactivates the note and routes it
-elsewhere. Repeatedly taking handovers and not consuming them is visible to the
-operator and is grounds for de-listing your token.
+A handover is an *offer*, not an obligation. Ignore it and after `router_inflight_ttl_ms`
+(default 30 s) the solver reactivates the note and routes it elsewhere. Repeatedly taking
+handovers and not consuming them is visible to the operator and grounds for de-listing.
 
 ---
 
-## 6. A complete reference filler
+## 6. Operational notes
 
-```rust
-use std::time::Duration;
-use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let url   = "ws://solver-host:8090/v1/rfq";
-    let token = std::env::var("SOLVER_FILLER_TOKEN")?;
-    let pair  = PairSpec { offered: imiden_hex(), requested: iusdt_hex() };
-
-    loop {
-        let mut client = match FillerClient::connect(url, &token).await {
-            Ok(c) => c,
-            Err(e) => { eprintln!("connect failed: {e}; retrying in 5s"); sleep5().await; continue; }
-        };
-
-        client.quote(&pair, "2.00", 1_000_000, None)?;
-
-        // Refresh the quote every ~10s (TTL/2) from a cloned sender.
-        let refresher = client.sender();
-        let p = pair.clone();
-        let keepalive = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                if refresher.quote(&p, "2.00", 1_000_000, None).is_err() { break; }
-            }
-        });
-
-        while let Some(ev) = client.next_event().await {
-            match ev {
-                FillerEvent::Handover(h) => {
-                    if let Err(e) = try_fill(&h).await {   // your decode+policy+consume
-                        eprintln!("fill {} failed: {e}", h.note_id);
-                    }
-                }
-                FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
-                FillerEvent::Disconnected => break,
-                _ => {}
-            }
-        }
-        keepalive.abort();      // connection dropped → reconnect from the top
-    }
-}
-```
-
-`FillerClient::sender()` returns a cheap, cloneable `FillerSender` you can move into a
-timer task to refresh quotes while the main task drains events.
+- **Reconnect on `Disconnected`.** Quotes don't survive a disconnect; re-establish and
+  re-`serve_quotes` after reconnecting, with backoff on repeated connect failures.
+- **Idempotent handovers.** Dedupe by the note's id — a reactivated note can be offered
+  again (not to the DEX that already held it, within the same in-flight window).
+- **Message size.** The server caps inbound messages (default 16 KiB). Quotes are tiny.
+- **One connection, many pairs.** Serve as many pairs as you fill over one socket.
+  Multiple connections with the same token work and are routed independently.
 
 ---
 
-## 7. Operational notes
+## 7. Protocol reference (binary)
 
-- **Reconnect on `Disconnected`.** Quotes do not survive a disconnect; re-quote after
-  reconnecting (the loop above does this). Back off on repeated connect failures.
-- **Idempotent handovers.** Dedupe by `note_id` — a reactivated note can be offered
-  again (though not to the DEX that already held it, in the same in-flight window).
-- **Message size.** The server caps inbound messages (default 16 KiB). Quotes are tiny;
-  this won't bite normal use.
-- **One connection, many pairs.** Quote as many pairs as you fill over a single socket.
-  Multiple connections with the same token also work and are routed independently.
+miden `Serializable`/`Deserializable` over WebSocket **binary** frames at `GET /v1/rfq`.
+The SDK encodes/decodes it; you never touch the wire. (Binary isn't human-readable — log
+the decoded structs, not the frames.)
 
----
+**Client → server** (`ClientMsg`):
+- `Subscribe { pairs: Vec<PairSpec> }` — pairs you can fill.
+- `Quote { offered: FungibleAsset, requested: FungibleAsset, valid_for_ms: Option<u64> }`
+  — standing quote; resend to refresh.
 
-## 8. Protocol reference
+**Server → client** (`ServerMsg`):
+- `AuthOk` — handshake accepted (first frame).
+- `Handover { note: Note, fill_amount: u64, fill_price: PriceRatio }` — a note to fill.
+- `Error { code: String, msg: String }` — a message was rejected.
+- `Ask { pairs }` — reserved (a future pull/quote-on-demand mode); not emitted today.
 
-JSON, `type`-tagged, over a single websocket at `GET /v1/rfq`. The SDK encodes/decodes
-all of this for you; this section is for debugging or a non-Rust client.
-
-### Client → server
-
-| `type` | fields | meaning |
-|---|---|---|
-| `quote` | `pair: {offered, requested}`, `price: string`, `quantity: u64`, `valid_for_ms?: u64` | standing quote; resend to refresh |
-
-### Server → client
-
-| `type` | fields | meaning |
-|---|---|---|
-| `auth_ok` | — | handshake accepted (first frame) |
-| `handover` | `note_id: string`, `fill_amount: u64`, `note_hex: string`, `fill_price: string` | a note to fill, at `fill_price` |
-| `error` | `code: string`, `msg: string` | a message was rejected (e.g. bad price) |
-
-`pair` is `{ "offered": "0x<hex account id>", "requested": "0x<hex account id>" }`.
-`price` and `fill_price` are decimal strings, `requested` per `offered`, per whole token
-(`fill_price` is your quoted `price` echoed for the handed-over note). `quantity` and
-`fill_amount` are `requested`-token **base units**. `note_hex` is the hex of the
-serialized PSWAP note (optionally `0x`-prefixed).
-
-Example quote frame:
-
-```json
-{ "type": "quote",
-  "pair": { "offered": "0xabc…", "requested": "0xdef…" },
-  "price": "2.00", "quantity": 1000000 }
-```
+`PairSpec`/`FungibleAsset`/`Note` are miden types, serialized in miden's binary format.
 
 ---
 
-## 9. FAQ / gotchas
+## 8. FAQ / gotchas
 
-**Do I request per order?** No. You post a standing quote; the solver pushes matching
-notes. You never reply per order.
+**Do I request per order?** No. You keep a standing quote (`serve_quotes`); the solver
+pushes matching notes. You never reply per order.
 
-**My quote is "valid" but I get no handovers.** The solver only exports a note when (a)
-your quote price clears the note's fixed rate, (b) the note also beats oracle mid by the
+**My quote is live but I get no handovers.** The solver only exports a note when (a) your
+quote's rate clears the note's fixed rate, (b) the note also beats oracle mid by the
 operator's edge (it keeps the most-generous notes for internal crossing), and (c) your
-quote is within the off-market band vs oracle mid. A correct quote that's simply tighter
-than the available notes is normal — you'll get fills when notes that clear it appear.
+quote is within the off-market band vs oracle mid. A correct-but-tighter quote getting no
+flow is normal — you'll get fills when clearing notes appear.
 
-**Why was my quote rejected with an `error`?** Most common: malformed `price` (the SDK
-catches this before sending), `quantity = 0`, or an unparseable pair account id.
+**Why was my quote rejected with an `Error`?** Most common: a zero amount, or amounts
+that don't form a valid `FungibleAsset` (the SDK's `quote` rejects zero amounts locally).
 
-**Are partial fills possible?** Yes — `fill_amount` can be below the note's
-`requested_amount`. Use `consume_args(fill_amount)`.
+**Are partial fills possible?** Yes — `fill_amount` can be below the note's requested
+amount. Use `consume_args(0, fill_amount)`.
 
 **What if two of us quote the same pair?** The solver picks per its own policy (v1: best
-price wins the pair). Tighten your price to win more flow.
+rate wins). Tighten your rate to win more flow.
 
-**Does the solver take a spread?** No — it routes at the note's terms; `min_export_edge`
-is purely a retention threshold, not a fee. Your margin is yours.
+**Does the solver take a spread?** No — it routes at the note's terms; the export edge is
+a retention threshold, not a fee. Your margin is yours.
 
-**Decimals?** Quote the human price per whole token. Never pre-scale by decimals — the
-solver applies each token's on-chain decimals when it compares.
+**Decimals?** Quote in **base units** (the note's own units); never pre-scale by decimals
+— the solver applies each token's on-chain decimals for its own comparisons.
 
 ---
 
-See also: [external-liquidity-routing.md](external-liquidity-routing.md) (the solver-side
-architecture, export math, config, and operator runbook) and the crate docs
-(`cargo doc -p pswap-filler-sdk --features consume --open`).
+See also: [external-liquidity-routing.md](external-liquidity-routing.md) (solver-side
+architecture, export math, config, runbook) and the crate rustdoc.

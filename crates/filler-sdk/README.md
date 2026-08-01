@@ -3,20 +3,22 @@
 Rust client SDK for external DEXes (**"fillers"**) to fill Miden **PSWAP** orders
 that the solver can't cross internally and routes out over its RFQ websocket.
 
-You connect, declare the pairs you can fill, post standing `{price, quantity}`
-quotes, and receive **handovers** — serialized PSWAP notes you consume on-chain
-(on your own gas) at the note's fixed rate.
+You connect, declare the pairs you can fill, keep standing quotes live, and
+receive **handovers** — decoded PSWAP notes you consume on-chain (on your own
+gas) at the matched price.
+
+The wire protocol is **miden's own binary serialization over WebSocket binary
+frames**, so miden types (`AccountId`, `FungibleAsset`, `Note`) travel natively —
+no JSON, no hex, no string prices.
 
 > **Full integration guide:** [`docs/filler-integration.md`](../../docs/filler-integration.md)
-> — protocol reference, quoting/decimal semantics, a complete reference filler, and an
-> FAQ. This README is the quickstart.
+> — protocol reference, quoting semantics, and an FAQ. This README is the quickstart.
 
-## Integration in 4 steps
+## Integration in 3 steps
 
-1. **Connect & authenticate** — `FillerClient::connect(url, token)` with the bearer token the operator issued you.
-2. **Quote** a standing `{price, quantity}` per pair; refresh before the TTL.
-3. **Receive handovers** — loop on `next_event()`; each `Handover` is a note to fill.
-4. **Consume on-chain** — decode the note and self-consume with your own client/gas.
+1. **Connect** — `FillerClient::connect(url, token)` with the bearer token the operator issued you.
+2. **Serve quotes** — `serve_quotes(pairs, refresh, price_fn)`: the SDK keeps a fresh quote live per pair (it calls your `price_fn` each tick).
+3. **Consume handovers** — loop on `next_event()`; each `Handover` carries a `Note` you self-consume on-chain with your own client/gas.
 
 ## How the solver talks to your DEX
 
@@ -30,14 +32,14 @@ sequenceDiagram
 
     D->>R: connect /v1/rfq (Authorization: Bearer)
     R-->>D: AuthOk
-    D->>R: Quote { pair, price, quantity }
-    Note right of D: standing — refresh before the TTL
+    D->>R: Quote { offered, requested }
+    Note right of D: standing — the SDK refreshes it before the TTL
     R->>M: quotes_tx (watch) — latest quotes
     Note over M: each tick, select_notes():<br/>does an idle note clear your quote<br/>AND beat the oracle edge?
     M->>M: park the note (out of internal matching)
     M->>R: handover_tx (try_send)
-    R-->>D: Handover { note_id, fill_amount, note_hex, fill_price }
-    D->>D: decode_note + your policy check
+    R-->>D: Handover { note, fill_amount, fill_price }
+    D->>D: PswapNote::try_from(&note) + your policy check
     D->>C: consume the note on-chain (your gas, your keys)
     C-->>M: nullifier observed → consumed_rx
     M->>M: drop the note (settled)
@@ -46,56 +48,49 @@ sequenceDiagram
 
 ## Why this is a separate crate
 
-Add **only** `pswap-filler-sdk`. You do **not** depend on the solver, its
-`miden-client`, database, HTTP stack, or any internal module. The default build
-is small and pure (serde + tokio + a websocket client). The wire protocol is
-defined once here and the solver depends on *this* crate for it, so the two
-sides can never drift.
+Add **only** `pswap-filler-sdk`. You do **not** depend on the solver crate, its
+`miden-client`, database, HTTP stack, or any internal module. It does use
+`miden-protocol`/`miden-standards` (the binary protocol needs them, and you have
+them anyway to consume the note). The protocol is defined once here and the
+solver depends on *this* crate for it, so the two sides can never drift.
 
 ## Install
 
 ```toml
 [dependencies]
 pswap-filler-sdk = { git = "<this-repo>", package = "pswap-filler-sdk" }
-
-# Optional on-chain helpers (decode a handed-over note + read its swap terms).
-# Pulls in miden-protocol + miden-standards (NOT miden-client — you run the
-# consume tx with your own client). Omit if you only want the raw note bytes.
-# pswap-filler-sdk = { git = "...", features = ["consume"] }
 ```
 
 ## Quick start
 
 ```rust
+use std::time::Duration;
 use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+use pswap_filler_sdk::consume::{consume_args, PswapNote};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Authenticate with the bearer token the solver operator issued you.
     let mut client = FillerClient::connect("ws://solver-host:8090/v1/rfq", "my-token").await?;
 
-    // Pairs are hex account ids in the note's (offered, requested) orientation.
-    let pair = PairSpec { offered: imiden_hex, requested: iusdt_hex };
-
-    // Standing quote: price is requested-per-offered, per WHOLE token, as a
-    // decimal string. Refresh it before the server's quote TTL to keep it live.
-    client.quote(&pair, "2.00", 1_000_000, None)?;
+    // Subscribe + keep a fresh quote live per pair, hands-free. The SDK calls
+    // your pricing fn each tick for the current (offered, requested) base-unit
+    // amounts on the pair's faucets — so quotes never expire and never go stale.
+    let _q = client.serve_quotes(
+        vec![PairSpec { offered: imiden, requested: iusdt }],
+        Duration::from_secs(10),                  // ~half the router's quote TTL
+        |_pair| Some((1_000_000, 2_000_000)),     // your live price: give 1 iMIDEN, want 2 iUSDT
+    )?;
 
     while let Some(ev) = client.next_event().await {
         match ev {
-            FillerEvent::AuthOk => {}
             FillerEvent::Handover(h) => {
-                // h.note_hex is the serialized PSWAP note; h.fill_amount is the
-                // requested-token amount to fill; h.fill_price is the price to fill
-                // at (your quoted X, echoed). Decode + self-consume on-chain.
-                // With feature = "consume":
-                //   let note  = pswap_filler_sdk::consume::decode_note(&h.note_hex)?;
-                //   let terms = pswap_filler_sdk::consume::PswapTerms::from_note(&note)?;
-                //   let args  = pswap_filler_sdk::consume::consume_args(h.fill_amount)?;
-                //   // ... feed `note` + `args` into your own miden-client tx ...
+                let pswap = PswapNote::try_from(&h.note)?;      // what am I getting / paying?
+                // ... your risk check against `pswap` and `h.fill_price` ...
+                let _args = consume_args(0, h.fill_amount)?;    // then self-consume on-chain
             }
             FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
             FillerEvent::Disconnected => break,
+            _ => {}
         }
     }
     Ok(())
@@ -104,18 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Protocol notes
 
-- **Auth** — `Authorization: Bearer <token>` (the SDK sets this for you). A wrong
-  token fails the connection at the upgrade.
-- **Quotes are standing** — post once and refresh before expiry; you do not
-  re-request per order. A disconnect purges your quotes immediately.
-- **Price units** — requested-token per offered-token, **per whole token**, as a
-  decimal string (e.g. `"2.05"`). Validated client-side before it leaves.
-- **Handover = note bytes** — you self-consume on-chain; the solver never holds
-  your keys or pays your gas.
-
-## Features
-
-| feature | adds | pulls in |
-|---|---|---|
-| *(default)* | `FillerClient`, `protocol` | serde, tokio, tungstenite — **no miden** |
-| `consume` | `consume::{decode_note, PswapTerms, consume_args}` | `miden-protocol`, `miden-standards` |
+- **Auth** — `Authorization: Bearer <token>` (the SDK sets this). A wrong token fails at the upgrade.
+- **Quotes are standing** — `serve_quotes` keeps them fresh (keepalive + your live price each tick). A disconnect purges your quotes.
+- **Amounts, not prices** — a quote is two `FungibleAsset`s (`offered`/`requested`); their ratio is the rate, like a PSWAP note. `fill_price` on a handover is a `num/den` ratio (your matched quote, echoed).
+- **Handover = a decoded `Note`** — you self-consume on-chain; the solver never holds your keys or pays your gas.

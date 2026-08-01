@@ -1,6 +1,8 @@
 # 2. Filler SDK — a standalone crate that owns the wire protocol
 
-- **Status:** Accepted (implemented)
+- **Status:** Accepted (implemented). **Updated 2026-07-30** — the wire protocol
+  moved from JSON/serde to **miden-native binary**, superseding the original
+  "serde-only, zero-miden default" design (see *Update* below).
 - **Date:** 2026-06-24
 - **Deciders:** solver team
 - **Related:** ADR [0001](0001-external-liquidity-routing.md) (the routing feature), [docs/filler-integration.md](../filler-integration.md) (integration guide)
@@ -9,65 +11,76 @@
 
 External DEXes ("fillers") need to integrate with the solver's RFQ router (ADR
 [0001](0001-external-liquidity-routing.md)): connect, subscribe, post quotes, receive
-handovers, and consume notes on-chain. We want integration to be **turnkey** — "no
-front work" — while ensuring a DEX takes on **only the SDK's dependencies, not the
-solver's** (`miden-client`, `diesel`, `axum`, the database, internal modules). We also
-must not let the wire protocol drift between the two sides.
+handovers, and consume notes on-chain. We want integration to be **turnkey** while
+ensuring a DEX takes on **only the SDK, not the solver's internals** (`miden-client`,
+`diesel`, `axum`, the database, internal modules). We also must not let the wire
+protocol drift between the two sides.
 
 ## Decision
 
 Ship **`pswap-filler-sdk`** as a standalone crate inside the solver repo:
 
 1. **Separate crate, depended on one-way.** The solver depends on the SDK; the SDK
-   never depends on the solver. A DEX adds only `pswap-filler-sdk`.
-2. **The SDK owns the wire protocol.** The miden-free, serde-only `protocol` module
-   (`ClientMsg`/`ServerMsg`/`PairSpec`/`parse_decimal_price`) lives in the SDK; the
-   solver's router imports it from there. One definition ⇒ the two sides cannot drift.
-3. **Lean default build.** Default features pull only serde + tokio + a websocket
-   client — **zero miden**. `FillerClient::connect(url, token)` →
-   `subscribe`/`quote`/`next_event` (`FillerEvent`), with a background pump task so
-   send/receive never block each other.
-4. **`consume` feature, opt-in.** On-chain helpers (`decode_note`, `PswapTerms`,
-   `consume_args`) sit behind a feature flag that pulls **only** `miden-protocol` +
-   `miden-standards` — never `miden-client`. The DEX runs the consume transaction with
-   its own client/keystore/gas.
-5. **Decode at the DEX end.** The handover carries the note **bytes** (authoritative)
-   plus `fill_price`; the SDK decodes the bytes at the DEX's end (feature-gated) rather
-   than the solver pre-decoding structured terms onto the wire.
+   never depends on the solver. A DEX adds only `pswap-filler-sdk` — no solver crate,
+   no `miden-client`, no db/http.
+2. **The SDK owns the wire protocol.** `protocol` (`ClientMsg`/`ServerMsg`/`PairSpec`/
+   `PriceRatio`) lives in the SDK; the solver's router imports it from there. One
+   definition ⇒ the two sides cannot drift.
+3. **Miden-native binary wire.** Messages serialize with miden's `Serializable`/
+   `Deserializable` over WebSocket **binary** frames, so miden types (`AccountId`,
+   `FungibleAsset`, `Note`) travel natively — no serde, no hex, no decimal-string
+   prices. The SDK depends on `miden-protocol`/`miden-standards`, but stays independent
+   of the solver crate and of `miden-client`.
+4. **Typed handover.** `ServerMsg::Handover` carries a decoded `Note` (not hex bytes) +
+   a `PriceRatio` `fill_price`. On-chain helpers (`consume_args`, re-exported
+   `PswapNote`) are always available — no feature gate. The DEX runs the consume
+   transaction with its own client/keystore/gas.
+5. **Hands-free push.** `FillerClient::serve_quotes(pairs, refresh, price_fn)` keeps a
+   fresh quote live per pair: it calls the pricing fn each tick and re-sends, so quotes
+   never expire (keepalive) and never go stale-by-omission.
 
-## Reasoning / alternatives considered
+## Update (2026-07-30): why binary miden-native replaced serde-only
 
-- **Separate crate vs a module in the solver.** A module would force DEXes to depend on
-  the whole solver (and its `miden-client`/`diesel`/`axum`). A crate is the only way to
-  give them a small, version-stable dependency.
-- **SDK owns the protocol vs the solver owning it (SDK mirrors).** If each side defined
-  the messages, they would drift. Putting the one definition in the SDK and having the
-  solver depend on it makes drift impossible and keeps the protocol miden-free.
-- **Feature-gate `consume` vs always-on decode.** Always-on decode would pull
-  `miden-protocol` into every build, defeating the lean default. Gating keeps the
-  decision/pricing path miden-free; a DEX only pays for decode when it wants it — and
-  it already runs miden for the consume transaction anyway.
-- **Don't pull `miden-client` into the SDK.** Decoding a note needs only
-  `miden-protocol`/`miden-standards`. Pulling the client would pin the DEX to our
-  client version and drag in a heavy git dependency. The DEX brings its own client.
-- **SDK-side decode vs solver-side structured terms.** Sending decoded terms on the
-  wire was considered; instead the bytes stay authoritative and the SDK decodes them,
-  so the server stays dumb transport and there is one source of truth (the bytes). A
-  DEX can re-derive terms at consume time to verify.
-- **Keep the note bytes (don't replace with terms).** Consuming a note on-chain needs
-  the full `Note` object; terms are a lossy projection — enough to *decide*, not to
-  *consume*. So the handover carries bytes; `fill_price` rides alongside.
+The original design made the `protocol` module **serde-only with zero miden deps** (hex
+account ids, decimal-string prices), gating the miden helpers behind a `consume`
+feature. Its one real benefit was **version-decoupling**: an external DEX on a different
+`miden-protocol` version wouldn't collide with ours, and a non-Rust DEX could speak the
+JSON. We reversed it because **fillers ship in lockstep with the solver** (internal,
+all-Rust, versioned together), so there is no version skew to protect against and no
+non-Rust filler to serve. Given that, coupling to miden types is free, and it **deletes
+the whole serde-adapter + stringly-typed layer** (no `parse_decimal_price`, no
+hex↔`AccountId`, no `note_hex`, no `serde`/`serde_json`), unifies serialization on
+miden's own format, and hands the filler a typed `Note`.
+
+## Reasoning / alternatives
+
+- **Separate crate vs a solver module.** A module forces DEXes onto the whole solver.
+  A crate gives them a small, self-contained dependency. (Unchanged.)
+- **SDK owns the protocol vs each side defining it.** One definition in the SDK, imported
+  by the router, makes drift impossible. (Unchanged.)
+- **Miden-native (now) vs miden-free (original).** Miden-free buys version-decoupling +
+  non-Rust portability at the cost of a stringly-typed wire and serde glue. Neither
+  benefit applies to internal, versioned-together, all-Rust fillers — so miden-native
+  wins on type-safety, less code, and one serialization story.
+- **Binary vs JSON.** Binary lets miden types serialize natively and carries the note as
+  a typed field (no hex-in-JSON), at the cost of human-readability and non-Rust
+  portability — both moot here. The WS handshake (URL, `Authorization: Bearer`) stays
+  HTTP regardless.
+- **Still isolate from the solver crate.** That is the isolation that matters: a filler
+  must never pull `diesel`/`axum`/db. Miden types are fine — the filler already runs
+  miden to consume the note.
 
 ## Consequences
 
-- A DEX integrates against a tiny dependency surface; the default build has no miden,
-  so the SDK never constrains the DEX's miden version.
-- The wire protocol has a single home and cannot drift between solver and SDK.
-- **Rust-only.** A non-Rust DEX runs a thin Rust sidecar or reimplements the
-  (documented, JSON-over-websocket) protocol. Accepted for v1.
-- **`fill_price` is forward-compatible.** It is carried now and becomes the binding
-  fill rate when the overfill protocol ships; until then the chain settles at the
-  note's intrinsic rate.
-- Verified: default + `consume` build/test green with no miden/diesel/axum/tonic in the
-  default dependency tree; a seamless e2e drives the real router thread through the
-  public `FillerClient`.
+- A DEX integrates against a small surface (the SDK + miden, which it has anyway),
+  independent of the solver internals.
+- The wire protocol has a single home and cannot drift.
+- **Rust-only (firmly).** A non-Rust DEX would have to reimplement miden's binary
+  serialization; accepted, since any filler that can *consume* a note already runs miden
+  (Rust or WASM).
+- We give up cross-version decoupling from a filler's own miden build — acceptable
+  because fillers are versioned with the solver.
+- `fill_price` is a `num/den` ratio (the matcher echoes the matched quote price); it is
+  the binding fill rate for the overfill path and rides alongside the note today.
+- Verified: `cargo test -p pswap-filler-sdk` green; the crate builds independent of the
+  solver crate and `miden-client`.

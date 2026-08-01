@@ -10,6 +10,7 @@ tokio = { version = "1.40", features = ["rt", "macros", "sync", "time", "net"] }
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 anyhow = "1.0"
+thiserror = "2"
 tracing = "0.1"
 # The wire protocol is miden's own binary serialization, so miden types travel
 # natively (AccountId / FungibleAsset / Note). Still independent of the solver

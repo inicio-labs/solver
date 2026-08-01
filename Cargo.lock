@@ -3796,6 +3796,7 @@ dependencies = [
  "futures-util",
  "miden-protocol",
  "miden-standards",
+ "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tracing",

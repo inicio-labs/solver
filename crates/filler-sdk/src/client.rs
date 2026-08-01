@@ -22,22 +22,21 @@
 //! while let Some(ev) = client.next_event().await {
 //!     match ev {
 //!         LpEvent::Handover(h) => { /* consume h.note on-chain (it enforces its rate) */ }
-//!         LpEvent::Reconnecting { error, .. } => tracing::warn!(%error, "router link lost; retrying"),
+//!         LpEvent::Reconnecting { attempt } => tracing::warn!(attempt, "router link lost; retrying"),
 //!         LpEvent::Disconnected { reason } => { tracing::error!(%reason, "gave up"); break }
 //!         _ => {}
 //!     }
 //! }
 //! ```
 
-use std::fmt;
 use std::time::Duration;
 
-use futures_util::stream::{SplitStream, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use futures_util::SinkExt;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -57,38 +56,28 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const STABLE_UPTIME: Duration = Duration::from_secs(10);
 
 /// A typed error from the router link. `Clone` so it can ride on events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LpError {
     /// The router rejected the `Bearer` token at the websocket upgrade (HTTP
     /// 401). Terminal — retrying with the same token won't help.
+    #[error("router rejected authentication (check the token)")]
     AuthRejected,
     /// A transport-level failure (connect/upgrade/read/write on the socket).
+    #[error("transport error: {0}")]
     Transport(String),
-    /// The router (or the client) closed the connection; the string says which
-    /// side / why. Returned by [`LpSender::send`]/[`quote`](LpSender::quote) once
-    /// the client has been dropped.
+    /// The client has been dropped (the connection task is gone). Returned by
+    /// [`LpSender::send`]/[`quote`](LpSender::quote).
+    #[error("connection closed: {0}")]
     Closed(String),
     /// A quote rejected locally before it hit the wire (e.g. a zero amount). The
     /// caller's mistake, not the router's.
+    #[error("invalid quote: {0}")]
     InvalidQuote(String),
     /// An application-level error the router reported (e.g. a malformed quote was
     /// rejected). Non-fatal: the connection stays up.
+    #[error("router error [{code}]: {msg}")]
     Protocol { code: String, msg: String },
 }
-
-impl fmt::Display for LpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LpError::AuthRejected => write!(f, "router rejected authentication (check the token)"),
-            LpError::Transport(e) => write!(f, "transport error: {e}"),
-            LpError::Closed(r) => write!(f, "connection closed: {r}"),
-            LpError::InvalidQuote(r) => write!(f, "invalid quote: {r}"),
-            LpError::Protocol { code, msg } => write!(f, "router error [{code}]: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for LpError {}
 
 /// A note handed over by the solver for the LP to consume on-chain. `note` is a
 /// decoded miden [`Note`]; read its swap terms with
@@ -124,9 +113,9 @@ pub enum LpEvent {
     Handover(Handover),
     /// The router rejected a message we sent (non-fatal — the link stays up).
     Error(LpError),
-    /// The link dropped and the SDK is retrying. `error` says why; `attempt`
-    /// counts from 1. Followed by [`LpEvent::Reconnected`] once re-established.
-    Reconnecting { attempt: u32, error: LpError },
+    /// The link dropped and the SDK is retrying (`attempt` counts from 1; the
+    /// reason is logged). Followed by [`LpEvent::Reconnected`] once re-established.
+    Reconnecting { attempt: u32 },
     /// The link was re-established. Re-post your quotes here if you quote
     /// manually (the quote is the registration); [`LpClient::serve_quotes`]
     /// resumes on its own.
@@ -358,15 +347,15 @@ async fn connect_and_auth(url: &str, token: &str) -> Result<WsStream, LpError> {
 
 /// Why a single connection ended.
 enum ConnEnd {
-    /// The client was dropped (all senders gone) — stop for good.
+    /// The client was dropped (all senders / the event receiver gone) — stop.
     ClientGone,
     /// The socket dropped — reconnect.
-    Dropped(LpError),
+    Dropped,
 }
 
 /// Owns the reconnect lifecycle: run a connection, and on an unexpected drop,
-/// reconnect (backoff) → re-auth → emit Reconnected → resume. Ends
-/// when the client is dropped or the token is permanently rejected.
+/// reconnect (backoff) → re-auth → emit `Reconnected` → resume. Ends when the
+/// client is dropped or the token is permanently rejected.
 async fn supervise(
     mut socket: WsStream,
     url: String,
@@ -382,107 +371,74 @@ async fn supervise(
     let mut delay = RECONNECT_MIN;
     loop {
         let started = std::time::Instant::now();
-        let end = run_connection(socket, &mut out_rx, &ev_tx).await;
-        let drop_err = match end {
-            ConnEnd::ClientGone => return,
-            ConnEnd::Dropped(e) => e,
-        };
+        if let ConnEnd::ClientGone = run_connection(socket, &mut out_rx, &ev_tx).await {
+            return;
+        }
+        // The reader/sender loops already logged *why* the link dropped.
+        tracing::warn!("router link dropped; reconnecting");
         if started.elapsed() >= STABLE_UPTIME {
             attempt = 0;
             delay = RECONNECT_MIN;
         }
-        tracing::warn!(error = %drop_err, "router link dropped; reconnecting");
 
         socket = loop {
             if ev_tx.is_closed() {
                 return; // client dropped while we were backing off
             }
             attempt = attempt.saturating_add(1);
-            let _ = ev_tx.send(LpEvent::Reconnecting { attempt, error: drop_err.clone() });
+            let _ = ev_tx.send(LpEvent::Reconnecting { attempt });
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(RECONNECT_MAX); // grow for the next attempt
             match connect_and_auth(&url, &token).await {
                 Ok(s) => break s,
                 Err(LpError::AuthRejected) => {
-                    tracing::error!("router rejected the token on reconnect; giving up");
                     let _ = ev_tx.send(LpEvent::Disconnected {
                         reason: LpError::AuthRejected.to_string(),
                     });
-                    return;
+                    return; // bad token — retrying won't help
                 }
                 Err(e) => tracing::warn!(attempt, error = %e, "reconnect attempt failed"),
             }
         };
 
-        // Discard anything that queued during the outage — those quotes were
-        // priced before the drop, so flushing them now would put a **stale**
-        // price on the wire. Only fresh quotes (serve_quotes' next tick, or a
-        // manual re-post on `Reconnected`) should reach the router.
-        let mut stale = 0u32;
-        while out_rx.try_recv().is_ok() {
-            stale += 1;
-        }
-        if stale > 0 {
-            tracing::debug!(stale, "dropped quotes queued during the outage");
-        }
+        // Discard whatever queued during the outage — those quotes were priced
+        // before the drop, so flushing them now would put a stale price on the
+        // wire. Fresh quotes arrive on the next tick / a manual re-post.
+        while out_rx.try_recv().is_ok() {}
 
-        // Live again — tell the caller so it can re-post quotes.
         tracing::info!("router link re-established");
         let _ = ev_tx.send(LpEvent::Reconnected);
     }
 }
 
-/// Drive one live socket: spawn the *reader* (frames → events) as its own task,
-/// and run the *writer* (outbound queue → socket) as a separate loop here, so the
-/// two directions never block each other. Returns why the connection ended.
+/// Drive one live socket. The two directions run as mirror loops that never block
+/// each other — [`reader_loop`] (frames → events) in its own task, [`sender_loop`]
+/// (outbound queue → socket) here. Whichever ends first ends the connection.
 async fn run_connection(
     socket: WsStream,
     out_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
     ev_tx: &mpsc::UnboundedSender<LpEvent>,
 ) -> ConnEnd {
-    let (mut sink, stream) = socket.split();
+    let (sink, stream) = socket.split();
+    let mut reader = tokio::spawn(reader_loop(stream, ev_tx.clone()));
 
-    // Inbound loop lives in its own task; it reports its terminal reason here.
-    let (done_tx, mut done_rx) = oneshot::channel::<LpError>();
-    let reader = tokio::spawn(reader_loop(stream, ev_tx.clone(), done_tx));
-
-    // Outbound loop: drain the durable queue onto this socket. A `biased` select
-    // checks the reader's death signal first so we tear down promptly.
-    let end = loop {
-        tokio::select! {
-            biased;
-            reason = &mut done_rx => {
-                break ConnEnd::Dropped(
-                    reason.unwrap_or_else(|_| LpError::Closed("reader ended".into())),
-                );
-            }
-            // The client (its event receiver) was dropped — tear the link down
-            // even if a cloned `LpSender` is still alive somewhere.
-            _ = ev_tx.closed() => break ConnEnd::ClientGone,
-            msg = out_rx.recv() => match msg {
-                Some(msg) => {
-                    if let Err(e) = sink.send(Message::Binary(msg.to_bytes().into())).await {
-                        break ConnEnd::Dropped(LpError::Transport(e.to_string()));
-                    }
-                }
-                None => break ConnEnd::ClientGone, // all senders dropped
-            },
+    let end = tokio::select! {
+        // The read side ended (logged its reason). If the client is gone, stop;
+        // otherwise the socket is dead → reconnect.
+        _ = &mut reader => {
+            if ev_tx.is_closed() { ConnEnd::ClientGone } else { ConnEnd::Dropped }
         }
+        end = sender_loop(sink, out_rx, ev_tx) => end,
     };
-
     reader.abort();
     end
 }
 
-/// Inbound loop: decode server frames and forward them as events. Runs as its
-/// own task so a stalled write can't block reads. Reports why it stopped via
-/// `done_tx` (used by the supervisor to trigger a reconnect).
-async fn reader_loop(
-    mut stream: SplitStream<WsStream>,
-    ev_tx: mpsc::UnboundedSender<LpEvent>,
-    done_tx: oneshot::Sender<LpError>,
-) {
-    let reason = loop {
+/// Inbound loop: decode server frames and forward them as events. Mirror of
+/// [`sender_loop`]. Logs *why* it stopped (that's enough — the supervisor only
+/// needs to know the link ended).
+async fn reader_loop(mut stream: SplitStream<WsStream>, ev_tx: mpsc::UnboundedSender<LpEvent>) {
+    loop {
         match stream.next().await {
             Some(Ok(Message::Binary(b))) => match ServerMsg::read_from_bytes(&b) {
                 // The AuthOk frame is an app-level ack; the supervisor already
@@ -490,18 +446,42 @@ async fn reader_loop(
                 Ok(ServerMsg::AuthOk) => {}
                 Ok(m) => {
                     if ev_tx.send(LpEvent::from(m)).is_err() {
-                        break LpError::Closed("client dropped".into()); // receiver gone
+                        return; // client gone
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "drop undecodable server frame"),
             },
-            Some(Ok(Message::Close(_))) => break LpError::Closed("router closed the link".into()),
+            Some(Ok(Message::Close(_))) => return tracing::warn!("router closed the link"),
             Some(Ok(_)) => {} // ignore text/ping/pong
-            Some(Err(e)) => break LpError::Transport(e.to_string()),
-            None => break LpError::Closed("stream ended".into()),
+            Some(Err(e)) => return tracing::warn!(error = %e, "read error; dropping link"),
+            None => return tracing::warn!("router stream ended"),
         }
-    };
-    let _ = done_tx.send(reason);
+    }
+}
+
+/// Outbound loop: write queued messages to the socket. Mirror of [`reader_loop`].
+/// Returns why it stopped.
+async fn sender_loop(
+    mut sink: SplitSink<WsStream, Message>,
+    out_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
+    ev_tx: &mpsc::UnboundedSender<LpEvent>,
+) -> ConnEnd {
+    loop {
+        tokio::select! {
+            // The client (its event receiver) was dropped — tear the link down
+            // even if a cloned `LpSender` is still alive somewhere.
+            _ = ev_tx.closed() => return ConnEnd::ClientGone,
+            msg = out_rx.recv() => match msg {
+                Some(msg) => {
+                    if let Err(e) = sink.send(Message::Binary(msg.to_bytes().into())).await {
+                        tracing::warn!(error = %e, "write error; dropping link");
+                        return ConnEnd::Dropped;
+                    }
+                }
+                None => return ConnEnd::ClientGone, // all senders dropped
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -706,16 +686,13 @@ mod tests {
 
         assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
 
-        let mut typed_error_surfaced = false;
+        let mut reconnecting = false;
         let mut reconnected = false;
         for _ in 0..20 {
             match tokio::time::timeout(Duration::from_secs(3), client.next_event()).await {
-                Ok(Some(LpEvent::Reconnecting { error, attempt })) => {
+                Ok(Some(LpEvent::Reconnecting { attempt })) => {
                     assert!(attempt >= 1);
-                    // The reader's `break` produced a typed, non-empty error.
-                    assert!(!error.to_string().is_empty(), "empty error surfaced");
-                    assert!(matches!(error, LpError::Transport(_) | LpError::Closed(_)));
-                    typed_error_surfaced = true;
+                    reconnecting = true;
                 }
                 Ok(Some(LpEvent::Reconnected)) => {
                     reconnected = true;
@@ -726,7 +703,7 @@ mod tests {
                 Err(_) => panic!("timed out waiting to reconnect"),
             }
         }
-        assert!(typed_error_surfaced, "expected Reconnecting with a typed LpError");
+        assert!(reconnecting, "the dropped link should surface Reconnecting");
         assert!(reconnected, "SDK should reconnect after a drop");
         assert!(router.connections.load(Ordering::SeqCst) >= 2, "router should see a 2nd socket");
     }

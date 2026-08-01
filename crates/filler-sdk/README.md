@@ -63,7 +63,7 @@ pswap-filler-sdk = { git = "<this-repo>", package = "pswap-filler-sdk" }
 
 ## Quick start
 
-```rust
+```ignore
 use std::time::Duration;
 use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
 use pswap_filler_sdk::consume::{consume_args, PswapNote};
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         vec![PairSpec { offered: imiden, requested: iusdt }],
         Duration::from_secs(10),                  // ~half the router's quote TTL
         |_pair| Some((1_000_000, 2_000_000)),     // your live price: give 1 iMIDEN, want 2 iUSDT
-    )?;
+    );
 
     while let Some(ev) = client.next_event().await {
         match ev {

@@ -40,7 +40,7 @@
 //!         vec![PairSpec { offered: imiden, requested: iusdt }],
 //!         Duration::from_secs(10),                 // ~half the router's quote TTL
 //!         |_pair| Some((1_000_000, 2_000_000)),    // your live price: (offer, request) base units
-//!     )?;
+//!     );
 //!
 //!     while let Some(ev) = client.next_event().await {
 //!         match ev {

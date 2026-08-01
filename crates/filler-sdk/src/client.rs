@@ -32,7 +32,6 @@
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
 use futures_util::stream::{SplitStream, StreamExt};
 use futures_util::SinkExt;
 use miden_protocol::asset::FungibleAsset;
@@ -50,9 +49,12 @@ use crate::protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Backoff bounds for auto-reconnect: first retry after `MIN`, doubling up to
-/// `MAX`, reset to `MIN` after each successful reconnect.
+/// `MAX`. The backoff resets only once a connection has stayed up for
+/// `STABLE_UPTIME` — so a router that accepts then instantly drops backs off
+/// instead of being hammered (and flooding the event channel) forever.
 const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+const STABLE_UPTIME: Duration = Duration::from_secs(10);
 
 /// A typed error from the router link. `Clone` so it can ride on events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +64,13 @@ pub enum LpError {
     AuthRejected,
     /// A transport-level failure (connect/upgrade/read/write on the socket).
     Transport(String),
-    /// The router closed the connection.
+    /// The router (or the client) closed the connection; the string says which
+    /// side / why. Returned by [`LpSender::send`]/[`quote`](LpSender::quote) once
+    /// the client has been dropped.
     Closed(String),
+    /// A quote rejected locally before it hit the wire (e.g. a zero amount). The
+    /// caller's mistake, not the router's.
+    InvalidQuote(String),
     /// An application-level error the router reported (e.g. a malformed quote was
     /// rejected). Non-fatal: the connection stays up.
     Protocol { code: String, msg: String },
@@ -75,6 +82,7 @@ impl fmt::Display for LpError {
             LpError::AuthRejected => write!(f, "router rejected authentication (check the token)"),
             LpError::Transport(e) => write!(f, "transport error: {e}"),
             LpError::Closed(r) => write!(f, "connection closed: {r}"),
+            LpError::InvalidQuote(r) => write!(f, "invalid quote: {r}"),
             LpError::Protocol { code, msg } => write!(f, "router error [{code}]: {msg}"),
         }
     }
@@ -145,37 +153,51 @@ impl From<ServerMsg> for LpEvent {
 
 /// The send half of a connection. Cheaply cloneable, so it can be moved into
 /// other tasks (e.g. a timer that refreshes quotes) while the main task drains
-/// events. Sends are non-blocking: they queue onto the connection task and are
-/// written on whichever socket is currently live (including after a reconnect).
+/// events. Sends are non-blocking: they queue onto the connection task.
+///
+/// `Ok` means *enqueued*, not *delivered*. Anything still queued when the link
+/// drops is **discarded on reconnect** (it would otherwise put a stale price on
+/// the wire) — so after an [`LpEvent::Reconnected`], re-post your quote. (The
+/// hands-free [`LpClient::serve_quotes`] loop already does this for you.)
 #[derive(Clone)]
 pub struct LpSender {
     tx: mpsc::UnboundedSender<ClientMsg>,
 }
 
 impl LpSender {
-    /// Send a raw protocol message. Errors only if the client has been dropped.
-    pub fn send(&self, msg: ClientMsg) -> Result<()> {
-        self.tx.send(msg).map_err(|_| anyhow!("router connection closed"))
+    /// Send a raw protocol message. Fails with [`LpError::Closed`] only once the
+    /// client has been dropped (the connection task is gone).
+    pub fn send(&self, msg: ClientMsg) -> Result<(), LpError> {
+        self.tx
+            .send(msg)
+            .map_err(|_| LpError::Closed("client dropped; connection task gone".into()))
     }
 
     /// Post (or refresh) a standing quote: give up to `offered` for `requested`.
     /// The two assets carry both the rate and the max size (like a PSWAP note);
     /// their faucet ids imply the pair. `valid_for_ms` optionally shortens
     /// validity below the server's quote TTL.
+    ///
+    /// Returns [`LpError::InvalidQuote`] for a zero amount (logged at `warn`), or
+    /// [`LpError::Closed`] if the client has been dropped.
     pub fn quote(
         &self,
         offered: FungibleAsset,
         requested: FungibleAsset,
         valid_for_ms: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<(), LpError> {
         if u64::from(offered.amount()) == 0 || u64::from(requested.amount()) == 0 {
-            bail!("quote amounts must be > 0");
+            let err = LpError::InvalidQuote("quote amounts must be > 0".into());
+            tracing::warn!(error = %err, "rejecting quote before send");
+            return Err(err);
         }
-        self.send(ClientMsg::Quote {
-            offered,
-            requested,
-            valid_for_ms,
-        })
+        self.send(ClientMsg::Quote { offered, requested, valid_for_ms })
+    }
+
+    /// True once the client has been dropped (the connection task is gone). Lets
+    /// a background loop notice the shutdown even when it isn't currently sending.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 }
 
@@ -188,16 +210,20 @@ pub struct LpClient {
 impl LpClient {
     /// Connect to the router at `url` (e.g. `ws://host:port/v1/rfq`) and
     /// authenticate with `token` via the `Authorization: Bearer` header. Returns
-    /// once the socket is established; a wrong token fails the upgrade and errors
-    /// here. The first [`next_event`](Self::next_event) is [`LpEvent::AuthOk`].
+    /// once the socket is established. Errors with [`LpError::AuthRejected`] on a
+    /// bad token (HTTP 401 at the upgrade) or [`LpError::Transport`] on a bad url /
+    /// connect failure. The first [`next_event`](Self::next_event) is
+    /// [`LpEvent::AuthOk`].
     ///
     /// After this, the connection is self-healing: if it drops, the SDK
     /// reconnects with backoff and re-authenticates. Re-post your quotes on
     /// [`LpEvent::Reconnected`] (the quote is the registration);
     /// [`serve_quotes`](Self::serve_quotes) resumes on its own.
-    pub async fn connect(url: &str, token: &str) -> Result<Self> {
+    pub async fn connect(url: &str, token: &str) -> Result<Self, LpError> {
         // Fail fast on a bad url/token; hand the live socket to the supervisor.
-        let socket = connect_and_auth(url, token).await.map_err(|e| anyhow!(e))?;
+        let socket = connect_and_auth(url, token).await.inspect_err(|e| {
+            tracing::warn!(error = %e, "initial connect failed");
+        })?;
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<ClientMsg>();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<LpEvent>();
@@ -234,7 +260,7 @@ impl LpClient {
         offered: FungibleAsset,
         requested: FungibleAsset,
         valid_for_ms: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<(), LpError> {
         self.sender.quote(offered, requested, valid_for_ms)
     }
 
@@ -254,17 +280,11 @@ impl LpClient {
     /// quoting loop runs until the client is dropped; keep the returned
     /// [`QuoteTask`] (or drop it to detach) and call [`QuoteTask::abort`] to stop
     /// early. `price` must be cheap/non-blocking — it runs inline on the task.
-    pub fn serve_quotes<F>(
-        &self,
-        pairs: Vec<PairSpec>,
-        refresh: Duration,
-        price: F,
-    ) -> Result<QuoteTask>
+    pub fn serve_quotes<F>(&self, pairs: Vec<PairSpec>, refresh: Duration, price: F) -> QuoteTask
     where
         F: Fn(&PairSpec) -> Option<(u64, u64)> + Send + 'static,
     {
-        let handle = tokio::spawn(quote_loop(self.sender(), pairs, refresh, price));
-        Ok(QuoteTask(handle))
+        QuoteTask(tokio::spawn(quote_loop(self.sender(), pairs, refresh, price)))
     }
 }
 
@@ -288,6 +308,11 @@ where
     F: Fn(&PairSpec) -> Option<(u64, u64)>,
 {
     loop {
+        // Stop promptly on client-drop even if we never send this tick (a price
+        // fn that keeps returning None/zero would otherwise loop forever).
+        if sender.is_closed() {
+            return;
+        }
         for pair in &pairs {
             let Some((offered_amount, requested_amount)) = price(pair) else {
                 continue;
@@ -297,11 +322,13 @@ where
                 FungibleAsset::new(pair.requested, requested_amount),
             ) {
                 (Ok(offered), Ok(requested)) => {
-                    if sender.quote(offered, requested, None).is_err() {
-                        return; // client dropped → stop
+                    // Stop only when the client is gone; a rejected quote (e.g. a
+                    // zero amount) is already logged by `quote` — skip and carry on.
+                    if let Err(LpError::Closed(_)) = sender.quote(offered, requested, None) {
+                        return;
                     }
                 }
-                _ => tracing::warn!("serve_quotes: invalid quote amounts for a pair; skipping"),
+                _ => tracing::warn!("serve_quotes: could not build a FungibleAsset for a pair; skipping"),
             }
         }
         tokio::time::sleep(refresh).await;
@@ -350,26 +377,31 @@ async fn supervise(
 ) {
     let _ = ev_tx.send(LpEvent::AuthOk); // initial handshake acknowledged
 
+    // Backoff state persists across drops; it resets only after a connection that
+    // stayed up for `STABLE_UPTIME` (see the constant's note).
+    let mut attempt = 0u32;
+    let mut delay = RECONNECT_MIN;
     loop {
+        let started = std::time::Instant::now();
         let end = run_connection(socket, &mut out_rx, &ev_tx).await;
         let drop_err = match end {
             ConnEnd::ClientGone => return,
             ConnEnd::Dropped(e) => e,
         };
+        if started.elapsed() >= STABLE_UPTIME {
+            attempt = 0;
+            delay = RECONNECT_MIN;
+        }
         tracing::warn!(error = %drop_err, "router link dropped; reconnecting");
 
-        // Reconnect with capped exponential backoff.
-        let mut attempt = 1u32;
-        let mut delay = RECONNECT_MIN;
         socket = loop {
             if ev_tx.is_closed() {
                 return; // client dropped while we were backing off
             }
-            let _ = ev_tx.send(LpEvent::Reconnecting {
-                attempt,
-                error: drop_err.clone(),
-            });
+            attempt = attempt.saturating_add(1);
+            let _ = ev_tx.send(LpEvent::Reconnecting { attempt, error: drop_err.clone() });
             tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(RECONNECT_MAX); // grow for the next attempt
             match connect_and_auth(&url, &token).await {
                 Ok(s) => break s,
                 Err(LpError::AuthRejected) => {
@@ -379,11 +411,7 @@ async fn supervise(
                     });
                     return;
                 }
-                Err(e) => {
-                    tracing::warn!(attempt, error = %e, "reconnect attempt failed");
-                    attempt += 1;
-                    delay = (delay * 2).min(RECONNECT_MAX);
-                }
+                Err(e) => tracing::warn!(attempt, error = %e, "reconnect attempt failed"),
             }
         };
 
@@ -429,10 +457,13 @@ async fn run_connection(
                     reason.unwrap_or_else(|_| LpError::Closed("reader ended".into())),
                 );
             }
+            // The client (its event receiver) was dropped — tear the link down
+            // even if a cloned `LpSender` is still alive somewhere.
+            _ = ev_tx.closed() => break ConnEnd::ClientGone,
             msg = out_rx.recv() => match msg {
                 Some(msg) => {
-                    if sink.send(Message::Binary(msg.to_bytes().into())).await.is_err() {
-                        break ConnEnd::Dropped(LpError::Transport("write failed".into()));
+                    if let Err(e) = sink.send(Message::Binary(msg.to_bytes().into())).await {
+                        break ConnEnd::Dropped(LpError::Transport(e.to_string()));
                     }
                 }
                 None => break ConnEnd::ClientGone, // all senders dropped
@@ -513,6 +544,11 @@ mod tests {
             "router error [bad_quote]: nope"
         );
         assert!(LpError::AuthRejected.to_string().contains("token"));
+        assert_eq!(
+            LpError::InvalidQuote("quote amounts must be > 0".into()).to_string(),
+            "invalid quote: quote amounts must be > 0"
+        );
+        assert_eq!(LpError::Closed("bye".into()).to_string(), "connection closed: bye");
     }
 
     fn sample_faucets() -> (miden_protocol::account::AccountId, miden_protocol::account::AccountId) {
@@ -535,14 +571,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_after_close_errors() {
+    async fn send_after_close_errors_with_typed_closed() {
         let (tx, rx) = mpsc::unbounded_channel::<ClientMsg>();
         let s = LpSender { tx };
         drop(rx); // connection task gone
         let (a, b) = sample_faucets();
-        assert!(s
+        let err = s
             .quote(FungibleAsset::new(a, 1).unwrap(), FungibleAsset::new(b, 1).unwrap(), None)
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(err, LpError::Closed(_)), "expected Closed, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn quote_rejects_zero_amount_with_typed_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let s = LpSender { tx };
+        let (a, b) = sample_faucets();
+        let err = s
+            .quote(FungibleAsset::new(a, 0).unwrap(), FungibleAsset::new(b, 5).unwrap(), None)
+            .unwrap_err();
+        assert!(matches!(err, LpError::InvalidQuote(_)), "expected InvalidQuote, got {err:?}");
+        // A rejected quote never reaches the wire.
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -575,6 +625,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(matches!(rx.try_recv().unwrap(), ClientMsg::Quote { .. }));
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn quote_loop_stops_on_client_drop_even_when_never_sending() {
+        // A price fn that always returns None never sends — so the loop must
+        // notice the client-drop via is_closed(), not via a send error, or it
+        // would leak forever (detached task).
+        let (tx, rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (a, b) = sample_faucets();
+        let handle = tokio::spawn(quote_loop(
+            LpSender { tx },
+            vec![PairSpec { offered: a, requested: b }],
+            Duration::from_millis(10),
+            |_p| None,
+        ));
+        drop(rx); // client gone
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "quote_loop must terminate after the client is dropped");
     }
 
     // ── Resilience: an in-process mock router the SDK connects to ────────────

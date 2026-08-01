@@ -89,7 +89,7 @@ assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
   fails the connection** (HTTP 401) — `connect` returns `Err`, no session opens.
 - On success the **first event is always `AuthOk`**. The connection then **auto-reconnects**:
   a transient drop surfaces as `Reconnecting` then `Reconnected` (the SDK re-authenticates
-  re-authenticates for you), and the event stream only ends (`next_event` → `None`) when
+  for you), and the event stream only ends (`next_event` → `None`) when
   you drop the client. A terminal `Disconnected { reason }` is emitted only if the SDK
   gives up — today that means the token was rejected on reconnect.
 - Default port **8090**, path **`/v1/rfq`**. Tokens are bearer secrets — treat them like
@@ -111,7 +111,7 @@ let _q = client.serve_quotes(
     vec![PairSpec { offered: imiden, requested: iusdt }],   // AccountIds, (offered, requested)
     Duration::from_secs(10),                                // ~half the router's quote TTL
     |_pair| Some((1_000_000, 2_000_000)),                   // your live price (base units)
-)?;
+);
 ```
 
 The SDK calls your pricing fn **every tick** for the current amounts and re-sends the

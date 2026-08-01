@@ -18,10 +18,10 @@ protocol drift between the two sides.
 
 ## Decision
 
-Ship **`pswap-filler-sdk`** as a standalone crate inside the solver repo:
+Ship **`pswap-lp-sdk`** as a standalone crate inside the solver repo:
 
 1. **Separate crate, depended on one-way.** The solver depends on the SDK; the SDK
-   never depends on the solver. A DEX adds only `pswap-filler-sdk` — no solver crate,
+   never depends on the solver. A DEX adds only `pswap-lp-sdk` — no solver crate,
    no `miden-client`, no db/http.
 2. **The SDK owns the wire protocol.** `protocol` (`ClientMsg`/`ServerMsg`/`PairSpec`)
    lives in the SDK; the solver's router imports it from there. One definition ⇒ the
@@ -85,5 +85,5 @@ miden's own format, and hands the filler a typed `Note`.
 - A handover is `note` + `fill_amount` only. The note enforces its own on-chain rate, so
   no separate price rides along; if the overfill path later makes the binding fill rate
   differ from the note's intrinsic rate, re-add an echoed price then.
-- Verified: `cargo test -p pswap-filler-sdk` green; the crate builds independent of the
+- Verified: `cargo test -p pswap-lp-sdk` green; the crate builds independent of the
   solver crate and `miden-client`.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-price", "crates/mock-mirror", "crates/filler-sdk"]
+members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-price", "crates/mock-mirror", "crates/lp-sdk"]
 resolver = "2"
 
 [workspace.dependencies]

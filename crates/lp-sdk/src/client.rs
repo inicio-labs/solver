@@ -11,7 +11,7 @@
 //! frames (see [`crate::protocol`]).
 //!
 //! ```ignore
-//! use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
+//! use pswap_lp_sdk::{LpClient, LpEvent, PairSpec};
 //! use miden_protocol::asset::FungibleAsset;
 //!
 //! let mut client = LpClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;

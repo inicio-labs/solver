@@ -8,7 +8,7 @@
 //! `miden-client` — the filler runs the transaction with its own client/gas.
 //!
 //! ```ignore
-//! use pswap_filler_sdk::consume::{consume_args, PswapNote};
+//! use pswap_lp_sdk::consume::{consume_args, PswapNote};
 //!
 //! let pswap = PswapNote::try_from(&handover.note)?;      // what am I getting / paying?
 //! // ... your policy check against pswap.offered_asset() / requested_asset() ...

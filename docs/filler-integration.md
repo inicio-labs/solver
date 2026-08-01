@@ -2,10 +2,10 @@
 
 **Audience:** external DEXes ("fillers") integrating with a Miden PSWAP solver to
 receive and fill order flow it can't cross internally.
-**SDK:** [`pswap-filler-sdk`](../crates/filler-sdk) (Rust). **Transport:** one
+**SDK:** [`pswap-lp-sdk`](../crates/lp-sdk) (Rust). **Transport:** one
 websocket (miden-binary frames). **Auth:** a bearer token the operator issues you.
 
-The SDK's rustdoc (`cargo doc -p pswap-filler-sdk --open`) is the API reference;
+The SDK's rustdoc (`cargo doc -p pswap-lp-sdk --open`) is the API reference;
 this guide covers the semantics you can't read off the types.
 
 ---
@@ -35,7 +35,7 @@ Three facts make this simpler than a normal RFQ/AMM integration:
 ```mermaid
 sequenceDiagram
     autonumber
-    participant D as Your DEX<br/>(pswap-filler-sdk)
+    participant D as Your DEX<br/>(pswap-lp-sdk)
     participant R as Solver router<br/>(websocket thread)
     participant M as Matcher<br/>(in-memory order book)
     participant C as Miden chain
@@ -65,7 +65,7 @@ solver reactivates it and matches it elsewhere.
 
 ```toml
 [dependencies]
-pswap-filler-sdk = { git = "<solver-repo-url>", package = "pswap-filler-sdk" }
+pswap-lp-sdk = { git = "<solver-repo-url>", package = "pswap-lp-sdk" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 ```
@@ -79,7 +79,7 @@ your own client for the consume transaction, so nothing conflicts with your stac
 ## 3. Connect
 
 ```rust
-use pswap_filler_sdk::{LpClient, LpEvent};
+use pswap_lp_sdk::{LpClient, LpEvent};
 
 let mut client = LpClient::connect("ws://solver-host:8090/v1/rfq", "your-token").await?;
 assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
@@ -105,7 +105,7 @@ pair).
 
 ```rust
 use std::time::Duration;
-use pswap_filler_sdk::PairSpec;
+use pswap_lp_sdk::PairSpec;
 
 let _q = client.serve_quotes(
     vec![PairSpec { offered: imiden, requested: iusdt }],   // AccountIds, (offered, requested)
@@ -151,7 +151,7 @@ pair. Quoting a pair *is* the registration — no separate step.
 ## 5. Receive handovers & consume
 
 ```rust
-use pswap_filler_sdk::consume::{consume_args, PswapNote};
+use pswap_lp_sdk::consume::{consume_args, PswapNote};
 
 while let Some(ev) = client.next_event().await {
     match ev {

@@ -1,8 +1,8 @@
 [package]
-name = "pswap-filler-sdk"
+name = "pswap-lp-sdk"
 version = "0.1.0"
 edition = "2021"
-description = "Client SDK for external DEXes ('fillers') to receive and fill Miden PSWAP orders routed by the solver's RFQ websocket. Speaks the router's miden-binary protocol; independent of the solver's internals (no db / http / matcher)."
+description = "Client SDK for external liquidity providers (LPs) to receive and fill Miden PSWAP orders routed by the solver's RFQ websocket. Speaks the router's miden-binary protocol; independent of the solver's internals (no db / http / matcher)."
 license = "MIT"
 
 [dependencies]

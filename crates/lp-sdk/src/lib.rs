@@ -8,7 +8,7 @@
 //!
 //! ## Isolation
 //!
-//! A filler depends on **only** `pswap-filler-sdk` — never the solver crate, its
+//! An LP depends on **only** `pswap-lp-sdk` — never the solver crate, its
 //! `miden-client`, `diesel`, `axum`, database, or any internal module. The wire
 //! protocol ([`protocol`]) is the single shared source of truth: the solver's
 //! router and this SDK both build on it, so the two can never drift.
@@ -30,8 +30,8 @@
 //!
 //! ```ignore
 //! use std::time::Duration;
-//! use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
-//! use pswap_filler_sdk::consume::{consume_args, PswapNote};
+//! use pswap_lp_sdk::{LpClient, LpEvent, PairSpec};
+//! use pswap_lp_sdk::consume::{consume_args, PswapNote};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

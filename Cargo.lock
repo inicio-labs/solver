@@ -3789,7 +3789,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pswap-filler-sdk"
+name = "pswap-lp-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",

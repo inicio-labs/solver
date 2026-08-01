@@ -1,4 +1,4 @@
-# pswap-filler-sdk
+# pswap-lp-sdk
 
 Rust client SDK for external DEXes (**"fillers"**) to fill Miden **PSWAP** orders
 that the solver can't cross internally and routes out over its RFQ websocket.
@@ -25,7 +25,7 @@ no JSON, no hex, no string prices.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant D as Your DEX<br/>(pswap-filler-sdk)
+    participant D as Your DEX<br/>(pswap-lp-sdk)
     participant R as Solver router<br/>(websocket thread)
     participant M as Matcher<br/>(in-memory order book)
     participant C as Miden chain
@@ -48,7 +48,7 @@ sequenceDiagram
 
 ## Why this is a separate crate
 
-Add **only** `pswap-filler-sdk`. You do **not** depend on the solver crate, its
+Add **only** `pswap-lp-sdk`. You do **not** depend on the solver crate, its
 `miden-client`, database, HTTP stack, or any internal module. It does use
 `miden-protocol`/`miden-standards` (the binary protocol needs them, and you have
 them anyway to consume the note). The protocol is defined once here and the
@@ -58,15 +58,15 @@ solver depends on *this* crate for it, so the two sides can never drift.
 
 ```toml
 [dependencies]
-pswap-filler-sdk = { git = "<this-repo>", package = "pswap-filler-sdk" }
+pswap-lp-sdk = { git = "<this-repo>", package = "pswap-lp-sdk" }
 ```
 
 ## Quick start
 
 ```ignore
 use std::time::Duration;
-use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
-use pswap_filler_sdk::consume::{consume_args, PswapNote};
+use pswap_lp_sdk::{LpClient, LpEvent, PairSpec};
+use pswap_lp_sdk::consume::{consume_args, PswapNote};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

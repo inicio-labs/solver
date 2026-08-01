@@ -171,10 +171,11 @@ impl LpSender {
             .map_err(|_| LpError::Closed("client dropped; connection task gone".into()))
     }
 
-    /// Post (or refresh) a standing quote: give up to `offered` for `requested`.
-    /// The two assets carry both the rate and the max size (like a PSWAP note);
-    /// their faucet ids imply the pair. `valid_for_ms` optionally shortens
-    /// validity below the server's quote TTL.
+    /// Post (or refresh) a standing quote: **give up to `offered` to receive
+    /// `requested`** (both from your side — offered = what you give, requested =
+    /// what you want). The two assets carry the rate (their ratio) and the max
+    /// size (like a PSWAP note); their faucet ids imply the pair. `valid_for_ms`
+    /// optionally shortens validity below the server's quote TTL.
     ///
     /// Returns [`LpError::InvalidQuote`] for a zero amount (logged at `warn`), or
     /// [`LpError::Closed`] if the client has been dropped.

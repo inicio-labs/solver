@@ -14,8 +14,10 @@ use miden_protocol::crypto::utils::{
 };
 use miden_protocol::note::Note;
 
-/// A trading pair as faucet account ids, in the note's `(offered, requested)`
-/// orientation.
+/// A trading pair as faucet account ids, from **your** (the filler's) side:
+/// `offered` = the faucet of the token you give, `requested` = the faucet of the
+/// token you want. A note you fill is the mirror — its offered asset is your
+/// `requested` token, and vice versa.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairSpec {
     pub offered: AccountId,
@@ -46,10 +48,10 @@ impl Deserializable for PairSpec {
 /// client messages can be added without a wire break.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
-    /// A standing quote: the DEX will give up to `offered` for `requested`. The
-    /// two assets carry both the rate (their ratio) and the max size, exactly
-    /// like a PSWAP note; their faucet ids imply the pair. Resend before expiry
-    /// to refresh.
+    /// A standing quote, from the DEX's side: **give up to `offered` to receive
+    /// `requested`** (offered = what you give, requested = what you want). The two
+    /// assets carry both the rate (their ratio) and the max size, like a PSWAP
+    /// note; their faucet ids imply the pair. Resend before expiry to refresh.
     Quote {
         offered: FungibleAsset,
         requested: FungibleAsset,

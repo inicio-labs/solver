@@ -124,9 +124,8 @@ For manual control you can also `client.quote(offered, requested, valid_for_ms)`
 
 ### What a quote means (base units, not a human price)
 
-A quote is two amounts on the pair's faucets: **`offered`** (base units of the pair's
-`offered` token — what you *receive*) and **`requested`** (base units of the `requested`
-token — what you *pay*).
+A quote is two amounts, from **your** side: **`offered`** (base units of the token you
+*give*) and **`requested`** (base units of the token you *want*).
 
 - **Their ratio is your rate** — the worst price you'll accept. The solver only hands
   you notes whose fixed on-chain rate is at least this generous to you.
@@ -139,8 +138,13 @@ token — what you *pay*).
 > ratios directly (and applies each token's decimals only for its oracle off-market
 > check — see [external-liquidity-routing.md](external-liquidity-routing.md)).
 
-`PairSpec { offered, requested }` and its reverse are distinct pairs. The pair you quote
-is the pair you fill — no separate registration.
+`PairSpec { offered, requested }` is your side (give / want); its reverse is a distinct
+pair. Quoting a pair *is* the registration — no separate step.
+
+> **Mirror warning.** A quote's `offered` is what **you give**; a handed-over note's
+> `offered_asset()` is what **you receive** (§5) — the same word, opposite sides. A note
+> you fill is the mirror of your quote: its offered asset is your quote's `requested`
+> token, its requested asset is your quote's `offered` token.
 
 ---
 

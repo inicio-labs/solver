@@ -79,16 +79,19 @@ your own client for the consume transaction, so nothing conflicts with your stac
 ## 3. Connect
 
 ```rust
-use pswap_filler_sdk::{FillerClient, FillerEvent};
+use pswap_filler_sdk::{LpClient, LpEvent};
 
-let mut client = FillerClient::connect("ws://solver-host:8090/v1/rfq", "your-token").await?;
-assert!(matches!(client.next_event().await, Some(FillerEvent::AuthOk)));
+let mut client = LpClient::connect("ws://solver-host:8090/v1/rfq", "your-token").await?;
+assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
 ```
 
 - The SDK sends `Authorization: Bearer <token>` on the upgrade. A **wrong/missing token
   fails the connection** (HTTP 401) — `connect` returns `Err`, no session opens.
-- On success the **first event is always `AuthOk`**; the **last is always
-  `Disconnected`**.
+- On success the **first event is always `AuthOk`**. The connection then **auto-reconnects**:
+  a transient drop surfaces as `Reconnecting` then `Reconnected` (the SDK re-authenticates
+  re-authenticates for you), and the event stream only ends (`next_event` → `None`) when
+  you drop the client. A terminal `Disconnected { reason }` is emitted only if the SDK
+  gives up — today that means the token was rejected on reconnect.
 - Default port **8090**, path **`/v1/rfq`**. Tokens are bearer secrets — treat them like
   API keys; don't share or log them.
 
@@ -96,8 +99,9 @@ assert!(matches!(client.next_event().await, Some(FillerEvent::AuthOk)));
 
 ## 4. Quote
 
-The one-call, hands-free path is `serve_quotes` — subscribe + keep a fresh quote live
-per pair:
+The one-call, hands-free path is `serve_quotes` — keep a fresh quote live per pair.
+There's no subscribe step: **the quote is the registration** (its faucet ids imply the
+pair).
 
 ```rust
 use std::time::Duration;
@@ -147,7 +151,7 @@ use pswap_filler_sdk::consume::{consume_args, PswapNote};
 
 while let Some(ev) = client.next_event().await {
     match ev {
-        FillerEvent::Handover(h) => {
+        LpEvent::Handover(h) => {
             // h.note        : Note       — the PSWAP note to consume (decoded)
             // h.fill_amount : u64        — requested-token base units to fill
             // h.fill_price  : PriceRatio — { num, den }, requested-per-offered (your matched quote)
@@ -162,9 +166,10 @@ while let Some(ev) = client.next_event().await {
             let args = consume_args(0, h.fill_amount)?;  // (account_fill, note_fill) → Word
             // ... feed h.note + args into YOUR miden-client transaction (below) ...
         }
-        FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
-        FillerEvent::Disconnected => break,   // reconnect (see §6)
-        _ => {}
+        LpEvent::Error(e) => eprintln!("router error: {e}"),  // typed LpError (e.g. rejected quote)
+        LpEvent::Reconnecting { attempt, error } => eprintln!("link lost (try {attempt}): {error}"),
+        LpEvent::Disconnected { reason } => break,             // SDK gave up (see §6)
+        _ => {}                                                // AuthOk, Reconnected, Ask
     }
 }
 ```
@@ -207,8 +212,11 @@ handovers and not consuming them is visible to the operator and grounds for de-l
 
 ## 6. Operational notes
 
-- **Reconnect on `Disconnected`.** Quotes don't survive a disconnect; re-establish and
-  re-`serve_quotes` after reconnecting, with backoff on repeated connect failures.
+- **Reconnect is automatic.** The SDK reconnects with capped backoff and re-authenticates
+  on its own — watch for `Reconnecting`/`Reconnected`. Your standing quotes don't survive a
+  drop, but `serve_quotes` resumes pushing on the next tick; if you quote manually, re-post
+  on `Reconnected` (the quote is the registration). The SDK only stops (terminal
+  `Disconnected { reason }`) when the token is rejected.
 - **Idempotent handovers.** Dedupe by the note's id — a reactivated note can be offered
   again (not to the DEX that already held it, within the same in-flight window).
 - **Message size.** The server caps inbound messages (default 16 KiB). Quotes are tiny.
@@ -224,9 +232,9 @@ The SDK encodes/decodes it; you never touch the wire. (Binary isn't human-readab
 the decoded structs, not the frames.)
 
 **Client → server** (`ClientMsg`):
-- `Subscribe { pairs: Vec<PairSpec> }` — pairs you can fill.
 - `Quote { offered: FungibleAsset, requested: FungibleAsset, valid_for_ms: Option<u64> }`
-  — standing quote; resend to refresh.
+  — standing quote; resend to refresh. The faucet ids imply the pair, so this is also the
+  registration — there is no separate subscribe message.
 
 **Server → client** (`ServerMsg`):
 - `AuthOk` — handshake accepted (first frame).

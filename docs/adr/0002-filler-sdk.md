@@ -10,7 +10,7 @@
 ## Context
 
 External DEXes ("fillers") need to integrate with the solver's RFQ router (ADR
-[0001](0001-external-liquidity-routing.md)): connect, subscribe, post quotes, receive
+[0001](0001-external-liquidity-routing.md)): connect, post quotes, receive
 handovers, and consume notes on-chain. We want integration to be **turnkey** while
 ensuring a DEX takes on **only the SDK, not the solver's internals** (`miden-client`,
 `diesel`, `axum`, the database, internal modules). We also must not let the wire
@@ -35,9 +35,11 @@ Ship **`pswap-filler-sdk`** as a standalone crate inside the solver repo:
    a `PriceRatio` `fill_price`. On-chain helpers (`consume_args`, re-exported
    `PswapNote`) are always available — no feature gate. The DEX runs the consume
    transaction with its own client/keystore/gas.
-5. **Hands-free push.** `FillerClient::serve_quotes(pairs, refresh, price_fn)` keeps a
+5. **Hands-free push.** `LpClient::serve_quotes(pairs, refresh, price_fn)` keeps a
    fresh quote live per pair: it calls the pricing fn each tick and re-sends, so quotes
-   never expire (keepalive) and never go stale-by-omission.
+   never expire (keepalive) and never go stale-by-omission. The connection is
+   auto-reconnecting (backoff + re-auth), so serve_quotes survives drops. There is
+   no subscribe step — the quote is the registration (its faucet ids imply the pair).
 
 ## Update (2026-07-30): why binary miden-native replaced serde-only
 

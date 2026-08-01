@@ -22,19 +22,20 @@
 //!
 //! ## Quick start
 //!
-//! Subscribe + provide a pricing fn + handle handovers — that's the whole push
-//! integration. [`serve_quotes`](client::FillerClient::serve_quotes) keeps a
+//! Provide a pricing fn + handle handovers — that's the whole push
+//! integration. [`serve_quotes`](client::LpClient::serve_quotes) keeps a
 //! fresh quote live for each pair (keepalive + no stale-by-omission); you just
-//! return the current `(offered_amount, requested_amount)` when asked.
+//! return the current `(offered_amount, requested_amount)` when asked. The
+//! connection is auto-reconnecting, so the loop below survives transient drops.
 //!
 //! ```ignore
 //! use std::time::Duration;
-//! use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+//! use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
 //! use pswap_filler_sdk::consume::{consume_args, PswapNote};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let mut client = FillerClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
+//!     let mut client = LpClient::connect("ws://solver:8090/v1/rfq", "my-token").await?;
 //!     let _q = client.serve_quotes(
 //!         vec![PairSpec { offered: imiden, requested: iusdt }],
 //!         Duration::from_secs(10),                 // ~half the router's quote TTL
@@ -43,12 +44,12 @@
 //!
 //!     while let Some(ev) = client.next_event().await {
 //!         match ev {
-//!             FillerEvent::Handover(h) => {
+//!             LpEvent::Handover(h) => {
 //!                 let pswap = PswapNote::try_from(&h.note)?;   // what am I getting / paying?
 //!                 // ... your risk check against `pswap` and `h.fill_price` ...
 //!                 let _args = consume_args(0, h.fill_amount)?; // then self-consume on-chain
 //!             }
-//!             FillerEvent::Disconnected => break,
+//!             LpEvent::Disconnected { reason } => break,       // SDK gave up (e.g. bad token)
 //!             _ => {}
 //!         }
 //!     }
@@ -61,5 +62,5 @@ pub mod consume;
 pub mod protocol;
 
 // Ergonomic top-level re-exports — the common path needs only these.
-pub use client::{FillerClient, FillerEvent, FillerSender, Handover, QuoteTask};
+pub use client::{Handover, LpClient, LpError, LpEvent, LpSender, QuoteTask};
 pub use protocol::{ClientMsg, PairSpec, PriceRatio, ServerMsg};

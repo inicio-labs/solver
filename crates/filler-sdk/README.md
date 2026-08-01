@@ -16,7 +16,7 @@ no JSON, no hex, no string prices.
 
 ## Integration in 3 steps
 
-1. **Connect** — `FillerClient::connect(url, token)` with the bearer token the operator issued you.
+1. **Connect** — `LpClient::connect(url, token)` with the bearer token the operator issued you.
 2. **Serve quotes** — `serve_quotes(pairs, refresh, price_fn)`: the SDK keeps a fresh quote live per pair (it calls your `price_fn` each tick).
 3. **Consume handovers** — loop on `next_event()`; each `Handover` carries a `Note` you self-consume on-chain with your own client/gas.
 
@@ -65,14 +65,15 @@ pswap-filler-sdk = { git = "<this-repo>", package = "pswap-filler-sdk" }
 
 ```rust
 use std::time::Duration;
-use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+use pswap_filler_sdk::{LpClient, LpEvent, PairSpec};
 use pswap_filler_sdk::consume::{consume_args, PswapNote};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut client = FillerClient::connect("ws://solver-host:8090/v1/rfq", "my-token").await?;
+    let mut client = LpClient::connect("ws://solver-host:8090/v1/rfq", "my-token").await?;
 
-    // Subscribe + keep a fresh quote live per pair, hands-free. The SDK calls
+    // Keep a fresh quote live per pair, hands-free (the quote is the pair's
+    // registration — no separate subscribe step). The SDK calls
     // your pricing fn each tick for the current (offered, requested) base-unit
     // amounts on the pair's faucets — so quotes never expire and never go stale.
     let _q = client.serve_quotes(
@@ -83,14 +84,14 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(ev) = client.next_event().await {
         match ev {
-            FillerEvent::Handover(h) => {
+            LpEvent::Handover(h) => {
                 let pswap = PswapNote::try_from(&h.note)?;      // what am I getting / paying?
                 // ... your risk check against `pswap` and `h.fill_price` ...
                 let _args = consume_args(0, h.fill_amount)?;    // then self-consume on-chain
             }
-            FillerEvent::Error { code, msg } => eprintln!("router error {code}: {msg}"),
-            FillerEvent::Disconnected => break,
-            _ => {}
+            LpEvent::Error(e) => eprintln!("router error: {e}"),  // typed LpError
+            LpEvent::Disconnected { reason } => break,            // SDK gave up (auth rejected)
+            _ => {}                                               // AuthOk, Reconnecting/Reconnected, Ask
         }
     }
     Ok(())
@@ -100,6 +101,6 @@ async fn main() -> anyhow::Result<()> {
 ## Protocol notes
 
 - **Auth** — `Authorization: Bearer <token>` (the SDK sets this). A wrong token fails at the upgrade.
-- **Quotes are standing** — `serve_quotes` keeps them fresh (keepalive + your live price each tick). A disconnect purges your quotes.
+- **Quotes are standing** — `serve_quotes` keeps them fresh (keepalive + your live price each tick). A disconnect purges your quotes, but the connection auto-reconnects (backoff + re-auth) and `serve_quotes` resumes pushing. There's no subscribe step — **the quote is the registration** (its faucet ids imply the pair); re-post on `Reconnected` if you quote manually.
 - **Amounts, not prices** — a quote is two `FungibleAsset`s (`offered`/`requested`); their ratio is the rate, like a PSWAP note. `fill_price` on a handover is a `num/den` ratio (your matched quote, echoed).
 - **Handover = a decoded `Note`** — you self-consume on-chain; the solver never holds your keys or pays your gas.

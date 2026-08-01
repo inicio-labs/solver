@@ -64,14 +64,16 @@ impl Deserializable for PriceRatio {
 
 // ── Client → server ──────────────────────────────────────────────────────────
 
-/// Messages a DEX (client) sends to the router.
+/// Messages a DEX (client) sends to the router. A standing quote is the only
+/// client message — **the quote is the registration**: its faucet ids imply the
+/// pair, so there's no separate subscribe step. (Tagged for forward-compat: more
+/// client messages can be added without a wire break.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
-    /// Pairs the DEX can fill (for `Ask` targeting; quotes still gate per pair).
-    Subscribe { pairs: Vec<PairSpec> },
     /// A standing quote: the DEX will give up to `offered` for `requested`. The
     /// two assets carry both the rate (their ratio) and the max size, exactly
-    /// like a PSWAP note. Resend before expiry to refresh.
+    /// like a PSWAP note; their faucet ids imply the pair. Resend before expiry
+    /// to refresh.
     Quote {
         offered: FungibleAsset,
         requested: FungibleAsset,
@@ -81,17 +83,12 @@ pub enum ClientMsg {
 }
 
 impl ClientMsg {
-    const SUBSCRIBE: u8 = 0;
-    const QUOTE: u8 = 1;
+    const QUOTE: u8 = 0;
 }
 
 impl Serializable for ClientMsg {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         match self {
-            ClientMsg::Subscribe { pairs } => {
-                target.write_u8(ClientMsg::SUBSCRIBE);
-                pairs.write_into(target);
-            }
             ClientMsg::Quote { offered, requested, valid_for_ms } => {
                 target.write_u8(ClientMsg::QUOTE);
                 offered.write_into(target);
@@ -105,9 +102,6 @@ impl Serializable for ClientMsg {
 impl Deserializable for ClientMsg {
     fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
         match source.read_u8()? {
-            ClientMsg::SUBSCRIBE => {
-                Ok(ClientMsg::Subscribe { pairs: Vec::<PairSpec>::read_from(source)? })
-            }
             ClientMsg::QUOTE => Ok(ClientMsg::Quote {
                 offered: FungibleAsset::read_from(source)?,
                 requested: FungibleAsset::read_from(source)?,
@@ -121,6 +115,9 @@ impl Deserializable for ClientMsg {
 // ── Server → client ──────────────────────────────────────────────────────────
 
 /// Messages the router sends to a DEX.
+// `Handover` carries a typed miden `Note` by value — deliberate (that's the point
+// of the binary protocol). Frames are decoded one-at-a-time, never stored in bulk.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ServerMsg {
     /// Handshake accepted; the connection is live.
@@ -197,11 +194,17 @@ mod tests {
 
     #[test]
     fn client_msg_binary_round_trip() {
-        // Subscribe with an empty pair list exercises the tag + Vec framing
-        // without needing miden asset fixtures.
-        let sub = ClientMsg::Subscribe { pairs: vec![] };
-        let back = ClientMsg::read_from_bytes(&sub.to_bytes()).unwrap();
-        assert_eq!(sub, back);
+        use miden_protocol::account::AccountId;
+        // A Quote exercises the tag + FungibleAsset + Option framing.
+        let a = AccountId::from_hex("0x4a03c1843860c9b17582c021d563ae").unwrap();
+        let b = AccountId::from_hex("0x2458e5446128e6b150b75b8ebd9ce1").unwrap();
+        let q = ClientMsg::Quote {
+            offered: FungibleAsset::new(a, 1_000).unwrap(),
+            requested: FungibleAsset::new(b, 2_000).unwrap(),
+            valid_for_ms: Some(5_000),
+        };
+        let back = ClientMsg::read_from_bytes(&q.to_bytes()).unwrap();
+        assert_eq!(q, back);
     }
 
     #[test]

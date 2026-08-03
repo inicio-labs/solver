@@ -116,10 +116,9 @@ while let Some(ev) = client.next_event().await {
 
 ## Testing / definition of done
 
-- Unit-test `price` and `accept` — assert the quote **gives the token we intend to give**.
-- Drive `LpClient` against a local mock websocket (adapt `mock_router` from the SDK's
-  `client.rs` tests) to exercise connect → quote → injected `Handover` → our handler, with no
-  chain.
+- Keep the SDK glue thin: put logic in pure fns `price(pair) -> Option<(u64,u64)>` and
+  `on_handover(note, fill_amount)`. Unit-test both — assert `price` **gives the token we intend
+  to give** (orientation), and that `on_handover` accepts/rejects and builds args correctly.
 - On **testnet** first: run with `accept = false`, log handovers, confirm they offer the token
   we asked for (orientation sanity), then do **one real fill** and verify the right asset
   landed in our account.

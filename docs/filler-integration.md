@@ -303,66 +303,110 @@ than take handovers you'll drop.
 
 ---
 
-## 7. Complete example
+## 7. The integration you write
 
-A single-file skeleton — the parts marked `// YOU:` are your business logic.
+This is the shape of the code **you** put in your codebase. `main` wires up the SDK (fixed —
+copy it as-is); `LpBot` holds *your* pricing and consume logic (fill in the two bodies + your
+miden-client setup). Everything SDK-facing here is exact.
 
 ```rust
+use std::sync::Arc;
 use std::time::Duration;
 use anyhow::Result;
+use tokio::sync::Mutex;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::AccountId;
-use miden_protocol::asset::FungibleAsset;
+use miden_protocol::note::Note;
 use pswap_lp_sdk::consume::{consume_args, PswapNote};
 use pswap_lp_sdk::{LpClient, LpEvent, PairSpec};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Config the operator gives you (load the token from your secrets store):
-    let url   = "ws://solver-host:8090/v1/rfq";
-    let token = std::env::var("PSWAP_TOKEN")?;
-    let imiden = AccountId::from_hex("0x…")?; // faucet AccountIds from the operator
+    // Config the operator gives you (load the token from your secret store):
+    let url    = "ws://solver-host:8090/v1/rfq";
+    let token  = std::env::var("PSWAP_TOKEN")?;
+    let imiden = AccountId::from_hex("0x…")?;      // faucet AccountIds from the operator
     let iusdt  = AccountId::from_hex("0x…")?;
-    let my_account_id = AccountId::from_hex("0x…")?; // YOUR filling account
 
-    // 1) Connect (auto-reconnects from here on).
+    // Your state: your miden-client + filling account (see LpBot::new below).
+    let bot = LpBot::new(imiden, iusdt).await?;
+
+    // Connect (auto-reconnects from here on) and keep a quote live per pair.
     let mut client = LpClient::connect(url, &token).await?;
-
-    // 2) Keep a fresh quote live, hands-free. `price` returns your CURRENT
-    //    (give_amount, want_amount) in base units — offered = give, requested = want.
     let _quotes = client.serve_quotes(
-        vec![PairSpec { offered: iusdt, requested: imiden }], // give iUSDT, want iMIDEN
-        Duration::from_secs(10),
-        move |_pair| Some(your_live_price()), // YOU: your live quote, or None to skip this tick
+        vec![PairSpec { offered: iusdt, requested: imiden }],  // offered = you GIVE, requested = you WANT
+        Duration::from_secs(10),                               // refresh ≈ half the quote TTL
+        { let bot = bot.clone(); move |pair| bot.price(pair) },
     );
 
-    // 3) Handle events. Handovers are notes YOU consume on-chain.
+    // Event loop. Handovers are notes you consume on-chain; everything else is lifecycle.
     while let Some(ev) = client.next_event().await {
         match ev {
             LpEvent::Handover(h) => {
-                let pswap = PswapNote::try_from(&h.note)?;      // what you receive / pay
-                if !accept(&pswap, h.fill_amount) {             // YOU: risk check; the rate is fixed
-                    continue;
-                }
-                let args = consume_args(0, h.fill_amount)?;     // (account_fill, note_fill)
-                let request = TransactionRequestBuilder::new()
-                    .input_notes([(h.note.clone(), Some(args))])
-                    .build()?;
-                // YOU: your authenticated miden-client. Failure? log + drop (don't retry a nullified note).
-                if let Err(e) = your_client_submit(my_account_id, request).await {
-                    tracing::warn!(note = ?h.note.id(), error = %e, "consume failed; skipping");
+                if let Err(e) = bot.on_handover(&h.note, h.fill_amount).await {
+                    tracing::warn!(note = ?h.note.id(), error = %e, "handover skipped");
                 }
             }
             LpEvent::Reconnecting { attempt } => tracing::warn!(attempt, "link lost; retrying"),
-            LpEvent::Reconnected => {} // re-post here only if you quote manually (serve_quotes self-heals)
+            LpEvent::Reconnected => {}  // serve_quotes self-heals; re-post only if you quote manually
             LpEvent::Error(e) => tracing::warn!(error = %e, "router rejected a message"),
-            LpEvent::Disconnected { reason } => { tracing::error!(%reason, "SDK gave up"); break }
+            LpEvent::Disconnected { reason } => { tracing::error!(%reason, "SDK stopped"); break }
             LpEvent::AuthOk | LpEvent::Ask { .. } => {}
         }
     }
     Ok(())
 }
+
+/// Your integration state + logic. Cheap to `clone` (share it with the quote loop).
+#[derive(Clone)]
+struct LpBot {
+    client: Arc<Mutex<YourMidenClient>>,  // YOU: your authenticated miden-client
+    account_id: AccountId,                // YOU: your filling account
+    imiden: AccountId,
+    iusdt: AccountId,
+    // + whatever your pricing needs (order book handle, oracle client, inventory, …)
+}
+
+impl LpBot {
+    async fn new(imiden: AccountId, iusdt: AccountId) -> Result<Self> {
+        // YOU: build your miden-client + keystore and your filling account id.
+        todo!("wire up your miden-client")
+    }
+
+    /// Your live quote for `pair`, in BASE UNITS: `(amount you GIVE, amount you WANT)`.
+    /// Return `None` to skip this tick. (offered = give, requested = want.)
+    fn price(&self, pair: &PairSpec) -> Option<(u64, u64)> {
+        // YOU: price from your book/oracle + size it. e.g. give up to 2,000,000 iUSDT
+        // to get at least 1,000,000 iMIDEN:
+        Some((2_000_000, 1_000_000))
+    }
+
+    /// Decide on one handover, then consume it on-chain (your gas, your keys).
+    async fn on_handover(&self, note: &Note, fill_amount: u64) -> Result<()> {
+        let pswap = PswapNote::try_from(note)?;       // pswap.offered_asset() = you receive,
+                                                      // pswap.storage().requested_asset() = you pay
+        if !self.accept(&pswap, fill_amount) {        // YOU: risk check — the rate is fixed on-chain,
+            return Ok(());                            // you only decide *whether* to fill
+        }
+        let args = consume_args(0, fill_amount)?;     // (account_fill, note_fill)
+        let request = TransactionRequestBuilder::new()
+            .input_notes([(note.clone(), Some(args))])
+            .build()?;
+        // Submit with your own client. On failure: log + drop — do NOT retry a note that may
+        // already be nullified. (Dedupe by note.id() if you run more than one link.)
+        self.client.lock().await.submit_new_transaction(self.account_id, request).await?;
+        Ok(())
+    }
+
+    /// YOU: accept the fill? (inventory, live price vs. the note's fixed rate, limits, …)
+    fn accept(&self, pswap: &PswapNote, fill_amount: u64) -> bool {
+        true
+    }
+}
 ```
+
+Only three things are yours to fill in: `LpBot::new` (your miden-client), `price` (your quote),
+and `accept` (your risk check). The rest is the exact wiring.
 
 ---
 
@@ -374,10 +418,10 @@ solver:
 1. **Unit-test the parts that matter in isolation** — your pricing fn and your `accept(...)`
    risk check are pure functions; test them directly (esp. the offered/requested orientation
    — assert your quote gives the token you intend to give).
-2. **Local protocol test.** The SDK's own tests spin up an in-process mock websocket router
-   (`mock_router` in `client.rs`) that speaks the binary protocol — copy it to drive
-   `LpClient` end-to-end (connect → quote → inject a `Handover` → assert your handler runs)
-   with no solver and no chain.
+2. **Factor your logic so it's testable off-chain.** Keep the SDK glue thin and put your
+   decisions in pure functions — `price(pair) -> Option<(u64, u64)>` and
+   `on_handover(note, fill_amount)` (which decides accept/reject and builds the consume). Unit-
+   test those directly; you don't need a live solver to prove your pricing and risk logic.
 3. **Testnet dry-run.** Ask the operator for a **testnet** endpoint, token, and funded faucet
    ids. First run with `accept(…) = false` and just **log** the handovers you receive — this
    proves connectivity, auth, and that your quote is oriented correctly (you should get notes

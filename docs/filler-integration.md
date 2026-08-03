@@ -1,12 +1,26 @@
-# Filler Integration Guide — PSWAP external liquidity
+# PSWAP Liquidity Integration Guide
 
-**Audience:** external DEXes ("fillers") integrating with a Miden PSWAP solver to
-receive and fill order flow it can't cross internally.
-**SDK:** [`pswap-lp-sdk`](../crates/lp-sdk) (Rust). **Transport:** one
-websocket (miden-binary frames). **Auth:** a bearer token the operator issues you.
+**Who this is for:** an external DEX / liquidity provider (LP) integrating with a Miden PSWAP
+solver to receive and fill order flow the solver can't cross internally. *(You'll see "filler"
+and "LP" used interchangeably — same thing: you.)*
 
-The SDK's rustdoc (`cargo doc -p pswap-lp-sdk --open`) is the API reference;
-this guide covers the semantics you can't read off the types.
+**What you'll build:** a small service that keeps a standing quote live over one websocket and
+consumes the notes the solver hands you, on-chain, with your own miden-client.
+**SDK:** [`pswap-lp-sdk`](../crates/lp-sdk) (Rust) · **Transport:** one websocket
+(miden-binary frames) · **Auth:** a bearer token the operator issues you.
+
+**Start here:** skim §1 (mental model) and the **mirror warning in §4** (the one thing that
+loses money if you get it wrong), then copy the complete example in §7 and adapt it. The SDK's
+rustdoc (`cargo doc -p pswap-lp-sdk --open`) is the type-level API reference; this guide covers
+the semantics you can't read off the types.
+
+**Using an AI coding agent?** Drop [`partner-integration-CLAUDE.md`](./partner-integration-CLAUDE.md)
+into your repo as `CLAUDE.md` (or `AGENTS.md`) — it's a condensed, rules-first version of this
+guide written for an agent to generate correct integration code first-try.
+
+**Contents:** 1 Mental model · 2 Install · 3 Connect · 4 Quote (+ orientation) · 5 Handovers &
+consume · 6 Operational reference · 7 Complete example · 8 Testing · 9 Events/errors/glossary ·
+10 Troubleshooting · 11 Pre-launch checklist.
 
 ---
 
@@ -141,10 +155,27 @@ A quote is two amounts, from **your** side: **`offered`** (base units of the tok
 `PairSpec { offered, requested }` is your side (give / want); its reverse is a distinct
 pair. Quoting a pair *is* the registration — no separate step.
 
-> **Mirror warning.** A quote's `offered` is what **you give**; a handed-over note's
-> `offered_asset()` is what **you receive** (§5) — the same word, opposite sides. A note
-> you fill is the mirror of your quote: its offered asset is your quote's `requested`
-> token, its requested asset is your quote's `offered` token.
+> **Mirror warning — read twice.** A quote's `offered` is what **you give**; a handed-over
+> note's `offered_asset()` is what **you receive** (§5) — the same word, opposite sides. A
+> note you fill is the mirror of your quote: its offered asset is your quote's `requested`
+> token, its requested asset is your quote's `offered` token. Swapping the two silently
+> quotes the **wrong side of the market** — the single most expensive integration mistake.
+
+**Worked example** — you want to *buy iMIDEN, paying with iUSDT*, up to 2,000,000 iUSDT, at
+no worse than 2 iUSDT per iMIDEN:
+
+```rust
+// You GIVE iUSDT and WANT iMIDEN, so:
+client.quote(
+    FungibleAsset::new(iusdt,  2_000_000)?,   // offered  = what you GIVE  (up to 2,000,000 iUSDT)
+    FungibleAsset::new(imiden, 1_000_000)?,   // requested = what you WANT (at least 1,000,000 iMIDEN)
+    None,                                     // valid_for_ms: None → capped at the router's TTL
+)?;
+```
+
+The solver then hands you notes that **offer iMIDEN and request iUSDT** — you consume them
+to *receive* iMIDEN and *pay* iUSDT. (Quote `offered`/`requested` are always your side; the
+`imiden`/`iusdt` here are the faucet `AccountId`s the operator gives you — see §2.)
 
 ---
 
@@ -169,13 +200,15 @@ while let Some(ev) = client.next_event().await {
             let args = consume_args(0, h.fill_amount)?;  // (account_fill, note_fill) → Word
             // ... feed h.note + args into YOUR miden-client transaction (below) ...
         }
-        LpEvent::Error(e) => eprintln!("router error: {e}"),  // typed LpError (e.g. rejected quote)
-        LpEvent::Reconnecting { attempt, error } => eprintln!("link lost (try {attempt}): {error}"),
-        LpEvent::Disconnected { reason } => break,             // SDK gave up (see §6)
-        _ => {}                                                // AuthOk, Reconnected, Ask
+        LpEvent::Error(e) => eprintln!("router rejected a message: {e}"),   // typed LpError
+        LpEvent::Reconnecting { attempt } => eprintln!("link lost; retrying (attempt {attempt})"),
+        LpEvent::Disconnected { reason } => { eprintln!("SDK stopped: {reason}"); break } // gave up (§6)
+        _ => {}   // AuthOk, Reconnected, Ask — safe to ignore (or log)
     }
 }
 ```
+
+> The full set of `LpEvent` variants and what to do with each is in [§9](#9-reference-events-errors-glossary).
 
 - **The note carries the rate.** A PSWAP note enforces its own fixed rate on-chain, so
   `h.note` + `h.fill_amount` fully specify the fill — there is no separate price field.
@@ -189,21 +222,33 @@ while let Some(ev) = client.next_event().await {
 
 ### Self-consume on-chain (your code, your client)
 
-The SDK stops at the note + args — running the transaction is yours (your keystore, your
-gas). With `miden-client` that is roughly:
+The SDK stops at the note + args — running the transaction is **yours** (your keystore,
+your gas). This uses **your own `miden-client`**, not the SDK. The shape (same call the
+solver's own executor uses) is:
 
 ```rust
-// PSEUDO — uses YOUR miden-client, not the SDK:
-// let request = TransactionRequestBuilder::new()
-//     .input_notes([(h.note, Some(args))])
-//     .build()?;
-// let tx = your_client.new_transaction(your_account_id, request).await?;
-// your_client.submit_transaction(tx).await?;
+use miden_client::transaction::TransactionRequestBuilder;
+
+// `args` is the Word from `consume_args(0, h.fill_amount)?` above.
+let request = TransactionRequestBuilder::new()
+    .input_notes([(h.note.clone(), Some(args))])   // (Note, Option<NoteArgs>); NoteArgs = Word
+    .build()?;
+
+// `my_account_id` is YOUR filling account; `client` is YOUR authenticated miden-client.
+client.submit_new_transaction(my_account_id, request).await?;
 ```
 
-The note's payback (the requested asset) settles to the **creator**; the offered asset
-lands in **your** account. Once your consume confirms on-chain, the solver's ingest sees
-the nullifier and drops the note — no message back from you needed.
+- The note's payback (the requested asset) settles to the **note's creator**; the offered
+  asset lands in **your** account.
+- Once your consume confirms on-chain, the solver's ingest sees the **nullifier** and drops
+  the note — you send **no message back**; the handover is settled by the chain, not by an
+  ack.
+- **Idempotency:** treat consumption as at-least-once. Dedupe by the note's id (`h.note.id()`)
+  and never submit two transactions for the same note id concurrently — the second will fail
+  (the note is already nullified), wasting gas. See [§6](#6-operational-reference).
+- **Gas & failure:** if your submit fails (RPC, insufficient gas, note already consumed by
+  someone else), just drop it — the note either settled elsewhere or the solver will re-route
+  it after its in-flight TTL. Do **not** retry blindly against an already-nullified note.
 
 ### If you don't fill
 
@@ -213,69 +258,211 @@ handovers and not consuming them is visible to the operator and grounds for de-l
 
 ---
 
-## 6. Operational notes
+## 6. Operational reference
 
-- **Reconnect is automatic.** The SDK reconnects with capped backoff and re-authenticates
-  on its own — watch for `Reconnecting`/`Reconnected`. Your standing quotes don't survive a
-  drop, but `serve_quotes` resumes pushing on the next tick; if you quote manually, re-post
-  on `Reconnected` (the quote is the registration). The SDK only stops (terminal
-  `Disconnected { reason }`) when the token is rejected.
-- **Idempotent handovers.** Dedupe by the note's id — a reactivated note can be offered
-  again (not to the DEX that already held it, within the same in-flight window).
-- **Message size.** The server caps inbound messages (default 16 KiB). Quotes are tiny.
-- **One connection, many pairs.** Serve as many pairs as you fill over one socket.
-  Multiple connections with the same token work and are routed independently.
+**Reconnect is automatic.** The SDK reconnects with capped backoff and re-authenticates on
+its own — you just handle `Reconnecting` / `Reconnected`. Standing quotes do **not** survive
+a drop, but `serve_quotes` resumes on the next tick. If you quote **manually**, re-post on
+`Reconnected` (the quote is the registration). The SDK stops only when the token is rejected
+(terminal `Disconnected { reason }` → the event stream ends).
+
+**Idempotency.** Treat both handovers and consumption as at-least-once:
+- The **same note id can be handed to you more than once** (e.g. after its in-flight window
+  lapses). Dedupe by `h.note.id()`; don't submit two txs for one note id.
+- A note you didn't take can be routed to **another** LP. If your consume races and loses,
+  your tx just fails (note already nullified) — drop it, don't retry.
+
+**Parameters** (operator-configurable — confirm the exact values with your operator):
+
+| Thing | Typical default | Notes |
+|---|---|---|
+| Endpoint | `ws://<host>:8090/v1/rfq` | `wss://` in production |
+| Quote TTL | ~20 s | a quote not refreshed within the TTL is dropped |
+| Refresh cadence | ~½ the TTL | `serve_quotes(pairs, Duration::from_secs(10), …)` |
+| In-flight TTL | 30 s | unconsumed handover → note reactivated & re-routed |
+| Max inbound message | 16 KiB | quotes are tiny; not a concern |
+
+**Tokens.** The operator issues you a **bearer token** out-of-band (it's your identity + your
+allow-list). Treat it like an API key: never log or commit it; load it from your secrets
+store. Rotation is operator-driven — on a rotated/revoked token the next `connect` (or a
+reconnect) fails with `LpError::AuthRejected`.
+
+**Connections.** One socket serves as many pairs as you like. Multiple connections with the
+same token also work and are routed independently — handy for HA (run two, dedupe handovers
+by note id).
+
+**Observability — what to log/alert on:**
+- `Reconnecting` bursts / `Disconnected` → link or auth problem (page on `Disconnected`).
+- `Error(_)` → you sent something the router rejected (usually a bad quote) — alert; it's a bug.
+- handovers received vs consumed (a growing gap = your consume path is failing → **de-listing risk**).
+- your consume tx success rate + latency.
+
+**De-listing.** Repeatedly taking handovers and not consuming them is visible to the operator
+and is grounds for de-listing. If you can't fill right now, **widen or stop quoting** rather
+than take handovers you'll drop.
 
 ---
 
-## 7. Protocol reference (binary)
+## 7. Complete example
 
-miden `Serializable`/`Deserializable` over WebSocket **binary** frames at `GET /v1/rfq`.
-The SDK encodes/decodes it; you never touch the wire. (Binary isn't human-readable — log
-the decoded structs, not the frames.)
+A single-file skeleton — the parts marked `// YOU:` are your business logic.
 
-**Client → server** (`ClientMsg`):
-- `Quote { offered: FungibleAsset, requested: FungibleAsset, valid_for_ms: Option<u64> }`
-  — standing quote; resend to refresh. The faucet ids imply the pair, so this is also the
-  registration — there is no separate subscribe message.
+```rust
+use std::time::Duration;
+use anyhow::Result;
+use miden_client::transaction::TransactionRequestBuilder;
+use miden_protocol::account::AccountId;
+use miden_protocol::asset::FungibleAsset;
+use pswap_lp_sdk::consume::{consume_args, PswapNote};
+use pswap_lp_sdk::{LpClient, LpEvent, PairSpec};
 
-**Server → client** (`ServerMsg`):
-- `AuthOk` — handshake accepted (first frame).
-- `Handover { note: Note, fill_amount: u64 }` — a note to fill (the note carries its rate).
-- `Error { code: String, msg: String }` — a message was rejected.
-- `Ask { pairs }` — reserved (a future pull/quote-on-demand mode); not emitted today.
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Config the operator gives you (load the token from your secrets store):
+    let url   = "ws://solver-host:8090/v1/rfq";
+    let token = std::env::var("PSWAP_TOKEN")?;
+    let imiden = AccountId::from_hex("0x…")?; // faucet AccountIds from the operator
+    let iusdt  = AccountId::from_hex("0x…")?;
+    let my_account_id = AccountId::from_hex("0x…")?; // YOUR filling account
 
-`PairSpec`/`FungibleAsset`/`Note` are miden types, serialized in miden's binary format.
+    // 1) Connect (auto-reconnects from here on).
+    let mut client = LpClient::connect(url, &token).await?;
+
+    // 2) Keep a fresh quote live, hands-free. `price` returns your CURRENT
+    //    (give_amount, want_amount) in base units — offered = give, requested = want.
+    let _quotes = client.serve_quotes(
+        vec![PairSpec { offered: iusdt, requested: imiden }], // give iUSDT, want iMIDEN
+        Duration::from_secs(10),
+        move |_pair| Some(your_live_price()), // YOU: your live quote, or None to skip this tick
+    );
+
+    // 3) Handle events. Handovers are notes YOU consume on-chain.
+    while let Some(ev) = client.next_event().await {
+        match ev {
+            LpEvent::Handover(h) => {
+                let pswap = PswapNote::try_from(&h.note)?;      // what you receive / pay
+                if !accept(&pswap, h.fill_amount) {             // YOU: risk check; the rate is fixed
+                    continue;
+                }
+                let args = consume_args(0, h.fill_amount)?;     // (account_fill, note_fill)
+                let request = TransactionRequestBuilder::new()
+                    .input_notes([(h.note.clone(), Some(args))])
+                    .build()?;
+                // YOU: your authenticated miden-client. Failure? log + drop (don't retry a nullified note).
+                if let Err(e) = your_client_submit(my_account_id, request).await {
+                    tracing::warn!(note = ?h.note.id(), error = %e, "consume failed; skipping");
+                }
+            }
+            LpEvent::Reconnecting { attempt } => tracing::warn!(attempt, "link lost; retrying"),
+            LpEvent::Reconnected => {} // re-post here only if you quote manually (serve_quotes self-heals)
+            LpEvent::Error(e) => tracing::warn!(error = %e, "router rejected a message"),
+            LpEvent::Disconnected { reason } => { tracing::error!(%reason, "SDK gave up"); break }
+            LpEvent::AuthOk | LpEvent::Ask { .. } => {}
+        }
+    }
+    Ok(())
+}
+```
 
 ---
 
-## 8. FAQ / gotchas
+## 8. Testing before production
 
-**Do I request per order?** No. You keep a standing quote (`serve_quotes`); the solver
-pushes matching notes. You never reply per order.
+The SDK is transport-only, so you can validate most of your integration without a live
+solver:
 
-**My quote is live but I get no handovers.** The solver only exports a note when (a) your
-quote's rate clears the note's fixed rate, (b) the note also beats oracle mid by the
-operator's edge (it keeps the most-generous notes for internal crossing), and (c) your
-quote is within the off-market band vs oracle mid. A correct-but-tighter quote getting no
-flow is normal — you'll get fills when clearing notes appear.
+1. **Unit-test the parts that matter in isolation** — your pricing fn and your `accept(...)`
+   risk check are pure functions; test them directly (esp. the offered/requested orientation
+   — assert your quote gives the token you intend to give).
+2. **Local protocol test.** The SDK's own tests spin up an in-process mock websocket router
+   (`mock_router` in `client.rs`) that speaks the binary protocol — copy it to drive
+   `LpClient` end-to-end (connect → quote → inject a `Handover` → assert your handler runs)
+   with no solver and no chain.
+3. **Testnet dry-run.** Ask the operator for a **testnet** endpoint, token, and funded faucet
+   ids. First run with `accept(…) = false` and just **log** the handovers you receive — this
+   proves connectivity, auth, and that your quote is oriented correctly (you should get notes
+   offering the token you asked for). Then flip `accept` on and do **one real fill on
+   testnet**, and check which asset actually landed in your account before touching mainnet.
+4. **Chaos check.** Kill the network mid-run; confirm you see `Reconnecting`→`Reconnected` and
+   quoting resumes on its own (the SDK is designed to never crash on a dropped link).
 
-**Why was my quote rejected with an `Error`?** Most common: a zero amount, or amounts
-that don't form a valid `FungibleAsset` (the SDK's `quote` rejects zero amounts locally).
+---
 
-**Are partial fills possible?** Yes — `fill_amount` can be below the note's requested
-amount. Use `consume_args(0, fill_amount)`.
+## 9. Reference: events, errors, glossary
 
-**What if two of us quote the same pair?** The solver picks per its own policy (v1: best
-rate wins). Tighten your rate to win more flow.
+**`LpEvent` (from `next_event()`) — handle these:**
 
-**Does the solver take a spread?** No — it routes at the note's terms; the export edge is
-a retention threshold, not a fee. Your margin is yours.
+| Variant | Meaning | What to do |
+|---|---|---|
+| `AuthOk` | Handshake accepted (first event). | Nothing (or log "connected"). |
+| `Handover(h)` | A note to fill: `h.note`, `h.fill_amount`. | Risk-check, then consume on-chain. |
+| `Reconnecting { attempt }` | Link dropped; SDK is retrying (reason is logged). | Log/metric. Nothing else. |
+| `Reconnected` | Link back; pairs still registered. | Re-post **only** if you quote manually. |
+| `Error(LpError)` | The router rejected a message you sent. | Log/alert — it's a bug in what you sent. |
+| `Disconnected { reason }` | **Terminal.** SDK gave up (e.g. token rejected). | Alert; the stream ends after this. |
+| `Ask { pairs }` | Reserved (future pull mode). | Ignore today. |
 
-**Decimals?** Quote in **base units** (the note's own units); never pre-scale by decimals
-— the solver applies each token's on-chain decimals for its own comparisons.
+**`LpError` (typed, from `connect`/`quote`/`send` and inside `Error`/logs):**
+
+| Variant | When |
+|---|---|
+| `AuthRejected` | Bad/rotated token (HTTP 401 at upgrade). Terminal — fix the token. |
+| `Transport(String)` | Socket/connect/read/write failure. The SDK reconnects. |
+| `Closed(String)` | You called `quote`/`send` after dropping the client. |
+| `InvalidQuote(String)` | Your quote was rejected locally (e.g. a zero amount) before it hit the wire. |
+| `Protocol { code, msg }` | The router rejected a message you sent. |
+
+**Wire protocol** (binary; the SDK encodes/decodes it — you never touch the wire): miden
+`Serializable`/`Deserializable` over WebSocket **binary** frames at `GET /v1/rfq`.
+`ClientMsg::Quote { offered, requested, valid_for_ms }` up; `ServerMsg::{AuthOk, Handover
+{ note, fill_amount }, Error { code, msg }, Ask { pairs }}` down. `AccountId`/`FungibleAsset`
+/`Note` travel as native miden types.
+
+**Glossary:**
+- **Note (PSWAP note):** an on-chain swap order. Encodes offered/requested assets and a fixed
+  rate. Consuming it executes the swap.
+- **Handover:** the solver offering you a note to consume. Not custody, not an obligation.
+- **Quote:** your standing counter-order — *give up to `offered`, want `requested`*.
+- **Faucet:** the account that issues a token; a token is identified by its faucet `AccountId`.
+- **Base units:** a token's smallest on-chain unit (like wei). Always quote in base units.
+- **Maker / creator:** who created the note; the requested asset settles back to them.
+- **Nullifier:** the on-chain marker that a note was consumed (prevents double-spend).
+
+---
+
+## 10. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `connect` returns `Err(AuthRejected)` | Bad/expired token, or wrong URL/port | Re-check the token + endpoint with the operator. |
+| Immediate `Disconnected { reason: "…auth…" }` | Token rejected on (re)connect | Same as above — the SDK won't retry a bad token. |
+| `Reconnecting` loops forever | Router down / network / TLS | Check the endpoint is up; `wss://` needs TLS reachable. The SDK keeps retrying with backoff. |
+| Quote live, **no handovers** | Rate not clearing, or no idle notes on that pair yet | Normal if your rate is tight. Widen the rate; confirm the pair is active with the operator. |
+| Handovers arrive **for the wrong direction** | Orientation swapped | You mixed up `offered`/`requested`. `offered` = what you GIVE (see §4). |
+| `LpEvent::Error` on every quote | Zero/invalid amount, or unpriced pair | Check your `price` fn returns non-zero base-unit amounts on valid faucets. |
+| Consume tx fails "already consumed / nullified" | The note was filled elsewhere, or you double-submitted | Drop it; dedupe by `h.note.id()`; never submit twice for one note. |
+| Received asset is not what you expected | Orientation / decimals confusion | The note's `offered_asset()` is what you receive (§5). Work in base units only. |
+| `serve_quotes` seems to stop | You dropped the `QuoteTask` handle **and** the client, or `price` panicked | Keep the `QuoteTask`; keep `price` cheap and non-panicking. |
+
+---
+
+## 11. Pre-launch checklist
+
+- [ ] Token loaded from a secret (never logged/committed); tested against **testnet** first.
+- [ ] Faucet `AccountId`s for every pair confirmed with the operator.
+- [ ] Quote orientation verified with **one real testnet fill** — the right asset landed in
+      your account.
+- [ ] `price` fn returns **base-unit** amounts, non-zero, and is cheap/non-blocking.
+- [ ] You handle **every** `LpEvent` arm (esp. `Handover`, `Reconnecting`, `Disconnected`).
+- [ ] Consume path is **idempotent**: dedupe by `note.id()`, never double-submit, drop on
+      "already nullified".
+- [ ] Handover-received vs consumed metric wired up (de-listing guard).
+- [ ] Alerts on `Disconnected` and on a growing received-vs-consumed gap.
+- [ ] Refresh cadence ≈ ½ the operator's quote TTL.
+- [ ] Chaos-tested a mid-run network drop (auto-reconnect confirmed).
 
 ---
 
 See also: [external-liquidity-routing.md](external-liquidity-routing.md) (solver-side
-architecture, export math, config, runbook) and the crate rustdoc.
+architecture, export math, config, runbook) and the crate rustdoc
+(`cargo doc -p pswap-lp-sdk --open`).

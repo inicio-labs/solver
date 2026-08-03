@@ -46,9 +46,13 @@ the one in-memory order book:
    `mpsc` handovers out via `try_send`).
 7. **Allow-list auth** via `SOLVER_ROUTER_TOKENS` (env), constant-time check at the
    websocket upgrade.
-8. **`fill_price` carried, forward-compatible.** The handover echoes the DEX's quoted
-   price so a future overfill protocol can bind to it; today the chain still settles at
-   the note's rate (see ADR [0002](0002-filler-sdk.md) and the as-built doc).
+8. **Handover carries only the note + fill amount.** The DEX receives the serialized
+   note (which binds its own rate on-chain) and the requested-token `fill_amount` —
+   nothing else is needed to self-consume. An earlier draft also echoed the DEX's
+   quoted `fill_price` for a future overfill protocol, but the note already binds the
+   rate and no overfill protocol exists yet, so it was dropped as dead wire weight (to
+   be re-derived from the quote if/when overfill lands). See ADR
+   [0002](0002-filler-sdk.md) and the as-built doc.
 
 ## Reasoning / alternatives considered
 
@@ -90,4 +94,5 @@ the one in-memory order book:
   100% function coverage, with a property test asserting `active_order_count()`
   invariance across park→unpark and park→consume.
 - **Deferred:** mock-mirror-as-DEX on-chain e2e; event-driven Ask-on-pair-update;
-  multi-DEX residual split; the overfill protocol that makes `fill_price` binding.
+  multi-DEX residual split; an overfill protocol (let a DEX fill beyond the note's
+  own rate, re-introducing an explicit fill price on the handover).

@@ -12,7 +12,7 @@ consume-script = { path = "../consume-script" }
 # Shared RFQ wire protocol with external fillers. Depend on it for the protocol
 # types only (default features ⇒ no extra miden deps); the SDK is the crate
 # external DEXes import. One definition of the protocol, so the two can't drift.
-pswap-filler-sdk = { path = "../filler-sdk" }
+pswap-lp-sdk = { path = "../lp-sdk" }
 miden-client = { workspace = true }
 miden-protocol.workspace = true
 miden-standards.workspace = true

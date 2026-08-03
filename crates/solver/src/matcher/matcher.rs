@@ -10,9 +10,7 @@ use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::matching::types::DexId;
 use crate::price::{PriceSnapshot, WatchPriceFeed};
-use crate::router::{
-    format_price, select_notes, Handover, HandoverPick, NoteView, Pair, QuotesSnapshot,
-};
+use crate::router::{select_notes, Handover, HandoverPick, NoteView, Pair, QuotesSnapshot};
 use crate::types::*;
 
 /// Hooks that enable the external-liquidity pass inside the matcher tick. When
@@ -334,7 +332,6 @@ fn route_external<F: crate::matching::price_feed::PriceFeed>(
                 note_id: pick.note_id,
                 fill: pick.fill,
                 note_bytes: bytes.clone(),
-                fill_price: format_price(pick.price_num, pick.price_den),
             });
         }
     }
@@ -383,8 +380,10 @@ mod tests {
         Quote {
             dex,
             pair: (imiden(), iusdt()),
-            price_num: 2,
-            price_den: 1,
+            // Base-unit rate (note orientation) at the oracle mid: IMIDEN $2 / 8dec
+            // vs IUSDT $1 / 6dec ⇒ 1e8 imiden-base ↔ 2e6 iusdt-base = 1/50.
+            price_num: 1,
+            price_den: 50,
             quantity: qty,
             expires_at,
         }
@@ -435,8 +434,6 @@ mod tests {
         assert_eq!(items[0].note_id, id);
         assert_eq!(items[0].fill, 2_000_000);
         assert_eq!(items[0].note_bytes, vec![0xAA, 0xBB, 0xCC]);
-        // The handover carries the DEX's quoted price as the fill price ("2" = 2/1).
-        assert_eq!(items[0].fill_price, "2");
         // Orderbook change: the note is parked, invisible to internal matching.
         assert!(book.is_parked(id));
         assert_eq!(book.active_order_count(), 0);
@@ -598,18 +595,23 @@ mod tests {
     }
 
     /// FULL LOOP through the public SDK and the real router thread: a DEX
-    /// (`FillerClient`) connects, subscribes, and posts an **RFQ quote**; an
+    /// (`LpClient`) connects and posts a filler-centric **RFQ quote**; an
     /// unmatched **order** sits in the matcher; the real `run_matcher` external
     /// pass selects it, and the **handover travels all the way back to the SDK**
-    /// as a `FillerEvent::Handover`. This is the end-to-end the hand-injected
-    /// `integration_filler_sdk` test does NOT cover: SDK quote → router →
-    /// matcher select → router → SDK handover, nothing mocked in between.
+    /// as an `LpEvent::Handover` carrying the decoded `Note`. This is the
+    /// end-to-end the hand-injected `integration_lp_sdk` test does NOT cover:
+    /// SDK quote → router → matcher select → router → SDK handover, nothing
+    /// mocked in between. Feeds a **real serialized note** (the SDK decodes it on
+    /// the way back — fake bytes would be dropped at `Note::read_from_bytes`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sdk_quote_and_order_route_through_real_matcher_back_to_sdk() {
         use crate::db::{init_db, register_token, set_token_metadata};
         use crate::router::{spawn_router_thread, RouterConfig};
+        use miden_protocol::asset::FungibleAsset;
         use miden_protocol::crypto::utils::Serializable;
-        use pswap_filler_sdk::{FillerClient, FillerEvent, PairSpec};
+        use miden_protocol::note::Note;
+        use miden_protocol::Word;
+        use pswap_lp_sdk::{Handover, LpClient, LpEvent};
 
         // DB with both tokens priced + decimalled (export gates need both).
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -653,9 +655,13 @@ mod tests {
             spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
         ready.await.unwrap().expect("router bound");
 
+        // A REAL serialized note; its id is the OrderId (as ingest computes it).
+        let note = Note::mock_noop(Word::from([0x00C0_FFEEu32, 1, 2, 3]));
+        let note_bytes = note.to_bytes();
+        let id = note.id();
+
         // An unmatched order: offer 1.1 IMIDEN ($2.20) for 2 IUSDT ($2.00) — +10%
-        // generous, so it clears a price-2 quote at 100 bps edge.
-        let id = nid(4242);
+        // generous, so it clears a mid quote at 100 bps edge / 200 bps dev.
         order_tx
             .send(IngestOrder {
                 note_id: id,
@@ -663,7 +669,7 @@ mod tests {
                 requested_token: iusdt(),
                 offered_amount: 110_000_000,
                 requested_amount: 2_000_000,
-                raw_note_data: vec![0xC0, 0xFF, 0xEE],
+                raw_note_data: note_bytes.clone(),
             })
             .await
             .unwrap();
@@ -676,7 +682,6 @@ mod tests {
             max_dev_bps: 200,
         };
         let url = format!("ws://127.0.0.1:{port}/v1/rfq");
-        let pair = PairSpec { offered: imiden().to_hex(), requested: iusdt().to_hex() };
 
         // Matcher is current-thread + LocalSet in production — mirror that.
         let local = tokio::task::LocalSet::new();
@@ -694,11 +699,18 @@ mod tests {
                     cancel.clone(),
                 ));
 
-                // The DEX connects via the SDK and posts an RFQ quote.
-                let mut client = FillerClient::connect(&url, "dex-tok").await.expect("connect");
-                assert_eq!(client.next_event().await, Some(FillerEvent::AuthOk));
-                client.subscribe(vec![pair.clone()]).unwrap();
-                client.quote(&pair, "2", 1_000_000_000, None).unwrap();
+                // The DEX connects and posts a filler-centric quote: it GIVES iusdt
+                // and WANTS imiden (to fill a note that offers imiden / wants iusdt),
+                // priced at the oracle mid (2e6 iusdt : 1e8 imiden).
+                let mut client = LpClient::connect(&url, "dex-tok").await.expect("connect");
+                assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
+                client
+                    .quote(
+                        FungibleAsset::new(iusdt(), 2_000_000_000).unwrap(),
+                        FungibleAsset::new(imiden(), 100_000_000_000).unwrap(),
+                        None,
+                    )
+                    .unwrap();
 
                 // The matcher selects the order; the handover returns to the SDK.
                 let handover = loop {
@@ -707,15 +719,14 @@ mod tests {
                         .expect("handover within timeout")
                         .expect("event present");
                     match ev {
-                        FillerEvent::Handover(h) => break h,
-                        FillerEvent::Disconnected => panic!("disconnected before handover"),
-                        _ => continue, // ignore any Ask/Error noise
+                        LpEvent::Handover(h) => break h,
+                        LpEvent::Disconnected { reason } => panic!("disconnected: {reason}"),
+                        _ => continue, // ignore any Ask/Error/reconnect noise
                     }
                 };
-                assert_eq!(handover.note_id, id.to_string(), "the order we fed");
-                assert_eq!(handover.fill_amount, 2_000_000, "full requested amount");
-                assert_eq!(handover.fill_price, "2", "the DEX's quoted price, echoed");
-                assert_eq!(handover.note_hex, "c0ffee", "exact serialized note bytes");
+                let Handover { note: got, fill_amount } = handover;
+                assert_eq!(fill_amount, 2_000_000, "full requested amount");
+                assert_eq!(got.id(), id, "the exact note we fed, decoded round-trip");
 
                 drop(client); // let the router's graceful shutdown complete
                 cancel.cancel();

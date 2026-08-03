@@ -5,14 +5,14 @@
 //! - shared channel payloads ([`QuotesSnapshot`], [`Handover`]) below.
 //! - (server thread + matcher pass are wired in `router::server` / `matcher`).
 //!
-//! The websocket wire protocol lives in the standalone `pswap-filler-sdk` crate
-//! (`pswap_filler_sdk::protocol`) — the same definition external fillers import,
-//! so the contract can't drift between the two sides.
+//! The websocket wire protocol lives in the standalone `pswap-lp-sdk` crate
+//! (`pswap_lp_sdk::protocol`) — the same definition external LPs import, so the
+//! contract can't drift between the two sides.
 
 pub mod select;
 pub mod server;
 
-pub use select::{format_price, select_notes, Decimals, NoteView, Pair, Pick, Quote};
+pub use select::{select_notes, Decimals, NoteView, Pair, Pick, Quote};
 pub use server::{spawn_router_thread, RouterConfig};
 
 use crate::matching::types::{Amount, DexId, OrderId};
@@ -38,8 +38,4 @@ pub struct HandoverPick {
     pub fill: Amount,
     /// Serialized PSWAP note bytes for the DEX to consume on-chain.
     pub note_bytes: Vec<u8>,
-    /// The price the solver requires this note be filled at (the winning DEX
-    /// quote's price), as a decimal string — requested-per-offered, per whole
-    /// token. Echoed to the DEX in the handover.
-    pub fill_price: String,
 }

@@ -88,7 +88,7 @@ authoritative — the chain nullifier is the source of truth).
 | `crates/e2e` | standalone devnet end-to-end harness (provision/fund/load/run). See [crates/e2e/README.md](crates/e2e/README.md). |
 | `crates/mock-price` | standalone mock CoinGecko price service (devnet/local pricing). Tiny, no miden deps. |
 | `crates/mock-mirror` | devnet liquidity harness: posts favorable PSWAP counter-orders so the solver matches. See [crates/mock-mirror/README.md](crates/mock-mirror/README.md). |
-| `crates/filler-sdk` | `pswap-filler-sdk`: client SDK external DEXes ("fillers") use to receive and fill routed orders over the RFQ websocket. Standalone — no solver/miden deps by default. See [crates/filler-sdk/README.md](crates/filler-sdk/README.md). |
+| `crates/lp-sdk` | `pswap-lp-sdk`: client SDK external DEXes (liquidity providers) use to receive and fill routed orders over the RFQ websocket. Standalone — no solver or `miden-client` dependency. See [crates/lp-sdk/README.md](crates/lp-sdk/README.md). |
 
 ---
 
@@ -144,7 +144,7 @@ env var (default: `./solver.toml`).
 > **External liquidity routing** lets allow-listed DEXes fill orders the matcher can't
 > cross internally, over a websocket RFQ. Architecture + config + operator runbook:
 > [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). DEX-side
-> integration + the `pswap-filler-sdk`: [docs/filler-integration.md](docs/filler-integration.md).
+> integration + the `pswap-lp-sdk`: [docs/filler-integration.md](docs/filler-integration.md).
 
 ### Price feed — devnet without CoinGecko
 

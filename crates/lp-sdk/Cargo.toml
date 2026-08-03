@@ -19,3 +19,6 @@ miden-standards = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+# `testing` unlocks miden_protocol::note::Note::mock_noop for the handover-frame
+# byte-identity unit test (dev-only; not part of the shipped SDK surface).
+miden-protocol = { workspace = true, features = ["testing"] }

@@ -12,7 +12,8 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use miden_protocol::account::AccountId;
+use miden_protocol::asset::FungibleAsset;
+use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,8 +24,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::matching::types::{DexId, TokenId};
-use pswap_filler_sdk::protocol::{parse_decimal_price, ClientMsg, PairSpec, ServerMsg};
+use crate::matching::types::DexId;
+use pswap_lp_sdk::protocol::{handover_frame, ClientMsg, ServerMsg};
 use crate::router::{Handover, Pair, Quote, QuotesSnapshot};
 
 /// Configuration for the router websocket server.
@@ -52,8 +53,9 @@ struct RouterState {
     quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
     /// Per-DEX quotes: `dex → (pair → quote)`.
     quotes: Arc<Mutex<HashMap<DexId, HashMap<Pair, Quote>>>>,
-    /// Per-DEX outbound sender, for routing handovers to the right connection.
-    conns: Arc<Mutex<HashMap<DexId, mpsc::UnboundedSender<ServerMsg>>>>,
+    /// Per-DEX outbound sender of pre-serialized wire frames, for routing
+    /// handovers (and auth/error replies) to the right connection.
+    conns: Arc<Mutex<HashMap<DexId, mpsc::UnboundedSender<Vec<u8>>>>>,
     next_dex: Arc<AtomicUsize>,
     conn_count: Arc<AtomicUsize>,
 }
@@ -89,79 +91,76 @@ impl RouterState {
         let _ = self.quotes_tx.send(Arc::new(snap));
     }
 
-    /// Handle one decoded client message for `dex`. Returns an optional error to
-    /// send back to that connection.
-    fn handle_client_msg(&self, dex: DexId, text: &str) -> Option<ServerMsg> {
-        let msg: ClientMsg = match serde_json::from_str(text) {
+    /// Handle one decoded (binary) client message for `dex`. Returns an optional
+    /// error to send back to that connection.
+    fn handle_client_msg(&self, dex: DexId, bytes: &[u8]) -> Option<ServerMsg> {
+        let msg = match ClientMsg::read_from_bytes(bytes) {
             Ok(m) => m,
             Err(e) => {
                 return Some(ServerMsg::Error {
                     code: "bad_message".into(),
-                    msg: format!("invalid message: {e}"),
+                    msg: format!("undecodable message: {e}"),
                 })
             }
         };
         match msg {
-            ClientMsg::Subscribe { .. } => None, // accepted; quotes gate per pair
-            ClientMsg::Quote { pair, price, quantity, valid_for_ms } => {
-                let parsed_pair = match parse_pair(&pair) {
-                    Some(p) => p,
-                    None => {
-                        return Some(ServerMsg::Error {
-                            code: "bad_pair".into(),
-                            msg: "invalid pair account id".into(),
-                        })
-                    }
-                };
-                let (num, den) = match parse_decimal_price(&price) {
-                    Some(r) => r,
-                    None => {
-                        return Some(ServerMsg::Error {
-                            code: "bad_price".into(),
-                            msg: format!("invalid price: {price}"),
-                        })
-                    }
-                };
-                if quantity == 0 {
-                    return Some(ServerMsg::Error {
-                        code: "bad_quantity".into(),
-                        msg: "quantity must be > 0".into(),
-                    });
-                }
-                let ttl = valid_for_ms
-                    .map(|v| v.min(self.cfg.quote_ttl_ms))
-                    .unwrap_or(self.cfg.quote_ttl_ms);
-                let quote = Quote {
-                    dex,
-                    pair: parsed_pair,
-                    price_num: num,
-                    price_den: den,
-                    quantity,
-                    expires_at: now_millis().saturating_add(ttl),
-                };
-                self.quotes
-                    .lock()
-                    .unwrap()
-                    .entry(dex)
-                    .or_default()
-                    .insert(parsed_pair, quote);
-                self.republish();
-                None
+            // A quote is filler-centric: the DEX gives `offered` and wants
+            // `requested`. Our internal `Quote` is note-centric (a note it fills
+            // offers what the DEX wants), so we FLIP the pair and take the two
+            // base-unit amounts as the rate. Decimals never enter here — the
+            // willingness gate is a base-unit cross (see `select::export_surplus`).
+            ClientMsg::Quote { offered, requested, valid_for_ms } => {
+                self.register_quote(dex, offered, requested, valid_for_ms)
             }
         }
     }
 
-    /// Deliver a matcher handover batch to the appropriate DEX connections.
+    /// Build + store the note-centric internal quote from a filler-centric SDK
+    /// quote. Returns an error `ServerMsg` if the amounts are invalid.
+    fn register_quote(
+        &self,
+        dex: DexId,
+        offered: FungibleAsset,
+        requested: FungibleAsset,
+        valid_for_ms: Option<u64>,
+    ) -> Option<ServerMsg> {
+        let give = u64::from(offered.amount()); // base units the DEX gives
+        let want = u64::from(requested.amount()); // base units the DEX wants
+        if give == 0 || want == 0 {
+            return Some(ServerMsg::Error {
+                code: "bad_quote".into(),
+                msg: "quote amounts must be > 0".into(),
+            });
+        }
+        // Flip to note orientation: a note this DEX fills OFFERS what the DEX wants
+        // and REQUESTS what it gives.
+        let pair: Pair = (requested.faucet_id(), offered.faucet_id());
+        let ttl = valid_for_ms
+            .map(|v| v.min(self.cfg.quote_ttl_ms))
+            .unwrap_or(self.cfg.quote_ttl_ms);
+        let quote = Quote {
+            dex,
+            pair,
+            // base-unit rate = requested-per-offered (note orientation) = give/want.
+            price_num: give as u128,
+            price_den: want as u128,
+            // max requested-token (what the DEX pays) it will take = what it gives.
+            quantity: give,
+            expires_at: now_millis().saturating_add(ttl),
+        };
+        self.quotes.lock().unwrap().entry(dex).or_default().insert(pair, quote);
+        self.republish();
+        None
+    }
+
+    /// Deliver a matcher handover batch to the appropriate DEX connections. The
+    /// note travels as opaque bytes end to end; we assemble the `Handover` wire
+    /// frame straight from them (no decode/re-encode) — see `handover_frame`.
     fn deliver(&self, handover: Handover) {
         let conns = self.conns.lock().unwrap();
         for item in handover.items {
             let Some(tx) = conns.get(&item.dex) else { continue };
-            let _ = tx.send(ServerMsg::Handover {
-                note_id: format!("{}", item.note_id),
-                fill_amount: item.fill,
-                note_hex: hex::encode(&item.note_bytes),
-                fill_price: item.fill_price.clone(),
-            });
+            let _ = tx.send(handover_frame(&item.note_bytes, item.fill));
         }
     }
 
@@ -171,12 +170,6 @@ impl RouterState {
         self.conn_count.fetch_sub(1, Ordering::Relaxed);
         self.republish(); // drop this DEX's quotes immediately
     }
-}
-
-fn parse_pair(spec: &PairSpec) -> Option<Pair> {
-    let offered: TokenId = AccountId::from_hex(&spec.offered).ok()?;
-    let requested: TokenId = AccountId::from_hex(&spec.requested).ok()?;
-    Some((offered, requested))
 }
 
 fn bearer_from(headers: &HeaderMap) -> Option<String> {
@@ -217,32 +210,31 @@ async fn handle_conn(state: RouterState, socket: WebSocket) {
     let dex = state.next_dex.fetch_add(1, Ordering::Relaxed) as DexId;
     state.conn_count.fetch_add(1, Ordering::Relaxed);
 
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     state.conns.lock().unwrap().insert(dex, outbound_tx.clone());
-    let _ = outbound_tx.send(ServerMsg::AuthOk);
+    let _ = outbound_tx.send(ServerMsg::AuthOk.to_bytes());
 
     let (mut sink, mut stream) = socket.split();
 
-    // Writer task: drain outbound queue → socket.
+    // Writer task: drain outbound queue → socket (pre-serialized binary frames).
     let writer = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            let txt = serde_json::to_string(&msg).unwrap_or_default();
-            if sink.send(Message::Text(txt.into())).await.is_err() {
+        while let Some(frame) = outbound_rx.recv().await {
+            if sink.send(Message::Binary(frame.into())).await.is_err() {
                 break;
             }
         }
     });
 
-    // Reader loop: decode client messages, reply with any error.
+    // Reader loop: decode client binary frames, reply with any error.
     while let Some(item) = stream.next().await {
         match item {
-            Ok(Message::Text(t)) => {
-                if let Some(err) = state.handle_client_msg(dex, t.as_str()) {
-                    let _ = outbound_tx.send(err);
+            Ok(Message::Binary(b)) => {
+                if let Some(err) = state.handle_client_msg(dex, &b) {
+                    let _ = outbound_tx.send(err.to_bytes());
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => {} // ignore binary / ping / pong
+            Ok(_) => {} // ignore text / ping / pong
         }
     }
 
@@ -320,11 +312,13 @@ pub fn spawn_router_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matching::types::TokenId;
     use crate::router::HandoverPick;
     use miden_protocol::note::NoteId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
     };
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     fn tok_a() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
@@ -346,14 +340,38 @@ mod tests {
         (RouterState::new(cfg, tx), rx)
     }
 
-    fn quote_json(pair: (&str, &str), price: &str, quantity: u64) -> String {
-        serde_json::json!({
-            "type": "quote",
-            "pair": { "offered": pair.0, "requested": pair.1 },
-            "price": price,
-            "quantity": quantity,
-        })
-        .to_string()
+    /// Encode a filler-centric `Quote` to wire bytes: the DEX offers `offered.1`
+    /// base units of `offered.0` and wants `requested.1` of `requested.0`.
+    fn quote_bytes(
+        offered: (TokenId, u64),
+        requested: (TokenId, u64),
+        valid_for_ms: Option<u64>,
+    ) -> Vec<u8> {
+        ClientMsg::Quote {
+            offered: FungibleAsset::new(offered.0, offered.1).unwrap(),
+            requested: FungibleAsset::new(requested.0, requested.1).unwrap(),
+            valid_for_ms,
+        }
+        .to_bytes()
+    }
+
+    /// Assert a received server frame is a binary `AuthOk`.
+    fn expect_auth_ok(msg: WsMessage) {
+        match msg {
+            WsMessage::Binary(b) => assert!(
+                matches!(ServerMsg::read_from_bytes(&b), Ok(ServerMsg::AuthOk)),
+                "expected AuthOk, decoded something else"
+            ),
+            other => panic!("expected binary AuthOk frame, got {other:?}"),
+        }
+    }
+
+    /// Extract the raw bytes of a received binary frame (panics otherwise).
+    fn frame_of(msg: WsMessage) -> Vec<u8> {
+        match msg {
+            WsMessage::Binary(b) => b.to_vec(),
+            other => panic!("expected binary frame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -367,98 +385,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_pair_valid_and_invalid() {
-        let spec = PairSpec { offered: tok_a().to_hex(), requested: tok_b().to_hex() };
-        assert_eq!(parse_pair(&spec), Some((tok_a(), tok_b())));
-        let bad = PairSpec { offered: "not-hex".into(), requested: tok_b().to_hex() };
-        assert!(parse_pair(&bad).is_none());
-    }
-
-    #[test]
-    fn quote_message_publishes_snapshot() {
+    fn quote_publishes_flipped_base_unit_snapshot() {
         let (s, mut rx) = make_state(vec!["t".into()]);
-        let json = quote_json((&tok_a().to_hex(), &tok_b().to_hex()), "2.5", 1_000_000);
-        assert!(s.handle_client_msg(42, &json).is_none(), "valid quote accepted");
+        // Filler-centric: DEX offers 2_500 of tok_a, wants 1_000 of tok_b.
+        let bytes = quote_bytes((tok_a(), 2_500), (tok_b(), 1_000), None);
+        assert!(s.handle_client_msg(42, &bytes).is_none(), "valid quote accepted");
 
         assert!(rx.has_changed().unwrap());
         let snap = rx.borrow_and_update().clone();
         assert_eq!(snap.len(), 1);
         let q = &snap[0];
         assert_eq!(q.dex, 42);
-        assert_eq!(q.pair, (tok_a(), tok_b()));
-        assert_eq!((q.price_num, q.price_den), (25, 10)); // "2.5"
-        assert_eq!(q.quantity, 1_000_000);
+        // Stored note-centric: the pair FLIPS (a note it fills offers what the DEX
+        // wants, requests what it gives).
+        assert_eq!(q.pair, (tok_b(), tok_a()));
+        // Base-unit rate = give/want = 2500/1000 (no decimals scaling here).
+        assert_eq!((q.price_num, q.price_den), (2_500, 1_000));
+        // Max requested-token it will take (what it pays out) = what it gives.
+        assert_eq!(q.quantity, 2_500);
         assert!(q.expires_at > 0);
     }
 
     #[test]
     fn bad_quotes_return_structured_errors() {
         let (s, _rx) = make_state(vec!["t".into()]);
-        let pa = tok_a().to_hex();
-        let pb = tok_b().to_hex();
+        // Zero offered amount → structured error (never panic).
         assert!(matches!(
-            s.handle_client_msg(1, &quote_json((&pa, &pb), "abc", 1)),
+            s.handle_client_msg(1, &quote_bytes((tok_a(), 0), (tok_b(), 5), None)),
             Some(ServerMsg::Error { .. })
         ));
+        // Zero requested amount → structured error.
         assert!(matches!(
-            s.handle_client_msg(1, &quote_json((&pa, &pb), "2", 0)),
+            s.handle_client_msg(1, &quote_bytes((tok_a(), 5), (tok_b(), 0), None)),
             Some(ServerMsg::Error { .. })
         ));
+        // Undecodable bytes → structured error.
         assert!(matches!(
-            s.handle_client_msg(1, &quote_json(("xx", "yy"), "2", 1)),
+            s.handle_client_msg(1, &[0xFF, 0x00, 0x13]),
             Some(ServerMsg::Error { .. })
         ));
-        assert!(matches!(
-            s.handle_client_msg(1, "not json"),
-            Some(ServerMsg::Error { .. })
-        ));
-    }
-
-    #[test]
-    fn subscribe_is_accepted() {
-        let (s, _rx) = make_state(vec!["t".into()]);
-        let json = serde_json::json!({
-            "type": "subscribe",
-            "pairs": [{ "offered": tok_a().to_hex(), "requested": tok_b().to_hex() }],
-        })
-        .to_string();
-        assert!(s.handle_client_msg(1, &json).is_none());
     }
 
     #[test]
     fn deliver_routes_handover_to_the_right_connection() {
         let (s, _rx) = make_state(vec!["t".into()]);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         s.conns.lock().unwrap().insert(7, out_tx);
         let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 99)).unwrap();
 
         s.deliver(Handover {
-            items: vec![HandoverPick {
-                dex: 7,
-                note_id,
-                fill: 500,
-                note_bytes: vec![0xDE, 0xAD],
-                fill_price: "2.5".into(),
-            }],
+            items: vec![HandoverPick { dex: 7, note_id, fill: 500, note_bytes: vec![0xDE, 0xAD] }],
         });
-        match out_rx.try_recv().unwrap() {
-            ServerMsg::Handover { note_id: nid, fill_amount, note_hex, fill_price } => {
-                assert_eq!(fill_amount, 500);
-                assert_eq!(note_hex, "dead");
-                assert_eq!(nid, format!("{note_id}"));
-                assert_eq!(fill_price, "2.5");
-            }
-            other => panic!("expected handover, got {other:?}"),
-        }
+        // The router emits the raw Handover wire frame straight from the opaque
+        // note bytes — byte-for-byte `handover_frame(note_bytes, fill)`.
+        assert_eq!(out_rx.try_recv().unwrap(), handover_frame(&[0xDE, 0xAD], 500));
+
         // A handover for an unknown DEX is silently dropped (no panic).
         s.deliver(Handover {
-            items: vec![HandoverPick {
-                dex: 999,
-                note_id,
-                fill: 1,
-                note_bytes: vec![],
-                fill_price: "1".into(),
-            }],
+            items: vec![HandoverPick { dex: 999, note_id, fill: 1, note_bytes: vec![] }],
         });
         assert!(out_rx.try_recv().is_err());
     }
@@ -467,7 +451,7 @@ mod tests {
     fn deregister_drops_that_dexs_quotes() {
         let (s, mut rx) = make_state(vec!["t".into()]);
         s.conn_count.fetch_add(1, Ordering::Relaxed);
-        s.handle_client_msg(5, &quote_json((&tok_a().to_hex(), &tok_b().to_hex()), "2", 10));
+        s.handle_client_msg(5, &quote_bytes((tok_a(), 20), (tok_b(), 10), None));
         let _ = rx.borrow_and_update();
         s.deregister(5);
         assert!(rx.borrow_and_update().is_empty(), "deregistered DEX's quotes are purged");
@@ -476,15 +460,8 @@ mod tests {
     #[test]
     fn dex_declared_ttl_is_capped_at_server_ttl() {
         let (s, mut rx) = make_state(vec!["t".into()]);
-        let json = serde_json::json!({
-            "type": "quote",
-            "pair": { "offered": tok_a().to_hex(), "requested": tok_b().to_hex() },
-            "price": "2",
-            "quantity": 10,
-            "valid_for_ms": 999_999_999u64,
-        })
-        .to_string();
-        s.handle_client_msg(3, &json);
+        let bytes = quote_bytes((tok_a(), 20), (tok_b(), 10), Some(999_999_999));
+        s.handle_client_msg(3, &bytes);
         let snap = rx.borrow_and_update().clone();
         // expires_at ≤ now + server quote_ttl_ms (20s), not the DEX's huge value.
         assert!(snap[0].expires_at <= now_millis() + 20_000);
@@ -496,7 +473,6 @@ mod tests {
     async fn ws_end_to_end_auth_quote_handover() {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(Vec::new()));
         let cfg = RouterConfig {
@@ -541,12 +517,11 @@ mod tests {
             tokio_tungstenite::connect_async(format!("ws://{addr}/v1/rfq?token=secret"))
                 .await
                 .expect("authed connect");
-        let first = ws.next().await.unwrap().unwrap();
-        assert!(first.to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws.next().await.unwrap().unwrap());
 
-        // Post a quote → it reaches the matcher's quotes_rx.
-        let quote = quote_json((&tok_a().to_hex(), &tok_b().to_hex()), "2", 1_000);
-        ws.send(WsMessage::Text(quote.into())).await.unwrap();
+        // Post a (filler-centric) quote → it reaches the matcher's quotes_rx.
+        let quote = quote_bytes((tok_a(), 2_000), (tok_b(), 1_000), None);
+        ws.send(WsMessage::Binary(quote.into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), quotes_rx.changed())
             .await
             .expect("quote propagated")
@@ -555,17 +530,11 @@ mod tests {
         assert_eq!(snap.len(), 1);
         let dex = snap[0].dex;
 
-        // Deliver a handover for that DEX → the client receives it.
+        // Deliver a handover for that DEX → the client receives the exact frame.
         let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 5)).unwrap();
         handover_tx
             .send(Handover {
-                items: vec![HandoverPick {
-                    dex,
-                    note_id,
-                    fill: 7,
-                    note_bytes: vec![0xAB],
-                    fill_price: "2".into(),
-                }],
+                items: vec![HandoverPick { dex, note_id, fill: 7, note_bytes: vec![0xAB] }],
             })
             .await
             .unwrap();
@@ -574,9 +543,7 @@ mod tests {
             .expect("handover delivered")
             .unwrap()
             .unwrap();
-        let txt = msg.to_text().unwrap();
-        assert!(txt.contains("handover"), "got: {txt}");
-        assert!(txt.contains("\"note_hex\":\"ab\""), "got: {txt}");
+        assert_eq!(frame_of(msg), handover_frame(&[0xAB], 7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -631,8 +598,7 @@ mod tests {
             tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/rfq?token=s"))
                 .await
                 .expect("connect to thread-served router");
-        let first = ws.next().await.unwrap().unwrap();
-        assert!(first.to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws.next().await.unwrap().unwrap());
 
         drop(ws);
         drop(handover_tx);
@@ -672,8 +638,7 @@ mod tests {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .expect("header-authed connect");
-        let first = ws.next().await.unwrap().unwrap();
-        assert!(first.to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws.next().await.unwrap().unwrap());
 
         // Wrong bearer header → rejected at the upgrade.
         let mut bad = format!("ws://{addr}/v1/rfq").into_client_request().unwrap();
@@ -691,7 +656,6 @@ mod tests {
     async fn ws_two_dexes_routed_independently() {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(Vec::new()));
         let cfg = RouterConfig {
@@ -720,18 +684,19 @@ mod tests {
 
         let url = format!("ws://{addr}/v1/rfq?token=s");
         let (mut ws_a, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
-        assert!(ws_a.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws_a.next().await.unwrap().unwrap());
         let (mut ws_b, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        assert!(ws_b.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws_b.next().await.unwrap().unwrap());
 
-        // A quotes pair (a,b); B quotes the opposite orientation (b,a).
-        ws_a.send(WsMessage::Text(
-            quote_json((&tok_a().to_hex(), &tok_b().to_hex()), "2", 1_000).into(),
+        // Filler-centric quotes: A offers a / wants b → stored pair FLIPS to (b,a);
+        // B offers b / wants a → stored pair (a,b).
+        ws_a.send(WsMessage::Binary(
+            quote_bytes((tok_a(), 2_000), (tok_b(), 1_000), None).into(),
         ))
         .await
         .unwrap();
-        ws_b.send(WsMessage::Text(
-            quote_json((&tok_b().to_hex(), &tok_a().to_hex()), "2", 1_000).into(),
+        ws_b.send(WsMessage::Binary(
+            quote_bytes((tok_b(), 2_000), (tok_a(), 1_000), None).into(),
         ))
         .await
         .unwrap();
@@ -746,19 +711,20 @@ mod tests {
             snap = quotes_rx.borrow_and_update().clone();
         }
         assert_eq!(snap.len(), 2, "both DEXes' quotes coexist");
-        let dex_ab = snap.iter().find(|q| q.pair == (tok_a(), tok_b())).unwrap().dex;
-        let dex_ba = snap.iter().find(|q| q.pair == (tok_b(), tok_a())).unwrap().dex;
-        assert_ne!(dex_ab, dex_ba, "distinct DEX ids");
+        // A's quote flipped to (b,a); B's to (a,b).
+        let dex_a = snap.iter().find(|q| q.pair == (tok_b(), tok_a())).unwrap().dex;
+        let dex_b = snap.iter().find(|q| q.pair == (tok_a(), tok_b())).unwrap().dex;
+        assert_ne!(dex_a, dex_b, "distinct DEX ids");
 
-        // Handover to each DEX → each client receives only its own.
+        // Handover to each DEX → each client receives only its own exact frame.
         let n1 = NoteId::try_from_hex(&format!("0x{:064x}", 1)).unwrap();
         let n2 = NoteId::try_from_hex(&format!("0x{:064x}", 2)).unwrap();
         handover_tx
-            .send(Handover { items: vec![HandoverPick { dex: dex_ab, note_id: n1, fill: 1, note_bytes: vec![0x01], fill_price: "2".into() }] })
+            .send(Handover { items: vec![HandoverPick { dex: dex_a, note_id: n1, fill: 1, note_bytes: vec![0x01] }] })
             .await
             .unwrap();
         handover_tx
-            .send(Handover { items: vec![HandoverPick { dex: dex_ba, note_id: n2, fill: 2, note_bytes: vec![0x02], fill_price: "2".into() }] })
+            .send(Handover { items: vec![HandoverPick { dex: dex_b, note_id: n2, fill: 2, note_bytes: vec![0x02] }] })
             .await
             .unwrap();
 
@@ -772,9 +738,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        // ws_a quoted (a,b) so it is dex_ab → it must receive note 01; ws_b → 02.
-        assert!(ma.to_text().unwrap().contains("\"note_hex\":\"01\""), "DEX A got its note");
-        assert!(mb.to_text().unwrap().contains("\"note_hex\":\"02\""), "DEX B got its note");
+        // ws_a is dex_a → note 01; ws_b is dex_b → note 02.
+        assert_eq!(frame_of(ma), handover_frame(&[0x01], 1), "DEX A got its note");
+        assert_eq!(frame_of(mb), handover_frame(&[0x02], 2), "DEX B got its note");
     }
 
     /// DoS guard: a message larger than `max_msg_bytes` closes *that* connection
@@ -784,7 +750,6 @@ mod tests {
     async fn ws_oversized_message_closes_only_that_connection() {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         let (quotes_tx, _rx) = watch::channel(Arc::new(Vec::new()));
         let cfg = RouterConfig {
@@ -804,10 +769,10 @@ mod tests {
 
         let url = format!("ws://{addr}/v1/rfq?token=t");
         let (mut ws, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
-        assert!(ws.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws.next().await.unwrap().unwrap());
 
         // A message far larger than the 128-byte cap.
-        let _ = ws.send(WsMessage::Text("x".repeat(8192).into())).await;
+        let _ = ws.send(WsMessage::Binary(vec![0u8; 8192].into())).await;
 
         // The server rejects the oversized frame and drops the connection: the
         // client's stream ends (Close / Err / None) instead of hanging.
@@ -822,6 +787,6 @@ mod tests {
 
         // The router itself is unharmed: a fresh client still connects + authenticates.
         let (mut ws2, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-        assert!(ws2.next().await.unwrap().unwrap().to_text().unwrap().contains("auth_ok"));
+        expect_auth_ok(ws2.next().await.unwrap().unwrap());
     }
 }

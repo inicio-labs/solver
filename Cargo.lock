@@ -4679,7 +4679,7 @@ dependencies = [
  "miden-standards",
  "miden-testing",
  "proptest",
- "pswap-filler-sdk",
+ "pswap-lp-sdk",
  "rand 0.9.4",
  "reqwest",
  "serde",

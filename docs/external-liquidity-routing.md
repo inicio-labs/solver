@@ -61,8 +61,8 @@ DB poll in this path.
 - **Order book park/unpark** (`crates/solver/src/matching/order_book.rs`) — how a note
   is taken out of internal matching while it's in flight to a DEX, without disturbing
   the matching gates (see §3).
-- **Filler SDK** (`crates/filler-sdk`, `pswap-filler-sdk`) — the client DEXes use, and
-  the home of the shared wire protocol (see §6).
+- **LP SDK** (`crates/lp-sdk`, `pswap-lp-sdk`) — the client DEXes (liquidity providers)
+  use, and the home of the shared wire protocol (see §6).
 
 ### 2.2 Two channels (matcher ↔ router)
 
@@ -198,17 +198,23 @@ export SOLVER_ROUTER_TOKENS="dex-acme-7f3c…,dex-globex-9a21…"
 
 ## 6. The RFQ protocol & SDK
 
-The wire protocol (JSON, `type`-tagged, over `/v1/rfq`) lives in
-**`crates/filler-sdk/src/protocol.rs`** — the single shared definition. The solver
-depends on `pswap-filler-sdk` for it one-way, so the two sides can't drift. (Grepping
-the solver for the protocol types finds nothing locally; they're in the SDK.)
+The wire protocol (a compact **binary** encoding — miden `Serializable`, over binary
+websocket frames on `/v1/rfq`) lives in **`crates/lp-sdk/src/protocol.rs`** — the single
+shared definition. The solver depends on `pswap-lp-sdk` for it one-way, so the two sides
+can't drift. (Grepping the solver for the protocol types finds nothing locally; they're
+in the SDK.)
 
-Messages: `subscribe{pairs}` · `quote{pair, price, quantity, valid_for_ms?}` (client→)
-and `auth_ok` · `ask{pairs}` · `handover{note_id, fill_amount, note_hex, fill_price}` ·
-`error{code, msg}` (→client). Auth is `Authorization: Bearer`
-(or `?token=` for browsers), checked constant-time at the upgrade. Price is `requested`
-per `offered`, per whole token, decimal string. Full field-by-field reference and a
-reference filler are in [filler-integration.md](filler-integration.md).
+Messages: `Quote{offered, requested, valid_for_ms?}` (client→) and `AuthOk` ·
+`Ask{pairs}` · `Handover{note, fill_amount}` · `Error{code, msg}` (→client). A quote is
+**filler-centric** and carries typed `FungibleAsset`s: `offered` is what the DEX gives,
+`requested` is what it wants — their faucet ids imply the pair and their amounts carry
+both the rate (the ratio) and the max size, so there is **no separate `subscribe` step
+and no decimal price string** (the quote is the registration). The router flips this to
+the note-centric orientation internally. Auth is `Authorization: Bearer` (or `?token=`
+for browsers), checked constant-time at the upgrade. The `Handover` carries the typed
+PSWAP `note` (which binds its own rate on-chain) plus the requested-token `fill_amount` —
+enough to self-consume. Full field-by-field reference and a reference filler are in
+[filler-integration.md](filler-integration.md).
 
 The SDK ships a `consume` feature (off by default) that decodes a handed-over note and
 reads its terms using `miden-protocol`/`miden-standards` only — never `miden-client`, so
@@ -268,10 +274,10 @@ it can't constrain a DEX's miden version.
 - **Router (real websocket):** auth reject/accept (header + `?token=`), quote→snapshot,
   off-market/bad-quote errors, handover delivery, capacity 503, two-DEX independence,
   thread bootstrap + graceful shutdown.
-- **Seamless end-to-end:** `crates/solver/tests/integration_filler_sdk.rs` drives the
-  **real router thread** through the **public SDK** (`FillerClient`): bad token rejected
-  → `AuthOk` → quote reaches the matcher → handover surfaces as a `FillerEvent` with the
-  exact bytes.
+- **Seamless end-to-end:** `crates/solver/tests/integration_lp_sdk.rs` drives the
+  **real router thread** through the **public SDK** (`LpClient`): bad token rejected
+  → `AuthOk` → quote reaches the matcher → handover surfaces as an `LpEvent::Handover`
+  carrying the decoded note + fill amount.
 
 Changed files carry ≥95% line + 100% function coverage.
 

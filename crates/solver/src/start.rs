@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client_factory::ClientFactory;
 use crate::config::SolverConfig;
 use crate::db;
+use crate::matcher::RouterHooks;
 use crate::pipeline::{self, PipelineConfig};
 use crate::price::{PriceClient, SharedSymbolMap};
 use crate::types::TokenId;
@@ -151,7 +152,7 @@ pub async fn start(
     // enabled. The matcher reads cached quotes and emits handovers; the router
     // websocket thread (spawned below) owns the other ends of these channels.
     let router_hooks = if config.engine.router_enabled {
-        Some(crate::matcher::RouterHooks {
+        Some(RouterHooks {
             quotes_rx: channels.quotes_rx.clone(),
             handover_tx: channels.handover_tx.clone(),
             inflight_ttl_ms: config.engine.router_inflight_ttl_ms,

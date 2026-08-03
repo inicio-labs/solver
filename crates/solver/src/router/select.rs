@@ -30,15 +30,21 @@ pub type Decimals = HashMap<TokenId, u8>;
 pub struct Quote {
     pub dex: DexId,
     /// The pair this quote applies to, `(offered_token, requested_token)` in the
-    /// orientation of the notes it can fill.
+    /// orientation of the notes it can fill (i.e. `offered_token` is what the DEX
+    /// *receives* on consuming the note). The router builds this by **flipping**
+    /// the DEX's filler-centric SDK quote (it gives `offered`, wants `requested`),
+    /// since a note it fills offers what the DEX wants.
     pub pair: Pair,
     /// Price as an exact rational `price_num / price_den` = requested-token per
-    /// offered-token, per WHOLE token (same per-whole-token basis as
-    /// `price_cents`). The router parses the DEX's decimal price into this
-    /// rational so the matcher never touches a float. Both > 0.
+    /// offered-token, in **base units** (NOT per whole token). Taken straight
+    /// from the SDK quote's base-unit amounts after the flip: `price_num =
+    /// sdk.offered.amount`, `price_den = sdk.requested.amount`. Because both the
+    /// note's terms and this price are base-unit, the willingness gate is a plain
+    /// cross with no decimals; decimals enter only the oracle gates. Both > 0.
     pub price_num: u128,
     pub price_den: u128,
-    /// Max requested-token quantity (base units) the DEX will take on this pair.
+    /// Max requested-token quantity (base units) the DEX will take on this pair
+    /// (= the SDK quote's `offered.amount` — the most it will give).
     pub quantity: Amount,
     /// Wall-clock unix-millis after which the quote is stale.
     pub expires_at: u64,
@@ -53,14 +59,6 @@ pub struct Pick {
     /// (whole-note handover; partial-note handover is a later refinement).
     pub fill: Amount,
     pub pair: Pair,
-    /// The price the solver requires this note be filled at — the winning DEX
-    /// quote's price (requested-per-offered, per whole token), as the exact
-    /// rational `price_num / price_den`. Carried verbatim from the quote so the
-    /// handover can tell the DEX "fill at X" independently of the note's own
-    /// on-chain rate (relevant once the overfill protocol lands; until then the
-    /// chain still settles at the note's rate and this is the agreed floor).
-    pub price_num: u128,
-    pub price_den: u128,
 }
 
 /// Minimal view of a residual note the selector needs (built from `Order`).
@@ -81,31 +79,6 @@ impl NoteView {
 
 fn pow10(n: u8) -> Option<u128> {
     10u128.checked_pow(n as u32)
-}
-
-/// Format an exact rational price `num / den` as a canonical decimal string —
-/// e.g. `(205, 100)` → `"2.05"`, `(1000, 10)` → `"100"`. `den` is always a power
-/// of ten for router-parsed quotes (see `parse_decimal_price`), so this is exact;
-/// it falls back to `"num/den"` if `den` is somehow not a power of ten, keeping
-/// the function total. This is the price the handover carries to the DEX.
-pub fn format_price(num: u128, den: u128) -> String {
-    if den == 0 {
-        return format!("{num}/0");
-    }
-    if den == 1 {
-        return num.to_string();
-    }
-    let k = den.ilog10();
-    if 10u128.pow(k) != den {
-        return format!("{num}/{den}");
-    }
-    let int = num / den;
-    let frac = num % den;
-    if frac == 0 {
-        return int.to_string();
-    }
-    let frac_str = format!("{frac:0width$}", width = k as usize);
-    format!("{int}.{}", frac_str.trim_end_matches('0'))
 }
 
 /// Scale offered/requested USD values to a shared denominator, reduced by the
@@ -167,27 +140,46 @@ fn export_surplus(
         return None;
     }
 
-    // (4) off-market guard: reject iff |num*c_req − c_off*den| * 10000 > dev * c_off * den
+    // (4) off-market guard (oracle check — this is where decimals enter): reject
+    //     if the quote's base-unit rate deviates from oracle mid by > max_dev_bps.
+    //     Oracle mid (requested-base per offered-base) = c_off·10^d_req /
+    //     (c_req·10^d_off); the quote rate is price_num/price_den. Cross-multiplied
+    //     and reduced by the common 10^m factor (m = min(d_off,d_req)):
+    //       reject iff |num·c_req·10^(d_off-m) − c_off·den·10^(d_req-m)|·10000
+    //                    > dev · c_off · den · 10^(d_req-m)
+    //     OVERFLOW: price_num/price_den are base-unit `FungibleAsset` amounts, so
+    //     each is ≤ `AssetAmount::MAX` (2^63−2^31), enforced on the wire by
+    //     `AssetAmount::read_from`. But unlike gate 3 these products ALSO carry a
+    //     `UsdCents` (u64, not amount-bounded) and a 10^(Δdecimals) factor, which
+    //     are not covered by that bound — so they CAN exceed u128 for extreme
+    //     tokens (high price × large size × wide decimal gap). `checked_mul` then
+    //     yields `None` and the `?` treats the note as not-exportable — fail-safe,
+    //     never a mis-fill or panic (see `no_panic_on_overflow_inputs`).
     let m = d_off.min(d_req);
-    let num_cr = quote.price_num.checked_mul(c_req as u128)?;
-    let coff_den = (c_off as u128).checked_mul(quote.price_den)?;
-    let dev_lhs = num_cr.abs_diff(coff_den).checked_mul(10_000)?;
+    let q_side = quote
+        .price_num
+        .checked_mul(c_req as u128)?
+        .checked_mul(pow10(d_off - m)?)?;
+    let mid_side = (c_off as u128)
+        .checked_mul(quote.price_den)?
+        .checked_mul(pow10(d_req - m)?)?;
+    let dev_lhs = q_side.abs_diff(mid_side).checked_mul(10_000)?;
     let dev_rhs = (max_dev_bps as u128)
         .checked_mul(c_off as u128)?
-        .checked_mul(quote.price_den)?;
+        .checked_mul(quote.price_den)?
+        .checked_mul(pow10(d_req - m)?)?;
     if dev_lhs > dev_rhs {
         return None;
     }
 
-    // (3) DEX-willingness: note_rate (R/O, whole) <= quote price
-    //   requested·10^(d_off-m)·price_den <= price_num·offered·10^(d_req-m)
-    let w_lhs = (note.requested as u128)
-        .checked_mul(pow10(d_off - m)?)?
-        .checked_mul(quote.price_den)?;
-    let w_rhs = quote
-        .price_num
-        .checked_mul(note.offered as u128)?
-        .checked_mul(pow10(d_req - m)?)?;
+    // (3) DEX-willingness (base-unit cross — NO decimals): the note's base-unit
+    //     rate (requested/offered) must be at or below the quote's base-unit rate.
+    //       reject iff requested·price_den > price_num·offered
+    //     All four factors are `FungibleAsset` amounts, each ≤ `AssetAmount::MAX`
+    //     (2^63−2^31), so both products are < 2^126: this cross provably CANNOT
+    //     overflow u128 — the `checked_mul` here is belt-and-suspenders only.
+    let w_lhs = (note.requested as u128).checked_mul(quote.price_den)?;
+    let w_rhs = quote.price_num.checked_mul(note.offered as u128)?;
     if w_lhs > w_rhs {
         return None;
     }
@@ -260,8 +252,6 @@ pub fn select_notes(
                 note_id: note.id,
                 fill: note.requested,
                 pair: quote.pair,
-                price_num: quote.price_num,
-                price_den: quote.price_den,
             });
         }
     }
@@ -313,12 +303,13 @@ mod tests {
         d
     }
 
-    /// A quote priced exactly at oracle mid for the IMIDEN/IUSDT pair (mid =
-    /// c_off/c_req = 200/100 = 2 IUSDT per IMIDEN). At mid: off-market deviation
-    /// is 0, and any at-or-below-mid note rate passes willingness — so this
-    /// isolates the oracle-edge gate (gate 2) in tests on that pair.
+    /// A quote priced exactly at oracle mid for the IMIDEN/IUSDT pair. Mid is 2
+    /// IUSDT per **whole** IMIDEN; in **base units** (IMIDEN 8-dec, IUSDT 6-dec)
+    /// that is `2e6 / 1e8 = 1/50` requested-base per offered-base. At mid the
+    /// off-market deviation is 0 and any at-or-below-mid note rate passes
+    /// willingness — so this isolates the oracle-edge gate (gate 2) on that pair.
     fn open_quote(dex: DexId, pair: Pair, quantity: Amount) -> Quote {
-        Quote { dex, pair, price_num: 2, price_den: 1, quantity, expires_at: u64::MAX }
+        Quote { dex, pair, price_num: 1, price_den: 50, quantity, expires_at: u64::MAX }
     }
 
     // --- the 100× decimals trap ---
@@ -422,9 +413,9 @@ mod tests {
         let pair = (imiden(), iusdt());
         // Generous note (would export under a sane quote)...
         let note = NoteView { id: nid(50), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        // ...but the quote's implied price is wildly off oracle mid. Mid (R/O) =
-        // c_off/c_req = 200/100 = 2. A quote of 100 R per O is 50× off → reject at 100bps band.
-        let q = Quote { dex: 1, pair, price_num: 100, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
+        // ...but the quote's implied rate is wildly off oracle mid. Base mid = 1/50
+        // (requested-base per offered-base); a quote of 1/1 is 50× that → reject at 100bps.
+        let q = Quote { dex: 1, pair, price_num: 1, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
         let picks = select_notes(&[note], &[q], 0, &mid, &decimals(), &HashMap::new(), &HashSet::new(), 100, 100);
         assert!(picks.is_empty(), "off-market quote must not pull notes");
     }
@@ -432,14 +423,32 @@ mod tests {
     #[test]
     fn dex_unwilling_when_quote_below_note_rate() {
         let pair = (imiden(), iusdt());
-        // Note rate (R per O, whole) = (2 IUSDT)/(1.3 IMIDEN) ≈ 1.538 R/O.
+        // Note base rate (requested/offered) = 2e6/130e6 ≈ 0.0154.
         let note = NoteView { id: nid(60), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        // DEX quotes it will pay only 1.0 R per O — below the note rate → unwilling
-        // (it would lose vs its own quote). But 1.0 vs mid 2.0 is 50% off, which a
-        // wide band must allow so we isolate the willingness gate.
-        let q = Quote { dex: 1, pair, price_num: 1, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
+        // DEX quotes only 1 IUSDT per whole IMIDEN = 1e6/1e8 = 0.01 base — below the
+        // note's rate → unwilling. (0.01 vs mid 0.02 is 50% off; the wide band lets it
+        // through so we isolate the willingness gate.)
+        let q = Quote { dex: 1, pair, price_num: 1, price_den: 100, quantity: u64::MAX, expires_at: u64::MAX };
         let s = export_surplus(&note, &q, &mid, &decimals(), 100, 100_000);
         assert_eq!(s, None, "DEX quote below the note rate → not willing");
+    }
+
+    #[test]
+    fn willingness_is_base_unit_exact_no_decimals() {
+        // Regression: gate 3 is a plain base-unit cross (requested·den ≤ num·offered)
+        // with NO decimal scaling, even under asymmetric decimals (the "100× trap":
+        // IMIDEN 8-dec vs IUSDT 6-dec). Isolate it with a generous note (clears
+        // gates 2 & 4 at a wide band) and move the quote by ONE base unit.
+        let pair = (imiden(), iusdt());
+        // Generous note: 1.5 IMIDEN ($3) offered for 2 IUSDT ($2). Its base rate
+        // (requested/offered) = 2e6 / 1.5e8.
+        let note = NoteView { id: nid(1), offered_token: imiden(), offered: 150_000_000, requested_token: iusdt(), requested: 2_000_000 };
+        // Quote exactly at the note's base rate → willing (borderline).
+        let at = Quote { dex: 1, pair, price_num: 2_000_000, price_den: 150_000_000, quantity: u64::MAX, expires_at: u64::MAX };
+        assert!(export_surplus(&note, &at, &mid, &decimals(), 0, 100_000).is_some());
+        // One base unit stingier (den +1 → rate just below the note's) → unwilling.
+        let below = Quote { dex: 1, pair, price_num: 2_000_000, price_den: 150_000_001, quantity: u64::MAX, expires_at: u64::MAX };
+        assert_eq!(export_surplus(&note, &below, &mid, &decimals(), 0, 100_000), None);
     }
 
     // --- overflow / extreme inputs ---
@@ -485,7 +494,8 @@ mod tests {
         let price = |t: TokenId| if t == o { Some(200) } else if t == r { Some(100) } else { None };
         // 1 O = $2.  2*10^18 base-units of R = 2 whole R = $2 → parity.
         let parity = NoteView { id: nid(1), offered_token: o, offered: 1, requested_token: r, requested: 2_000_000_000_000_000_000 };
-        let q = Quote { dex: 1, pair: (o, r), price_num: 2, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
+        // base mid = c_off·10^d_req/(c_req·10^d_off) = 200·10^18/100 = 2·10^18 (R-base per O-base).
+        let q = Quote { dex: 1, pair: (o, r), price_num: 2_000_000_000_000_000_000, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
         assert_eq!(
             export_surplus(&parity, &q, &price, &d, 1, 1_000_000),
             None,
@@ -576,22 +586,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn format_price_canonicalizes_and_round_trips() {
-        use pswap_filler_sdk::protocol::parse_decimal_price as parse;
-
-        // Direct cases, including trailing-zero trimming and "x.0" → "x".
-        assert_eq!(format_price(2, 1), "2");
-        assert_eq!(format_price(205, 100), "2.05");
-        assert_eq!(format_price(250, 100), "2.5");
-        assert_eq!(format_price(1000, 10), "100");
-        assert_eq!(format_price(999, 1000), "0.999");
-
-        // parse(s) → (n,d) → format → parse must preserve the exact value.
-        for s in ["2", "2.05", "0.999", "100.0", "3.50", "0.1"] {
-            let (n, d) = parse(s).unwrap();
-            let (n2, d2) = parse(&format_price(n, d)).unwrap();
-            assert_eq!(n * d2, n2 * d, "round-trip changed value for {s}");
-        }
-    }
 }

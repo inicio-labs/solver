@@ -174,27 +174,6 @@ impl<F: PriceFeed> OrderBook<F> {
         self.park_queue.push_back((now, id));
     }
 
-    /// Unpark every note parked longer than `ttl` ms as of `now` (a no-show by
-    /// the DEX it was handed to). Returns `(id, dex)` for each note returned to
-    /// matching, so the caller can restore reserves / avoid re-offering it to the
-    /// same DEX. O(number expiring) — pops only the expired prefix of the queue.
-    pub fn reactivate_parked_older_than(&mut self, ttl: u64, now: u64) -> Vec<(OrderId, DexId)> {
-        let mut reactivated = Vec::new();
-        while let Some(&(parked_at, id)) = self.park_queue.front() {
-            // Monotonic queue: once the front isn't expired, none behind it are.
-            if parked_at.saturating_add(ttl) > now {
-                break;
-            }
-            self.park_queue.pop_front();
-            // Skip tombstones (id already consumed → gone from `parked`).
-            if let Some((dex, _)) = self.parked.remove(&id) {
-                self.reindex(id);
-                reactivated.push((id, dex));
-            }
-        }
-        reactivated
-    }
-
     /// Immediately unpark a specific note — the **rollback** of a `park` whose
     /// handover was never delivered (e.g. a `try_send` into a full channel).
     /// Re-adds it to the rate index and drops it from `parked`; the now-stale
@@ -207,6 +186,28 @@ impl<F: PriceFeed> OrderBook<F> {
         let (dex, _) = self.parked.remove(&id)?;
         self.reindex(id);
         Some(dex)
+    }
+
+    /// Unpark every note parked longer than `ttl` ms as of `now` (a no-show by
+    /// the DEX it was handed to). Returns `(id, dex)` for each note returned to
+    /// matching, so the caller can restore reserves / avoid re-offering it to the
+    /// same DEX. O(number expiring) — pops only the expired prefix of the queue.
+    pub fn reactivate_parked_older_than(&mut self, ttl: u64, now: u64) -> Vec<(OrderId, DexId)> {
+        let mut reactivated = Vec::new();
+        while let Some(&(parked_at, id)) = self.park_queue.front() {
+            // Monotonic queue: once the front isn't expired, none behind it are.
+            if parked_at.saturating_add(ttl) > now {
+                break;
+            }
+            self.park_queue.pop_front();
+            // Skip tombstones (id already consumed → gone from `parked`). `unpark`
+            // does the remove-from-`parked` + reindex; we add the "don't re-offer
+            // to this DEX" signal a plain rollback lacks.
+            if let Some(dex) = self.unpark(id) {
+                reactivated.push((id, dex));
+            }
+        }
+        reactivated
     }
 
     /// Re-add a parked note's **existing** struct to the rate index — does NOT

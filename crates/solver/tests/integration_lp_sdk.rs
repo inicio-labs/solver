@@ -1,0 +1,139 @@
+//! Seamless end-to-end: the **public `pswap-lp-sdk`** driving the **real router
+//! thread** over a real websocket — the exact integration path an external DEX
+//! (liquidity provider) follows. No internal solver types on the client side
+//! beyond the shared protocol; everything goes through `LpClient`.
+//!
+//! Proves the turnkey flow end to end:
+//!   1. wrong token → `connect` fails at the upgrade;
+//!   2. right token → first event is `AuthOk`;
+//!   3. a filler-centric `quote` → the (flipped) quote reaches the matcher's
+//!      `quotes_rx`;
+//!   4. a matcher `Handover` → arrives at the SDK as `LpEvent::Handover` carrying
+//!      the decoded `Note` and the fill amount.
+//!
+//! The router-rejects-a-quote path is no longer reachable through the public SDK
+//! (it validates amounts locally, and the pair travels as typed asset ids rather
+//! than malformable hex), so `ServerMsg::Error → LpEvent::Error` surfacing is
+//! covered by the SDK's own unit test (`client.rs`) instead of here.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use miden_protocol::account::AccountId;
+use miden_protocol::asset::FungibleAsset;
+use miden_protocol::crypto::utils::Serializable;
+use miden_protocol::note::Note;
+use miden_protocol::testing::account_id::{
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+};
+use miden_protocol::Word;
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
+
+use pswap_lp_sdk::{LpClient, LpEvent};
+use solver::router::{spawn_router_thread, Handover, HandoverPick, QuotesSnapshot, RouterConfig};
+
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe); // release so the router thread can bind it
+    port
+}
+
+/// Drive the router exclusively through the SDK's `LpClient`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_lp_round_trip_against_real_router() {
+    let port = free_port();
+
+    // Matcher's ends of the two channels.
+    let (quotes_tx, mut quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
+    let (handover_tx, handover_rx) = mpsc::channel::<Handover>(8);
+    let cancel = CancellationToken::new();
+
+    let cfg = RouterConfig {
+        bind: "127.0.0.1".into(),
+        port,
+        max_connections: 8,
+        max_msg_bytes: 16384,
+        quote_ttl_ms: 20_000,
+        auth_tokens: vec!["dex-secret".into()],
+    };
+    let (thread, ready) =
+        spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+    ready.await.unwrap().expect("router bound");
+
+    let url = format!("ws://127.0.0.1:{port}/v1/rfq");
+
+    // (1) Wrong token → upgrade rejected → connect errors.
+    assert!(
+        LpClient::connect(&url, "wrong-token").await.is_err(),
+        "bad token must fail the connect"
+    );
+
+    // (2) Right token → first event is AuthOk.
+    let mut client = LpClient::connect(&url, "dex-secret")
+        .await
+        .expect("authed connect");
+    assert!(
+        matches!(client.next_event().await, Some(LpEvent::AuthOk)),
+        "first event after connect is AuthOk"
+    );
+
+    // (3) Post a filler-centric quote through the SDK: the DEX GIVES `b` and WANTS
+    // `a`, so the router flips it to the note-centric pair (a, b).
+    let a: AccountId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+    let b: AccountId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+    client
+        .quote(
+            FungibleAsset::new(b, 1_000).unwrap(), // offered = what the DEX gives
+            FungibleAsset::new(a, 500).unwrap(),   // requested = what the DEX wants
+            None,
+        )
+        .unwrap();
+
+    // The (flipped) quote reaches the matcher's quotes_rx.
+    tokio::time::timeout(Duration::from_secs(3), quotes_rx.changed())
+        .await
+        .expect("quote propagated to matcher")
+        .unwrap();
+    let snap = quotes_rx.borrow_and_update().clone();
+    assert_eq!(snap.len(), 1, "exactly one standing quote");
+    assert_eq!(snap[0].pair, (a, b), "pair flips to note orientation");
+    assert_eq!(snap[0].quantity, 1_000, "quantity = offered base units");
+    let dex = snap[0].dex;
+
+    // (4) Matcher hands a real note over for that DEX → SDK surfaces the decoded
+    // note + fill amount.
+    let note = Note::mock_noop(Word::from([0xDEAD_BEEFu32, 4, 5, 6]));
+    handover_tx
+        .send(Handover {
+            items: vec![HandoverPick {
+                dex,
+                note_id: note.id(),
+                fill: 250,
+                note_bytes: note.to_bytes(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    let ev = tokio::time::timeout(Duration::from_secs(3), client.next_event())
+        .await
+        .expect("handover delivered")
+        .expect("event present");
+    match ev {
+        LpEvent::Handover(h) => {
+            assert_eq!(h.fill_amount, 250);
+            assert_eq!(h.note.id(), note.id(), "exact note bytes, decoded round-trip");
+        }
+        other => panic!("expected Handover, got {other:?}"),
+    }
+
+    // Graceful shutdown: drop client + handover sender, cancel, join the thread.
+    drop(client);
+    drop(handover_tx);
+    cancel.cancel();
+    tokio::task::spawn_blocking(move || thread.join().unwrap())
+        .await
+        .unwrap();
+}

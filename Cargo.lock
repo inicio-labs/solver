@@ -3792,7 +3792,6 @@ dependencies = [
 name = "pswap-lp-sdk"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "futures-util",
  "miden-protocol",
  "miden-standards",

@@ -107,12 +107,12 @@ while let Some(ev) = client.next_event().await {
   -> Result<(), LpError>` — manual quote (rare; prefer `serve_quotes`).
 - `LpClient::next_event().await -> Option<LpEvent>` — event loop; `None` = SDK stopped.
 - `Handover { note: Note, fill_amount: u64 }` (in `LpEvent::Handover`).
-- `consume::consume_args(account_fill: u64, note_fill: u64) -> anyhow::Result<Word>` — pass
+- `consume::consume_args(account_fill: u64, note_fill: u64) -> Result<Word, LpError>` — pass
   `account_fill = 0` and `note_fill = h.fill_amount` for a note-side fill.
 - `consume::PswapNote::try_from(&Note)` — `.offered_asset()` (we receive), `.storage()
   .requested_asset()` (we pay), `.storage().creator_account_id()` (settles back to maker).
 - `LpError`: `AuthRejected | Transport(String) | Closed(String) | InvalidQuote(String) |
-  Protocol { code, msg }`.
+  Protocol { code, msg } | Consume(String)`.
 
 ## Testing / definition of done
 

@@ -408,9 +408,10 @@ solver:
 |---|---|
 | `AuthRejected` | Bad/rotated token (HTTP 401 at upgrade). Terminal — fix the token. |
 | `Transport(String)` | Socket/connect/read/write failure. The SDK reconnects. |
-| `Closed(String)` | You called `quote`/`send` after dropping the client. |
+| `Closed(String)` | You called `quote` after dropping the client. |
 | `InvalidQuote(String)` | Your quote was rejected locally (e.g. a zero amount) before it hit the wire. |
 | `Protocol { code, msg }` | The router rejected a message you sent. |
+| `Consume(String)` | `consume_args(...)` failed to build the on-chain note args. |
 
 **Wire protocol** (binary; the SDK encodes/decodes it — you never touch the wire): miden
 `Serializable`/`Deserializable` over WebSocket **binary** frames at `GET /v1/rfq`.

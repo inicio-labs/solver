@@ -55,7 +55,8 @@ const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const STABLE_UPTIME: Duration = Duration::from_secs(10);
 
-/// A typed error from the router link. `Clone` so it can ride on events.
+/// A typed error from the SDK — the router link, or the on-chain consume
+/// helpers. `Clone` so it can ride on events.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LpError {
     /// The router rejected the `Bearer` token at the websocket upgrade (HTTP
@@ -77,6 +78,10 @@ pub enum LpError {
     /// rejected). Non-fatal: the connection stays up.
     #[error("router error [{code}]: {msg}")]
     Protocol { code: String, msg: String },
+    /// Building the on-chain consume args for a handover failed
+    /// ([`crate::consume::consume_args`]).
+    #[error("failed to build consume args: {0}")]
+    Consume(String),
 }
 
 /// A note handed over by the solver for the LP to consume on-chain. `note` is a
@@ -152,9 +157,9 @@ pub struct LpSender {
 }
 
 impl LpSender {
-    /// Send a raw protocol message. Fails with [`LpError::Closed`] only once the
-    /// client has been dropped (the connection task is gone).
-    pub fn send(&self, msg: ClientMsg) -> Result<(), LpError> {
+    /// Internal: queue a raw protocol message. Fails with [`LpError::Closed`] only
+    /// once the client has been dropped. Public callers use [`quote`](Self::quote).
+    pub(crate) fn send(&self, msg: ClientMsg) -> Result<(), LpError> {
         self.tx
             .send(msg)
             .map_err(|_| LpError::Closed("client dropped; connection task gone".into()))

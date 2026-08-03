@@ -16,8 +16,9 @@
 //! // feed `handover.note` + `args` into your own miden-client TransactionRequestBuilder.
 //! ```
 
-use anyhow::{anyhow, Result};
 use miden_protocol::Word;
+
+use crate::client::LpError;
 
 pub use miden_standards::note::PswapNote;
 
@@ -30,9 +31,8 @@ pub use miden_standards::note::PswapNote;
 /// requested amount as `note_fill`. The returned [`Word`] is what the filler
 /// passes as the note's args in its own transaction request — the same value the
 /// solver's executor uses (`PswapNote::create_args(account_fill, note_fill)`).
-pub fn consume_args(account_fill: u64, note_fill: u64) -> Result<Word> {
-    PswapNote::create_args(account_fill, note_fill)
-        .map_err(|e| anyhow!("failed to build consume args: {e}"))
+pub fn consume_args(account_fill: u64, note_fill: u64) -> Result<Word, LpError> {
+    PswapNote::create_args(account_fill, note_fill).map_err(|e| LpError::Consume(e.to_string()))
 }
 
 #[cfg(test)]

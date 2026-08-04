@@ -99,13 +99,11 @@ pub async fn run_matcher(
             last_now
         };
 
-        // Drain consumed notes: remove from book.
+        // Sync the book with inbound events: drop consumed notes, add new orders.
         while let Ok(note_id) = consumed_rx.try_recv() {
             engine.book.remove_order(note_id);
             raw_notes.remove(&note_id);
         }
-
-        // Drain pending new orders.
         while let Ok(order) = order_rx.try_recv() {
             engine.book.add_user_order(
                 order.note_id,
@@ -117,49 +115,67 @@ pub async fn run_matcher(
             raw_notes.insert(order.note_id, order.raw_note_data);
         }
 
-        // Reactivate parked notes whose DEX no-showed past the TTL.
+        // 1. Reactivate parked notes whose DEX no-showed past the in-flight TTL.
         if let Some(r) = router.as_ref() {
             for (id, dex) in engine.book.reactivate_parked_older_than(r.inflight_ttl_ms, now) {
                 tracing::debug!(note = %id, dex, "parked note timed out; reactivated");
             }
         }
 
-        // Internal matching — unchanged from the non-routing path.
-        if !engine.book.orders.is_empty() {
-            engine.book.feed = WatchPriceFeed::from_watch(&price_rx);
-            let batch = engine.run();
-            if !batch.filled_orders.is_empty() {
-                tracing::info!(orders = batch.filled_orders.len(), "matcher produced batch");
-                let mut filled_notes = Vec::new();
-                for &order_id in &batch.filled_orders {
-                    let Some(raw_note_data) = raw_notes.get(&order_id).cloned() else { continue };
-                    let requested_filled = engine
-                        .book
-                        .orders
-                        .get(&order_id)
-                        .map(|o| o.requested_filled())
-                        .unwrap_or(0);
-                    filled_notes.push(FilledNote { note_id: order_id, requested_filled, raw_note_data });
-                }
-                if exec_tx.send(ExecutionBatch { filled_notes }).await.is_err() {
-                    tracing::warn!("executor channel closed, matcher shutting down");
-                    return;
-                }
-                for &order_id in &batch.filled_orders {
-                    engine.book.remove_order(order_id);
-                    raw_notes.remove(&order_id);
-                }
-                engine.book.protocol_balances.clear();
-            }
+        // 2. Internal matching (→ executor).
+        if internal_match(&mut engine, &mut raw_notes, &price_rx, &exec_tx).await {
+            return; // executor channel closed
         }
 
-        // External pass: hand residual notes to DEXes whose quotes they clear.
+        // 3. External matching: hand residual notes to DEXes whose quotes clear them.
         if let Some(r) = router.as_ref() {
             if external_pass(&mut engine, &raw_notes, r, now) {
                 router = None; // router channel closed — stop routing
             }
         }
     }
+}
+
+/// Internal matching pass — unchanged from the non-routing path: refresh the price
+/// feed, run the engine, and settle any filled notes to the executor. A no-op when
+/// the book is empty or nothing crosses. Returns `true` if the executor channel has
+/// closed (the matcher should stop).
+async fn internal_match(
+    engine: &mut MatchingEngine<WatchPriceFeed>,
+    raw_notes: &mut HashMap<OrderId, Vec<u8>>,
+    price_rx: &watch::Receiver<PriceSnapshot>,
+    exec_tx: &mpsc::Sender<ExecutionBatch>,
+) -> bool {
+    if engine.book.orders.is_empty() {
+        return false;
+    }
+    engine.book.feed = WatchPriceFeed::from_watch(price_rx);
+    let batch = engine.run();
+    if batch.filled_orders.is_empty() {
+        return false;
+    }
+    tracing::info!(orders = batch.filled_orders.len(), "matcher produced batch");
+    let mut filled_notes = Vec::new();
+    for &order_id in &batch.filled_orders {
+        let Some(raw_note_data) = raw_notes.get(&order_id).cloned() else { continue };
+        let requested_filled = engine
+            .book
+            .orders
+            .get(&order_id)
+            .map(|o| o.requested_filled())
+            .unwrap_or(0);
+        filled_notes.push(FilledNote { note_id: order_id, requested_filled, raw_note_data });
+    }
+    if exec_tx.send(ExecutionBatch { filled_notes }).await.is_err() {
+        tracing::warn!("executor channel closed, matcher shutting down");
+        return true;
+    }
+    for &order_id in &batch.filled_orders {
+        engine.book.remove_order(order_id);
+        raw_notes.remove(&order_id);
+    }
+    engine.book.protocol_balances.clear();
+    false
 }
 
 /// Select residual notes against the cached quotes, park each pick, and

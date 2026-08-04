@@ -17,7 +17,7 @@ integrators want [filler-integration.md](filler-integration.md)).
 When the internal matcher can't cross an order against another user, that order is
 idle liquidity in our book. We offer it to **allow-listed external DEXes ("fillers")**
 over a websocket RFQ: each DEX posts a standing quote per pair (the base-unit amounts it
-will **give** and **want**), the matcher matches its idle notes against those quotes, and
+will **supply** and **demand**), the matcher matches its idle notes against those quotes, and
 hands over the **serialized
 note bytes**. The DEX **self-consumes on-chain at the note's fixed rate**, on its own
 gas. Our existing ingest path detects the on-chain fill and drops the note.
@@ -97,15 +97,13 @@ reusing the book's own index machinery rather than inventing a parallel flag pat
   `parked_at + ttl ≤ now` and stops at the first still-fresh entry (usually 0 pops); a
   popped id no longer in `parked` is a consumed tombstone, skipped. It re-indexes the
   surviving struct via the existing add path (note rejoins the back of its rate FIFO —
-  fair; it was "away") and returns `(id, dex)` so the matcher won't re-offer it to that DEX.
+  fair; it was "away") and returns `(id, dex)` (the `dex` it no-showed at, for logging).
 - **Exits from PARKED:** (a) **consume** — the DEX self-consumes → `consumed_rx` → drop
   from `orders` (settled); (b) **no-show** — not consumed within `router_inflight_ttl_ms`
-  → reactivation re-indexes it (matchable + re-routable, but **not** re-offered to the
-  same DEX); (c) **rollback** — if the handover `try_send` is dropped (full/closed
-  channel), the note never reached the DEX, so it is **immediately unparked**
-  (`OrderBook::unpark`) with **no** re-offer penalty — a
-  dropped delivery costs nothing. The DEX-no-show penalty in (b) applies only to notes
-  that were actually delivered.
+  → reactivation re-indexes it (matchable + re-routable again, including to the same DEX);
+  (c) **rollback** — if the handover `try_send` is dropped (full/closed channel), the note
+  never reached the DEX, so it is **immediately unparked** (`OrderBook::unpark`) — a
+  dropped delivery costs nothing.
 - **One park-aware conditional:** the `consumed_rx` removal of an *already-parked* note
   must not decrement the counter again (it was decremented at park) — just drop it from
   `orders`. `add_user_order` is idempotent on note id as general defence.
@@ -116,34 +114,47 @@ test asserts `active_order_count()` invariance across park→unpark and park→c
 
 ---
 
-## 4. Selection predicate (willingness only)
+## 4. Selection (willingness only, per pair)
 
 A PSWAP note carries its rate **fixed on-chain**: whoever consumes it pays exactly the
 note's `requested` for its `offered`, so the maker's price holds regardless of which DEX
 fills it. Selection is therefore a single **willingness** check — does the DEX's standing
-quote accept the note's rate? — plus mechanics.
+quote accept the note's rate? — run **per pair** over two rate-sorted inputs.
 
-A note (offers `offered` of `O`, requests `requested` of `R`) is **routable** to a quote
-(`give`/`want` — the DEX's two base-unit amounts) iff:
+**Both sides arrive pre-sorted.** Notes come from the book's `pair_index`
+(`OrderBook::notes_for_pair`), which holds each pair's notes ascending by
+`requested/offered` — cheapest first (parked notes aren't in the index). Quotes are
+published grouped by pair (`QuotesSnapshot = HashMap<Pair, Vec<Quote>>`), each list sorted
+by `supply/demand` **descending** — most generous first — once on quote change (in the
+router's `republish`), so the matcher tick pays nothing.
 
-1. **Pair match** — the note's `(O, R)` equals the quote's pair (the router already
-   flipped the DEX's filler-centric quote into note orientation).
-2. **Willingness** — `requested · want ≤ give · offered`. A plain base-unit integer
-   cross: both the note amounts and the quote are base units of the *same two tokens*, so
-   **decimals cancel** — no `10^decimals`, no oracle prices. Every factor is a
-   `FungibleAsset` amount (`u64`), so each product is `< 2^128` and can't overflow `u128`.
-3. **Not used / not blocked** — each note goes to at most one DEX per tick, and a note
-   that no-showed at a DEX is not re-offered to it (the `blocked` set).
-4. **Fits capacity** — accumulate `Σ fill ≤ quote.give`.
+**Willingness cross.** A note (offers `offered` of `O`, requests `requested` of `R`) is
+routable to a quote (`supply`/`demand`) iff `requested · demand ≤ supply · offered` (note
+rate ≤ quote rate). A plain base-unit integer cross: both sides are base units of the
+*same two tokens*, so **decimals cancel** — no `10^decimals`, no oracle prices. Every
+factor is a `u64`, so each product is `< 2^128` and can't overflow `u128`.
+
+**Assignment (`match_pair`).** Per pair, walk notes cheapest-first; each note goes to the
+**tightest** crossing quote that still has room — the crossing quote with the *smallest*
+rate — so the more generous quotes stay free for the notes that need them. Because quotes
+descend by rate, the crossing quotes are a prefix and the scan **breaks** as soon as one
+stops crossing. A note goes to at most one DEX; fills accumulate against each quote's
+`supply`; v1 routes **whole notes only** (a note larger than every quote's remaining
+capacity is left for internal matching — no splitting).
 
 A quote governs a **single batch**: once a note is handed over against it, the router
 **consumes** it (drops it from the snapshot) so it isn't re-hit — the DEX re-quotes its
-current capacity for the next round, and there is no solver-side reservation to track.
-There is **no oracle-edge or off-market gate**: the solver is a matchmaker here, not a
-price authority over a rate the chain already binds. (An earlier design added a
-decimals-correct retention edge vs oracle mid, an off-market-quote guard, marginal-first
-ordering, and a cross-batch reservation ledger; all of that was removed for v1 — see ADR
-0001.)
+current capacity next round, and there is no solver-side reservation. There is **no
+oracle-edge or off-market gate**: the solver is a matchmaker over a rate the chain already
+binds. (An earlier design added a retention edge vs oracle mid, an off-market-quote guard,
+and a cross-batch reservation ledger; all removed for v1 — see ADR 0001.)
+
+**Reserved for v2 — uniform-price clearing.** The two rate-sorted inputs are exactly what
+a uniform-price batch clearing consumes. `match_pair` already returns a `PairMatch` whose
+`clearing: Option<Rate>` is the seam (v1: `None`), and every `Pick` carries a `price`
+(v1: the note's own on-chain rate). A future version computes one clearing rate per pair
+and settles matched notes at it via the overfill/rebate hook (ADR 0002); today each note
+settles at its own rate, and partial-fill at the clearing margin lands with it.
 
 ---
 
@@ -232,9 +243,8 @@ it can't constrain a DEX's miden version.
 - **Flow leak (explicitly accepted).** A trusted DEX gets a near-real-time, byte-level
   view of our unmatched residual: it can quote-to-receive-bytes, never consume, let the
   TTL reactivate, and cherry-pick. This is acceptable **only** under genuine trust in
-  every token holder. Partial mitigation in place: on reactivation a note is **not
-  re-offered to the same DEX**. A per-DEX outstanding-handover cap and an
-  indicative→firm two-stage are documented follow-ups, not built.
+  every token holder. A per-DEX outstanding-handover cap and an indicative→firm
+  two-stage are documented follow-ups, not built.
 - **No custody risk.** The solver never holds DEX funds or keys; a handover is bytes.
   Worst case from a misbehaving DEX is wasted in-flight windows (bounded by the TTL),
   not loss.
@@ -247,10 +257,12 @@ it can't constrain a DEX's miden version.
 ## 9. Testing
 
 - **`select_notes` (unit + property):** base-unit DEX-willingness (the ±1-base-unit
-  boundary), pair-match, give cap, stale-quote skip, blocked-pair skip, zero-quote guard,
-  extreme-amount overflow-safety, and a 400-case invariant proptest.
+  boundary), pair-match, supply cap, tightest-crossing-quote assignment, per-pick
+  `price` = the note's own rate, stale-quote skip, zero-quote guard, extreme-amount
+  overflow-safety, and a 400-case invariant proptest.
 - **Order book:** `active_order_count()` invariance across park→unpark and park→consume;
-  parked notes skipped by the matching gates; idempotent re-add.
+  parked notes skipped by the matching gates; idempotent re-add; `notes_for_pair`
+  rate-ordering (best first, parked/inactive excluded).
 - **Matcher:** route-to-DEX, internal-match unaffected, reactivation-then-consume,
   backpressure (a full `handover_tx` doesn't stall the tick).
 - **Router (real websocket):** auth reject/accept (header + `?token=`), quote→snapshot,

@@ -12,15 +12,18 @@
 pub mod select;
 pub mod server;
 
-pub use select::{select_notes, Pair, Pick, Quote};
+pub use select::{select_notes, Pair, Pick, Quote, Rate};
 pub use server::{spawn_router_thread, RouterConfig};
 
 use crate::matching::types::{Amount, DexId, OrderId};
+use std::collections::HashMap;
 
-/// Latest standing quotes from all connected DEXes — one entry per
-/// `(dex, pair)`. Published by the router on the `quotes` watch channel and
-/// read (filtered by freshness) by the matcher each tick.
-pub type QuotesSnapshot = Vec<Quote>;
+/// Latest standing quotes from all connected DEXes, **grouped by pair** and each
+/// list sorted by rate (`supply/demand`) descending — most generous first.
+/// Published by the router on the `quotes` watch channel and read (filtered by
+/// freshness) by the matcher each tick. The per-pair grouping + rate sort is done
+/// once on quote change (see `router::server`), so the matcher reads it ready.
+pub type QuotesSnapshot = HashMap<Pair, Vec<Quote>>;
 
 /// A batch of notes the matcher sends the router to deliver to DEXes, over the
 /// `route` mpsc channel with `try_send` (never blocks the tick).

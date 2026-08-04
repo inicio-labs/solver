@@ -51,6 +51,28 @@ fn best_order_returns_cheapest() {
 }
 
 #[test]
+fn notes_for_pair_rate_ordered_and_excludes_parked() {
+    let feed = make_feed();
+    let mut book = OrderBook::new(feed);
+    let mut gen = NoteIdGen::new();
+    let a = gen.next();
+    let b = gen.next();
+    let c = gen.next();
+    book.add_user_order(a, usdc(), eth(), 2000, 1); // rate 1/2000 (worst)
+    book.add_user_order(b, usdc(), eth(), 3000, 1); // rate 1/3000 (best)
+    book.add_user_order(c, usdc(), eth(), 2500, 1); // rate 1/2500 (mid)
+
+    // Ascending requested/offered — best (most generous) first, as select_notes wants.
+    let ids: Vec<_> = book.notes_for_pair(usdc(), eth()).iter().map(|o| o.id).collect();
+    assert_eq!(ids, vec![b, c, a]);
+
+    // A parked note is out of the index, so it drops from the list.
+    book.park(b, 7, 100);
+    let ids: Vec<_> = book.notes_for_pair(usdc(), eth()).iter().map(|o| o.id).collect();
+    assert_eq!(ids, vec![c, a], "parked note excluded");
+}
+
+#[test]
 fn best_order_returns_best_rate() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);

@@ -29,7 +29,7 @@ the one in-memory order book:
    the decision hub (internal cross → executor, else external → a DEX whose quote it
    clears). No DB poll, no second copy of the book.
 2. **Standing-quote RFQ, single-use.** Each allow-listed DEX posts a quote per registered
-   pair — its two base-unit amounts, `give`/`want` (the amounts it will give and want) —
+   pair — its two base-unit amounts, `supply`/`demand` (what it will supply and want back) —
    and refreshes it before a TTL. The matcher matches its idle notes against the cached
    quotes every tick; the router **consumes** a quote once a note is handed over against
    it, so the DEX re-quotes its current capacity (no solver-side reservation). (No
@@ -43,7 +43,7 @@ the one in-memory order book:
 5. **Willingness-only selection (no oracle, no decimals).** A PSWAP note's rate is
    fixed on-chain, so the maker's price is guaranteed however the note fills.
    `select_notes` is therefore a pure base-unit **willingness** cross — does the DEX's
-   quote accept the note's rate (`requested·want ≤ give·offered`)? Exact `u128`, no oracle
+   quote accept the note's rate (`requested·demand ≤ supply·offered`)? Exact `u128`, no oracle
    prices, no `10^decimals` scaling: the solver is a matchmaker here, not a price
    authority over a rate the chain already binds.
 6. **Router = transport only**, on its own OS thread + multi-thread runtime (mirrors
@@ -89,9 +89,8 @@ the one in-memory order book:
 
 - **Flow leak (accepted).** A trusted DEX gets a near-real-time, byte-level view of our
   unmatched residual and could quote-to-receive-bytes, never consume, and cherry-pick on
-  reactivation. Acceptable only under genuine trust in every token holder. Partial
-  mitigation shipped: a reactivated note is not re-offered to the same DEX. Per-DEX
-  outstanding-handover cap + indicative→firm two-stage are documented follow-ups.
+  reactivation. Acceptable only under genuine trust in every token holder. Per-DEX
+  outstanding-handover cap + indicative→firm two-stage are documented follow-ups (not built).
 - **Every willing note is routable.** v1 hands off any note a connected DEX will fill; it
   does **not** retain surplus for internal crossing (that retention policy was removed
   with the oracle gates). Multi-DEX competition is the intended recapture lever (deferred).

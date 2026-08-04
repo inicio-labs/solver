@@ -154,7 +154,7 @@ impl<F: PriceFeed> OrderBook<F> {
     /// struct in `orders`. Mirrors the index-removal half of `remove_order`, so
     /// `active_pair_count` / `has_orders` / `best_order` stay correct with no
     /// change to them. No-op if the note is missing, already parked, or filled.
-    pub fn park(&mut self, id: OrderId, dex: DexId, now: u64) {
+    pub fn park(&mut self, id: OrderId, dex: DexId, time: u64) {
         if self.parked.contains_key(&id) {
             return;
         }
@@ -170,8 +170,8 @@ impl<F: PriceFeed> OrderBook<F> {
         }
         self.remove_from_index(pair, key, id);
 
-        self.parked.insert(id, (dex, now));
-        self.park_queue.push_back((now, id));
+        self.parked.insert(id, (dex, time));
+        self.park_queue.push_back((time, id));
     }
 
     /// Immediately unpark a specific note — the **rollback** of a `park` whose
@@ -179,30 +179,27 @@ impl<F: PriceFeed> OrderBook<F> {
     /// Re-adds it to the rate index and drops it from `parked`; the now-stale
     /// `park_queue` entry becomes a harmless tombstone, skipped by the next
     /// `reactivate_parked_older_than`. Returns the DEX it had been parked for, or
-    /// `None` if it wasn't parked. Unlike TTL reactivation this carries **no**
-    /// "don't re-offer to that DEX" signal — the note was never actually offered,
-    /// so it stays fully eligible, including to that same DEX.
+    /// `None` if it wasn't parked.
     pub fn unpark(&mut self, id: OrderId) -> Option<DexId> {
         let (dex, _) = self.parked.remove(&id)?;
         self.reindex(id);
         Some(dex)
     }
 
-    /// Unpark every note parked longer than `ttl` ms as of `now` (a no-show by
+    /// Unpark every note parked longer than `ttl` ms as of `time` (a no-show by
     /// the DEX it was handed to). Returns `(id, dex)` for each note returned to
-    /// matching, so the caller can restore reserves / avoid re-offering it to the
-    /// same DEX. O(number expiring) — pops only the expired prefix of the queue.
-    pub fn reactivate_parked_older_than(&mut self, ttl: u64, now: u64) -> Vec<(OrderId, DexId)> {
+    /// matching (the `dex` it no-showed at, for the caller's log). O(number
+    /// expiring) — pops only the expired prefix of the queue.
+    pub fn reactivate_parked_older_than(&mut self, ttl: u64, time: u64) -> Vec<(OrderId, DexId)> {
         let mut reactivated = Vec::new();
         while let Some(&(parked_at, id)) = self.park_queue.front() {
             // Monotonic queue: once the front isn't expired, none behind it are.
-            if parked_at.saturating_add(ttl) > now {
+            if parked_at.saturating_add(ttl) > time {
                 break;
             }
             self.park_queue.pop_front();
-            // Skip tombstones (id already consumed → gone from `parked`). `unpark`
-            // does the remove-from-`parked` + reindex; we add the "don't re-offer
-            // to this DEX" signal a plain rollback lacks.
+            // Skip tombstones (id already consumed → gone from `parked`); `unpark`
+            // does the remove-from-`parked` + reindex.
             if let Some(dex) = self.unpark(id) {
                 reactivated.push((id, dex));
             }
@@ -255,6 +252,24 @@ impl<F: PriceFeed> OrderBook<F> {
         }
 
         None
+    }
+
+    /// Active orders for a pair in **rate order** (best/cheapest first), as they
+    /// sit in `pair_index` (ascending `RateKey`, FIFO within a rate). Parked notes
+    /// aren't in the index, so they're excluded; the index may still hold lazily
+    /// un-pruned inactive ids, so we filter `is_active`. Feeds `select_notes`
+    /// pre-sorted for the external pass.
+    pub fn notes_for_pair(&self, offered: TokenId, requested: TokenId) -> Vec<Order> {
+        let Some(btree) = self.pair_index.get(&(offered, requested)) else {
+            return Vec::new();
+        };
+        btree
+            .values()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| self.orders.get(id))
+            .filter(|o| o.is_active())
+            .cloned()
+            .collect()
     }
 
     /// Check if any active orders exist for a pair — O(1).

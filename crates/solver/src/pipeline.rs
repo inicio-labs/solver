@@ -208,7 +208,7 @@ pub fn create_channels() -> PipelineChannels {
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
-    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
+    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
     let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
         order_tx,

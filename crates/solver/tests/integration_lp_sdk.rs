@@ -46,7 +46,7 @@ async fn sdk_lp_round_trip_against_real_router() {
     let port = free_port();
 
     // Matcher's ends of the two channels.
-    let (quotes_tx, mut quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
+    let (quotes_tx, mut quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
     let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(8);
     let cancel = CancellationToken::new();
 
@@ -97,10 +97,11 @@ async fn sdk_lp_round_trip_against_real_router() {
         .expect("quote propagated to matcher")
         .unwrap();
     let snap = quotes_rx.borrow_and_update().clone();
-    assert_eq!(snap.len(), 1, "exactly one standing quote");
-    assert_eq!(snap[0].pair, (a, b), "pair flips to note orientation");
-    assert_eq!((snap[0].give, snap[0].want), (1_000, 500), "the DEX's two base-unit amounts");
-    let dex = snap[0].dex;
+    assert_eq!(snap.values().flatten().count(), 1, "exactly one standing quote");
+    let q = snap.values().flatten().next().unwrap();
+    assert_eq!(q.pair, (a, b), "pair flips to note orientation");
+    assert_eq!((q.supply, q.demand), (1_000, 500), "the DEX's two base-unit amounts");
+    let dex = q.dex;
 
     // (4) Matcher hands a real note over for that DEX → SDK surfaces the decoded
     // note + fill amount.

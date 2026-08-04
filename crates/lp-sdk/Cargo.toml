@@ -19,5 +19,4 @@ miden-standards = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
-# `testing` provides Note::mock_noop for the handover_frame test.
 miden-protocol = { workspace = true, features = ["testing"] }

@@ -75,11 +75,26 @@ impl RouterState {
             .any(|allowed| bool::from(allowed.as_bytes().ct_eq(tb)))
     }
 
-    /// Rebuild and broadcast the merged quotes snapshot to the matcher.
+    /// Rebuild and broadcast the quotes snapshot to the matcher: grouped by pair,
+    /// each list sorted by rate (`supply/demand`) **descending** — most generous
+    /// first — which is the order `select_notes` relies on. Sorting here (on quote
+    /// change) keeps the matcher tick free of it.
     fn republish(&self) {
-        let snap: Vec<Quote> = {
+        let snap: QuotesSnapshot = {
             let quotes = self.quotes.lock().unwrap();
-            quotes.values().flat_map(|m| m.values().cloned()).collect()
+            let mut by_pair: QuotesSnapshot = HashMap::new();
+            for per_pair in quotes.values() {
+                for (pair, q) in per_pair {
+                    by_pair.entry(*pair).or_default().push(q.clone());
+                }
+            }
+            for list in by_pair.values_mut() {
+                // descending supply/demand: `a` before `b` when a's rate is higher.
+                list.sort_by(|a, b| {
+                    (b.supply as u128 * a.demand as u128).cmp(&(a.supply as u128 * b.demand as u128))
+                });
+            }
+            by_pair
         };
         let _ = self.quotes_tx.send(Arc::new(snap));
     }
@@ -112,9 +127,9 @@ impl RouterState {
         requested: FungibleAsset,
         valid_for_ms: Option<u64>,
     ) -> Option<ServerMsg> {
-        let give = u64::from(offered.amount()); // base units the DEX gives
-        let want = u64::from(requested.amount()); // base units the DEX wants
-        if give == 0 || want == 0 {
+        let supply = u64::from(offered.amount()); // base units the DEX supplies
+        let demand = u64::from(requested.amount()); // base units the DEX wants back
+        if supply == 0 || demand == 0 {
             return Some(ServerMsg::Error {
                 code: "bad_quote".into(),
                 msg: "quote amounts must be > 0".into(),
@@ -126,7 +141,7 @@ impl RouterState {
         let ttl = valid_for_ms
             .map(|v| v.min(self.cfg.quote_ttl_ms))
             .unwrap_or(self.cfg.quote_ttl_ms);
-        let quote = Quote { dex, pair, give, want, expires_at: now_millis().saturating_add(ttl) };
+        let quote = Quote { dex, pair, supply, demand, expires_at: now_millis().saturating_add(ttl) };
         self.quotes.lock().unwrap().entry(dex).or_default().insert(pair, quote);
         self.republish();
         None
@@ -337,7 +352,7 @@ mod tests {
             quote_ttl_ms: 20_000,
             auth_tokens: tokens,
         };
-        let (tx, rx) = watch::channel(Arc::new(Vec::new()));
+        let (tx, rx) = watch::channel(Arc::new(HashMap::new()));
         (RouterState::new(cfg, tx), rx)
     }
 
@@ -394,14 +409,14 @@ mod tests {
 
         assert!(rx.has_changed().unwrap());
         let snap = rx.borrow_and_update().clone();
-        assert_eq!(snap.len(), 1);
-        let q = &snap[0];
+        assert_eq!(snap.values().flatten().count(), 1);
+        let q = snap.values().flatten().next().unwrap();
         assert_eq!(q.dex, 42);
         // Stored note-centric: the pair FLIPS (a note it fills offers what the DEX
         // wants, requests what it gives).
         assert_eq!(q.pair, (tok_b(), tok_a()));
-        // give/want are the DEX's two base-unit amounts (rate + capacity).
-        assert_eq!((q.give, q.want), (2_500, 1_000));
+        // supply/demand are the DEX's two base-unit amounts (rate + capacity).
+        assert_eq!((q.supply, q.demand), (2_500, 1_000));
         assert!(q.expires_at > 0);
     }
 
@@ -478,7 +493,7 @@ mod tests {
         s.handle_client_msg(3, &bytes);
         let snap = rx.borrow_and_update().clone();
         // expires_at ≤ now + server quote_ttl_ms (20s), not the DEX's huge value.
-        assert!(snap[0].expires_at <= now_millis() + 20_000);
+        assert!(snap.values().flatten().next().unwrap().expires_at <= now_millis() + 20_000);
     }
 
     /// Real websocket round-trip: bad token rejected; good token → AuthOk; a
@@ -488,7 +503,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
 
-        let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(HashMap::new()));
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
             port: 0,
@@ -541,8 +556,8 @@ mod tests {
             .expect("quote propagated")
             .unwrap();
         let snap = quotes_rx.borrow_and_update().clone();
-        assert_eq!(snap.len(), 1);
-        let dex = snap[0].dex;
+        assert_eq!(snap.values().flatten().count(), 1);
+        let dex = snap.values().flatten().next().unwrap().dex;
 
         // Deliver a handover for that DEX → the client receives the exact frame.
         let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 5)).unwrap();
@@ -562,7 +577,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ws_rejects_when_at_capacity() {
-        let (quotes_tx, _rx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, _rx) = watch::channel(Arc::new(HashMap::new()));
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
             port: 0,
@@ -593,7 +608,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        let (quotes_tx, _qrx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, _qrx) = watch::channel(Arc::new(HashMap::new()));
         let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(8);
         let cancel = CancellationToken::new();
         let cfg = RouterConfig {
@@ -629,7 +644,7 @@ mod tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let (quotes_tx, _rx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, _rx) = watch::channel(Arc::new(HashMap::new()));
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
             port: 0,
@@ -671,7 +686,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
 
-        let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, mut quotes_rx) = watch::channel(Arc::new(HashMap::new()));
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
             port: 0,
@@ -726,8 +741,8 @@ mod tests {
         }
         assert_eq!(snap.len(), 2, "both DEXes' quotes coexist");
         // A's quote flipped to (b,a); B's to (a,b).
-        let dex_a = snap.iter().find(|q| q.pair == (tok_b(), tok_a())).unwrap().dex;
-        let dex_b = snap.iter().find(|q| q.pair == (tok_a(), tok_b())).unwrap().dex;
+        let dex_a = snap.values().flatten().find(|q| q.pair == (tok_b(), tok_a())).unwrap().dex;
+        let dex_b = snap.values().flatten().find(|q| q.pair == (tok_a(), tok_b())).unwrap().dex;
         assert_ne!(dex_a, dex_b, "distinct DEX ids");
 
         // RouteBatch to each DEX → each client receives only its own exact frame.
@@ -765,7 +780,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use std::time::Duration;
 
-        let (quotes_tx, _rx) = watch::channel(Arc::new(Vec::new()));
+        let (quotes_tx, _rx) = watch::channel(Arc::new(HashMap::new()));
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
             port: 0,

@@ -1,35 +1,28 @@
 use miden_protocol::note::NoteId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{self, DbPool};
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
-use crate::matching::types::DexId;
+use crate::matching::types::{DexId, Order};
 use crate::price::{PriceSnapshot, WatchPriceFeed};
-use crate::router::{select_notes, Handover, HandoverPick, NoteView, Pair, QuotesSnapshot};
+use crate::router::{select_notes, QuotesSnapshot, RouteBatch, RoutedNote};
 use crate::types::*;
 
-/// Hooks that enable the external-liquidity pass inside the matcher tick. When
-/// `None` (router disabled), the matcher behaves exactly as before. All fields
-/// are `Send` channels/scalars — the router itself runs on its own OS thread.
+/// Hooks that enable the external-liquidity pass in the matcher tick. When the
+/// router is disabled these are absent and the matcher behaves exactly as before.
+/// All fields are `Send`; the router itself runs on its own OS thread.
 pub struct RouterHooks {
     /// Latest standing quotes from connected DEXes (filtered by freshness here).
     pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
     /// Selected notes pushed to the router for delivery (`try_send`, never blocks).
-    pub handover_tx: mpsc::Sender<Handover>,
+    pub route_tx: mpsc::Sender<RouteBatch>,
     /// How long a handed-over note waits for on-chain consume before reactivating.
     pub inflight_ttl_ms: u64,
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The matcher owns a persistent OrderBook and runs matching on a timer.
@@ -53,7 +46,7 @@ pub async fn run_matcher(
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
     triangular_enabled: bool,
-    router: Option<RouterHooks>,
+    mut router: Option<RouterHooks>,
     cancel: CancellationToken,
 ) {
     let feed = WatchPriceFeed::from_watch(&price_rx);
@@ -63,11 +56,6 @@ pub async fn run_matcher(
     // Map from OrderId → raw note data for building FilledNotes / handovers.
     let mut raw_notes: HashMap<OrderId, Vec<u8>> = HashMap::new();
 
-    // External-routing bookkeeping (only used when `router` is Some).
-    // Per-(dex,pair) reserved quote quantity, and per-note reservation record so
-    // we can release the exact amount on consume/reactivation.
-    let mut reserved: HashMap<(DexId, Pair), Amount> = HashMap::new();
-    let mut reservations: HashMap<OrderId, (DexId, Pair, Amount)> = HashMap::new();
     // Notes that no-showed at a DEX → don't immediately re-offer to that DEX.
     let mut no_reoffer: HashMap<OrderId, HashSet<DexId>> = HashMap::new();
     // Monotonic-clamped wall clock (SystemTime can step backwards).
@@ -113,16 +101,14 @@ pub async fn run_matcher(
             last_now
         };
 
-        // 0. Drain consumed-note notifications FIRST (the ONE removal path).
-        //    Release any reservation, drop no-reoffer state, remove from book.
+        // Drain consumed notes: drop no-reoffer state, remove from book.
         while let Ok(note_id) = consumed_rx.try_recv() {
-            release_reservation(&mut reserved, &mut reservations, note_id);
             no_reoffer.remove(&note_id);
             engine.book.remove_order(note_id);
             raw_notes.remove(&note_id);
         }
 
-        // 1. Drain all pending new orders from the channel.
+        // Drain pending new orders.
         while let Ok(order) = order_rx.try_recv() {
             engine.book.add_user_order(
                 order.note_id,
@@ -134,21 +120,17 @@ pub async fn run_matcher(
             raw_notes.insert(order.note_id, order.raw_note_data);
         }
 
-        // 2. Reactivate parked notes whose DEX no-showed past the TTL
-        //    (unconditional, before any early-out).
+        // Reactivate parked notes whose DEX no-showed past the TTL.
         if let Some(r) = router.as_ref() {
             for (id, dex) in engine.book.reactivate_parked_older_than(r.inflight_ttl_ms, now) {
-                release_reservation(&mut reserved, &mut reservations, id);
                 no_reoffer.entry(id).or_default().insert(dex);
                 tracing::debug!(note = %id, dex, "parked note timed out; reactivated");
             }
         }
 
-        // 3. Refresh price feed.
-        engine.book.feed = WatchPriceFeed::from_watch(&price_rx);
-
-        // 4. Internal matching (only when matchable liquidity exists).
-        if engine.book.active_order_count() > 0 {
+        // Internal matching — unchanged from the non-routing path.
+        if !engine.book.orders.is_empty() {
+            engine.book.feed = WatchPriceFeed::from_watch(&price_rx);
             let batch = engine.run();
             if !batch.filled_orders.is_empty() {
                 tracing::info!(orders = batch.filled_orders.len(), "matcher produced batch");
@@ -175,110 +157,72 @@ pub async fn run_matcher(
             }
         }
 
-        // 5. External pass: hand residual notes to DEXes whose quotes they clear.
+        // External pass: hand residual notes to DEXes whose quotes they clear.
         if let Some(r) = router.as_ref() {
-            external_pass(
-                &mut engine,
-                &raw_notes,
-                &mut reserved,
-                &mut reservations,
-                &no_reoffer,
-                r,
-                now,
-            );
-        }
-    }
-}
-
-/// Release a note's reservation (if any) back to its `(dex,pair)` budget.
-fn release_reservation(
-    reserved: &mut HashMap<(DexId, Pair), Amount>,
-    reservations: &mut HashMap<OrderId, (DexId, Pair, Amount)>,
-    note_id: OrderId,
-) {
-    if let Some((dex, pair, amt)) = reservations.remove(&note_id) {
-        if let Some(c) = reserved.get_mut(&(dex, pair)) {
-            *c = c.saturating_sub(amt);
-        }
-    }
-}
-
-/// Select residual notes against the cached quotes, park each pick (remove from
-/// the matching index), reserve its quantity, and `try_send` a handover. Pure
-/// reads except the book parks and the reservation ledger. Never `.await`s.
-fn external_pass(
-    engine: &mut MatchingEngine<WatchPriceFeed>,
-    raw_notes: &HashMap<OrderId, Vec<u8>>,
-    reserved: &mut HashMap<(DexId, Pair), Amount>,
-    reservations: &mut HashMap<OrderId, (DexId, Pair, Amount)>,
-    no_reoffer: &HashMap<OrderId, HashSet<DexId>>,
-    r: &RouterHooks,
-    now: u64,
-) {
-    let quotes = r.quotes_rx.borrow().clone(); // Arc<Vec<Quote>>
-
-    let items = route_external(
-        &mut engine.book,
-        raw_notes,
-        &quotes[..],
-        reserved,
-        reservations,
-        no_reoffer,
-        now,
-    );
-
-    if !items.is_empty() {
-        let n = items.len();
-        match r.handover_tx.try_send(Handover { items }) {
-            Ok(()) => tracing::info!(count = n, "routed unmatched notes to DEXes"),
-            Err(e) => {
-                // The DEX never received these, so roll the batch back: unpark each
-                // note and release its reservation. A dropped handover is then a
-                // no-op (the notes stay eligible next tick, to the same DEX) rather
-                // than a no-re-offer penalty earned on TTL reactivation for a note
-                // the DEX never saw.
-                let reason = e.to_string();
-                let dropped = e.into_inner();
-                for item in &dropped.items {
-                    engine.book.unpark(item.note_id);
-                    release_reservation(reserved, reservations, item.note_id);
-                }
-                tracing::warn!(
-                    count = n,
-                    reason = %reason,
-                    "handover not sent; rolled back park so notes stay eligible"
-                );
+            if external_pass(&mut engine, &raw_notes, &no_reoffer, r, now) {
+                router = None; // router channel closed — stop routing
             }
         }
     }
 }
 
-/// Pure core of the external pass (no DB / channel I/O): select residual notes
-/// against the cached quotes, **park** each pick (removing it from the matching
-/// index), reserve its quantity, and return the handover items. `book` is
-/// mutated only via `park`. Directly unit-tested — this is the proof that an
-/// unmatched order + a clearing DEX quote ⇒ the note is parked and handed over.
+/// Select residual notes against the cached quotes, park each pick, and
+/// `try_send` a handover. Never `.await`s. Returns `true` if the router channel
+/// has **closed** — the caller should then stop the external pass.
+fn external_pass(
+    engine: &mut MatchingEngine<WatchPriceFeed>,
+    raw_notes: &HashMap<OrderId, Vec<u8>>,
+    no_reoffer: &HashMap<OrderId, HashSet<DexId>>,
+    r: &RouterHooks,
+    now: u64,
+) -> bool {
+    let quotes = r.quotes_rx.borrow().clone(); // Arc<Vec<Quote>>
+
+    let items = route_external(&mut engine.book, raw_notes, &quotes[..], no_reoffer, now);
+    if items.is_empty() {
+        return false;
+    }
+
+    let n = items.len();
+    match r.route_tx.try_send(RouteBatch { items }) {
+        Ok(()) => {
+            tracing::info!(count = n, "routed unmatched notes to DEXes");
+            false
+        }
+        Err(e) => {
+            // Not delivered → unpark so the notes stay eligible. A closed channel
+            // means the router thread is gone: also tell the caller to stop.
+            let closed = matches!(e, mpsc::error::TrySendError::Closed(_));
+            for item in &e.into_inner().items {
+                engine.book.unpark(item.note_id);
+            }
+            if closed {
+                tracing::error!(count = n, "router channel closed; disabling external pass");
+            } else {
+                tracing::warn!(count = n, "handover not sent (channel full); unparked");
+            }
+            closed
+        }
+    }
+}
+
+/// Pure core of the external pass: select residual notes against the cached
+/// quotes, **park** each pick (removing it from the matching index), and return
+/// the handover items. `book` is mutated only via `park`.
 fn route_external<F: crate::matching::price_feed::PriceFeed>(
     book: &mut OrderBook<F>,
     raw_notes: &HashMap<OrderId, Vec<u8>>,
     quotes: &[crate::router::Quote],
-    reserved: &mut HashMap<(DexId, Pair), Amount>,
-    reservations: &mut HashMap<OrderId, (DexId, Pair, Amount)>,
     no_reoffer: &HashMap<OrderId, HashSet<DexId>>,
     now: u64,
-) -> Vec<HandoverPick> {
-    // Candidates: active, non-parked residual notes.
-    let candidates: Vec<NoteView> = book
+) -> Vec<RoutedNote> {
+    // Route only WHOLE notes: a partially-filled note (requested_remaining <
+    // requested) is left for internal matching — v1 hands DEXes whole notes only.
+    let candidates: Vec<Order> = book
         .orders
         .values()
-        .filter(|o| o.is_active() && !book.is_parked(o.id))
-        .map(|o| NoteView {
-            id: o.id,
-            offered_token: o.offered_token,
-            offered: o.offered,
-            requested_token: o.requested_token,
-            requested: o.requested,
-        })
+        .filter(|o| o.requested_remaining == o.requested && !book.is_parked(o.id))
+        .cloned()
         .collect();
     if candidates.is_empty() || quotes.is_empty() {
         return Vec::new();
@@ -289,21 +233,24 @@ fn route_external<F: crate::matching::price_feed::PriceFeed>(
         .flat_map(|(id, dexes)| dexes.iter().map(move |d| (*id, *d)))
         .collect();
 
-    let picks = select_notes(&candidates, quotes, now, reserved, &blocked);
+    let picks = select_notes(&candidates, quotes, now, &blocked);
 
     let mut items = Vec::with_capacity(picks.len());
     for pick in &picks {
+        // Skip (don't park) a note whose raw bytes we don't have — parking it
+        // without a handover would strand it until the TTL for nothing.
+        let Some(bytes) = raw_notes.get(&pick.note_id) else {
+            tracing::warn!(note = %pick.note_id, "no raw note data; skipping external route");
+            continue;
+        };
         book.park(pick.note_id, pick.dex, now);
-        *reserved.entry((pick.dex, pick.pair)).or_default() += pick.fill;
-        reservations.insert(pick.note_id, (pick.dex, pick.pair, pick.fill));
-        if let Some(bytes) = raw_notes.get(&pick.note_id) {
-            items.push(HandoverPick {
-                dex: pick.dex,
-                note_id: pick.note_id,
-                fill: pick.fill,
-                note_bytes: bytes.clone(),
-            });
-        }
+        items.push(RoutedNote {
+            dex: pick.dex,
+            note_id: pick.note_id,
+            fill: pick.fill,
+            pair: pick.pair,
+            note_bytes: bytes.clone(),
+        });
     }
     items
 }
@@ -330,8 +277,9 @@ mod tests {
     }
     /// A quote for the IMIDEN/IUSDT pair at base-unit rate 1/50 (requested-base per
     /// offered-base). Any note whose rate is at or below this is willing.
-    fn quote_at_mid(dex: DexId, qty: Amount, expires_at: u64) -> Quote {
-        Quote { dex, pair: (imiden(), iusdt()), price_num: 1, price_den: 50, quantity: qty, expires_at }
+    fn quote_at_mid(dex: DexId, give: Amount, expires_at: u64) -> Quote {
+        // rate give/want = 1/50; `give` is the capacity.
+        Quote { dex, pair: (imiden(), iusdt()), give, want: give.saturating_mul(50), expires_at }
     }
     // Offer `offered` IMIDEN for `requested` IUSDT.
     fn book_with_order(
@@ -353,50 +301,52 @@ mod tests {
         let id = nid(1);
         // Offer 1.1 IMIDEN for 2 IUSDT — the DEX (quoting 1/50) is willing → exported.
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
-        let pair = (imiden(), iusdt());
         let quotes = vec![quote_at_mid(7, 10_000_000, u64::MAX)];
-        let mut reserved = HashMap::new();
-        let mut reservations = HashMap::new();
 
         assert_eq!(book.active_order_count(), 1);
-        let items = route_external(
-            &mut book,
-            &raw,
-            &quotes,
-            &mut reserved,
-            &mut reservations,
-            &HashMap::new(),
-            1_000,
-        );
+        let items = route_external(&mut book, &raw, &quotes, &HashMap::new(), 1_000);
 
-        // Handover emitted: the note → DEX 7, with its bytes.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].dex, 7);
         assert_eq!(items[0].note_id, id);
         assert_eq!(items[0].fill, 2_000_000);
         assert_eq!(items[0].note_bytes, vec![0xAA, 0xBB, 0xCC]);
-        // Orderbook change: the note is parked, invisible to internal matching.
+        // The note is parked, invisible to internal matching.
         assert!(book.is_parked(id));
         assert_eq!(book.active_order_count(), 0);
         assert!(book.best_order(imiden(), iusdt()).is_none());
-        // Reservation recorded against the quote budget.
-        assert_eq!(reserved.get(&(7u64, pair)).copied(), Some(2_000_000));
-        assert!(reservations.contains_key(&id));
     }
 
     #[test]
     fn unwilling_order_retained_not_exported() {
         let id = nid(2);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
-        // The DEX only accepts 1/100 — below the note's rate (2e6/110e6) → unwilling.
-        let q = Quote { dex: 7, pair: (imiden(), iusdt()), price_num: 1, price_den: 100, quantity: 10_000_000, expires_at: u64::MAX };
-        let items = route_external(
-            &mut book, &raw, &[q],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
-        );
+        // The DEX accepts only 1/100 — below the note's rate → unwilling.
+        let q = Quote { dex: 7, pair: (imiden(), iusdt()), give: 10_000_000, want: 1_000_000_000, expires_at: u64::MAX };
+        let items = route_external(&mut book, &raw, &[q], &HashMap::new(), 1_000);
         assert!(items.is_empty());
         assert!(!book.is_parked(id), "an unroutable order stays matchable internally");
         assert_eq!(book.active_order_count(), 1);
+    }
+
+    #[test]
+    fn partially_filled_note_not_routed() {
+        let id = nid(8);
+        let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
+        book.orders.get_mut(&id).unwrap().fill(1_000_000); // partial internal fill
+        let items = route_external(&mut book, &raw, &[quote_at_mid(7, 10_000_000, u64::MAX)], &HashMap::new(), 1_000);
+        assert!(items.is_empty(), "v1 routes whole notes only");
+        assert!(!book.is_parked(id));
+    }
+
+    #[test]
+    fn missing_raw_bytes_skips_without_parking() {
+        let id = nid(9);
+        let (mut book, _raw) = book_with_order(id, 110_000_000, 2_000_000);
+        // Candidate in the book, but its bytes are absent → skipped, not parked.
+        let items = route_external(&mut book, &HashMap::new(), &[quote_at_mid(7, 10_000_000, u64::MAX)], &HashMap::new(), 1_000);
+        assert!(items.is_empty());
+        assert!(!book.is_parked(id), "no raw bytes → not parked");
     }
 
     #[test]
@@ -404,10 +354,7 @@ mod tests {
         let id = nid(3);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         // expires_at == now ⇒ stale (strict >).
-        let items = route_external(
-            &mut book, &raw, &[quote_at_mid(7, 10_000_000, 1_000)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
-        );
+        let items = route_external(&mut book, &raw, &[quote_at_mid(7, 10_000_000, 1_000)], &HashMap::new(), 1_000);
         assert!(items.is_empty());
         assert!(!book.is_parked(id));
     }
@@ -419,17 +366,11 @@ mod tests {
         let mut no_reoffer: HashMap<OrderId, HashSet<DexId>> = HashMap::new();
         no_reoffer.entry(id).or_default().insert(7u64);
         // DEX 7 is blocked for this note.
-        let items = route_external(
-            &mut book, &raw, &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 1_000,
-        );
+        let items = route_external(&mut book, &raw, &[quote_at_mid(7, 10_000_000, u64::MAX)], &no_reoffer, 1_000);
         assert!(items.is_empty(), "not re-offered to the DEX it no-showed at");
         assert!(!book.is_parked(id));
         // A different DEX can still take it.
-        let items2 = route_external(
-            &mut book, &raw, &[quote_at_mid(9, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 1_000,
-        );
+        let items2 = route_external(&mut book, &raw, &[quote_at_mid(9, 10_000_000, u64::MAX)], &no_reoffer, 1_000);
         assert_eq!(items2.len(), 1);
         assert_eq!(items2[0].dex, 9);
         assert!(book.is_parked(id));
@@ -459,7 +400,7 @@ mod tests {
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, mut exec_rx) = mpsc::channel(16);
         let (quotes_tx, quotes_rx) = watch::channel(Arc::new(Vec::new()));
-        let (handover_tx, mut handover_rx) = mpsc::channel(16);
+        let (route_tx, mut route_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
 
         let mut prices = PriceSnapshot::new();
@@ -472,7 +413,7 @@ mod tests {
 
         let hooks = RouterHooks {
             quotes_rx,
-            handover_tx,
+            route_tx,
             inflight_ttl_ms: 60_000,
         };
         let id = nid(777);
@@ -504,7 +445,7 @@ mod tests {
                     cancel.clone(),
                 ));
 
-                let handover = tokio::time::timeout(Duration::from_secs(2), handover_rx.recv())
+                let handover = tokio::time::timeout(Duration::from_secs(2), route_rx.recv())
                     .await
                     .expect("handover within timeout")
                     .expect("handover present");
@@ -555,10 +496,10 @@ mod tests {
         let (_consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, _exec_rx) = mpsc::channel(16);
-        // The router owns quotes_tx (publishes DEX quotes) + handover_rx (delivers
-        // handovers); the matcher owns quotes_rx + handover_tx. Real wiring.
+        // The router owns quotes_tx (publishes DEX quotes) + route_rx (delivers
+        // handovers); the matcher owns quotes_rx + route_tx. Real wiring.
         let (quotes_tx, quotes_rx) = watch::channel(Arc::new(Vec::new()));
-        let (handover_tx, handover_rx) = mpsc::channel(16);
+        let (route_tx, route_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
 
         let mut prices = PriceSnapshot::new();
@@ -579,7 +520,7 @@ mod tests {
             auth_tokens: vec!["dex-tok".into()],
         };
         let (router_thread, ready) =
-            spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+            spawn_router_thread(cfg, quotes_tx, route_rx, cancel.clone()).unwrap();
         ready.await.unwrap().expect("router bound");
 
         // A REAL serialized note; its id is the OrderId (as ingest computes it).
@@ -603,7 +544,7 @@ mod tests {
 
         let hooks = RouterHooks {
             quotes_rx,
-            handover_tx,
+            route_tx,
             inflight_ttl_ms: 60_000,
         };
         let url = format!("ws://127.0.0.1:{port}/v1/rfq");
@@ -666,7 +607,7 @@ mod tests {
 
     /// Backpressure rollback: when the handover channel is **full**, the external
     /// pass must not stall — and the dropped batch is **rolled back** (notes
-    /// unparked, reservations released), so a note the DEX never received is not
+    /// unparked), so a note the DEX never received is not
     /// penalized. It stays immediately eligible: once the channel drains, a retry
     /// re-routes it to that **same** DEX. Exercises the `try_send` Full branch and
     /// the rollback in `external_pass`.
@@ -689,44 +630,47 @@ mod tests {
             watch::channel(Arc::new(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)]));
 
         // Capacity-1 handover channel, pre-filled → the first try_send is Full.
-        let (handover_tx, mut handover_rx) = mpsc::channel::<Handover>(1);
-        handover_tx.try_send(Handover { items: vec![] }).unwrap();
+        let (route_tx, mut route_rx) = mpsc::channel::<RouteBatch>(1);
+        route_tx.try_send(RouteBatch { items: vec![] }).unwrap();
 
         let hooks = RouterHooks {
             quotes_rx,
-            handover_tx,
+            route_tx,
             inflight_ttl_ms: 60_000,
         };
 
         let id = nid(99);
         let (book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         let mut engine = MatchingEngine::new(book).with_triangular_enabled(false);
-        let mut reserved = HashMap::new();
-        let mut reservations = HashMap::new();
         let no_reoffer = HashMap::new();
 
-        // (1) Full channel → the handover is dropped and ROLLED BACK: not parked,
-        //     back in internal matching, reservation released. No hang, no penalty.
-        external_pass(
-            &mut engine, &raw,
-            &mut reserved, &mut reservations, &no_reoffer, &hooks, 1_000,
-        );
+        // (1) Full channel → the handover is dropped and rolled back: unparked,
+        //     back in internal matching. No hang, no penalty.
+        external_pass(&mut engine, &raw, &no_reoffer, &hooks, 1_000);
         assert!(!engine.book.is_parked(id), "dropped handover rolled back — note not left parked");
         assert_eq!(engine.book.active_order_count(), 1, "note is eligible again");
-        assert!(!reservations.contains_key(&id), "reservation released on rollback");
 
         // (2) Drain the channel, retry → the note re-routes to the SAME DEX and is
         //     delivered. The drop cost it nothing.
-        let _ = handover_rx.try_recv(); // free the slot
-        external_pass(
-            &mut engine, &raw,
-            &mut reserved, &mut reservations, &no_reoffer, &hooks, 2_000,
-        );
+        let _ = route_rx.try_recv(); // free the slot
+        external_pass(&mut engine, &raw, &no_reoffer, &hooks, 2_000);
         assert!(engine.book.is_parked(id), "after the drop the note re-routes to the same DEX");
-        assert!(reservations.contains_key(&id), "reservation recorded on the successful retry");
-        let delivered = handover_rx.try_recv().expect("handover delivered on retry");
+        let delivered = route_rx.try_recv().expect("handover delivered on retry");
         assert_eq!(delivered.items.len(), 1);
         assert_eq!(delivered.items[0].note_id, id);
+    }
+
+    #[test]
+    fn closed_route_channel_reported_and_unparked() {
+        let id = nid(100);
+        let (_qtx, quotes_rx) = watch::channel(Arc::new(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)]));
+        let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(1);
+        drop(route_rx); // receiver gone → channel closed
+        let hooks = RouterHooks { quotes_rx, route_tx, inflight_ttl_ms: 60_000 };
+        let (book, raw) = book_with_order(id, 110_000_000, 2_000_000);
+        let mut engine = MatchingEngine::new(book).with_triangular_enabled(false);
+        assert!(external_pass(&mut engine, &raw, &HashMap::new(), &hooks, 1_000), "closed channel is reported");
+        assert!(!engine.book.is_parked(id), "note unparked on closed channel");
     }
 
     fn harness_db() -> (tempfile::NamedTempFile, DbPool) {
@@ -822,7 +766,7 @@ mod tests {
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, _exec_rx) = mpsc::channel(16);
         let (quotes_tx, quotes_rx) = watch::channel(Arc::new(Vec::new()));
-        let (handover_tx, mut handover_rx) = mpsc::channel(16);
+        let (route_tx, mut route_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
 
         let mut prices = PriceSnapshot::new();
@@ -849,7 +793,7 @@ mod tests {
         // Tiny in-flight TTL so the parked note reactivates quickly.
         let hooks = RouterHooks {
             quotes_rx,
-            handover_tx,
+            route_tx,
             inflight_ttl_ms: 1,
         };
         let local = tokio::task::LocalSet::new();
@@ -867,14 +811,14 @@ mod tests {
                     cancel.clone(),
                 ));
                 // First handover (note parked).
-                let h = tokio::time::timeout(Duration::from_secs(2), handover_rx.recv())
+                let h = tokio::time::timeout(Duration::from_secs(2), route_rx.recv())
                     .await
                     .expect("first handover")
                     .unwrap();
                 assert_eq!(h.items[0].note_id, id);
                 // After the TTL the note reactivates but is blocked for DEX 1, so we
                 // should NOT get a second handover for a while.
-                let second = tokio::time::timeout(Duration::from_millis(200), handover_rx.recv()).await;
+                let second = tokio::time::timeout(Duration::from_millis(200), route_rx.recv()).await;
                 assert!(second.is_err(), "reactivated note not re-offered to same DEX");
                 // Now the order is consumed on-chain → release path runs.
                 consumed_tx.send(id).await.unwrap();
@@ -890,18 +834,12 @@ mod tests {
         // No quotes.
         let id = nid(6);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
-        let items = route_external(
-            &mut book, &raw, &[],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
-        );
+        let items = route_external(&mut book, &raw, &[], &HashMap::new(), 1_000);
         assert!(items.is_empty());
         assert!(!book.is_parked(id));
         // Empty book.
         let mut empty = OrderBook::new(WatchPriceFeed::new());
-        let items2 = route_external(
-            &mut empty, &HashMap::new(), &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
-        );
+        let items2 = route_external(&mut empty, &HashMap::new(), &[quote_at_mid(7, 10_000_000, u64::MAX)], &HashMap::new(), 1_000);
         assert!(items2.is_empty());
     }
 }

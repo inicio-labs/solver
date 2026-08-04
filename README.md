@@ -139,7 +139,7 @@ env var (default: `./solver.toml`).
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
 | `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
-| `router_enabled` + `router_*` | — | off | External liquidity routing (RFQ websocket to other DEXes). Off by default; 9 `router_*` knobs + the `SOLVER_ROUTER_TOKENS` env allow-list. See [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). |
+| `router_enabled` + `router_*` | — | off | External liquidity routing (RFQ websocket to other DEXes). Off by default; 6 `router_*` knobs + the `SOLVER_ROUTER_TOKENS` env allow-list. See [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). |
 
 > **External liquidity routing** lets allow-listed DEXes fill orders the matcher can't
 > cross internally, over a websocket RFQ. Architecture + config + operator runbook:

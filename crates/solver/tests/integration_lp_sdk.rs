@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use pswap_lp_sdk::{LpClient, LpEvent};
-use solver::router::{spawn_router_thread, Handover, HandoverPick, QuotesSnapshot, RouterConfig};
+use solver::router::{spawn_router_thread, RouteBatch, RoutedNote, QuotesSnapshot, RouterConfig};
 
 fn free_port() -> u16 {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -47,7 +47,7 @@ async fn sdk_lp_round_trip_against_real_router() {
 
     // Matcher's ends of the two channels.
     let (quotes_tx, mut quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
-    let (handover_tx, handover_rx) = mpsc::channel::<Handover>(8);
+    let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(8);
     let cancel = CancellationToken::new();
 
     let cfg = RouterConfig {
@@ -59,7 +59,7 @@ async fn sdk_lp_round_trip_against_real_router() {
         auth_tokens: vec!["dex-secret".into()],
     };
     let (thread, ready) =
-        spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+        spawn_router_thread(cfg, quotes_tx, route_rx, cancel.clone()).unwrap();
     ready.await.unwrap().expect("router bound");
 
     let url = format!("ws://127.0.0.1:{port}/v1/rfq");
@@ -99,18 +99,19 @@ async fn sdk_lp_round_trip_against_real_router() {
     let snap = quotes_rx.borrow_and_update().clone();
     assert_eq!(snap.len(), 1, "exactly one standing quote");
     assert_eq!(snap[0].pair, (a, b), "pair flips to note orientation");
-    assert_eq!(snap[0].quantity, 1_000, "quantity = offered base units");
+    assert_eq!((snap[0].give, snap[0].want), (1_000, 500), "the DEX's two base-unit amounts");
     let dex = snap[0].dex;
 
     // (4) Matcher hands a real note over for that DEX → SDK surfaces the decoded
     // note + fill amount.
     let note = Note::mock_noop(Word::from([0xDEAD_BEEFu32, 4, 5, 6]));
-    handover_tx
-        .send(Handover {
-            items: vec![HandoverPick {
+    route_tx
+        .send(RouteBatch {
+            items: vec![RoutedNote {
                 dex,
                 note_id: note.id(),
                 fill: 250,
+                pair: (a, b),
                 note_bytes: note.to_bytes(),
             }],
         })
@@ -124,14 +125,14 @@ async fn sdk_lp_round_trip_against_real_router() {
     match ev {
         LpEvent::Handover(h) => {
             assert_eq!(h.fill_amount, 250);
-            assert_eq!(h.note.id(), note.id(), "exact note bytes, decoded round-trip");
+            assert_eq!(h.note.to_bytes(), note.to_bytes(), "exact note bytes, decoded round-trip");
         }
         other => panic!("expected Handover, got {other:?}"),
     }
 
     // Graceful shutdown: drop client + handover sender, cancel, join the thread.
     drop(client);
-    drop(handover_tx);
+    drop(route_tx);
     cancel.cancel();
     tokio::task::spawn_blocking(move || thread.join().unwrap())
         .await

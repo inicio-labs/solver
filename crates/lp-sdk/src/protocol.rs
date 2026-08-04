@@ -144,15 +144,10 @@ impl Serializable for ServerMsg {
     }
 }
 
-/// Build the raw `Handover` wire frame from an **already-serialized** note (as
-/// ingest produced it, i.e. `note.to_bytes()`) plus `fill_amount`, without
-/// decoding then re-encoding the note. Byte-identical to
-/// `ServerMsg::Handover { note, fill_amount }.to_bytes()` whenever
+/// Build the raw `Handover` wire frame from an already-serialized note plus
+/// `fill_amount`, without decoding+re-encoding. Byte-identical to
+/// `ServerMsg::Handover { note, fill_amount }.to_bytes()` when
 /// `note_bytes == note.to_bytes()` (see the test).
-///
-/// The router carries PSWAP notes as opaque bytes end to end; this lets it emit
-/// the typed-`Note` wire frame without ever parsing them (and without a wasteful
-/// decode-then-re-encode round trip).
 pub fn handover_frame(note_bytes: &[u8], fill_amount: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + note_bytes.len() + 8);
     out.write_u8(ServerMsg::HANDOVER);

@@ -2,7 +2,7 @@
 //! DEXes that quote for them, so they self-consume on-chain.
 //!
 //! - [`select`] — the pure, decimal-correct note-selection math (`select_notes`).
-//! - shared channel payloads ([`QuotesSnapshot`], [`Handover`]) below.
+//! - shared channel payloads ([`QuotesSnapshot`], [`RouteBatch`]) below.
 //! - (server thread + matcher pass are wired in `router::server` / `matcher`).
 //!
 //! The websocket wire protocol lives in the standalone `pswap-lp-sdk` crate
@@ -12,7 +12,7 @@
 pub mod select;
 pub mod server;
 
-pub use select::{select_notes, NoteView, Pair, Pick, Quote};
+pub use select::{select_notes, Pair, Pick, Quote};
 pub use server::{spawn_router_thread, RouterConfig};
 
 use crate::matching::types::{Amount, DexId, OrderId};
@@ -22,20 +22,22 @@ use crate::matching::types::{Amount, DexId, OrderId};
 /// read (filtered by freshness) by the matcher each tick.
 pub type QuotesSnapshot = Vec<Quote>;
 
-/// A batch of notes the matcher hands to the router for delivery to DEXes.
-/// Sent on the `handover` mpsc channel with `try_send` (never blocks the tick).
+/// A batch of notes the matcher sends the router to deliver to DEXes, over the
+/// `route` mpsc channel with `try_send` (never blocks the tick).
 #[derive(Clone, Debug)]
-pub struct Handover {
-    pub items: Vec<HandoverPick>,
+pub struct RouteBatch {
+    pub items: Vec<RoutedNote>,
 }
 
 /// One note to deliver to one DEX over its websocket connection.
 #[derive(Clone, Debug)]
-pub struct HandoverPick {
+pub struct RoutedNote {
     pub dex: DexId,
     pub note_id: OrderId,
     /// requested-token amount the DEX should fill.
     pub fill: Amount,
+    /// The quote's pair — the router drops the used quote so it isn't re-hit.
+    pub pair: Pair,
     /// Serialized PSWAP note bytes for the DEX to consume on-chain.
     pub note_bytes: Vec<u8>,
 }

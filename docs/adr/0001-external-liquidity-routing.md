@@ -28,9 +28,12 @@ the one in-memory order book:
 1. **Central-book model.** The matcher's `OrderBook` is the single source of truth and
    the decision hub (internal cross → executor, else external → a DEX whose quote it
    clears). No DB poll, no second copy of the book.
-2. **Standing-quote RFQ.** Each allow-listed DEX posts a `{price, quantity}` quote per
-   registered pair and refreshes it before a TTL. The matcher matches its idle notes
-   against the cached quotes every tick. (No per-order `Ask`/reply round-trip.)
+2. **Standing-quote RFQ, single-use.** Each allow-listed DEX posts a quote per registered
+   pair — its two base-unit amounts, `give`/`want` (the amounts it will give and want) —
+   and refreshes it before a TTL. The matcher matches its idle notes against the cached
+   quotes every tick; the router **consumes** a quote once a note is handed over against
+   it, so the DEX re-quotes its current capacity (no solver-side reservation). (No
+   per-order `Ask`/reply round-trip.)
 3. **Permissionless handover.** The matcher hands the DEX the serialized note bytes;
    the DEX **self-consumes on-chain**. The existing ingest `consumed_notes` →
    `consumed_rx` path detects the fill and drops the note — no executor change.
@@ -40,9 +43,9 @@ the one in-memory order book:
 5. **Willingness-only selection (no oracle, no decimals).** A PSWAP note's rate is
    fixed on-chain, so the maker's price is guaranteed however the note fills.
    `select_notes` is therefore a pure base-unit **willingness** cross — does the DEX's
-   quote accept the note's rate (`requested·price_den ≤ price_num·offered`)? Exact
-   `u128`, no oracle prices, no `10^decimals` scaling: the solver is a matchmaker here,
-   not a price authority over a rate the chain already binds.
+   quote accept the note's rate (`requested·want ≤ give·offered`)? Exact `u128`, no oracle
+   prices, no `10^decimals` scaling: the solver is a matchmaker here, not a price
+   authority over a rate the chain already binds.
 6. **Router = transport only**, on its own OS thread + multi-thread runtime (mirrors
    `spawn_price_api_thread`); two `Send` channels to the matcher (`watch` quotes in,
    `mpsc` handovers out via `try_send`).

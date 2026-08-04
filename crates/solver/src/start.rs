@@ -154,7 +154,7 @@ pub async fn start(
     let router_hooks = if config.engine.router_enabled {
         Some(RouterHooks {
             quotes_rx: channels.quotes_rx.clone(),
-            handover_tx: channels.handover_tx.clone(),
+            route_tx: channels.route_tx.clone(),
             inflight_ttl_ms: config.engine.router_inflight_ttl_ms,
         })
     } else {
@@ -273,7 +273,7 @@ pub async fn start(
         let (t, r) = crate::router::spawn_router_thread(
             router_cfg,
             channels.quotes_tx,
-            channels.handover_rx,
+            channels.route_rx,
             cancel.clone(),
         )?;
         (Some(t), Some(r))

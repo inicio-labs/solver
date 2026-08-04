@@ -1,6 +1,6 @@
 //! Websocket RFQ server thread. Allow-listed DEXes connect, post standing
 //! quotes (→ `quotes_tx`, read by the matcher), and receive note handovers
-//! (← `handover_rx`, produced by the matcher). Runs on its own OS thread with a
+//! (← `route_rx`, produced by the matcher). Runs on its own OS thread with a
 //! multi-thread runtime, mirroring `spawn_price_api_thread`. Thin transport:
 //! every order decision is made in the matcher, not here.
 
@@ -19,14 +19,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::matching::types::DexId;
+use crate::types::now_millis;
 use pswap_lp_sdk::protocol::{handover_frame, ClientMsg, ServerMsg};
-use crate::router::{Handover, Pair, Quote, QuotesSnapshot};
+use crate::router::{Pair, Quote, QuotesSnapshot, RouteBatch};
 
 /// Configuration for the router websocket server.
 #[derive(Clone, Debug)]
@@ -38,13 +38,6 @@ pub struct RouterConfig {
     pub quote_ttl_ms: u64,
     /// Allow-list of bearer tokens (sourced from env). Empty ⇒ reject everyone.
     pub auth_tokens: Vec<String>,
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -104,11 +97,6 @@ impl RouterState {
             }
         };
         match msg {
-            // A quote is filler-centric: the DEX gives `offered` and wants
-            // `requested`. Our internal `Quote` is note-centric (a note it fills
-            // offers what the DEX wants), so we FLIP the pair and take the two
-            // base-unit amounts as the rate. Decimals never enter here — the
-            // willingness gate is a base-unit cross (see `select::dex_is_willing`).
             ClientMsg::Quote { offered, requested, valid_for_ms } => {
                 self.register_quote(dex, offered, requested, valid_for_ms)
             }
@@ -138,36 +126,49 @@ impl RouterState {
         let ttl = valid_for_ms
             .map(|v| v.min(self.cfg.quote_ttl_ms))
             .unwrap_or(self.cfg.quote_ttl_ms);
-        let quote = Quote {
-            dex,
-            pair,
-            // base-unit rate = requested-per-offered (note orientation) = give/want.
-            price_num: give as u128,
-            price_den: want as u128,
-            // max requested-token (what the DEX pays) it will take = what it gives.
-            quantity: give,
-            expires_at: now_millis().saturating_add(ttl),
-        };
+        let quote = Quote { dex, pair, give, want, expires_at: now_millis().saturating_add(ttl) };
         self.quotes.lock().unwrap().entry(dex).or_default().insert(pair, quote);
         self.republish();
         None
     }
 
-    /// Deliver a matcher handover batch to the appropriate DEX connections. The
-    /// note travels as opaque bytes end to end; we assemble the `Handover` wire
-    /// frame straight from them (no decode/re-encode) — see `handover_frame`.
-    fn deliver(&self, handover: Handover) {
-        let conns = self.conns.lock().unwrap();
-        for item in handover.items {
-            let Some(tx) = conns.get(&item.dex) else { continue };
-            let _ = tx.send(handover_frame(&item.note_bytes, item.fill));
+    /// Deliver a `RouteBatch` to DEX connections, then **consume** each used quote
+    /// so it isn't handed out again until the DEX re-quotes. The note travels as
+    /// opaque bytes; the wire frame is built from them via `handover_frame`.
+    fn deliver(&self, batch: RouteBatch) {
+        {
+            let conns = self.conns.lock().unwrap();
+            for item in &batch.items {
+                let Some(tx) = conns.get(&item.dex) else {
+                    tracing::warn!(dex = item.dex, note = %item.note_id, "handover dropped: DEX not connected");
+                    continue;
+                };
+                if tx.send(handover_frame(&item.note_bytes, item.fill)).is_err() {
+                    tracing::warn!(dex = item.dex, note = %item.note_id, "handover dropped: writer closed");
+                }
+            }
+        }
+        let mut consumed = false;
+        {
+            let mut quotes = self.quotes.lock().unwrap();
+            for item in &batch.items {
+                if let Some(m) = quotes.get_mut(&item.dex) {
+                    consumed |= m.remove(&item.pair).is_some();
+                }
+            }
+        }
+        if consumed {
+            self.republish();
         }
     }
 
     fn deregister(&self, dex: DexId) {
         self.conns.lock().unwrap().remove(&dex);
         self.quotes.lock().unwrap().remove(&dex);
-        self.conn_count.fetch_sub(1, Ordering::Relaxed);
+        // Saturating: an unpaired deregister must not underflow to usize::MAX.
+        let _ = self
+            .conn_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
         self.republish(); // drop this DEX's quotes immediately
     }
 }
@@ -248,7 +249,7 @@ async fn handle_conn(state: RouterState, socket: WebSocket) {
 pub fn spawn_router_thread(
     cfg: RouterConfig,
     quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
-    mut handover_rx: mpsc::Receiver<Handover>,
+    mut route_rx: mpsc::Receiver<RouteBatch>,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -265,14 +266,14 @@ pub fn spawn_router_thread(
             rt.block_on(async move {
                 let state = RouterState::new(cfg, quotes_tx);
 
-                // Handover relay: matcher → DEX connections.
+                // RouteBatch relay: matcher → DEX connections.
                 let relay_state = state.clone();
                 let relay_cancel = cancel.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             _ = relay_cancel.cancelled() => break,
-                            h = handover_rx.recv() => match h {
+                            h = route_rx.recv() => match h {
                                 Some(handover) => relay_state.deliver(handover),
                                 None => break,
                             },
@@ -313,7 +314,7 @@ pub fn spawn_router_thread(
 mod tests {
     use super::*;
     use crate::matching::types::TokenId;
-    use crate::router::HandoverPick;
+    use crate::router::RoutedNote;
     use miden_protocol::note::NoteId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -399,10 +400,8 @@ mod tests {
         // Stored note-centric: the pair FLIPS (a note it fills offers what the DEX
         // wants, requests what it gives).
         assert_eq!(q.pair, (tok_b(), tok_a()));
-        // Base-unit rate = give/want = 2500/1000 (no decimals scaling here).
-        assert_eq!((q.price_num, q.price_den), (2_500, 1_000));
-        // Max requested-token it will take (what it pays out) = what it gives.
-        assert_eq!(q.quantity, 2_500);
+        // give/want are the DEX's two base-unit amounts (rate + capacity).
+        assert_eq!((q.give, q.want), (2_500, 1_000));
         assert!(q.expires_at > 0);
     }
 
@@ -433,18 +432,33 @@ mod tests {
         s.conns.lock().unwrap().insert(7, out_tx);
         let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 99)).unwrap();
 
-        s.deliver(Handover {
-            items: vec![HandoverPick { dex: 7, note_id, fill: 500, note_bytes: vec![0xDE, 0xAD] }],
+        s.deliver(RouteBatch {
+            items: vec![RoutedNote { dex: 7, note_id, fill: 500, pair: (tok_a(), tok_b()), note_bytes: vec![0xDE, 0xAD] }],
         });
-        // The router emits the raw Handover wire frame straight from the opaque
+        // The router emits the raw RouteBatch wire frame straight from the opaque
         // note bytes — byte-for-byte `handover_frame(note_bytes, fill)`.
         assert_eq!(out_rx.try_recv().unwrap(), handover_frame(&[0xDE, 0xAD], 500));
 
         // A handover for an unknown DEX is silently dropped (no panic).
-        s.deliver(Handover {
-            items: vec![HandoverPick { dex: 999, note_id, fill: 1, note_bytes: vec![] }],
+        s.deliver(RouteBatch {
+            items: vec![RoutedNote { dex: 999, note_id, fill: 1, pair: (tok_a(), tok_b()), note_bytes: vec![] }],
         });
         assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handover_consumes_the_quote() {
+        let (s, mut rx) = make_state(vec!["t".into()]);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        s.conns.lock().unwrap().insert(7, out_tx);
+        s.handle_client_msg(7, &quote_bytes((tok_a(), 2_000), (tok_b(), 1_000), None));
+        let _ = rx.borrow_and_update();
+        let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 1)).unwrap();
+        // Delivering a handover against that quote consumes it (not re-hittable).
+        s.deliver(RouteBatch {
+            items: vec![RoutedNote { dex: 7, note_id, fill: 500, pair: (tok_b(), tok_a()), note_bytes: vec![0xAB] }],
+        });
+        assert!(rx.borrow_and_update().is_empty(), "used quote is consumed");
     }
 
     #[test]
@@ -485,12 +499,12 @@ mod tests {
         };
         let state = RouterState::new(cfg, quotes_tx);
 
-        // Handover relay (as in spawn_router_thread).
-        let (handover_tx, mut handover_rx) = mpsc::channel::<Handover>(8);
+        // RouteBatch relay (as in spawn_router_thread).
+        let (route_tx, mut route_rx) = mpsc::channel::<RouteBatch>(8);
         {
             let st = state.clone();
             tokio::spawn(async move {
-                while let Some(h) = handover_rx.recv().await {
+                while let Some(h) = route_rx.recv().await {
                     st.deliver(h);
                 }
             });
@@ -532,9 +546,9 @@ mod tests {
 
         // Deliver a handover for that DEX → the client receives the exact frame.
         let note_id = NoteId::try_from_hex(&format!("0x{:064x}", 5)).unwrap();
-        handover_tx
-            .send(Handover {
-                items: vec![HandoverPick { dex, note_id, fill: 7, note_bytes: vec![0xAB] }],
+        route_tx
+            .send(RouteBatch {
+                items: vec![RoutedNote { dex, note_id, fill: 7, pair: (tok_b(), tok_a()), note_bytes: vec![0xAB] }],
             })
             .await
             .unwrap();
@@ -580,7 +594,7 @@ mod tests {
         drop(probe);
 
         let (quotes_tx, _qrx) = watch::channel(Arc::new(Vec::new()));
-        let (handover_tx, handover_rx) = mpsc::channel::<Handover>(8);
+        let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(8);
         let cancel = CancellationToken::new();
         let cfg = RouterConfig {
             bind: "127.0.0.1".into(),
@@ -591,7 +605,7 @@ mod tests {
             auth_tokens: vec!["s".into()],
         };
         let (thread, ready) =
-            spawn_router_thread(cfg, quotes_tx, handover_rx, cancel.clone()).unwrap();
+            spawn_router_thread(cfg, quotes_tx, route_rx, cancel.clone()).unwrap();
         ready.await.unwrap().expect("router bound");
 
         let (mut ws, _resp) =
@@ -601,7 +615,7 @@ mod tests {
         expect_auth_ok(ws.next().await.unwrap().unwrap());
 
         drop(ws);
-        drop(handover_tx);
+        drop(route_tx);
         cancel.cancel();
         tokio::task::spawn_blocking(move || thread.join().unwrap())
             .await
@@ -667,11 +681,11 @@ mod tests {
             auth_tokens: vec!["s".into()],
         };
         let state = RouterState::new(cfg, quotes_tx);
-        let (handover_tx, mut handover_rx) = mpsc::channel::<Handover>(8);
+        let (route_tx, mut route_rx) = mpsc::channel::<RouteBatch>(8);
         {
             let st = state.clone();
             tokio::spawn(async move {
-                while let Some(h) = handover_rx.recv().await {
+                while let Some(h) = route_rx.recv().await {
                     st.deliver(h);
                 }
             });
@@ -716,15 +730,15 @@ mod tests {
         let dex_b = snap.iter().find(|q| q.pair == (tok_a(), tok_b())).unwrap().dex;
         assert_ne!(dex_a, dex_b, "distinct DEX ids");
 
-        // Handover to each DEX → each client receives only its own exact frame.
+        // RouteBatch to each DEX → each client receives only its own exact frame.
         let n1 = NoteId::try_from_hex(&format!("0x{:064x}", 1)).unwrap();
         let n2 = NoteId::try_from_hex(&format!("0x{:064x}", 2)).unwrap();
-        handover_tx
-            .send(Handover { items: vec![HandoverPick { dex: dex_a, note_id: n1, fill: 1, note_bytes: vec![0x01] }] })
+        route_tx
+            .send(RouteBatch { items: vec![RoutedNote { dex: dex_a, note_id: n1, fill: 1, pair: (tok_b(), tok_a()), note_bytes: vec![0x01] }] })
             .await
             .unwrap();
-        handover_tx
-            .send(Handover { items: vec![HandoverPick { dex: dex_b, note_id: n2, fill: 2, note_bytes: vec![0x02] }] })
+        route_tx
+            .send(RouteBatch { items: vec![RoutedNote { dex: dex_b, note_id: n2, fill: 2, pair: (tok_a(), tok_b()), note_bytes: vec![0x02] }] })
             .await
             .unwrap();
 

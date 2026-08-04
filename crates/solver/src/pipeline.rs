@@ -15,7 +15,7 @@ use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
-use crate::router::{Handover, QuotesSnapshot};
+use crate::router::{RouteBatch, QuotesSnapshot};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -197,8 +197,8 @@ pub struct PipelineChannels {
     pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
     pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
     /// Selected notes: matcher → router (delivered to DEXes over websocket).
-    pub handover_tx: mpsc::Sender<Handover>,
-    pub handover_rx: mpsc::Receiver<Handover>,
+    pub route_tx: mpsc::Sender<RouteBatch>,
+    pub route_rx: mpsc::Receiver<RouteBatch>,
 }
 
 pub fn create_channels() -> PipelineChannels {
@@ -209,7 +209,7 @@ pub fn create_channels() -> PipelineChannels {
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(Vec::new()));
-    let (handover_tx, handover_rx) = mpsc::channel::<Handover>(PIPELINE_CHANNEL_BUF);
+    let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
         order_tx,
         order_rx,
@@ -225,8 +225,8 @@ pub fn create_channels() -> PipelineChannels {
         subscribe_rx,
         quotes_tx,
         quotes_rx,
-        handover_tx,
-        handover_rx,
+        route_tx,
+        route_rx,
     }
 }
 

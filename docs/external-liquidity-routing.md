@@ -1,6 +1,6 @@
 # External Liquidity Routing (RFQ to other DEXes)
 
-**STATUS: IMPLEMENTED.** Router, matcher external pass, decimal-correct selection,
+**STATUS: IMPLEMENTED.** Router, matcher external pass, willingness-only selection,
 config, and the filler SDK are built and tested. Opt-in via `router_enabled`
 (default off).
 

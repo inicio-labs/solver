@@ -270,13 +270,27 @@ pub async fn start(
             quote_ttl_ms: config.engine.router_quote_ttl_ms,
             auth_tokens,
         };
-        let (t, r) = crate::router::spawn_router_thread(
+        match crate::router::spawn_router_thread(
             router_cfg,
             channels.quotes_tx,
             channels.route_rx,
             cancel.clone(),
-        )?;
-        (Some(t), Some(r))
+        ) {
+            Ok((t, r)) => (Some(t), Some(r)),
+            Err(e) => {
+                // Router failed to start — tear down the already-spawned services
+                // (same cancel + join path as a startup-gate failure) so nothing is
+                // left running after `start` returns.
+                cancel.cancel();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = ingest_thread.join();
+                    let _ = executor_thread.join();
+                    let _ = price_api_thread.join();
+                })
+                .await;
+                return Err(e).context("router startup failed");
+            }
+        }
     } else {
         (None, None)
     };

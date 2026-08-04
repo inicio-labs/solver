@@ -106,8 +106,6 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     router_max_msg_bytes: 16384,
                     router_quote_ttl_ms: 20_000,
                     router_inflight_ttl_ms: 30_000,
-                    router_min_export_edge_bps: 50,
-                    router_quote_max_deviation_bps: 200,
                 },
             };
 

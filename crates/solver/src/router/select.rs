@@ -2,27 +2,22 @@
 //!
 //! Decides which unmatched notes to hand to which DEX given the DEXes' standing
 //! quotes. Referentially transparent — no I/O, no websocket, no `OrderBook`
-//! mutation — so it is exhaustively unit-tested. This is the **#1 correctness
-//! surface**: a note's terms and a DEX's price live in *different* unit bases
-//! (raw base units vs cents-per-whole-token), so every comparison is done in
-//! exact `u128` integer arithmetic with explicit `10^decimals` normalisation.
-//! A naive raw-rate-vs-price compare mis-routes by `10^(d_off−d_req)` (e.g. 100×
-//! for 6-dec vs 8-dec tokens).
+//! mutation — so it is exhaustively unit-tested.
 //!
-//! NOTE on bases: the internal matcher (`price_feed::is_order_profitable`,
-//! `three_edge_cycle`) is decimals-*blind* — it multiplies raw amount × cents,
-//! which is only correct because the live devnet tokens share 8 decimals. This
-//! module is deliberately decimals-*correct*; for equal decimals the two agree.
+//! A PSWAP note carries its rate **fixed on-chain**: whoever consumes it pays
+//! exactly the note's `requested` for its `offered`, so the maker's price is
+//! guaranteed regardless of which DEX fills it. Selection is therefore a pure
+//! **willingness** check — does the DEX's standing quote accept the note's rate?
+//! Both the note's terms and the quote's price live in the *same two tokens'
+//! base units*, so the check is an exact integer cross with **no decimals and no
+//! oracle** (the solver is a matchmaker here, not a price authority — it does not
+//! second-guess a fixed on-chain rate against an off-chain oracle).
 
-use crate::matching::price_feed::UsdCents;
 use crate::matching::types::{Amount, DexId, OrderId, TokenId};
 use std::collections::{HashMap, HashSet};
 
 /// A pair as the NOTE orients it: `(offered_token, requested_token)`.
 pub type Pair = (TokenId, TokenId);
-
-/// Token decimals (immutable on-chain faucet property).
-pub type Decimals = HashMap<TokenId, u8>;
 
 /// A DEX's standing quote for one registered pair (one orientation). A DEX that
 /// wants both directions of a pair posts two quotes.
@@ -36,11 +31,11 @@ pub struct Quote {
     /// since a note it fills offers what the DEX wants.
     pub pair: Pair,
     /// Price as an exact rational `price_num / price_den` = requested-token per
-    /// offered-token, in **base units** (NOT per whole token). Taken straight
-    /// from the SDK quote's base-unit amounts after the flip: `price_num =
-    /// sdk.offered.amount`, `price_den = sdk.requested.amount`. Because both the
-    /// note's terms and this price are base-unit, the willingness gate is a plain
-    /// cross with no decimals; decimals enter only the oracle gates. Both > 0.
+    /// offered-token, in **base units** (taken straight from the SDK quote's
+    /// base-unit amounts after the flip: `price_num = sdk.offered.amount`,
+    /// `price_den = sdk.requested.amount`). Because both the note's terms and this
+    /// price are base-unit, willingness is a plain integer cross — no decimals.
+    /// Both > 0.
     pub price_num: u128,
     pub price_den: u128,
     /// Max requested-token quantity (base units) the DEX will take on this pair
@@ -77,136 +72,44 @@ impl NoteView {
     }
 }
 
-fn pow10(n: u8) -> Option<u128> {
-    10u128.checked_pow(n as u32)
-}
-
-/// Scale offered/requested USD values to a shared denominator, reduced by the
-/// common `10^min(d_off,d_req)` factor to bound magnitude. Returns
-/// `(offered_scaled, requested_scaled)` in identical units, or `None` on
-/// overflow (treated as not-exportable — conservative).
-fn scaled_usd(
-    off_raw: Amount,
-    c_off: UsdCents,
-    d_off: u8,
-    req_raw: Amount,
-    c_req: UsdCents,
-    d_req: u8,
-) -> Option<(u128, u128)> {
-    let m = d_off.min(d_req);
-    let off = (off_raw as u128)
-        .checked_mul(c_off as u128)?
-        .checked_mul(pow10(d_req - m)?)?;
-    let req = (req_raw as u128)
-        .checked_mul(c_req as u128)?
-        .checked_mul(pow10(d_off - m)?)?;
-    Some((off, req))
-}
-
-/// Decide whether `note` is exportable to the DEX behind `quote`, returning the
-/// USD surplus `offered − requested` (in the quote-pair's reduced units, so it
-/// is comparable for ordering *within* a pair) — or `None` if not exportable.
+/// Is the DEX behind `quote` willing to fill `note` at the note's fixed rate?
 ///
-/// Gates (all must hold):
-///   1. data: both tokens priced AND both decimals known;
-///   2. oracle-edge vs MID: note generous to the consumer by ≥ `min_edge_bps`
-///      *at oracle mid* (NOT the DEX's quote — so an in-band manipulated quote
-///      can't move the export decision);
-///   3. DEX-willingness: note rate is on the profitable side of the quote;
-///   4. off-market guard: reject if the quote deviates from mid by > `max_dev_bps`.
-fn export_surplus(
-    note: &NoteView,
-    quote: &Quote,
-    price_cents: &impl Fn(TokenId) -> Option<UsdCents>,
-    decimals: &Decimals,
-    min_edge_bps: u64,
-    max_dev_bps: u64,
-) -> Option<u128> {
-    // (1) data gate
-    let c_off = price_cents(note.offered_token)?;
-    let c_req = price_cents(note.requested_token)?;
-    let d_off = *decimals.get(&note.offered_token)?;
-    let d_req = *decimals.get(&note.requested_token)?;
-    if c_off == 0 || c_req == 0 || quote.price_den == 0 || quote.price_num == 0 {
-        return None;
+/// Base-unit cross, **no decimals**: the note demands `requested/offered`; the DEX
+/// accepts anything at or below `price_num/price_den`. Willing iff
+///   `note.requested · price_den ≤ price_num · note.offered`.
+/// Both the note amounts and the quote price are base units of the same two
+/// tokens, so decimals cancel.
+///
+/// All four factors are `FungibleAsset` amounts, each ≤ `AssetAmount::MAX`
+/// (2^63−2^31, wire-enforced), so both products are < 2^126 and cannot overflow
+/// u128; the `checked_mul` is belt-only (an impossible overflow ⇒ "not willing").
+fn dex_is_willing(note: &NoteView, quote: &Quote) -> bool {
+    if quote.price_num == 0 || quote.price_den == 0 {
+        return false;
     }
-
-    let (off, req) = scaled_usd(note.offered, c_off, d_off, note.requested, c_req, d_req)?;
-
-    // (2) oracle-edge: off >= req * (10000 + edge) / 10000
-    let lhs = off.checked_mul(10_000)?;
-    let rhs = req.checked_mul(10_000u128.checked_add(min_edge_bps as u128)?)?;
-    if lhs < rhs {
-        return None;
-    }
-
-    // (4) off-market guard (oracle check — this is where decimals enter): reject
-    //     if the quote's base-unit rate deviates from oracle mid by > max_dev_bps.
-    //     Oracle mid (requested-base per offered-base) = c_off·10^d_req /
-    //     (c_req·10^d_off); the quote rate is price_num/price_den. Cross-multiplied
-    //     and reduced by the common 10^m factor (m = min(d_off,d_req)):
-    //       reject iff |num·c_req·10^(d_off-m) − c_off·den·10^(d_req-m)|·10000
-    //                    > dev · c_off · den · 10^(d_req-m)
-    //     OVERFLOW: price_num/price_den are base-unit `FungibleAsset` amounts, so
-    //     each is ≤ `AssetAmount::MAX` (2^63−2^31), enforced on the wire by
-    //     `AssetAmount::read_from`. But unlike gate 3 these products ALSO carry a
-    //     `UsdCents` (u64, not amount-bounded) and a 10^(Δdecimals) factor, which
-    //     are not covered by that bound — so they CAN exceed u128 for extreme
-    //     tokens (high price × large size × wide decimal gap). `checked_mul` then
-    //     yields `None` and the `?` treats the note as not-exportable — fail-safe,
-    //     never a mis-fill or panic (see `no_panic_on_overflow_inputs`).
-    let m = d_off.min(d_req);
-    let q_side = quote
-        .price_num
-        .checked_mul(c_req as u128)?
-        .checked_mul(pow10(d_off - m)?)?;
-    let mid_side = (c_off as u128)
-        .checked_mul(quote.price_den)?
-        .checked_mul(pow10(d_req - m)?)?;
-    let dev_lhs = q_side.abs_diff(mid_side).checked_mul(10_000)?;
-    let dev_rhs = (max_dev_bps as u128)
-        .checked_mul(c_off as u128)?
-        .checked_mul(quote.price_den)?
-        .checked_mul(pow10(d_req - m)?)?;
-    if dev_lhs > dev_rhs {
-        return None;
-    }
-
-    // (3) DEX-willingness (base-unit cross — NO decimals): the note's base-unit
-    //     rate (requested/offered) must be at or below the quote's base-unit rate.
-    //       reject iff requested·price_den > price_num·offered
-    //     All four factors are `FungibleAsset` amounts, each ≤ `AssetAmount::MAX`
-    //     (2^63−2^31), so both products are < 2^126: this cross provably CANNOT
-    //     overflow u128 — the `checked_mul` here is belt-and-suspenders only.
-    let w_lhs = (note.requested as u128).checked_mul(quote.price_den)?;
-    let w_rhs = quote.price_num.checked_mul(note.offered as u128)?;
-    if w_lhs > w_rhs {
-        return None;
-    }
-
-    Some(off.saturating_sub(req))
+    let (Some(lhs), Some(rhs)) = (
+        (note.requested as u128).checked_mul(quote.price_den),
+        quote.price_num.checked_mul(note.offered as u128),
+    ) else {
+        return false;
+    };
+    lhs <= rhs
 }
 
 /// Select which notes to hand to which DEX.
 ///
-/// For each fresh quote, gathers the eligible residual notes for that pair
-/// (Export gates), orders them **marginal-eligible-first** (smallest USD surplus
-/// first — give away the least-generous, retain the best for internal crossing),
-/// and accumulates up to `quote.quantity − reserved[(dex,pair)]`. Each note is
-/// handed to at most one DEX (`used` set). Pure: no mutation of inputs.
-#[allow(clippy::too_many_arguments)]
+/// For each fresh quote, walk the residual notes for that pair (book order) and
+/// take each one the DEX is willing to fill, accumulating up to
+/// `quote.quantity − reserved[(dex,pair)]`. Each note is handed to at most one DEX
+/// (`used` set). Pure: no mutation of inputs.
 pub fn select_notes(
     candidates: &[NoteView],
     quotes: &[Quote],
     now: u64,
-    price_cents: &impl Fn(TokenId) -> Option<UsdCents>,
-    decimals: &Decimals,
     reserved: &HashMap<(DexId, Pair), Amount>,
     // `blocked`: (note, dex) pairs not to offer — e.g. a note that already
     // no-showed at that DEX (don't immediately re-offer it to the same one).
     blocked: &HashSet<(OrderId, DexId)>,
-    min_edge_bps: u64,
-    max_dev_bps: u64,
 ) -> Vec<Pick> {
     let mut picks = Vec::new();
     let mut used: HashSet<OrderId> = HashSet::new();
@@ -221,26 +124,15 @@ pub fn select_notes(
             continue;
         }
 
-        // Eligible notes for this quote's pair, with their surplus (same pair =>
-        // same unit scale => surplus is comparable here).
-        let mut eligible: Vec<(u128, &NoteView)> = candidates
-            .iter()
-            .filter(|n| {
-                n.pair() == quote.pair
-                    && !used.contains(&n.id)
-                    && !blocked.contains(&(n.id, quote.dex))
-            })
-            .filter_map(|n| {
-                export_surplus(n, quote, price_cents, decimals, min_edge_bps, max_dev_bps)
-                    .map(|s| (s, n))
-            })
-            .collect();
-        // Marginal-first: smallest surplus given away first. `sort_by_key` is
-        // stable, so equal-surplus notes keep input (book FIFO) order.
-        eligible.sort_by_key(|(s, _)| *s);
-
         let mut taken: u128 = 0;
-        for (_surplus, note) in eligible {
+        for note in candidates {
+            if note.pair() != quote.pair
+                || used.contains(&note.id)
+                || blocked.contains(&(note.id, quote.dex))
+                || !dex_is_willing(note, quote)
+            {
+                continue;
+            }
             let fill = note.requested as u128;
             if taken + fill > budget {
                 continue; // would exceed the DEX's quoted quantity; a smaller note may still fit
@@ -281,246 +173,151 @@ mod tests {
         NoteId::try_from_hex(&format!("0x{seed:064x}")).unwrap()
     }
 
-    // Oracle: IMIDEN = $2.00 (200c), IUSDT = $1.00 (100c), IBTC = $100.00 (10000c).
-    fn mid(t: TokenId) -> Option<UsdCents> {
-        if t == imiden() {
-            Some(200)
-        } else if t == iusdt() {
-            Some(100)
-        } else if t == ibtc() {
-            Some(10_000)
-        } else {
-            None
-        }
+    /// A quote with an explicit base-unit rate + quantity, never stale.
+    fn quote(dex: DexId, pair: Pair, price_num: u128, price_den: u128, quantity: Amount) -> Quote {
+        Quote { dex, pair, price_num, price_den, quantity, expires_at: u64::MAX }
     }
 
-    /// decimals: IMIDEN 8, IUSDT **6**, IBTC 8 — asymmetric on purpose.
-    fn decimals() -> Decimals {
-        let mut d = Decimals::new();
-        d.insert(imiden(), 8);
-        d.insert(iusdt(), 6);
-        d.insert(ibtc(), 8);
-        d
+    fn note(id: u64, offered_token: TokenId, offered: Amount, requested_token: TokenId, requested: Amount) -> NoteView {
+        NoteView { id: nid(id), offered_token, offered, requested_token, requested }
     }
 
-    /// A quote priced exactly at oracle mid for the IMIDEN/IUSDT pair. Mid is 2
-    /// IUSDT per **whole** IMIDEN; in **base units** (IMIDEN 8-dec, IUSDT 6-dec)
-    /// that is `2e6 / 1e8 = 1/50` requested-base per offered-base. At mid the
-    /// off-market deviation is 0 and any at-or-below-mid note rate passes
-    /// willingness — so this isolates the oracle-edge gate (gate 2) on that pair.
-    fn open_quote(dex: DexId, pair: Pair, quantity: Amount) -> Quote {
-        Quote { dex, pair, price_num: 1, price_den: 50, quantity, expires_at: u64::MAX }
-    }
-
-    // --- the 100× decimals trap ---
+    // --- willingness (the only gate) ---
 
     #[test]
-    fn parity_note_not_exported_decimals_correct() {
-        // Offer 1 IMIDEN (1e8 @ $2 = $2) for 2 IUSDT (2e6 @ $1 = $2): parity.
-        let note = NoteView {
-            id: nid(1),
-            offered_token: imiden(),
-            offered: 100_000_000, // 1e8, 8-dec
-            requested_token: iusdt(),
-            requested: 2_000_000, // 2e6, 6-dec
-        };
-        // margin 0 → not exported for any positive edge (decimals-correct).
-        let s = export_surplus(&note, &open_quote(1, note.pair(), u64::MAX), &mid, &decimals(), 1, 100_000);
-        assert_eq!(s, None, "a fair note must not be exported");
-        // And exactly at edge 0 it is borderline-exportable with zero surplus.
-        let s0 = export_surplus(&note, &open_quote(1, note.pair(), u64::MAX), &mid, &decimals(), 0, 100_000);
-        assert_eq!(s0, Some(0), "at edge 0, parity clears with zero surplus");
-    }
-
-    #[test]
-    fn generous_note_exported_stingy_retained() {
+    fn willing_when_note_rate_at_or_below_quote() {
         let pair = (imiden(), iusdt());
-        // Generous: offer 1.1 IMIDEN ($2.20) for 2 IUSDT ($2.00) → +10%.
-        let generous = NoteView {
-            id: nid(2),
-            offered_token: imiden(),
-            offered: 110_000_000,
-            requested_token: iusdt(),
-            requested: 2_000_000,
-        };
-        // Stingy: offer 1.005 IMIDEN ($2.01) for 2 IUSDT ($2.00) → +0.5%.
-        let stingy = NoteView {
-            id: nid(3),
-            offered_token: imiden(),
-            offered: 100_500_000,
-            requested_token: iusdt(),
-            requested: 2_000_000,
-        };
-        let q = open_quote(1, pair, u64::MAX);
-        // At a 1% (100bps) edge: generous exports, stingy is retained.
-        assert!(export_surplus(&generous, &q, &mid, &decimals(), 100, 100_000).is_some());
-        assert_eq!(export_surplus(&stingy, &q, &mid, &decimals(), 100, 100_000), None);
-    }
-
-    // --- ordering + quantity cap ---
-
-    #[test]
-    fn marginal_first_and_quantity_cap() {
-        let pair = (imiden(), iusdt());
-        // Two eligible notes, each requesting 2e6 IUSDT; budget only fits one.
-        // 'a' is more generous (bigger surplus) than 'b'; marginal-first picks b.
-        let a = NoteView { id: nid(10), offered_token: imiden(), offered: 150_000_000, requested_token: iusdt(), requested: 2_000_000 }; // $3.00
-        let b = NoteView { id: nid(11), offered_token: imiden(), offered: 120_000_000, requested_token: iusdt(), requested: 2_000_000 }; // $2.40
-        let cands = vec![a.clone(), b.clone()];
-        let quotes = vec![open_quote(7, pair, 2_000_000)]; // room for exactly one note
-        let picks = select_notes(&cands, &quotes, 0, &mid, &decimals(), &HashMap::new(), &HashSet::new(), 100, 100_000);
+        // Note offers 1.1 IMIDEN for 2 IUSDT (base: 110e6 for 2e6).
+        let n = note(1, imiden(), 110_000_000, iusdt(), 2_000_000);
+        // Quote accepts up to 1/50 (requested-base per offered-base): willing.
+        let picks = select_notes(&[n], &[quote(7, pair, 1, 50, u64::MAX)], 0, &HashMap::new(), &HashSet::new());
         assert_eq!(picks.len(), 1);
-        assert_eq!(picks[0].note_id, b.id, "least-generous eligible note handed over first");
+        assert_eq!(picks[0].note_id, nid(1));
         assert_eq!(picks[0].fill, 2_000_000);
         assert_eq!(picks[0].dex, 7);
     }
 
     #[test]
+    fn unwilling_when_quote_rate_below_note() {
+        let pair = (imiden(), iusdt());
+        // Note base rate requested/offered = 2e6/130e6 ≈ 0.0154.
+        let n = note(2, imiden(), 130_000_000, iusdt(), 2_000_000);
+        // DEX accepts only 1/100 = 0.01 base — below the note's rate → unwilling.
+        let picks = select_notes(&[n], &[quote(1, pair, 1, 100, u64::MAX)], 0, &HashMap::new(), &HashSet::new());
+        assert!(picks.is_empty(), "DEX quote below the note rate → not willing");
+    }
+
+    #[test]
+    fn willingness_is_base_unit_exact_no_decimals() {
+        // The cross is a plain base-unit comparison (requested·den ≤ num·offered)
+        // with NO decimal scaling — even though IMIDEN is 8-dec and IUSDT 6-dec
+        // (the "100× trap" is irrelevant here because both sides are base units).
+        let pair = (imiden(), iusdt());
+        let n = note(1, imiden(), 150_000_000, iusdt(), 2_000_000);
+        // Quote exactly at the note's base rate → willing (borderline).
+        let at = quote(1, pair, 2_000_000, 150_000_000, u64::MAX);
+        assert_eq!(select_notes(&[n.clone()], &[at], 0, &HashMap::new(), &HashSet::new()).len(), 1);
+        // One base unit stingier (den +1 → rate just below the note's) → unwilling.
+        let below = quote(1, pair, 2_000_000, 150_000_001, u64::MAX);
+        assert!(select_notes(&[n], &[below], 0, &HashMap::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn zero_price_quote_is_not_willing() {
+        let pair = (imiden(), iusdt());
+        let n = note(1, imiden(), 130_000_000, iusdt(), 2_000_000);
+        assert!(select_notes(&[n.clone()], &[quote(1, pair, 0, 50, u64::MAX)], 0, &HashMap::new(), &HashSet::new()).is_empty());
+        assert!(select_notes(&[n], &[quote(1, pair, 1, 0, u64::MAX)], 0, &HashMap::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn pair_must_match() {
+        // A note on (IMIDEN, IUSDT) is never offered to an (IMIDEN, IBTC) quote.
+        let n = note(1, imiden(), 130_000_000, iusdt(), 2_000_000);
+        let q = quote(1, (imiden(), ibtc()), 1, 50, u64::MAX);
+        assert!(select_notes(&[n], &[q], 0, &HashMap::new(), &HashSet::new()).is_empty());
+    }
+
+    // --- quantity cap / reservations / mechanics ---
+
+    #[test]
+    fn quantity_cap_limits_picks() {
+        let pair = (imiden(), iusdt());
+        // Two willing notes, each requesting 2e6 IUSDT; budget fits exactly one.
+        let a = note(10, imiden(), 150_000_000, iusdt(), 2_000_000);
+        let b = note(11, imiden(), 120_000_000, iusdt(), 2_000_000);
+        let picks = select_notes(&[a, b], &[quote(7, pair, 1, 50, 2_000_000)], 0, &HashMap::new(), &HashSet::new());
+        assert_eq!(picks.len(), 1, "budget fits exactly one note");
+        assert_eq!(picks[0].note_id, nid(10), "first willing note in book order is taken");
+        assert_eq!(picks[0].fill, 2_000_000);
+    }
+
+    #[test]
     fn reserved_reduces_budget() {
         let pair = (imiden(), iusdt());
-        let note = NoteView { id: nid(20), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        let quotes = vec![open_quote(7, pair, 2_000_000)];
+        let n = note(20, imiden(), 130_000_000, iusdt(), 2_000_000);
         let mut reserved = HashMap::new();
-        reserved.insert((7u64, pair), 1_000_000); // half already committed → budget 1e6 < note's 2e6
-        let picks = select_notes(&[note], &quotes, 0, &mid, &decimals(), &reserved, &HashSet::new(), 100, 100_000);
+        reserved.insert((7u64, pair), 1_000_000); // half committed → budget 1e6 < note's 2e6
+        let picks = select_notes(&[n], &[quote(7, pair, 1, 50, 2_000_000)], 0, &reserved, &HashSet::new());
         assert!(picks.is_empty(), "note exceeds remaining quote budget");
     }
 
     #[test]
     fn stale_quote_skipped() {
         let pair = (imiden(), iusdt());
-        let note = NoteView { id: nid(30), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        let mut q = open_quote(7, pair, u64::MAX);
+        let n = note(30, imiden(), 130_000_000, iusdt(), 2_000_000);
+        let mut q = quote(7, pair, 1, 50, u64::MAX);
         q.expires_at = 1_000;
         // now == expires_at → stale (strict >).
-        let picks = select_notes(&[note], &[q], 1_000, &mid, &decimals(), &HashMap::new(), &HashSet::new(), 100, 100_000);
-        assert!(picks.is_empty());
+        assert!(select_notes(&[n], &[q], 1_000, &HashMap::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn blocked_pair_skipped() {
+        let pair = (imiden(), iusdt());
+        let n = note(35, imiden(), 130_000_000, iusdt(), 2_000_000);
+        let mut blocked = HashSet::new();
+        blocked.insert((nid(35), 7u64)); // don't re-offer this note to DEX 7
+        let picks = select_notes(&[n], &[quote(7, pair, 1, 50, u64::MAX)], 0, &HashMap::new(), &blocked);
+        assert!(picks.is_empty(), "a blocked (note, dex) is not re-offered");
     }
 
     #[test]
     fn note_handed_to_at_most_one_dex() {
         let pair = (imiden(), iusdt());
-        let note = NoteView { id: nid(40), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        let quotes = vec![open_quote(1, pair, u64::MAX), open_quote(2, pair, u64::MAX)];
-        let picks = select_notes(&[note], &quotes, 0, &mid, &decimals(), &HashMap::new(), &HashSet::new(), 100, 100_000);
+        let n = note(40, imiden(), 130_000_000, iusdt(), 2_000_000);
+        let quotes = vec![quote(1, pair, 1, 50, u64::MAX), quote(2, pair, 1, 50, u64::MAX)];
+        let picks = select_notes(&[n], &quotes, 0, &HashMap::new(), &HashSet::new());
         assert_eq!(picks.len(), 1, "a note goes to exactly one DEX even if many quote for it");
-    }
-
-    // --- gates 3 & 4 ---
-
-    #[test]
-    fn off_market_quote_rejected() {
-        let pair = (imiden(), iusdt());
-        // Generous note (would export under a sane quote)...
-        let note = NoteView { id: nid(50), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        // ...but the quote's implied rate is wildly off oracle mid. Base mid = 1/50
-        // (requested-base per offered-base); a quote of 1/1 is 50× that → reject at 100bps.
-        let q = Quote { dex: 1, pair, price_num: 1, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
-        let picks = select_notes(&[note], &[q], 0, &mid, &decimals(), &HashMap::new(), &HashSet::new(), 100, 100);
-        assert!(picks.is_empty(), "off-market quote must not pull notes");
-    }
-
-    #[test]
-    fn dex_unwilling_when_quote_below_note_rate() {
-        let pair = (imiden(), iusdt());
-        // Note base rate (requested/offered) = 2e6/130e6 ≈ 0.0154.
-        let note = NoteView { id: nid(60), offered_token: imiden(), offered: 130_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        // DEX quotes only 1 IUSDT per whole IMIDEN = 1e6/1e8 = 0.01 base — below the
-        // note's rate → unwilling. (0.01 vs mid 0.02 is 50% off; the wide band lets it
-        // through so we isolate the willingness gate.)
-        let q = Quote { dex: 1, pair, price_num: 1, price_den: 100, quantity: u64::MAX, expires_at: u64::MAX };
-        let s = export_surplus(&note, &q, &mid, &decimals(), 100, 100_000);
-        assert_eq!(s, None, "DEX quote below the note rate → not willing");
-    }
-
-    #[test]
-    fn willingness_is_base_unit_exact_no_decimals() {
-        // Regression: gate 3 is a plain base-unit cross (requested·den ≤ num·offered)
-        // with NO decimal scaling, even under asymmetric decimals (the "100× trap":
-        // IMIDEN 8-dec vs IUSDT 6-dec). Isolate it with a generous note (clears
-        // gates 2 & 4 at a wide band) and move the quote by ONE base unit.
-        let pair = (imiden(), iusdt());
-        // Generous note: 1.5 IMIDEN ($3) offered for 2 IUSDT ($2). Its base rate
-        // (requested/offered) = 2e6 / 1.5e8.
-        let note = NoteView { id: nid(1), offered_token: imiden(), offered: 150_000_000, requested_token: iusdt(), requested: 2_000_000 };
-        // Quote exactly at the note's base rate → willing (borderline).
-        let at = Quote { dex: 1, pair, price_num: 2_000_000, price_den: 150_000_000, quantity: u64::MAX, expires_at: u64::MAX };
-        assert!(export_surplus(&note, &at, &mid, &decimals(), 0, 100_000).is_some());
-        // One base unit stingier (den +1 → rate just below the note's) → unwilling.
-        let below = Quote { dex: 1, pair, price_num: 2_000_000, price_den: 150_000_001, quantity: u64::MAX, expires_at: u64::MAX };
-        assert_eq!(export_surplus(&note, &below, &mid, &decimals(), 0, 100_000), None);
     }
 
     // --- overflow / extreme inputs ---
 
     #[test]
-    fn no_panic_on_overflow_inputs() {
-        // Astronomical amounts/prices/decimals must not panic — the checked math
-        // returns None and the note is conservatively skipped (never mis-routed).
+    fn no_panic_on_extreme_amounts() {
+        // Astronomical amounts/prices must not panic — the checked cross returns
+        // "not willing" on the (impossible, given AssetAmount::MAX) overflow.
         let pair = (imiden(), iusdt());
-        let note = NoteView {
-            id: nid(1),
-            offered_token: imiden(),
-            offered: u64::MAX,
-            requested_token: iusdt(),
-            requested: u64::MAX,
-        };
-        let mut d = Decimals::new();
-        d.insert(imiden(), 18);
-        d.insert(iusdt(), 18);
-        let price = |t: TokenId| {
-            if t == imiden() || t == iusdt() {
-                Some(u64::MAX)
-            } else {
-                None
-            }
-        };
-        let q = Quote { dex: 1, pair, price_num: u128::MAX, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
-        let picks = select_notes(
-            &[note], &[q], 0, &price, &d, &HashMap::new(), &HashSet::new(), 0, u64::MAX,
-        );
+        let n = note(1, imiden(), u64::MAX, iusdt(), u64::MAX);
+        let q = quote(1, pair, u128::MAX, 1, u64::MAX);
+        let picks = select_notes(&[n], &[q], 0, &HashMap::new(), &HashSet::new());
         assert!(picks.is_empty(), "overflow inputs are conservatively skipped, not panicked");
     }
 
-    #[test]
-    fn extreme_decimals_0_and_18() {
-        // 0-dec offered vs 18-dec requested — the 10^decimals normalisation must
-        // still rank correctly. 1 unit of O ($2) for a parity amount of R ($2).
-        let o = imiden();
-        let r = iusdt();
-        let mut d = Decimals::new();
-        d.insert(o, 0); // whole units
-        d.insert(r, 18);
-        let price = |t: TokenId| if t == o { Some(200) } else if t == r { Some(100) } else { None };
-        // 1 O = $2.  2*10^18 base-units of R = 2 whole R = $2 → parity.
-        let parity = NoteView { id: nid(1), offered_token: o, offered: 1, requested_token: r, requested: 2_000_000_000_000_000_000 };
-        // base mid = c_off·10^d_req/(c_req·10^d_off) = 200·10^18/100 = 2·10^18 (R-base per O-base).
-        let q = Quote { dex: 1, pair: (o, r), price_num: 2_000_000_000_000_000_000, price_den: 1, quantity: u64::MAX, expires_at: u64::MAX };
-        assert_eq!(
-            export_surplus(&parity, &q, &price, &d, 1, 1_000_000),
-            None,
-            "parity across 0/18 decimals → not exported at a positive edge"
-        );
-        // Generous: 1 O ($2) for 1 whole R ($1) → +100% generous → exported.
-        let generous = NoteView { id: nid(2), offered_token: o, offered: 1, requested_token: r, requested: 1_000_000_000_000_000_000 };
-        assert!(export_surplus(&generous, &q, &price, &d, 1, 1_000_000).is_some());
-    }
-
-    // --- property-based: invariants over random books, quotes, decimals ---
+    // --- property-based: invariants over random books + quotes ---
 
     use proptest::prelude::*;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(400))]
-        /// Over random notes/quotes/decimals/prices, `select_notes` must: never
-        /// panic, hand each note to ≤1 DEX, never exceed a quote's quantity, fill
-        /// the full requested amount, and only export notes that genuinely clear
-        /// the oracle edge (no value leak). Bounds keep the reference recomputation
-        /// overflow-free; overflow safety itself is covered by the test above.
+        /// Over random notes/quotes, `select_notes` must: never panic, hand each
+        /// note to ≤1 DEX, never exceed a quote's quantity, fill the full requested
+        /// amount, only export notes whose pair matches, and only export notes the
+        /// DEX is genuinely willing to fill (recomputed independently — base-unit
+        /// cross). Bounds keep the reference recomputation overflow-free; overflow
+        /// safety itself is covered by `no_panic_on_extreme_amounts`.
         #[test]
         fn prop_select_notes_invariants(
-            decs in [0u8..=12, 0u8..=12, 0u8..=12],
-            prices in [1u64..=10_000u64, 1u64..=10_000u64, 1u64..=10_000u64],
             raw_notes in prop::collection::vec(
                 (0usize..3, 0usize..3, 1u64..=1_000_000_000u64, 1u64..=1_000_000_000u64),
                 0..8,
@@ -529,12 +326,8 @@ mod tests {
                 (1u64..=3u64, 0usize..3, 0usize..3, 1u128..=1_000_000u128, 1u128..=1_000u128, 1u64..=1_000_000_000_000u64),
                 0..5,
             ),
-            edge_bps in 0u64..=1_000u64,
         ) {
             let toks = [imiden(), iusdt(), ibtc()];
-            let mut decimals = Decimals::new();
-            for i in 0..3 { decimals.insert(toks[i], decs[i]); }
-            let price_of = |t: TokenId| toks.iter().position(|x| *x == t).map(|i| prices[i]);
 
             let candidates: Vec<NoteView> = raw_notes.iter().enumerate()
                 .filter(|(_, (i, j, _, _))| i != j)
@@ -555,9 +348,7 @@ mod tests {
                 })
                 .collect();
 
-            // Wide deviation band → off-market rarely binds (tested separately).
-            let picks = select_notes(&candidates, &quotes, 0, &price_of, &decimals,
-                &HashMap::new(), &HashSet::new(), edge_bps, u64::MAX);
+            let picks = select_notes(&candidates, &quotes, 0, &HashMap::new(), &HashSet::new());
 
             // (1) each note handed to at most one DEX.
             let mut once = HashSet::new();
@@ -571,19 +362,18 @@ mod tests {
                 prop_assert!(*sum <= q.quantity as u128, "over-allocated a quote's quantity");
             }
 
-            // (3) every picked note fills its full requested amount AND genuinely
-            //     clears the oracle edge (recomputed independently — no value leak).
+            // (3) every pick fills the full requested amount, matches the quote's
+            //     pair, and is one the DEX is genuinely willing to fill.
             for p in &picks {
                 let n = candidates.iter().find(|n| n.id == p.note_id).unwrap();
                 prop_assert_eq!(p.fill, n.requested);
-                let (c_off, c_req) = (price_of(n.offered_token).unwrap(), price_of(n.requested_token).unwrap());
-                let (d_off, d_req) = (decimals[&n.offered_token], decimals[&n.requested_token]);
-                let m = d_off.min(d_req);
-                let off = (n.offered as u128) * (c_off as u128) * 10u128.pow((d_req - m) as u32);
-                let req = (n.requested as u128) * (c_req as u128) * 10u128.pow((d_off - m) as u32);
-                prop_assert!(off * 10_000 >= req * (10_000 + edge_bps as u128), "exported a note below the edge threshold");
+                prop_assert_eq!(n.pair(), p.pair, "pick pair matches note");
+                let q = quotes.iter().find(|q| q.dex == p.dex && q.pair == p.pair).unwrap();
+                prop_assert!(
+                    (n.requested as u128) * q.price_den <= q.price_num * (n.offered as u128),
+                    "exported a note the DEX is not willing to fill"
+                );
             }
         }
     }
-
 }

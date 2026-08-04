@@ -108,7 +108,7 @@ impl RouterState {
             // `requested`. Our internal `Quote` is note-centric (a note it fills
             // offers what the DEX wants), so we FLIP the pair and take the two
             // base-unit amounts as the rate. Decimals never enter here — the
-            // willingness gate is a base-unit cross (see `select::export_surplus`).
+            // willingness gate is a base-unit cross (see `select::dex_is_willing`).
             ClientMsg::Quote { offered, requested, valid_for_ms } => {
                 self.register_quote(dex, offered, requested, valid_for_ms)
             }

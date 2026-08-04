@@ -23,8 +23,6 @@ pub struct RouterHooks {
     pub handover_tx: mpsc::Sender<Handover>,
     /// How long a handed-over note waits for on-chain consume before reactivating.
     pub inflight_ttl_ms: u64,
-    pub min_edge_bps: u64,
-    pub max_dev_bps: u64,
 }
 
 fn now_millis() -> u64 {
@@ -182,8 +180,6 @@ pub async fn run_matcher(
             external_pass(
                 &mut engine,
                 &raw_notes,
-                &pool,
-                &price_rx,
                 &mut reserved,
                 &mut reservations,
                 &no_reoffer,
@@ -210,35 +206,24 @@ fn release_reservation(
 /// Select residual notes against the cached quotes, park each pick (remove from
 /// the matching index), reserve its quantity, and `try_send` a handover. Pure
 /// reads except the book parks and the reservation ledger. Never `.await`s.
-#[allow(clippy::too_many_arguments)]
 fn external_pass(
     engine: &mut MatchingEngine<WatchPriceFeed>,
     raw_notes: &HashMap<OrderId, Vec<u8>>,
-    pool: &DbPool,
-    price_rx: &watch::Receiver<PriceSnapshot>,
     reserved: &mut HashMap<(DexId, Pair), Amount>,
     reservations: &mut HashMap<OrderId, (DexId, Pair, Amount)>,
     no_reoffer: &HashMap<OrderId, HashSet<DexId>>,
     r: &RouterHooks,
     now: u64,
 ) {
-    // Decimals (immutable per token; tiny table — refresh each tick).
-    let decimals = db::load_token_decimals(pool).unwrap_or_default();
-    let price_snap: PriceSnapshot = price_rx.borrow().clone();
-    let price_fn = |t: TokenId| price_snap.get(&t).copied();
     let quotes = r.quotes_rx.borrow().clone(); // Arc<Vec<Quote>>
 
     let items = route_external(
         &mut engine.book,
         raw_notes,
-        &decimals,
-        &price_fn,
         &quotes[..],
         reserved,
         reservations,
         no_reoffer,
-        r.min_edge_bps,
-        r.max_dev_bps,
         now,
     );
 
@@ -273,18 +258,13 @@ fn external_pass(
 /// index), reserve its quantity, and return the handover items. `book` is
 /// mutated only via `park`. Directly unit-tested — this is the proof that an
 /// unmatched order + a clearing DEX quote ⇒ the note is parked and handed over.
-#[allow(clippy::too_many_arguments)]
 fn route_external<F: crate::matching::price_feed::PriceFeed>(
     book: &mut OrderBook<F>,
     raw_notes: &HashMap<OrderId, Vec<u8>>,
-    decimals: &crate::router::Decimals,
-    price_cents: &impl Fn(TokenId) -> Option<u64>,
     quotes: &[crate::router::Quote],
     reserved: &mut HashMap<(DexId, Pair), Amount>,
     reservations: &mut HashMap<OrderId, (DexId, Pair, Amount)>,
     no_reoffer: &HashMap<OrderId, HashSet<DexId>>,
-    min_edge_bps: u64,
-    max_dev_bps: u64,
     now: u64,
 ) -> Vec<HandoverPick> {
     // Candidates: active, non-parked residual notes.
@@ -309,17 +289,7 @@ fn route_external<F: crate::matching::price_feed::PriceFeed>(
         .flat_map(|(id, dexes)| dexes.iter().map(move |d| (*id, *d)))
         .collect();
 
-    let picks = select_notes(
-        &candidates,
-        quotes,
-        now,
-        price_cents,
-        decimals,
-        reserved,
-        &blocked,
-        min_edge_bps,
-        max_dev_bps,
-    );
+    let picks = select_notes(&candidates, quotes, now, reserved, &blocked);
 
     let mut items = Vec::with_capacity(picks.len());
     for pick in &picks {
@@ -343,7 +313,7 @@ mod tests {
     use super::*;
     use crate::matching::order_book::OrderBook;
     use crate::price::WatchPriceFeed;
-    use crate::router::{Decimals, Quote};
+    use crate::router::Quote;
     use miden_protocol::note::NoteId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -358,35 +328,10 @@ mod tests {
     fn nid(seed: u64) -> NoteId {
         NoteId::try_from_hex(&format!("0x{seed:064x}")).unwrap()
     }
-    // Asymmetric on purpose (exercises the 10^decimals normalisation):
-    // IMIDEN 8-dec, IUSDT 6-dec. So 1 IMIDEN = 1e8, 1 IUSDT = 1e6.
-    fn decimals_pair() -> Decimals {
-        let mut d = Decimals::new();
-        d.insert(imiden(), 8);
-        d.insert(iusdt(), 6);
-        d
-    }
-    // IMIDEN = $2.00 (200c), IUSDT = $1.00 (100c). Mid (IUSDT per IMIDEN) = 2.
-    fn oracle(t: TokenId) -> Option<u64> {
-        if t == imiden() {
-            Some(200)
-        } else if t == iusdt() {
-            Some(100)
-        } else {
-            None
-        }
-    }
+    /// A quote for the IMIDEN/IUSDT pair at base-unit rate 1/50 (requested-base per
+    /// offered-base). Any note whose rate is at or below this is willing.
     fn quote_at_mid(dex: DexId, qty: Amount, expires_at: u64) -> Quote {
-        Quote {
-            dex,
-            pair: (imiden(), iusdt()),
-            // Base-unit rate (note orientation) at the oracle mid: IMIDEN $2 / 8dec
-            // vs IUSDT $1 / 6dec ⇒ 1e8 imiden-base ↔ 2e6 iusdt-base = 1/50.
-            price_num: 1,
-            price_den: 50,
-            quantity: qty,
-            expires_at,
-        }
+        Quote { dex, pair: (imiden(), iusdt()), price_num: 1, price_den: 50, quantity: qty, expires_at }
     }
     // Offer `offered` IMIDEN for `requested` IUSDT.
     fn book_with_order(
@@ -406,7 +351,7 @@ mod tests {
     #[test]
     fn unmatched_order_with_clearing_quote_is_parked_and_handed_over() {
         let id = nid(1);
-        // Offer 1.1 IMIDEN ($2.20) for 2 IUSDT ($2.00): +10% generous → exports at 50bps.
+        // Offer 1.1 IMIDEN for 2 IUSDT — the DEX (quoting 1/50) is willing → exported.
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         let pair = (imiden(), iusdt());
         let quotes = vec![quote_at_mid(7, 10_000_000, u64::MAX)];
@@ -417,14 +362,10 @@ mod tests {
         let items = route_external(
             &mut book,
             &raw,
-            &decimals_pair(),
-            &oracle,
             &quotes,
             &mut reserved,
             &mut reservations,
             &HashMap::new(),
-            100,
-            200,
             1_000,
         );
 
@@ -444,16 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn stingy_order_retained_not_exported() {
+    fn unwilling_order_retained_not_exported() {
         let id = nid(2);
-        // Offer 1.005 IMIDEN ($2.01) for 2 IUSDT ($2.00): +0.5% < 50bps → retained.
-        let (mut book, raw) = book_with_order(id, 100_500_000, 2_000_000);
+        let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
+        // The DEX only accepts 1/100 — below the note's rate (2e6/110e6) → unwilling.
+        let q = Quote { dex: 7, pair: (imiden(), iusdt()), price_num: 1, price_den: 100, quantity: 10_000_000, expires_at: u64::MAX };
         let items = route_external(
-            &mut book, &raw, &decimals_pair(), &oracle, &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 100, 200, 1_000,
+            &mut book, &raw, &[q],
+            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
         );
         assert!(items.is_empty());
-        assert!(!book.is_parked(id), "retained order stays matchable internally");
+        assert!(!book.is_parked(id), "an unroutable order stays matchable internally");
         assert_eq!(book.active_order_count(), 1);
     }
 
@@ -463,8 +405,8 @@ mod tests {
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         // expires_at == now ⇒ stale (strict >).
         let items = route_external(
-            &mut book, &raw, &decimals_pair(), &oracle, &[quote_at_mid(7, 10_000_000, 1_000)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 100, 200, 1_000,
+            &mut book, &raw, &[quote_at_mid(7, 10_000_000, 1_000)],
+            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
         );
         assert!(items.is_empty());
         assert!(!book.is_parked(id));
@@ -478,32 +420,19 @@ mod tests {
         no_reoffer.entry(id).or_default().insert(7u64);
         // DEX 7 is blocked for this note.
         let items = route_external(
-            &mut book, &raw, &decimals_pair(), &oracle, &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 100, 200, 1_000,
+            &mut book, &raw, &[quote_at_mid(7, 10_000_000, u64::MAX)],
+            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 1_000,
         );
         assert!(items.is_empty(), "not re-offered to the DEX it no-showed at");
         assert!(!book.is_parked(id));
         // A different DEX can still take it.
         let items2 = route_external(
-            &mut book, &raw, &decimals_pair(), &oracle, &[quote_at_mid(9, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 100, 200, 1_000,
+            &mut book, &raw, &[quote_at_mid(9, 10_000_000, u64::MAX)],
+            &mut HashMap::new(), &mut HashMap::new(), &no_reoffer, 1_000,
         );
         assert_eq!(items2.len(), 1);
         assert_eq!(items2[0].dex, 9);
         assert!(book.is_parked(id));
-    }
-
-    #[test]
-    fn unpriced_token_not_exported() {
-        let id = nid(5);
-        let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
-        let no_price = |_t: TokenId| None;
-        let items = route_external(
-            &mut book, &raw, &decimals_pair(), &no_price, &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 100, 200, 1_000,
-        );
-        assert!(items.is_empty(), "data gate (unpriced) excludes the note");
-        assert!(!book.is_parked(id));
     }
 
     /// End-to-end through the real `run_matcher` tick loop: an unmatched order +
@@ -545,8 +474,6 @@ mod tests {
             quotes_rx,
             handover_tx,
             inflight_ttl_ms: 60_000,
-            min_edge_bps: 100,
-            max_dev_bps: 200,
         };
         let id = nid(777);
         order_tx
@@ -678,8 +605,6 @@ mod tests {
             quotes_rx,
             handover_tx,
             inflight_ttl_ms: 60_000,
-            min_edge_bps: 100,
-            max_dev_bps: 200,
         };
         let url = format!("ws://127.0.0.1:{port}/v1/rfq");
 
@@ -760,12 +685,6 @@ mod tests {
             set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
         }
 
-        let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
-        let mut prices = PriceSnapshot::new();
-        prices.insert(imiden(), 200);
-        prices.insert(iusdt(), 100);
-        price_tx.send(prices).unwrap();
-
         let (_qtx, quotes_rx) =
             watch::channel(Arc::new(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)]));
 
@@ -777,8 +696,6 @@ mod tests {
             quotes_rx,
             handover_tx,
             inflight_ttl_ms: 60_000,
-            min_edge_bps: 100,
-            max_dev_bps: 200,
         };
 
         let id = nid(99);
@@ -791,7 +708,7 @@ mod tests {
         // (1) Full channel → the handover is dropped and ROLLED BACK: not parked,
         //     back in internal matching, reservation released. No hang, no penalty.
         external_pass(
-            &mut engine, &raw, &pool, &price_rx,
+            &mut engine, &raw,
             &mut reserved, &mut reservations, &no_reoffer, &hooks, 1_000,
         );
         assert!(!engine.book.is_parked(id), "dropped handover rolled back — note not left parked");
@@ -802,7 +719,7 @@ mod tests {
         //     delivered. The drop cost it nothing.
         let _ = handover_rx.try_recv(); // free the slot
         external_pass(
-            &mut engine, &raw, &pool, &price_rx,
+            &mut engine, &raw,
             &mut reserved, &mut reservations, &no_reoffer, &hooks, 2_000,
         );
         assert!(engine.book.is_parked(id), "after the drop the note re-routes to the same DEX");
@@ -934,8 +851,6 @@ mod tests {
             quotes_rx,
             handover_tx,
             inflight_ttl_ms: 1,
-            min_edge_bps: 100,
-            max_dev_bps: 200,
         };
         let local = tokio::task::LocalSet::new();
         local
@@ -976,16 +891,16 @@ mod tests {
         let id = nid(6);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         let items = route_external(
-            &mut book, &raw, &decimals_pair(), &oracle, &[],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 100, 200, 1_000,
+            &mut book, &raw, &[],
+            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
         );
         assert!(items.is_empty());
         assert!(!book.is_parked(id));
         // Empty book.
         let mut empty = OrderBook::new(WatchPriceFeed::new());
         let items2 = route_external(
-            &mut empty, &HashMap::new(), &decimals_pair(), &oracle, &[quote_at_mid(7, 10_000_000, u64::MAX)],
-            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 100, 200, 1_000,
+            &mut empty, &HashMap::new(), &[quote_at_mid(7, 10_000_000, u64::MAX)],
+            &mut HashMap::new(), &mut HashMap::new(), &HashMap::new(), 1_000,
         );
         assert!(items2.is_empty());
     }

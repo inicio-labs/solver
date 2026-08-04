@@ -37,10 +37,12 @@ the one in-memory order book:
 4. **Park / unpark for in-flight.** A handed-over note is removed from the rate index
    (counter decremented) but its `Order` is kept; reactivation after an in-flight TTL
    is O(expiring) via a time-ordered `park_queue`. See ADR rationale below.
-5. **Decimals-correct export math, vs oracle MID.** `select_notes` decides
-   exportability in exact `u128` integer arithmetic, measuring the retention edge
-   against the solver's own oracle mid (not the DEX's quote), with marginal-first
-   ordering and an off-market guard.
+5. **Willingness-only selection (no oracle, no decimals).** A PSWAP note's rate is
+   fixed on-chain, so the maker's price is guaranteed however the note fills.
+   `select_notes` is therefore a pure base-unit **willingness** cross — does the DEX's
+   quote accept the note's rate (`requested·price_den ≤ price_num·offered`)? Exact
+   `u128`, no oracle prices, no `10^decimals` scaling: the solver is a matchmaker here,
+   not a price authority over a rate the chain already binds.
 6. **Router = transport only**, on its own OS thread + multi-thread runtime (mirrors
    `spawn_price_api_thread`); two `Send` channels to the matcher (`watch` quotes in,
    `mpsc` handovers out via `try_send`).
@@ -66,18 +68,19 @@ the one in-memory order book:
   index), so the gates need **zero change**. This is the riskiest area, so we minimised
   new logic by construction. (Removing `active_pair_count` entirely was considered and
   rejected — it turns an O(1) gate into a scan.)
-- **Edge measured vs oracle mid, not the quote.** Measuring retention against the DEX's
-  own quote would let an in-band manipulated quote move our export decision. Mid is the
-  manipulation-resistant reference; the quote only gates DEX-willingness.
+- **Pure matchmaker, not a price authority.** Since a note's rate is fixed on-chain, the
+  solver neither gains nor risks value by routing any *willing* note — the maker gets
+  their exact rate regardless. So routing does **not** re-check the quote or the note
+  against an oracle. An earlier draft measured a retention "edge" against oracle mid and
+  rejected off-market quotes (`router_min_export_edge_bps` / `router_quote_max_deviation_bps`);
+  that was value-retention + anti-cherry-pick *policy*, not safety, and it was removed for
+  v1 (the oracle-price and per-token-decimals dependencies go with it). It can return when
+  real external DEXes and real surplus make retention worth policing.
 - **`try_send` for handovers.** The matcher tick is fund-critical and runs on the
   main-thread LocalSet; it must never block on a slow DEX socket. A full channel drops
   the handover (counted), and the note reactivates via TTL — safe degradation.
 - **DEX self-consumes (no executor change).** Keeps custody/gas with the DEX and avoids
   touching the settlement path in v1.
-- **Decimals-correct export despite a decimals-blind internal matcher.** The internal
-  matcher works on devnet only because tokens share 8 decimals; export must be correct
-  for asymmetric decimals (the "100× trap"), so `select_notes` normalises by
-  `10^decimals` explicitly.
 
 ## Consequences
 
@@ -86,8 +89,9 @@ the one in-memory order book:
   reactivation. Acceptable only under genuine trust in every token holder. Partial
   mitigation shipped: a reactivated note is not re-offered to the same DEX. Per-DEX
   outstanding-handover cap + indicative→firm two-stage are documented follow-ups.
-- **Zero external spread by design.** `router_min_export_edge_bps` (>0) is a *retention*
-  threshold, not a fee; multi-DEX competition is the real recapture lever (deferred).
+- **Every willing note is routable.** v1 hands off any note a connected DEX will fill; it
+  does **not** retain surplus for internal crossing (that retention policy was removed
+  with the oracle gates). Multi-DEX competition is the intended recapture lever (deferred).
 - **No custody risk.** A handover is bytes; worst case from a misbehaving DEX is wasted
   in-flight windows bounded by the TTL.
 - **Blast radius contained to the order book + matcher pass**, both behind ≥95% line /

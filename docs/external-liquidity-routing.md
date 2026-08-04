@@ -54,8 +54,8 @@ DB poll in this path.
   a blocked/slow DEX socket can never stall the matcher tick.
 - **Matcher external pass** (`crates/solver/src/matcher/matcher.rs`) — after internal
   matching, on **every** tick: reactivate expired in-flight notes, read the cached
-  quotes + oracle mid, run `select_notes`, **park** each pick, reserve its quantity,
-  and `try_send` a handover. No `.await`, no socket I/O on the tick.
+  quotes, run `select_notes`, **park** each pick, reserve its quantity, and `try_send`
+  a handover. No `.await`, no socket I/O on the tick.
 - **Selection math** (`crates/solver/src/router/select.rs`) — `select_notes` is a pure,
   read-only, exact-integer function (the correctness core; see §4).
 - **Order book park/unpark** (`crates/solver/src/matching/order_book.rs`) — how a note
@@ -115,46 +115,32 @@ test asserts `active_order_count()` invariance across park→unpark and park→c
 
 ---
 
-## 4. Export predicate (the #1 correctness item)
+## 4. Selection predicate (willingness only)
 
-A note offers `o_raw` of token `O` (decimals `d_O`, oracle cents `c_O`) and requests
-`r_raw` of token `R` (decimals `d_R`, oracle cents `c_R`). **All comparisons are exact
-`u128`, never float**, mirroring the matcher's own cross-multiplication. Common-
-denominator USD-cents:
+A PSWAP note carries its rate **fixed on-chain**: whoever consumes it pays exactly the
+note's `requested` for its `offered`, so the maker's price holds regardless of which DEX
+fills it. Selection is therefore a single **willingness** check — does the DEX's standing
+quote accept the note's rate? — plus mechanics.
 
-```
-offered_usd   ∝  o_raw · c_O · 10^d_R
-requested_usd ∝  r_raw · c_R · 10^d_O
-```
+A note (offers `offered` of `O`, requests `requested` of `R`) is **routable** to a quote
+`price_num / price_den` (requested-per-offered, in base units) iff:
 
-A note is **exportable** iff all hold:
+1. **Pair match** — the note's `(O, R)` equals the quote's pair (the router already
+   flipped the DEX's filler-centric quote into note orientation).
+2. **Willingness** — `requested · price_den ≤ price_num · offered`. A plain base-unit
+   integer cross: both the note amounts and the quote price are base units of the *same
+   two tokens*, so **decimals cancel** — no `10^decimals`, no oracle prices. Every factor
+   is a `FungibleAsset` amount (≤ `AssetAmount::MAX` = 2^63−2^31, wire-enforced), so the
+   products are `< 2^126` and cannot overflow `u128`.
+3. **Not used / not blocked** — each note goes to at most one DEX per tick, and a note
+   that no-showed at a DEX is not re-offered to it (the `blocked` set).
+4. **Fits budget** — accumulate `Σ fill ≤ quote.quantity − reserved[(dex,pair)]`.
 
-1. **Data gate** — both tokens priced (`c_O,c_R` known) and both decimals known, else
-   skip (mirrors "missing price ⇒ not matchable").
-2. **Oracle-edge gate (vs MID, not the quote):**
-   `o_raw · c_O · 10^d_R · 10_000 ≥ r_raw · c_R · 10^d_O · (10_000 + min_edge_bps)`.
-   The note must give the consumer ≥ `min_edge_bps` more USD value than it takes, **at
-   oracle mid**. Measuring against mid (not the DEX's quote) means an in-band
-   manipulated quote can't move the export decision.
-3. **DEX-willingness gate** — the DEX's quote price is on the profitable side of the
-   note's fixed rate (the DEX has said it will take notes at least this generous).
-4. **Off-market guard** — reject the whole quote if its implied price deviates from
-   oracle mid by `> router_quote_max_deviation_bps`.
-
-**Ordering:** hand over **marginal-eligible-first** (smallest `offered_usd −
-requested_usd` surplus first), accumulating `Σ fill ≤ quote.quantity − reserved`. This
-retains the most-generous notes for internal crossing (where the solver captures the
-surplus) and gives away the least first.
-
-> **The decimals trap (why this is exact, not "rate vs price").** Internally the matcher
-> is decimals-blind — it works on devnet only because the tokens happen to share 8
-> decimals. Export is decimals-**correct**. Worked example: IMIDEN \$2 / 8-dec, IUSDT
-> \$1 / 6-dec; a parity note (offer `1e8` IMIDEN, request `2e6` IUSDT) has
-> `offered_usd = 1e8·200·10^6` and `requested_usd = 2e6·100·10^8` → equal → margin 0 →
-> **not exported** for any `edge_bps>0` (correct: a fair note isn't given away). The raw
-> ratio `r_raw/o_raw = 0.02` differs from the price `2.0` by exactly `10^(d_O−d_R)=100×`
-> — comparing raw-rate to price directly mis-routes by 100×. The integer formula above
-> is the guard.
+Notes are taken in book order up to the quote's quantity. There is **no oracle-edge or
+off-market gate**: the solver is a matchmaker here, not a price authority over a rate the
+chain already binds. (An earlier design added a decimals-correct retention edge vs oracle
+mid, an off-market-quote guard, and marginal-first ordering; that value-retention policy —
+and its oracle-price + per-token-decimals dependencies — was removed for v1. See ADR 0001.)
 
 ---
 
@@ -172,8 +158,6 @@ All knobs live in `[engine]` of `solver.toml` with `#[serde(default)]`. The feat
 | `router_max_msg_bytes` | `16384` | max inbound websocket message size |
 | `router_quote_ttl_ms` | `20000` | how long a standing quote stays selectable |
 | `router_inflight_ttl_ms` | `30000` | how long a handed-over note waits before reactivating; set above realistic consume latency |
-| `router_min_export_edge_bps` | `50` | min edge over oracle mid before a note is exported (`>0` retains internal liquidity) |
-| `router_quote_max_deviation_bps` | `200` | reject a DEX quote deviating more than this from oracle mid |
 
 **Auth tokens are NOT in config.** The allow-list comes from the
 **`SOLVER_ROUTER_TOKENS`** env var (comma-separated), like `SOLVER_ADMIN_TOKEN`. If
@@ -185,8 +169,6 @@ connection** and logs a warning.
 router_enabled = true
 router_bind = "0.0.0.0"
 router_port = 8090
-router_min_export_edge_bps = 50
-router_quote_max_deviation_bps = 200
 ```
 
 ```bash
@@ -229,11 +211,9 @@ it can't constrain a DEX's miden version.
 2. **Issue tokens** — generate one opaque random token per DEX; put them in
    `SOLVER_ROUTER_TOKENS` (comma-separated); share each token with its DEX over a secure
    channel. Rotate by editing the var and restarting.
-3. **Tune retention** — `router_min_export_edge_bps` is the lever: higher keeps more
-   liquidity for internal crossing, lower exports more aggressively. `>0` always.
-4. **Tune safety** — `router_quote_max_deviation_bps` rejects off-market quotes;
-   `router_inflight_ttl_ms` must exceed realistic DEX consume latency or notes bounce
-   back too soon.
+3. **Tune the in-flight TTL** — `router_inflight_ttl_ms` must exceed realistic DEX
+   consume latency, or a handed-over note bounces back into internal matching too soon.
+   (v1 routes any willing note; there is no retention/off-market knob to tune.)
 5. **Verify readiness** — on boot, `start.rs` gates on the router's bind readiness
    oneshot; a router that can't bind fails startup loudly.
 6. **Watch** — handover/quote activity is logged; a `handover_tx` full/closed drop is
@@ -255,18 +235,17 @@ it can't constrain a DEX's miden version.
 - **No custody risk.** The solver never holds DEX funds or keys; a handover is bytes.
   Worst case from a misbehaving DEX is wasted in-flight windows (bounded by the TTL),
   not loss.
-- **Off-market protection.** Export decisions are measured against the solver's own
-  oracle mid, so an in-band manipulated quote can't change *which* notes leave; an
-  out-of-band one is rejected outright.
+- **Maker protected on-chain.** A note's rate is fixed on-chain, so a manipulated or
+  off-market DEX quote can't change the price a maker gets — it only affects *whether* a
+  DEX is willing to fill. v1 does not police quotes against an oracle (see §4 / ADR 0001).
 
 ---
 
 ## 9. Testing
 
-- **`select_notes` (unit + property):** the asymmetric-decimals boundary (6-dec IUSDT
-  vs 8-dec IMIDEN), the `edge_bps` margin, DEX-willingness, marginal-first ordering +
-  quantity cap, reserved-budget, stale-quote skip, off-market reject, overflow inputs,
-  and a 400-case invariant proptest.
+- **`select_notes` (unit + property):** base-unit DEX-willingness (the ±1-base-unit
+  boundary), pair-match, quantity cap, reserved-budget, stale-quote skip, blocked-pair
+  skip, zero-price guard, overflow inputs, and a 400-case invariant proptest.
 - **Order book:** `active_order_count()` invariance across park→unpark and park→consume;
   parked notes skipped by the matching gates; idempotent re-add.
 - **Matcher:** route-to-DEX, internal-match unaffected, reactivation-then-consume,

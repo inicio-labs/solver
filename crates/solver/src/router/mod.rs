@@ -12,7 +12,7 @@
 pub mod select;
 pub mod server;
 
-pub use select::{select_notes, Decimals, NoteView, Pair, Pick, Quote};
+pub use select::{select_notes, NoteView, Pair, Pick, Quote};
 pub use server::{spawn_router_thread, RouterConfig};
 
 use crate::matching::types::{Amount, DexId, OrderId};

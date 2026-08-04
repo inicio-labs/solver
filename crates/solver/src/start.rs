@@ -156,8 +156,6 @@ pub async fn start(
             quotes_rx: channels.quotes_rx.clone(),
             handover_tx: channels.handover_tx.clone(),
             inflight_ttl_ms: config.engine.router_inflight_ttl_ms,
-            min_edge_bps: config.engine.router_min_export_edge_bps,
-            max_dev_bps: config.engine.router_quote_max_deviation_bps,
         })
     } else {
         None

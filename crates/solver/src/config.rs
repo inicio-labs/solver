@@ -168,14 +168,6 @@ pub struct EngineConfig {
     /// reactivates (ms). Set above realistic consume latency. Default 30000.
     #[serde(default = "default_router_inflight_ttl_ms")]
     pub router_inflight_ttl_ms: u64,
-    /// Minimum edge over oracle mid (bps) before a note is exported; `>0` retains
-    /// liquidity for internal crossing. Default 50.
-    #[serde(default = "default_router_min_export_edge_bps")]
-    pub router_min_export_edge_bps: u64,
-    /// Max deviation of a DEX quote from oracle mid (bps) before it is rejected as
-    /// off-market. Default 200.
-    #[serde(default = "default_router_quote_max_deviation_bps")]
-    pub router_quote_max_deviation_bps: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -253,12 +245,6 @@ fn default_router_quote_ttl_ms() -> u64 {
 }
 fn default_router_inflight_ttl_ms() -> u64 {
     30_000
-}
-fn default_router_min_export_edge_bps() -> u64 {
-    50
-}
-fn default_router_quote_max_deviation_bps() -> u64 {
-    200
 }
 
 impl SolverConfig {

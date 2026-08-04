@@ -102,5 +102,3 @@ admin_port = 3001
 # router_max_msg_bytes = 16384
 # router_quote_ttl_ms = 20000             # how long a posted quote stays selectable
 # router_inflight_ttl_ms = 30000          # handed-over note reactivates after this if not consumed
-# router_min_export_edge_bps = 50         # min edge over oracle mid before exporting a note
-# router_quote_max_deviation_bps = 200    # reject quotes this far off oracle mid

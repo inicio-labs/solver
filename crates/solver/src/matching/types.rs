@@ -2,9 +2,8 @@ pub use crate::types::{TokenId, OrderId, Amount, OrderStatus};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-/// Identifier for an external DEX connection (assigned by the router). Used to
-/// record which DEX a note was handed to while parked, so the matcher can avoid
-/// immediately re-offering a reactivated note to the same DEX.
+/// Identifier for an external DEX connection (assigned by the router). Recorded
+/// against a parked note so reactivation can log which DEX it was handed to.
 pub type DexId = u64;
 
 /// Computes how much offered asset is released for a given fill of the requested asset.

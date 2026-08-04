@@ -211,7 +211,7 @@ fn unpark_immediate_rollback_restores_and_leaves_tombstone() {
     assert!(book.best_order(usdc(), eth()).is_some());
 
     // The stale park_queue entry is a tombstone: a later TTL sweep skips it, so
-    // the unparked note is not re-woken (and never earns a no-re-offer block).
+    // the unparked note is not re-woken.
     assert!(book.reactivate_parked_older_than(1, 9_999).is_empty(), "tombstone skipped");
     assert_eq!(book.active_order_count(), 1, "still exactly one active note");
 

@@ -521,8 +521,8 @@ mod tests {
         let note_bytes = note.to_bytes();
         let id = note.id();
 
-        // An unmatched order: offer 1.1 IMIDEN ($2.20) for 2 IUSDT ($2.00) — +10%
-        // generous, so it clears a mid quote at 100 bps edge / 200 bps dev.
+        // An unmatched order: offer 1.1 IMIDEN for 2 IUSDT — the DEX quote below
+        // crosses the note's rate, so the note is willing and gets routed.
         order_tx
             .send(IngestOrder {
                 note_id: id,
@@ -560,7 +560,7 @@ mod tests {
 
                 // The DEX connects and posts a filler-centric quote: it GIVES iusdt
                 // and WANTS imiden (to fill a note that offers imiden / wants iusdt),
-                // priced at the oracle mid (2e6 iusdt : 1e8 imiden).
+                // at a rate that crosses the note (2e6 iusdt : 1e8 imiden).
                 let mut client = LpClient::connect(&url, "dex-tok").await.expect("connect");
                 assert!(matches!(client.next_event().await, Some(LpEvent::AuthOk)));
                 client
@@ -748,8 +748,8 @@ mod tests {
     }
 
     /// A handed-over note that the DEX doesn't consume is reactivated after the
-    /// in-flight TTL (covers the reactivation + reservation-release path), and is
-    /// not re-offered to the same DEX (so no second handover).
+    /// in-flight TTL and re-offered to the same DEX (a second handover), then
+    /// consumed on-chain.
     #[tokio::test]
     async fn run_matcher_reactivates_and_consumes_parked_note() {
         let (_tmp, pool) = harness_db();

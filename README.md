@@ -88,6 +88,7 @@ authoritative — the chain nullifier is the source of truth).
 | `crates/e2e` | standalone devnet end-to-end harness (provision/fund/load/run). See [crates/e2e/README.md](crates/e2e/README.md). |
 | `crates/mock-price` | standalone mock CoinGecko price service (devnet/local pricing). Tiny, no miden deps. |
 | `crates/mock-mirror` | devnet liquidity harness: posts favorable PSWAP counter-orders so the solver matches. See [crates/mock-mirror/README.md](crates/mock-mirror/README.md). |
+| `crates/lp-sdk` | `pswap-lp-sdk`: client SDK external DEXes (liquidity providers) use to receive and fill routed orders over the RFQ websocket. Standalone — no solver or `miden-client` dependency. See [crates/lp-sdk/README.md](crates/lp-sdk/README.md). |
 
 ---
 
@@ -138,6 +139,12 @@ env var (default: `./solver.toml`).
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
 | `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
+| `router_enabled` + `router_*` | — | off | External liquidity routing (RFQ websocket to other DEXes). Off by default; 6 `router_*` knobs + the `SOLVER_ROUTER_TOKENS` env allow-list. See [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). |
+
+> **External liquidity routing** lets allow-listed DEXes fill orders the matcher can't
+> cross internally, over a websocket RFQ. Architecture + config + operator runbook:
+> [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). DEX-side
+> integration + the `pswap-lp-sdk`: [docs/filler-integration.md](docs/filler-integration.md).
 
 ### Price feed — devnet without CoinGecko
 

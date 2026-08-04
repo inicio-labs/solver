@@ -144,6 +144,18 @@ impl Serializable for ServerMsg {
     }
 }
 
+/// Build the raw `Handover` wire frame from an already-serialized note plus
+/// `fill_amount`, without decoding+re-encoding. Byte-identical to
+/// `ServerMsg::Handover { note, fill_amount }.to_bytes()` when
+/// `note_bytes == note.to_bytes()` (see the test).
+pub fn handover_frame(note_bytes: &[u8], fill_amount: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + note_bytes.len() + 8);
+    out.write_u8(ServerMsg::HANDOVER);
+    out.extend_from_slice(note_bytes);
+    fill_amount.write_into(&mut out);
+    out
+}
+
 impl Deserializable for ServerMsg {
     fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
         match source.read_u8()? {
@@ -202,5 +214,62 @@ mod tests {
     fn unknown_tag_is_error_not_panic() {
         assert!(ClientMsg::read_from_bytes(&[99]).is_err());
         assert!(ServerMsg::read_from_bytes(&[99]).is_err());
+    }
+
+    #[test]
+    fn handover_frame_matches_manual_wire_layout() {
+        // We can't cheaply construct a real `Note` here, so lock the frame
+        // layout instead: [HANDOVER tag] ++ opaque note bytes ++ fill_amount.
+        // (The router relies on this being byte-identical to a re-serialized
+        // `ServerMsg::Handover` when the bytes are a real `note.to_bytes()`.)
+        let note_bytes = b"opaque-serialized-note-bytes";
+        let frame = handover_frame(note_bytes, 7);
+        assert_eq!(frame[0], ServerMsg::HANDOVER);
+        assert_eq!(&frame[1..1 + note_bytes.len()], note_bytes);
+        assert_eq!(u64::read_from_bytes(&frame[1 + note_bytes.len()..]).unwrap(), 7);
+    }
+
+    #[test]
+    fn handover_frame_is_byte_identical_to_serialized_handover() {
+        // The load-bearing invariant: building the frame from an already-serialized
+        // note must equal serializing a typed `ServerMsg::Handover` — and decode
+        // back to the same note. Exercised here with a REAL note (not fake bytes),
+        // so the router's opaque-bytes shortcut is guarded inside the SDK itself.
+        use miden_protocol::note::Note;
+        use miden_protocol::Word;
+        let note = Note::mock_noop(Word::from([1u32, 2, 3, 4]));
+        let framed = handover_frame(&note.to_bytes(), 42);
+        let typed = ServerMsg::Handover { note: note.clone(), fill_amount: 42 }.to_bytes();
+        assert_eq!(framed, typed, "raw-frame builder must match typed serialization");
+        match ServerMsg::read_from_bytes(&framed).unwrap() {
+            ServerMsg::Handover { note: got, fill_amount } => {
+                assert_eq!(got.id(), note.id());
+                assert_eq!(fill_amount, 42);
+            }
+            other => panic!("expected Handover, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_and_pairspec_round_trip() {
+        // The reserved Ask path (the only carrier of PairSpec on the wire) had no
+        // round-trip coverage — a framing bug there would be silent.
+        use miden_protocol::account::AccountId;
+        let a = AccountId::from_hex("0x4a03c1843860c9b17582c021d563ae").unwrap();
+        let b = AccountId::from_hex("0x2458e5446128e6b150b75b8ebd9ce1").unwrap();
+        let ask = ServerMsg::Ask {
+            pairs: vec![
+                PairSpec { offered: a, requested: b },
+                PairSpec { offered: b, requested: a },
+            ],
+        };
+        match ServerMsg::read_from_bytes(&ask.to_bytes()).unwrap() {
+            ServerMsg::Ask { pairs } => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!((pairs[0].offered, pairs[0].requested), (a, b));
+                assert_eq!((pairs[1].offered, pairs[1].requested), (b, a));
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
     }
 }

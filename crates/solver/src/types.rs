@@ -12,6 +12,15 @@ pub type OrderId = NoteId;
 /// Token amount (u64 to match Miden's native asset amounts).
 pub type Amount = u64;
 
+/// Milliseconds since the Unix epoch (0 if the clock is before it). std has no
+/// single call for this — `SystemTime` + `duration_since(UNIX_EPOCH)` is idiomatic.
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Order lifecycle status.
 ///
 /// `Settling` is the interval between submitting an on-chain settlement

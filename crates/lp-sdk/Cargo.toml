@@ -19,3 +19,4 @@ miden-standards = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+miden-protocol = { workspace = true, features = ["testing"] }

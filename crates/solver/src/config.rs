@@ -142,6 +142,32 @@ pub struct EngineConfig {
     /// Set ≥ 2 × (price_interval_ms / 1000).
     #[serde(default = "default_price_staleness_secs")]
     pub price_staleness_secs: u64,
+
+    // ── External liquidity routing (RFQ websocket to other DEXes) ─────────────
+    /// Enable the external-liquidity router (websocket RFQ server + matcher
+    /// external pass). Default `false` (opt-in). Allow-list tokens are sourced
+    /// from the `SOLVER_ROUTER_TOKENS` env var (comma-separated), not config.
+    #[serde(default)]
+    pub router_enabled: bool,
+    /// Router websocket bind address. Default `"127.0.0.1"`; `"0.0.0.0"` exposes it.
+    #[serde(default = "default_router_bind")]
+    pub router_bind: String,
+    /// Router websocket port. Default 8090.
+    #[serde(default = "default_router_port")]
+    pub router_port: u16,
+    /// Max concurrent DEX websocket connections. Default 64.
+    #[serde(default = "default_router_max_connections")]
+    pub router_max_connections: usize,
+    /// Max inbound websocket message size (bytes). Default 16384.
+    #[serde(default = "default_router_max_msg_bytes")]
+    pub router_max_msg_bytes: usize,
+    /// How long a DEX's standing quote stays selectable (ms). Default 20000.
+    #[serde(default = "default_router_quote_ttl_ms")]
+    pub router_quote_ttl_ms: u64,
+    /// How long a handed-over note waits for the DEX's on-chain consume before it
+    /// reactivates (ms). Set above realistic consume latency. Default 30000.
+    #[serde(default = "default_router_inflight_ttl_ms")]
+    pub router_inflight_ttl_ms: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -201,6 +227,24 @@ fn default_price_vs_currency() -> String {
 }
 fn default_price_staleness_secs() -> u64 {
     30
+}
+fn default_router_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_router_port() -> u16 {
+    8090
+}
+fn default_router_max_connections() -> usize {
+    64
+}
+fn default_router_max_msg_bytes() -> usize {
+    16384
+}
+fn default_router_quote_ttl_ms() -> u64 {
+    20_000
+}
+fn default_router_inflight_ttl_ms() -> u64 {
+    30_000
 }
 
 impl SolverConfig {

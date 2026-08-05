@@ -1,12 +1,14 @@
 //! The mirror: discover user PSWAPs, post favorable counter-orders, and refill
 //! from faucets. One straight-line tick loop, one client, no channels.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
 use miden_client::store::NoteFilter;
-use miden_client::transaction::TransactionRequestBuilder;
-use miden_client::Client;
+use miden_client::transaction::{TransactionRequest, TransactionRequestBuilder};
+use miden_client::{Client, ClientError};
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::crypto::rand::FeltRng;
@@ -15,7 +17,90 @@ use miden_standards::note::{PswapNote, PswapNoteStorage};
 
 use crate::config::MockConfig;
 
-type MockClient = Client<FilesystemKeyStore>;
+pub(crate) type MockClient = Client<FilesystemKeyStore>;
+
+// ─────────────── resilient submit: backoff on transient failures ────────────
+
+/// Max retry attempts for a transient submit failure. Attempt 0 is the first
+/// try, so up to `MAX_SUBMIT_RETRIES + 1` submits before giving up.
+const MAX_SUBMIT_RETRIES: u32 = 5;
+/// Initial backoff; doubles each retry, capped at `MAX_SUBMIT_BACKOFF`.
+const INITIAL_SUBMIT_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_SUBMIT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A submit failure worth retrying: it came from the network (`RpcError`) or the
+/// remote prover (`TransactionProvingError` — e.g. a "Timeout expired" /
+/// `Cancelled` from a congested public prover). A `TransactionExecutorError` is
+/// deterministic (a failed assertion — e.g. a foreign tag-collision P2ID note
+/// whose target-account check fails): retrying cannot help, so it is NOT
+/// transient and the caller skips it.
+pub(crate) fn is_transient(err: &ClientError) -> bool {
+    matches!(err, ClientError::RpcError(_) | ClientError::TransactionProvingError(_))
+}
+
+/// Submit a transaction with bounded exponential backoff on transient
+/// (network / prover) failures.
+///
+/// IDEMPOTENCY (critical): a transient error — especially an RPC timeout — can
+/// mean the tx actually *landed* but the response was lost. Blindly retrying
+/// would double-post a counter-order (or double-consume a note). Two guards keep
+/// retries safe:
+///  1. `build_req` MUST be deterministic across attempts — the counter note's
+///     serial (hence its note id), or the note being consumed, is fixed — so a
+///     landed tx re-submitted is rejected by the network as a duplicate
+///     (a deterministic error that stops the loop, never a second on-chain tx).
+///  2. Before each retry we re-sync and compare the account nonce to its
+///     pre-submit value: any landed tx (always FROM this account) advances it,
+///     so if it advanced a prior attempt already succeeded — return Ok without
+///     re-submitting.
+///
+/// `build_req` is a closure so the request (which `.build()` consumes) can be
+/// rebuilt fresh each attempt from the same deterministic inputs.
+pub(crate) async fn submit_with_backoff(
+    client: &mut MockClient,
+    account: AccountId,
+    label: &str,
+    mut build_req: impl FnMut() -> Result<TransactionRequest>,
+) -> Result<()> {
+    // Pre-submit nonce — the idempotency baseline (local store read, no
+    // round-trip). Best-effort: if it can't be read we simply skip guard #2 and
+    // rely on guard #1 (the network rejecting a duplicate).
+    let nonce_before = client.account_reader(account).nonce().await.ok();
+
+    let mut backoff = INITIAL_SUBMIT_BACKOFF;
+    for attempt in 0..=MAX_SUBMIT_RETRIES {
+        // On a retry, first check whether the previous attempt actually landed
+        // (committed on-chain but its response was lost): a state sync + nonce
+        // bump proves it, so we must NOT re-submit.
+        if attempt > 0 {
+            if let Some(before) = nonce_before {
+                let _ = client.sync_state().await;
+                if let Ok(now) = client.account_reader(account).nonce().await {
+                    if now != before {
+                        tracing::info!(label = %label, "prior attempt landed (nonce advanced); not re-submitting");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let req = build_req().map_err(|e| anyhow!("{label}: build request: {e}"))?;
+        match client.submit_new_transaction(account, req).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_transient(&e) && attempt < MAX_SUBMIT_RETRIES => {
+                tracing::warn!(
+                    label = %label, attempt, backoff_ms = backoff.as_millis() as u64, error = %e,
+                    "transient submit error; backing off then retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_SUBMIT_BACKOFF);
+            }
+            // Exhausted retries, or a deterministic (non-transient) failure.
+            Err(e) => return Err(anyhow!("{label}: {e}")),
+        }
+    }
+    unreachable!("loop returns inside the matched arms")
+}
 
 // ───────────────────────────── mirror math (pure) ──────────────────────────
 
@@ -154,10 +239,14 @@ async fn tick(
         return Ok(());
     }
 
-    // 1. MIRROR — collect new user orders, build all counters, submit one tx.
-    let mut specs: Vec<(FungibleAsset, FungibleAsset)> = Vec::new();
+    // 1. MIRROR — post ONE counter tx PER user order, each retried independently.
+    // Per-note (not one batched tx) so a single order's transient proving/RPC
+    // failure can't stall the others: it's retried with backoff, and if it still
+    // fails it's skipped without blocking the rest (mirrors `claim_incoming`).
+    let mut considered = 0usize;
+    let mut posted = 0usize;
     for note_id in summary.new_public_notes.iter().chain(summary.new_private_notes.iter()) {
-        if specs.len() >= cfg.settings.max_mirrors_per_tick {
+        if considered >= cfg.settings.max_mirrors_per_tick {
             tracing::warn!(cap = cfg.settings.max_mirrors_per_tick, "mirror cap hit this tick");
             break;
         }
@@ -184,20 +273,32 @@ async fn tick(
             .map_err(|e| anyhow!("counter offered asset: {e}"))?;
         let requested = FungibleAsset::new(order.offered_faucet, counter_requested)
             .map_err(|e| anyhow!("counter requested asset: {e}"))?;
-        specs.push((offered, requested));
+        considered += 1;
+
+        // Build the counter note ONCE so its serial (hence note id) is fixed
+        // across retries — the idempotency guarantee `submit_with_backoff` relies
+        // on (a landed-but-lost retry is rejected as a duplicate note).
+        let counter = match build_counter_note(client, mock_id, offered, requested) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "skip order: build counter note failed");
+                continue;
+            }
+        };
+        match submit_with_backoff(client, mock_id, "counter", || {
+            TransactionRequestBuilder::new()
+                .own_output_notes(vec![counter.clone()])
+                .build()
+                .map_err(|e| anyhow!("build mirror tx: {e}"))
+        })
+        .await
+        {
+            Ok(()) => posted += 1,
+            Err(e) => tracing::warn!(error = %e, order = ?note_id, "counter failed after retries; skipped"),
+        }
     }
-    if !specs.is_empty() {
-        let count = specs.len();
-        let notes = build_counter_notes(client, mock_id, specs)?;
-        let req = TransactionRequestBuilder::new()
-            .own_output_notes(notes)
-            .build()
-            .map_err(|e| anyhow!("build mirror tx: {e}"))?;
-        client
-            .submit_new_transaction(mock_id, req)
-            .await
-            .map_err(|e| anyhow!("submit mirror tx: {e}"))?;
-        tracing::info!(count, "posted counter-orders");
+    if posted > 0 {
+        tracing::info!(count = posted, "posted counter-orders");
     }
 
     // 2. MONITOR — warn (never mint) when inventory runs low. The mock does NOT
@@ -225,34 +326,32 @@ async fn tick(
     Ok(())
 }
 
-/// Build one PSWAP note per (offered, requested) spec, all sent by the mock.
-/// Replicates the builder snippet inside `build_pswap_create` so several notes
-/// can share one transaction.
-fn build_counter_notes(
+/// Build one PSWAP counter note (mock offers `offered`, requests `requested`).
+/// The serial is drawn once here; the caller reuses the returned note across
+/// submit retries so its note id stays fixed (idempotency — see
+/// `submit_with_backoff`).
+fn build_counter_note(
     client: &mut MockClient,
     mock_id: AccountId,
-    specs: Vec<(FungibleAsset, FungibleAsset)>,
-) -> Result<Vec<Note>> {
+    offered: FungibleAsset,
+    requested: FungibleAsset,
+) -> Result<Note> {
     let rng = client.rng();
-    let mut notes = Vec::with_capacity(specs.len());
-    for (offered, requested) in specs {
-        let storage = PswapNoteStorage::builder()
-            .requested_asset(requested)
-            .creator_account_id(mock_id)
-            .payback_note_type(NoteType::Public)
-            .build();
-        let pswap = PswapNote::builder()
-            .sender(mock_id)
-            .storage(storage)
-            .serial_number(rng.draw_word())
-            .note_type(NoteType::Public)
-            .offered_asset(offered)
-            .maybe_attachment(None)
-            .build()
-            .map_err(|e| anyhow!("build counter pswap: {e}"))?;
-        notes.push(pswap.into());
-    }
-    Ok(notes)
+    let storage = PswapNoteStorage::builder()
+        .requested_asset(requested)
+        .creator_account_id(mock_id)
+        .payback_note_type(NoteType::Public)
+        .build();
+    let pswap = PswapNote::builder()
+        .sender(mock_id)
+        .storage(storage)
+        .serial_number(rng.draw_word())
+        .note_type(NoteType::Public)
+        .offered_asset(offered)
+        .maybe_attachment(None)
+        .build()
+        .map_err(|e| anyhow!("build counter pswap: {e}"))?;
+    Ok(pswap.into())
 }
 
 /// Consume incoming **P2ID** notes (funding mints + trade-proceeds paybacks)
@@ -276,15 +375,28 @@ async fn claim_incoming(client: &mut MockClient, account: AccountId) -> Result<u
     if notes.is_empty() {
         return Ok(0);
     }
-    let count = notes.len();
-    let request = TransactionRequestBuilder::new()
-        .build_consume_notes(notes)
-        .map_err(|e| anyhow!("build consume: {e}"))?;
-    client
-        .submit_new_transaction(account, request)
+    // Consume per-note and tolerate un-consumable ones: on a busy network the
+    // account's 32-bit note tag collides with foreign P2ID notes, which fail the
+    // target-account assertion. A batch consume would fail the whole tx on one
+    // such note; per-note skips them and claims the genuine ones.
+    let mut ok = 0usize;
+    for note in notes {
+        // Retry transient prover/RPC failures with backoff; skip notes that fail
+        // deterministically (foreign tag-collision P2ID notes whose target-account
+        // assertion fails). Idempotent: a landed-but-lost consume is caught by the
+        // nonce check, or rejected as an already-nullified note on retry.
+        match submit_with_backoff(client, account, "claim", || {
+            TransactionRequestBuilder::new()
+                .build_consume_notes(vec![note.clone()])
+                .map_err(|e| anyhow!("build_consume: {e}"))
+        })
         .await
-        .map_err(|e| anyhow!("submit consume: {e}"))?;
-    Ok(count)
+        {
+            Ok(()) => ok += 1,
+            Err(e) => tracing::debug!(error = %e, "skip un-consumable note (foreign tag-collision or exhausted)"),
+        }
+    }
+    Ok(ok)
 }
 
 async fn subscribe_pairs(client: &mut MockClient, cfg: &MockConfig) -> Result<()> {

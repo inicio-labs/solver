@@ -1,0 +1,22 @@
+[package]
+name = "pswap-lp-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Client SDK for external liquidity providers (LPs) to receive and fill Miden PSWAP orders routed by the solver's RFQ websocket. Speaks the router's miden-binary protocol; independent of the solver's internals (no db / http / matcher)."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.40", features = ["rt", "macros", "sync", "time", "net"] }
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+thiserror = "2"
+tracing = "0.1"
+# The wire protocol is miden's own binary serialization, so miden types travel
+# natively (AccountId / FungibleAsset / Note). Still independent of the solver
+# crate and of `miden-client` — the filler runs the consume tx with its own client.
+miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+miden-protocol = { workspace = true, features = ["testing"] }

@@ -9,6 +9,10 @@ testing = []
 
 [dependencies]
 consume-script = { path = "../consume-script" }
+# Shared RFQ wire protocol with external fillers. Depend on it for the protocol
+# types only (default features ⇒ no extra miden deps); the SDK is the crate
+# external DEXes import. One definition of the protocol, so the two can't drift.
+pswap-lp-sdk = { path = "../lp-sdk" }
 miden-client = { workspace = true }
 miden-protocol.workspace = true
 miden-standards.workspace = true
@@ -22,13 +26,14 @@ serde_json = "1.0"
 toml = "0.8"
 diesel = { version = "2.2", features = ["sqlite", "r2d2"] }
 diesel_migrations = "2.2"
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 # Public price-API protections: request timeout + response cache header.
 # (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's
 # DefaultBodyLimit — no extra crates needed for those.)
 tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header", "cors"] }
 hex = "0.4"
 subtle = "2.5"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
@@ -47,6 +52,8 @@ miden-protocol = { workspace = true, features = ["testing"] }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }
 tempfile = "3"
+# WS client for the router end-to-end test (matches the version axum 0.8 pulls).
+tokio-tungstenite = "0.29"
 # Surfaces the solver's tracing logs in integration tests (e.g. the executor's
 # exact failure assertion) under `--nocapture`.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

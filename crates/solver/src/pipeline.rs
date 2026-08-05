@@ -17,6 +17,7 @@ use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
 use crate::swap_eta::SettlementStats;
+use crate::router::{RouteBatch, QuotesSnapshot};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -200,6 +201,12 @@ pub struct PipelineChannels {
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+    /// Standing DEX quotes: router → matcher (latest-wins).
+    pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
+    pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
+    /// Selected notes: matcher → router (delivered to DEXes over websocket).
+    pub route_tx: mpsc::Sender<RouteBatch>,
+    pub route_rx: mpsc::Receiver<RouteBatch>,
 }
 
 pub fn create_channels() -> PipelineChannels {
@@ -212,6 +219,8 @@ pub fn create_channels() -> PipelineChannels {
     let (stats_tx, stats_rx) = watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
+    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
+    let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
         order_tx,
         order_rx,
@@ -229,6 +238,10 @@ pub fn create_channels() -> PipelineChannels {
         exec_rx,
         subscribe_tx,
         subscribe_rx,
+        quotes_tx,
+        quotes_rx,
+        route_tx,
+        route_rx,
     }
 }
 
@@ -277,6 +290,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     exec_tx: mpsc::Sender<ExecutionBatch>,
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
+    router_hooks: Option<matcher::RouterHooks>,
 ) -> CoreHandles {
     // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
     let price_pool = config.db_pool.clone();
@@ -304,6 +318,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
             match_interval,
             triangular_enabled,
             swap_snapshot_tx,
+            router_hooks,
             matcher_cancel,
         )
         .await;

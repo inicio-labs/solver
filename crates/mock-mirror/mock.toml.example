@@ -13,6 +13,11 @@ timeout_ms = 10000
 network = "devnet"
 # Remote prover (offload proving; essential on small hosts). Omit to prove locally.
 prover_endpoint = "https://tx-prover.devnet.miden.io"
+# Timeout (ms) for remote-prover requests. Defaults to 30s; the miden-client
+# default of 10s is too tight for a congested public prover and causes spurious
+# "Timeout expired" proving failures (which strand un-countered orders). Only
+# used when prover_endpoint is set.
+prover_timeout_ms = 30000
 
 [mock]
 # Filled in by `mock-mirror provision` (it prints this). Leave unset to provision.

@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client_factory::ClientFactory;
 use crate::config::SolverConfig;
 use crate::db;
+use crate::matcher::RouterHooks;
 use crate::pipeline::{self, PipelineConfig};
 use crate::price::{PriceClient, SharedSymbolMap};
 use crate::types::TokenId;
@@ -147,6 +148,19 @@ pub async fn start(
     // stale until the first real fetch (no fabricated-fresh empty snapshot).
     let last_price_update = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
+    // Router hooks for the matcher's external pass — only when the router is
+    // enabled. The matcher reads cached quotes and emits handovers; the router
+    // websocket thread (spawned below) owns the other ends of these channels.
+    let router_hooks = if config.engine.router_enabled {
+        Some(RouterHooks {
+            quotes_rx: channels.quotes_rx.clone(),
+            route_tx: channels.route_tx.clone(),
+            inflight_ttl_ms: config.engine.router_inflight_ttl_ms,
+        })
+    } else {
+        None
+    };
+
     // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's
     //     LocalSet — the main coordination thread.
     let core = pipeline::spawn_core_services(
@@ -161,6 +175,7 @@ pub async fn start(
         channels.exec_tx,
         channels.swap_snapshot_tx,
         channels.subscribe_tx,
+        router_hooks,
     );
 
     // 11. Observability server (Send; on the main thread).
@@ -240,6 +255,55 @@ pub async fn start(
         cancel.clone(),
     )?;
 
+    // 13c. ROUTER THREAD (external liquidity RFQ websocket): its own OS thread +
+    //      multi-thread runtime (like the price-API) so DEX traffic can't stall
+    //      settlement. Only spawned when enabled; allow-list tokens come from the
+    //      `SOLVER_ROUTER_TOKENS` env var (comma-separated).
+    let (router_thread, router_ready_rx) = if config.engine.router_enabled {
+        let auth_tokens: Vec<String> = std::env::var("SOLVER_ROUTER_TOKENS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if auth_tokens.is_empty() {
+            tracing::warn!(
+                "router_enabled but SOLVER_ROUTER_TOKENS is empty — all DEX connections rejected"
+            );
+        }
+        let router_cfg = crate::router::RouterConfig {
+            bind: config.engine.router_bind.clone(),
+            port: config.engine.router_port,
+            max_connections: config.engine.router_max_connections,
+            max_msg_bytes: config.engine.router_max_msg_bytes,
+            quote_ttl_ms: config.engine.router_quote_ttl_ms,
+            auth_tokens,
+        };
+        match crate::router::spawn_router_thread(
+            router_cfg,
+            channels.quotes_tx,
+            channels.route_rx,
+            cancel.clone(),
+        ) {
+            Ok((t, r)) => (Some(t), Some(r)),
+            Err(e) => {
+                // Router failed to start — tear down the already-spawned services
+                // (same cancel + join path as a startup-gate failure) so nothing is
+                // left running after `start` returns.
+                cancel.cancel();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = ingest_thread.join();
+                    let _ = executor_thread.join();
+                    let _ = price_api_thread.join();
+                })
+                .await;
+                return Err(e).context("router startup failed");
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // 14. Startup gate: both client threads must report ready (client built +
     //     tasks spawned) before startup is considered successful. Any build /
     //     subscribe failure -> cancel everything, join, return the error.
@@ -259,6 +323,13 @@ pub async fn start(
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(anyhow!("price-api thread exited before signalling readiness")),
         }
+        if let Some(rx) = router_ready_rx {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(anyhow!("router thread exited before signalling readiness")),
+            }
+        }
         Ok(())
     }
     .await;
@@ -269,6 +340,9 @@ pub async fn start(
             let _ = ingest_thread.join();
             let _ = executor_thread.join();
             let _ = price_api_thread.join();
+            if let Some(t) = router_thread {
+                let _ = t.join();
+            }
         })
         .await;
         return Err(e).context("startup failed");
@@ -307,6 +381,11 @@ pub async fn start(
         }
         if let Err(e) = price_api_thread.join() {
             tracing::error!(?e, "price-api thread panicked");
+        }
+        if let Some(t) = router_thread {
+            if let Err(e) = t.join() {
+                tracing::error!(?e, "router thread panicked");
+            }
         }
     })
     .await;

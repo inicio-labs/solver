@@ -33,6 +33,16 @@ pub struct RpcCfg {
     /// locally.
     #[serde(default)]
     pub prover_endpoint: Option<String>,
+    /// Timeout (ms) for remote-prover requests. The miden-client default is 10s,
+    /// which is too tight for a congested public testnet prover and causes
+    /// spurious "Timeout expired" proving failures; default to 30s here. Only
+    /// used when `prover_endpoint` is set.
+    #[serde(default = "default_prover_timeout_ms")]
+    pub prover_timeout_ms: u64,
+}
+
+fn default_prover_timeout_ms() -> u64 {
+    30_000
 }
 
 impl RpcCfg {

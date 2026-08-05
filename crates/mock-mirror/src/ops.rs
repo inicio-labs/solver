@@ -35,15 +35,24 @@ pub async fn claim(client: &mut C, account: AccountId) -> Result<usize> {
     if notes.is_empty() {
         return Ok(0);
     }
-    let count = notes.len();
-    let request = TransactionRequestBuilder::new()
-        .build_consume_notes(notes)
-        .map_err(|e| anyhow!("build consume: {e}"))?;
-    client
-        .submit_new_transaction(account, request)
+    eprintln!("DIAG: {} candidate note(s) to consume", notes.len());
+    let mut ok = 0usize;
+    for note in notes {
+        let nid = format!("{}", note.id());
+        // Same resilient path as the mirror's auto-claim: retry transient
+        // prover/RPC failures with backoff, skip deterministic ones.
+        match crate::mirror::submit_with_backoff(client, account, "claim", || {
+            TransactionRequestBuilder::new()
+                .build_consume_notes(vec![note.clone()])
+                .map_err(|e| anyhow!("build_consume: {e}"))
+        })
         .await
-        .map_err(|e| anyhow!("submit consume: {e}"))?;
-    Ok(count)
+        {
+            Ok(()) => { ok += 1; eprintln!("CONSUMED {nid}"); }
+            Err(e) => { eprintln!("FAILNOTE {nid}: {e}"); }
+        }
+    }
+    Ok(ok)
 }
 
 /// Create a **public** PSWAP from `account` (so the solver's keyless ingest

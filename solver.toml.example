@@ -89,3 +89,16 @@ admin_port = 3001
 #                                    # (per-request override: ?precision=). NOT the token's decimals.
 # price_vs_currency = "usd"          # CoinGecko vs_currency (usd/eur/...; NOT "usdt")
 # price_staleness_secs = 30          # older than this → 503 (use ?allow_stale=true to override)
+
+# ── External liquidity routing (RFQ websocket to other DEXes) ────────────────
+# Off by default. When enabled, runs a websocket RFQ server on its own thread:
+# allow-listed DEXes connect to GET /v1/rfq, post standing {price, quantity}
+# quotes per registered pair, and receive note handovers to self-consume on-chain.
+# Allow-list tokens come from the SOLVER_ROUTER_TOKENS env var (comma-separated).
+# router_enabled = false
+# router_bind = "127.0.0.1"               # "0.0.0.0" to expose (front w/ a proxy)
+# router_port = 8090
+# router_max_connections = 64
+# router_max_msg_bytes = 16384
+# router_quote_ttl_ms = 20000             # how long a posted quote stays selectable
+# router_inflight_ttl_ms = 30000          # handed-over note reactivates after this if not consumed

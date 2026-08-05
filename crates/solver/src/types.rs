@@ -21,6 +21,19 @@ pub fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Seconds since the Unix epoch. A named alias (not a bare `u64`) so signatures
+/// carrying a wall-clock instant read as *time* at the call site.
+pub type UnixSecs = u64;
+
+/// Wall-clock now, in [`UnixSecs`] (saturating). The seconds analogue of
+/// [`now_millis`]; stamps order arrival for the swap-eta window.
+pub fn now_unix() -> UnixSecs {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Order lifecycle status.
 ///
 /// `Settling` is the interval between submitting an on-chain settlement
@@ -119,10 +132,10 @@ pub struct FilledNote {
     pub note_id: OrderId,
     pub requested_filled: Amount,
     pub raw_note_data: Vec<u8>,
-    /// Unix secs the matcher first observed this order (stamped in-memory, not
-    /// from the DB). Carried to the executor so it can record the settlement
-    /// duration (`settled − arrival`) for the in-memory swap-eta window.
-    pub arrival_unix: u64,
+    /// When the matcher first observed this order (stamped in-memory, not from
+    /// the DB). Carried to the executor so it can record the settlement duration
+    /// (`settled − arrival`) for the in-memory swap-eta window.
+    pub arrival_unix: UnixSecs,
 }
 
 /// A batch of matched orders to be executed together.

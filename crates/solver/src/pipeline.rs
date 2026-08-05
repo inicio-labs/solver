@@ -214,6 +214,14 @@ pub fn create_channels() -> PipelineChannels {
     let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
+    // Two separate swap-eta feeds, NOT one combined channel: they have two
+    // independent producers on two threads — the matcher publishes the live
+    // top-of-book each tick (fillability), the executor publishes settlement
+    // durations after each settlement (the 24h median). A `watch` value has
+    // replace semantics, so co-writing one struct from both would need a shared
+    // lock + read-modify-write (lost-update race). One channel per producer =
+    // each is the sole, lock-free writer of its own stream. Both read by the
+    // swap-eta handler in price_api.rs.
     let (swap_snapshot_tx, swap_snapshot_rx) =
         watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
     let (stats_tx, stats_rx) = watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));

@@ -1,7 +1,7 @@
 use miden_protocol::note::NoteId;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -11,12 +11,8 @@ use crate::matching::order_book::OrderBook;
 use crate::matching::types::{Order, SwapBookSnapshot};
 use crate::price::{PriceSnapshot, WatchPriceFeed};
 use crate::router::{select_notes, Pair, QuotesSnapshot, RouteBatch, RoutedNote};
+// `now_unix` / `UnixSecs` come from here (deduped — was a local copy).
 use crate::types::*;
-
-/// Unix secs, saturating. Used to stamp order arrival for the swap-eta window.
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
 
 /// Hooks that enable the external-liquidity pass in the matcher tick. When the
 /// router is disabled these are absent and the matcher behaves exactly as before.
@@ -65,10 +61,8 @@ pub async fn run_matcher(
 
     // Map from OrderId → raw note data for building FilledNotes / handovers.
     let mut raw_notes: HashMap<OrderId, Vec<u8>> = HashMap::new();
-    // Arrival time (unix secs) per order — stamped when the matcher first sees
-    // the order. Carried onto FilledNote so the executor can record the
-    // settlement duration for the swap-eta window. In-memory only (no DB).
-    let mut arrivals: HashMap<OrderId, u64> = HashMap::new();
+    // Per-order arrival time, carried onto FilledNote for the swap-eta window.
+    let mut arrivals: HashMap<OrderId, UnixSecs> = HashMap::new();
 
     // Monotonic-clamped wall clock (SystemTime can step backwards).
     let mut last_now: u64 = 0;

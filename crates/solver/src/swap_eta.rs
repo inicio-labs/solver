@@ -12,16 +12,22 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::matching::types::BestLevel;
-use crate::types::TokenId;
+use crate::types::{TokenId, UnixSecs};
 
 /// Retention window for settlement samples (24h).
 pub const WINDOW_SECS: u64 = 24 * 60 * 60;
 /// Hard per-pair cap on retained samples — a memory bound for a hot pair.
+///
+/// NOTE: this makes `median24h_seconds` **approximate** for any pair that sees
+/// more than `MAX_SAMPLES_PER_PAIR` settlements inside the 24h window: once the
+/// cap is hit, the oldest-but-still-fresh sample is dropped, so the reported
+/// median is the median of the most recent `MAX_SAMPLES_PER_PAIR`, not of the
+/// full window. Accepted trade-off: bounds memory for hot pairs.
 const MAX_SAMPLES_PER_PAIR: usize = 1000;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
-    at_unix: u64,
+    at_unix: UnixSecs,
     duration_secs: u64,
 }
 
@@ -41,7 +47,7 @@ impl SettlementStats {
     /// Record that a `pair` order settled in `duration_secs`, observed at
     /// `now_unix`. Prunes samples older than [`WINDOW_SECS`] and caps per-pair
     /// length at [`MAX_SAMPLES_PER_PAIR`].
-    pub fn record(&mut self, pair: (TokenId, TokenId), now_unix: u64, duration_secs: u64) {
+    pub fn record(&mut self, pair: (TokenId, TokenId), now_unix: UnixSecs, duration_secs: u64) {
         let q = self.by_pair.entry(pair).or_default();
         q.push_back(Sample { at_unix: now_unix, duration_secs });
 
@@ -56,7 +62,7 @@ impl SettlementStats {
 
     /// Median settlement seconds for `pair` over the last window as of
     /// `now_unix`. `None` if there are no fresh samples for the pair.
-    pub fn median_secs(&self, pair: (TokenId, TokenId), now_unix: u64) -> Option<u64> {
+    pub fn median_secs(&self, pair: (TokenId, TokenId), now_unix: UnixSecs) -> Option<u64> {
         let q = self.by_pair.get(&pair)?;
         let cutoff = now_unix.saturating_sub(WINDOW_SECS);
         let mut durs: Vec<u64> =
@@ -126,6 +132,11 @@ pub fn eval_off_market(
     let (Some(d_a), Some(d_b)) = (d_a, d_b) else {
         return (None, market_price);
     };
+    // The off-market comparison quantises USD prices to whole cents (integer math
+    // keeps the ratio comparison exact). ACCEPTED LIMITATION: an asset priced
+    // below ~$0.005 rounds to 0 cents, so we can't judge it and return the flag
+    // as unknown (`None`) rather than guess. `market_price` above is still exact.
+    // Revisit with lossless fixed-point if sub-cent assets get listed.
     let cents_a = (usd_a * 100.0).round() as u128;
     let cents_b = (usd_b * 100.0).round() as u128;
     if cents_a == 0 || cents_b == 0 {

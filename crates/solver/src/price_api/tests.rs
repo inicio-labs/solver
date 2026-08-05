@@ -122,6 +122,19 @@ fn swap_server(
     snapshot: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
+    swap_server_with_update(now(), registered, prices, snapshot, stats)
+}
+
+/// Like [`swap_server`] but with an explicit `last_price_update` timestamp, so a
+/// test can drive the staleness gate on the oracle side of `/v1/swap-eta`.
+#[allow(clippy::type_complexity)]
+fn swap_server_with_update(
+    last_update: i64,
+    registered: &[(AccountId, Option<i32>)],
+    prices: &[(AccountId, f64)],
+    snapshot: SwapBookSnapshot,
+    stats: SettlementStats,
+) -> Harness {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let pool = db::init_db(tmp.path().to_str().unwrap(), 2).unwrap();
     {
@@ -141,7 +154,7 @@ fn swap_server(
     let state = PriceApiState {
         precise_rx,
         pool,
-        last_price_update: Arc::new(AtomicI64::new(now())),
+        last_price_update: Arc::new(AtomicI64::new(last_update)),
         vs_currency: "usd".into(),
         default_precision: PricePrecision::Full,
         staleness_secs: 60,
@@ -430,6 +443,43 @@ async fn swap_eta_median_present_and_off_market_true() {
     let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 500)).await.json();
     assert_eq!(v["median24hSeconds"].as_u64().unwrap(), 20); // median of 10,20,30
     assert_eq!(v["offMarket"].as_bool().unwrap(), true);
+}
+
+#[tokio::test]
+async fn swap_eta_stale_oracle_fails_closed_to_null() {
+    // Same greedy, priced order as the off-market test, but with a price feed
+    // older than `staleness_secs`: the oracle verdict must fail closed to null
+    // rather than flag off-market from a dead feed. (Regression guard for the
+    // stale-oracle gate in `get_swap_eta`.)
+    let h = swap_server_with_update(
+        now() - 3600, // > staleness_secs (60)
+        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        SwapBookSnapshot::new(),
+        SettlementStats::new(),
+    );
+    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 500)).await.json();
+    assert!(v["offMarket"].is_null(), "stale oracle → offMarket null, not a stale verdict");
+    assert!(v["marketPrice"].is_null(), "stale oracle → marketPrice null");
+}
+
+#[tokio::test]
+async fn swap_eta_response_is_not_cached() {
+    // `/v1/swap-eta` must override the router-level `max-age` cache layer with
+    // `no-store`, since its fields come from independently-updated snapshots.
+    let h = swap_server(
+        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        SwapBookSnapshot::new(),
+        SettlementStats::new(),
+    );
+    let r = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await;
+    let cache = r.headers().get("cache-control").cloned();
+    assert_eq!(
+        cache.expect("cache-control header present").to_str().unwrap(),
+        "no-store",
+        "swap-eta must not inherit the router's price-interval max-age",
+    );
 }
 
 #[tokio::test]

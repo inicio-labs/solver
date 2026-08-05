@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use consume_script::ConsumeAssetScript;
@@ -507,10 +507,7 @@ fn record_settlement(
     stats: &mut SettlementStats,
     stats_tx: &watch::Sender<Arc<SettlementStats>>,
 ) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::types::now_unix();
 
     let mut changed = false;
     for filled in &batch.filled_notes {
@@ -528,6 +525,9 @@ fn record_settlement(
         changed = true;
     }
     if changed {
+        // send_replace (not send): overwrite the published stats with the latest
+        // and return the prior value (ignored). Unlike `send`, it never errors
+        // when the swap-eta reader isn't currently subscribed.
         stats_tx.send_replace(Arc::new(stats.clone()));
     }
 }

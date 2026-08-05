@@ -64,7 +64,9 @@ pub struct PriceApiConfig {
     pub swap_proving_ms: u64,
     /// Estimated block time (ms) — a term of the ETA.
     pub swap_block_ms: u64,
-    /// Slack (bps) before flagging `offMarket`.
+    /// Tolerance, in basis points, the `/v1/swap-eta` off-market check allows
+    /// before it sets `offMarket: true`. E.g. `50` ⇒ an order priced within 0.5%
+    /// of the oracle mid still counts as "at market"; worse than that is flagged.
     pub swap_offmarket_tol_bps: u64,
 }
 
@@ -339,7 +341,7 @@ fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, Api
 async fn get_swap_eta(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
-) -> Result<Json<SwapEtaResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let a = parse_faucet(&q, "offered_faucet")?;
     let b = parse_faucet(&q, "requested_faucet")?;
     if a == b {
@@ -366,8 +368,13 @@ async fn get_swap_eta(
     let can_fill = eval_can_fill(offered_amount, requested_amount, best);
     let estimated_seconds = if can_fill { Some(state.swap_eta_secs) } else { None };
 
-    // Oracle check (advisory; independent of the book).
-    let (usd_a, usd_b) = {
+    // Oracle check (advisory; independent of the book). Fail closed on a stale
+    // feed: if the price snapshot is older than the staleness bound, treat both
+    // prices as unavailable so `off_market`/`market_price` are never derived from
+    // stale data. The book-based `can_fill` is unaffected.
+    let (usd_a, usd_b) = if staleness(&state).1 {
+        (None, None)
+    } else {
         let snap = state.precise_rx.borrow();
         (snap.get(&a).map(|d| d.usd), snap.get(&b).map(|d| d.usd))
     };
@@ -385,7 +392,7 @@ async fn get_swap_eta(
     let now = now_secs().max(0) as u64;
     let median24h_seconds = state.stats_rx.borrow().median_secs((a, b), now);
 
-    Ok(Json(SwapEtaResponse {
+    let body = Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         offered_amount: offered_amount.to_string(),
@@ -395,7 +402,12 @@ async fn get_swap_eta(
         estimated_seconds,
         market_price,
         median24h_seconds,
-    }))
+    });
+    // Don't let the router-level `max-age=<price interval>` layer cache this:
+    // can_fill, off_market, and median24h_seconds come from independently-updated
+    // snapshots, so a shared max-age would serve stale fillability. `no-store`
+    // wins because the layer is `if_not_present`.
+    Ok(([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], body))
 }
 
 /// Concurrency limiter: acquire a permit per request, shed with `503` if none.

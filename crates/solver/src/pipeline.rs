@@ -14,7 +14,9 @@ use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
+use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
+use crate::swap_eta::SettlementStats;
 use crate::router::{RouteBatch, QuotesSnapshot};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
 
@@ -189,6 +191,12 @@ pub struct PipelineChannels {
     /// Full-precision price side-channel — consumed only by the price-query API.
     pub precise_tx: watch::Sender<PreciseSnapshot>,
     pub precise_rx: watch::Receiver<PreciseSnapshot>,
+    /// Top-of-book snapshot (matcher → swap-eta API), latest-wins.
+    pub swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    pub swap_snapshot_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    /// In-memory settlement-time window (executor → swap-eta API), latest-wins.
+    pub stats_tx: watch::Sender<Arc<SettlementStats>>,
+    pub stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pub exec_tx: mpsc::Sender<ExecutionBatch>,
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
@@ -206,6 +214,17 @@ pub fn create_channels() -> PipelineChannels {
     let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
+    // Two separate swap-eta feeds, NOT one combined channel: they have two
+    // independent producers on two threads — the matcher publishes the live
+    // top-of-book each tick (fillability), the executor publishes settlement
+    // durations after each settlement (the 24h median). A `watch` value has
+    // replace semantics, so co-writing one struct from both would need a shared
+    // lock + read-modify-write (lost-update race). One channel per producer =
+    // each is the sole, lock-free writer of its own stream. Both read by the
+    // swap-eta handler in price_api.rs.
+    let (swap_snapshot_tx, swap_snapshot_rx) =
+        watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
+    let (stats_tx, stats_rx) = watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
@@ -219,6 +238,10 @@ pub fn create_channels() -> PipelineChannels {
         price_rx,
         precise_tx,
         precise_rx,
+        swap_snapshot_tx,
+        swap_snapshot_rx,
+        stats_tx,
+        stats_rx,
         exec_tx,
         exec_rx,
         subscribe_tx,
@@ -262,6 +285,7 @@ pub struct CoreHandles {
 /// Spawn the `Send` services (price feed, matcher, admin HTTP) on the
 /// CALLER's LocalSet (the main coordination thread). None of these touch a
 /// miden client. `prepare_db` must have been called first.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_core_services<P: PriceClient + 'static>(
     config: &PipelineConfig,
     price_client: P,
@@ -272,6 +296,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     precise_tx: watch::Sender<PreciseSnapshot>,
     last_price_update: Arc<AtomicI64>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
+    swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     router_hooks: Option<matcher::RouterHooks>,
 ) -> CoreHandles {
@@ -300,6 +325,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
             exec_tx,
             match_interval,
             triangular_enabled,
+            swap_snapshot_tx,
             router_hooks,
             matcher_cancel,
         )

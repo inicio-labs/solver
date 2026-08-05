@@ -15,12 +15,13 @@ use miden_protocol::{
     note::{Note, NoteRecipient},
 };
 use miden_standards::note::PswapNote;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::client_factory::ClientFactory;
 use crate::db::{self, DbPool};
 use crate::ingest::{MidenClient, MidenClientAdapter};
+use crate::swap_eta::SettlementStats;
 use crate::types::{ExecutionBatch, FilledNote, IngestOrder, OrderStatus, TokenId};
 
 // ── Backoff knobs ──────────────────────────────────────────────────────────
@@ -443,6 +444,7 @@ async fn log_batch_consume_diagnostics(
 /// Locking: the executor shares a `Mutex<Client>` with the ingest/subscribe
 /// adapter. The lock is acquired per-submit-attempt and dropped before each
 /// backoff sleep so ingest isn't starved.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_executor(
     client: Arc<Mutex<Client<FilesystemKeyStore>>>,
     miden_adapter: Arc<Mutex<dyn MidenClient>>,
@@ -450,8 +452,13 @@ pub async fn run_executor(
     pool: DbPool,
     mut exec_rx: mpsc::Receiver<ExecutionBatch>,
     order_tx: mpsc::Sender<IngestOrder>,
+    // In-memory swap-eta settlement-time window; republished on each success.
+    stats_tx: watch::Sender<Arc<SettlementStats>>,
     cancel: CancellationToken,
 ) {
+    // Owned here (executor thread) and published over `stats_tx`. Ephemeral —
+    // no DB persistence; rebuilds after a restart.
+    let mut stats = SettlementStats::new();
     loop {
         // Cancellation is only checked BETWEEN batches. Once execute_batch
         // starts, only the backoff sleep is cancel-aware — the on-chain submit
@@ -480,12 +487,49 @@ pub async fn run_executor(
         .await;
 
         match result {
-            Ok(_) => tracing::info!(notes = batch.filled_notes.len(), "batch executed successfully"),
+            Ok(_) => {
+                tracing::info!(notes = batch.filled_notes.len(), "batch executed successfully");
+                record_settlement(&batch, &mut stats, &stats_tx);
+            }
             Err(e) => tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed"),
         }
     }
 
     tracing::info!("executor shutting down");
+}
+
+/// After a successful settlement, record each note's settlement duration
+/// (now − arrival) into the in-memory swap-eta window and republish it.
+/// Everything is in-memory: `arrival_unix` was stamped by the matcher and rides
+/// on the batch; the pair is parsed from the note's own bytes. No DB.
+fn record_settlement(
+    batch: &ExecutionBatch,
+    stats: &mut SettlementStats,
+    stats_tx: &watch::Sender<Arc<SettlementStats>>,
+) {
+    let now = crate::types::now_unix();
+
+    let mut changed = false;
+    for filled in &batch.filled_notes {
+        // Pair from the note's own terms (offered, requested) — the direction a
+        // wallet queries. Skip anything unparseable.
+        let Ok(note) = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)) else {
+            continue;
+        };
+        let Ok(parsed) = crate::types::Order::from_note(&note) else {
+            continue;
+        };
+        let pair = (parsed.offered_faucet_id, parsed.requested_faucet_id);
+        let duration = now.saturating_sub(filled.arrival_unix);
+        stats.record(pair, now, duration);
+        changed = true;
+    }
+    if changed {
+        // send_replace (not send): overwrite the published stats with the latest
+        // and return the prior value (ignored). Unlike `send`, it never errors
+        // when the swap-eta reader isn't currently subscribed.
+        stats_tx.send_replace(Arc::new(stats.clone()));
+    }
 }
 
 #[tracing::instrument(skip(client, miden_adapter, pool, batch, order_tx, cancel),
@@ -660,6 +704,7 @@ pub(crate) fn spawn_executor_thread(
     solver_id: AccountId,
     exec_rx: mpsc::Receiver<ExecutionBatch>,
     refeed_tx: mpsc::Sender<IngestOrder>,
+    stats_tx: watch::Sender<Arc<SettlementStats>>,
     sync_interval: Duration,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (exec_ready_tx, exec_ready_rx) = oneshot::channel::<Result<()>>();
@@ -667,6 +712,7 @@ pub(crate) fn spawn_executor_thread(
     let exec_db = db_pool;
     let exec_cancel = cancel;
     let exec_refeed_tx = refeed_tx;
+    let exec_stats_tx = stats_tx;
     let exec_sync_interval = sync_interval;
     let executor_thread = thread::Builder::new()
         .name("executor-client".into())
@@ -705,6 +751,7 @@ pub(crate) fn spawn_executor_thread(
                         exec_db,
                         exec_rx,
                         exec_refeed_tx,
+                        exec_stats_tx,
                         run_cancel,
                     )
                     .await;

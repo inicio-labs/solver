@@ -8,9 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::db::{self, DbPool};
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
-use crate::matching::types::Order;
+use crate::matching::types::{Order, SwapBookSnapshot};
 use crate::price::{PriceSnapshot, WatchPriceFeed};
 use crate::router::{select_notes, Pair, QuotesSnapshot, RouteBatch, RoutedNote};
+// `now_unix` / `UnixSecs` come from here (deduped — was a local copy).
 use crate::types::*;
 
 /// Hooks that enable the external-liquidity pass in the matcher tick. When the
@@ -37,6 +38,8 @@ pub struct RouterHooks {
 /// run the external pass (→ router), if enabled. The external pass and
 /// reactivation run on EVERY tick (no early `continue`), since the
 /// zero-internal-match tick is exactly when external routing matters most.
+/// It also stamps each order's arrival and publishes a top-of-book snapshot
+/// every tick for the swap-eta API.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_matcher(
     pool: DbPool,
@@ -46,6 +49,9 @@ pub async fn run_matcher(
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
     triangular_enabled: bool,
+    // Publishes the top-of-book snapshot each tick for the swap-eta API. Read
+    // lock-free off-thread, so wallet ETA traffic never touches the live book.
+    swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     mut router: Option<RouterHooks>,
     cancel: CancellationToken,
 ) {
@@ -55,6 +61,8 @@ pub async fn run_matcher(
 
     // Map from OrderId → raw note data for building FilledNotes / handovers.
     let mut raw_notes: HashMap<OrderId, Vec<u8>> = HashMap::new();
+    // Per-order arrival time, carried onto FilledNote for the swap-eta window.
+    let mut arrivals: HashMap<OrderId, UnixSecs> = HashMap::new();
 
     // Monotonic-clamped wall clock (SystemTime can step backwards).
     let mut last_now: u64 = 0;
@@ -72,6 +80,7 @@ pub async fn run_matcher(
                         order.offered_amount,
                         order.requested_amount,
                     );
+                    arrivals.insert(order.note_id, now_unix());
                     raw_notes.insert(order.note_id, order.raw_note_data);
                 }
                 if n > 0 {
@@ -103,6 +112,7 @@ pub async fn run_matcher(
         while let Ok(note_id) = consumed_rx.try_recv() {
             engine.book.remove_order(note_id);
             raw_notes.remove(&note_id);
+            arrivals.remove(&note_id);
         }
         while let Ok(order) = order_rx.try_recv() {
             engine.book.add_user_order(
@@ -112,6 +122,7 @@ pub async fn run_matcher(
                 order.offered_amount,
                 order.requested_amount,
             );
+            arrivals.entry(order.note_id).or_insert_with(now_unix);
             raw_notes.insert(order.note_id, order.raw_note_data);
         }
 
@@ -123,7 +134,7 @@ pub async fn run_matcher(
         }
 
         // 2. Internal matching (→ executor).
-        if internal_match(&mut engine, &mut raw_notes, &price_rx, &exec_tx).await {
+        if internal_match(&mut engine, &mut raw_notes, &mut arrivals, &price_rx, &exec_tx).await {
             return; // executor channel closed
         }
 
@@ -133,6 +144,10 @@ pub async fn run_matcher(
                 router = None; // router channel closed — stop routing
             }
         }
+        // Publish the post-tick top-of-book for the swap-eta API — every tick,
+        // including empty ones, so it never goes stale. Latest-wins, non-blocking;
+        // reflects the residual (after matching + routing) a new order would cross.
+        swap_snapshot_tx.send_replace(Arc::new(engine.book.snapshot_best_levels()));
     }
 }
 
@@ -143,6 +158,7 @@ pub async fn run_matcher(
 async fn internal_match(
     engine: &mut MatchingEngine<WatchPriceFeed>,
     raw_notes: &mut HashMap<OrderId, Vec<u8>>,
+    arrivals: &mut HashMap<OrderId, u64>,
     price_rx: &watch::Receiver<PriceSnapshot>,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
 ) -> bool {
@@ -164,7 +180,12 @@ async fn internal_match(
             .get(&order_id)
             .map(|o| o.requested_filled())
             .unwrap_or(0);
-        filled_notes.push(FilledNote { note_id: order_id, requested_filled, raw_note_data });
+        filled_notes.push(FilledNote {
+            note_id: order_id,
+            requested_filled,
+            raw_note_data,
+            arrival_unix: arrivals.get(&order_id).copied().unwrap_or_else(now_unix),
+        });
     }
     if exec_tx.send(ExecutionBatch { filled_notes }).await.is_err() {
         tracing::warn!("executor channel closed, matcher shutting down");
@@ -173,6 +194,7 @@ async fn internal_match(
     for &order_id in &batch.filled_orders {
         engine.book.remove_order(order_id);
         raw_notes.remove(&order_id);
+        arrivals.remove(&order_id);
     }
     engine.book.protocol_balances.clear();
     false
@@ -450,6 +472,7 @@ mod tests {
                     exec_tx,
                     Duration::from_millis(10),
                     false,
+                    watch::channel(Arc::new(SwapBookSnapshot::new())).0,
                     Some(hooks),
                     cancel.clone(),
                 ));
@@ -570,6 +593,7 @@ mod tests {
                     exec_tx,
                     Duration::from_millis(10),
                     false,
+                    watch::channel(Arc::new(SwapBookSnapshot::new())).0,
                     Some(hooks),
                     cancel.clone(),
                 ));
@@ -749,6 +773,7 @@ mod tests {
                     exec_tx,
                     Duration::from_millis(10),
                     false,
+                    watch::channel(Arc::new(SwapBookSnapshot::new())).0,
                     None, // router disabled
                     cancel.clone(),
                 ));
@@ -815,6 +840,7 @@ mod tests {
                     exec_tx,
                     Duration::from_millis(10),
                     false,
+                    watch::channel(Arc::new(SwapBookSnapshot::new())).0,
                     Some(hooks),
                     cancel.clone(),
                 ));

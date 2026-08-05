@@ -173,6 +173,7 @@ pub async fn start(
         channels.precise_tx,
         last_price_update.clone(),
         channels.exec_tx,
+        channels.swap_snapshot_tx,
         channels.subscribe_tx,
         router_hooks,
     );
@@ -221,6 +222,7 @@ pub async fn start(
         solver_id,
         channels.exec_rx,
         channels.order_tx.clone(),
+        channels.stats_tx,
         Duration::from_millis(config.engine.fetch_interval_ms),
     )?;
 
@@ -237,10 +239,17 @@ pub async fn start(
         precision: config.engine.price_precision.clone(),
         staleness_secs: config.engine.price_staleness_secs,
         price_interval_ms: config.engine.price_interval_ms,
+        swap_matching_trigger_ms: config.engine.pulse_interval_ms,
+        swap_sync_ms: config.engine.fetch_interval_ms,
+        swap_proving_ms: config.engine.swap_proving_estimate_ms,
+        swap_block_ms: config.engine.swap_block_time_ms,
+        swap_offmarket_tol_bps: config.engine.swap_offmarket_tolerance_bps,
     };
     let (price_api_thread, price_api_ready_rx) = crate::price_api::spawn_price_api_thread(
         price_api_cfg,
         channels.precise_rx,
+        channels.swap_snapshot_rx,
+        channels.stats_rx,
         db_pool.clone(),
         last_price_update,
         cancel.clone(),

@@ -37,7 +37,9 @@ use tower_http::timeout::TimeoutLayer;
 
 use crate::config::PricePrecision;
 use crate::db::{self, DbPool};
+use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
+use crate::swap_eta::{eval_can_fill, eval_off_market, SettlementStats};
 
 /// Knobs for the price-query server (sourced from `EngineConfig`).
 #[derive(Debug, Clone)]
@@ -53,6 +55,19 @@ pub struct PriceApiConfig {
     pub staleness_secs: u64,
     /// Used for the `Cache-Control: max-age` of responses.
     pub price_interval_ms: u64,
+    // ── swap-eta terms ──
+    /// Matcher tick interval (ms) — a term of the next-batch ETA.
+    pub swap_matching_trigger_ms: u64,
+    /// Ingest sync-poll interval (ms) — the pre-matcher delay, a term of the ETA.
+    pub swap_sync_ms: u64,
+    /// Estimated proving time (ms) — a term of the ETA.
+    pub swap_proving_ms: u64,
+    /// Estimated block time (ms) — a term of the ETA.
+    pub swap_block_ms: u64,
+    /// Tolerance, in basis points, the `/v1/swap-eta` off-market check allows
+    /// before it sets `offMarket: true`. E.g. `50` ⇒ an order priced within 0.5%
+    /// of the oracle mid still counts as "at market"; worse than that is flagged.
+    pub swap_offmarket_tol_bps: u64,
 }
 
 /// Shared (Send+Sync) state — no `!Send` client, so it lives on its own thread.
@@ -65,6 +80,14 @@ pub struct PriceApiState {
     default_precision: PricePrecision,
     staleness_secs: i64,
     max_batch: usize,
+    // ── swap-eta ──
+    /// Top-of-book snapshot from the matcher (read lock-free).
+    swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    /// In-memory settlement-time window from the executor.
+    stats_rx: watch::Receiver<Arc<SettlementStats>>,
+    /// Next-batch ETA (secs) = ceil((sync + trigger + proving + block)/1000).
+    swap_eta_secs: u64,
+    swap_offmarket_tol_bps: u64,
 }
 
 // ── Response / error ─────────────────────────────────────────────────────────
@@ -89,6 +112,8 @@ struct PriceResponse {
 
 enum ApiError {
     BadFaucetId(String),
+    BadAmount(String),
+    BadRequest(String),
     UnknownFaucet,
     NoPrice,
     Stale(i64),
@@ -101,6 +126,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             ApiError::BadFaucetId(m) => (StatusCode::BAD_REQUEST, "bad_faucet_id", m),
+            ApiError::BadAmount(m) => (StatusCode::BAD_REQUEST, "bad_amount", m),
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m),
             ApiError::UnknownFaucet => {
                 (StatusCode::NOT_FOUND, "unknown_faucet", "faucet not registered".into())
             }
@@ -259,6 +286,130 @@ async fn get_prices(
     Ok(Json(out))
 }
 
+// ── swap-eta ─────────────────────────────────────────────────────────────────
+
+/// Response for `GET /v1/swap-eta`. Two independent liquidity signals — the live
+/// book (`can_fill` + `estimated_seconds`) and the real-time oracle (`off_market`
+/// + `market_price`) — plus the historical in-memory median. All optional fields
+/// serialise as `null` (stable shape for the wallet), never omitted.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapEtaResponse {
+    offered_faucet: String,
+    requested_faucet: String,
+    offered_amount: String,
+    requested_amount: String,
+    /// Book: crosses the best opposite-pair rate AND that level has the depth.
+    can_fill: bool,
+    /// Oracle: order priced worse than market (why it won't fill). `null` if unpriced.
+    off_market: Option<bool>,
+    /// Next-batch ETA (secs); `null` when `can_fill` is false.
+    estimated_seconds: Option<u64>,
+    /// Oracle fair rate (requested-per-offered); `null` if unpriced.
+    market_price: Option<String>,
+    /// In-memory rolling per-pair median settlement secs; `null` when no samples.
+    median24h_seconds: Option<u64>,
+}
+
+fn key_bytes(id: AccountId) -> Vec<u8> {
+    let mut k = Vec::new();
+    id.write_into(&mut k);
+    k
+}
+
+fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
+    let raw = q.get(key).ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))?;
+    let v: u64 = raw
+        .parse()
+        .map_err(|_| ApiError::BadAmount(format!("`{key}` must be a u64, got {raw:?}")))?;
+    if v == 0 {
+        return Err(ApiError::BadAmount(format!("`{key}` must be > 0")));
+    }
+    Ok(v)
+}
+
+fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, ApiError> {
+    let raw = q.get(key).ok_or_else(|| ApiError::BadFaucetId(format!("missing `{key}`")))?;
+    AccountId::from_hex(raw).map_err(|e| ApiError::BadFaucetId(format!("`{key}`: {e}")))
+}
+
+/// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=`
+///
+/// Given a prospective order (offer A / request B, raw base-unit amounts), report
+/// whether it can fill in the next batch against the live book, the oracle price
+/// verdict, and the in-memory 24h median settlement time for the pair.
+async fn get_swap_eta(
+    State(state): State<PriceApiState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let a = parse_faucet(&q, "offered_faucet")?;
+    let b = parse_faucet(&q, "requested_faucet")?;
+    if a == b {
+        return Err(ApiError::BadRequest(
+            "offered_faucet and requested_faucet must differ".into(),
+        ));
+    }
+    let offered_amount = parse_amount(&q, "offered_amount")?;
+    let requested_amount = parse_amount(&q, "requested_amount")?;
+
+    // Registration gate + decimals (for the oracle compare).
+    let row_a = db::fetch_token_row(&state.pool, &key_bytes(a))
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::UnknownFaucet)?;
+    let row_b = db::fetch_token_row(&state.pool, &key_bytes(b))
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::UnknownFaucet)?;
+    let d_a = row_a.decimals.map(|d| d as u8);
+    let d_b = row_b.decimals.map(|d| d as u8);
+
+    // Book check — the incoming order (offer A, request B) crosses against the
+    // OPPOSITE pair (offer B, request A).
+    let best = state.swap_rx.borrow().get(&(b, a)).copied();
+    let can_fill = eval_can_fill(offered_amount, requested_amount, best);
+    let estimated_seconds = if can_fill { Some(state.swap_eta_secs) } else { None };
+
+    // Oracle check (advisory; independent of the book). Fail closed on a stale
+    // feed: if the price snapshot is older than the staleness bound, treat both
+    // prices as unavailable so `off_market`/`market_price` are never derived from
+    // stale data. The book-based `can_fill` is unaffected.
+    let (usd_a, usd_b) = if staleness(&state).1 {
+        (None, None)
+    } else {
+        let snap = state.precise_rx.borrow();
+        (snap.get(&a).map(|d| d.usd), snap.get(&b).map(|d| d.usd))
+    };
+    let (off_market, market_price) = eval_off_market(
+        offered_amount,
+        d_a,
+        usd_a,
+        requested_amount,
+        d_b,
+        usd_b,
+        state.swap_offmarket_tol_bps,
+    );
+
+    // Median — same direction (A → B) the note settles as; purely in-memory.
+    let now = now_secs().max(0) as u64;
+    let median24h_seconds = state.stats_rx.borrow().median_secs((a, b), now);
+
+    let body = Json(SwapEtaResponse {
+        offered_faucet: a.to_hex(),
+        requested_faucet: b.to_hex(),
+        offered_amount: offered_amount.to_string(),
+        requested_amount: requested_amount.to_string(),
+        can_fill,
+        off_market,
+        estimated_seconds,
+        market_price,
+        median24h_seconds,
+    });
+    // Don't let the router-level `max-age=<price interval>` layer cache this:
+    // can_fill, off_market, and median24h_seconds come from independently-updated
+    // snapshots, so a shared max-age would serve stale fillability. `no-store`
+    // wins because the layer is `if_not_present`.
+    Ok(([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], body))
+}
+
 /// Concurrency limiter: acquire a permit per request, shed with `503` if none.
 async fn concurrency_guard(State(sem): State<Arc<Semaphore>>, req: Request, next: Next) -> Response {
     match sem.try_acquire_owned() {
@@ -283,6 +434,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     let v1 = Router::new()
         .route("/price/{faucet_id}", get(get_price))
         .route("/prices", get(get_prices))
+        .route("/swap-eta", get(get_swap_eta))
         .with_state(state);
 
     // Public read-only price data → permissive CORS so browser wallets /
@@ -308,9 +460,12 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
 /// Spawn the price-query server on its OWN OS thread + multi-thread runtime.
 /// Returns the thread handle and a readiness oneshot (Ok once bound, Err on a
 /// bind/runtime failure) so startup can gate on it like the ingest thread.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_price_api_thread(
     cfg: PriceApiConfig,
     precise_rx: watch::Receiver<PreciseSnapshot>,
+    swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pool: DbPool,
     last_price_update: Arc<AtomicI64>,
     cancel: CancellationToken,
@@ -329,6 +484,11 @@ pub fn spawn_price_api_thread(
             rt.block_on(async move {
                 let default_precision =
                     PricePrecision::parse(&cfg.precision).unwrap_or(PricePrecision::Full);
+                let swap_eta_secs = (cfg.swap_sync_ms
+                    + cfg.swap_matching_trigger_ms
+                    + cfg.swap_proving_ms
+                    + cfg.swap_block_ms)
+                    .div_ceil(1000);
                 let state = PriceApiState {
                     precise_rx,
                     pool,
@@ -337,6 +497,10 @@ pub fn spawn_price_api_thread(
                     default_precision,
                     staleness_secs: cfg.staleness_secs as i64,
                     max_batch: cfg.max_batch,
+                    swap_rx,
+                    stats_rx,
+                    swap_eta_secs,
+                    swap_offmarket_tol_bps: cfg.swap_offmarket_tol_bps,
                 };
                 let app = build_app(state, &cfg);
 

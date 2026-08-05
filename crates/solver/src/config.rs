@@ -143,6 +143,18 @@ pub struct EngineConfig {
     #[serde(default = "default_price_staleness_secs")]
     pub price_staleness_secs: u64,
 
+    // ── Swap time-estimation API (`/v1/swap-eta`) ─────────────────────────────
+    /// Estimated proof-generation time (ms) for a settlement tx — a term of the
+    /// next-batch ETA. Calibrate to the deployment's prover. Default 2000.
+    #[serde(default = "default_swap_proving_estimate_ms")]
+    pub swap_proving_estimate_ms: u64,
+    /// Estimated chain block time (ms) — a term of the next-batch ETA. Default 6000.
+    #[serde(default = "default_swap_block_time_ms")]
+    pub swap_block_time_ms: u64,
+    /// Slack (bps) before an order is flagged `offMarket` vs the oracle mid.
+    /// Default 50 (0.5%).
+    #[serde(default = "default_swap_offmarket_tolerance_bps")]
+    pub swap_offmarket_tolerance_bps: u64,
     // ── External liquidity routing (RFQ websocket to other DEXes) ─────────────
     /// Enable the external-liquidity router (websocket RFQ server + matcher
     /// external pass). Default `false` (opt-in). Allow-list tokens are sourced
@@ -227,6 +239,15 @@ fn default_price_vs_currency() -> String {
 }
 fn default_price_staleness_secs() -> u64 {
     30
+}
+fn default_swap_proving_estimate_ms() -> u64 {
+    2000
+}
+fn default_swap_block_time_ms() -> u64 {
+    6000
+}
+fn default_swap_offmarket_tolerance_bps() -> u64 {
+    50
 }
 fn default_router_bind() -> String {
     "127.0.0.1".to_string()

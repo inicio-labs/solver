@@ -15,7 +15,7 @@ use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedSymbolMap};
+use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedTokenMap};
 use crate::swap_eta::SettlementStats;
 use crate::router::{RouteBatch, QuotesSnapshot};
 use crate::types::{ExecutionBatch, IngestOrder, TokenId};
@@ -48,7 +48,7 @@ pub struct PipelineConfig {
     /// Shared in-memory faucet-id → external-symbol cache. Hydrated from DB
     /// at boot and mutated by admin handlers. Pass the same Arc as the one
     /// used to construct the `HttpPriceClient` so both see the latest mapping.
-    pub symbol_map: SharedSymbolMap,
+    pub token_map: SharedTokenMap,
     /// Cancellation signal for graceful shutdown. Triggered by the binary
     /// on Ctrl-C (or any external shutdown event). Each pipeline task watches
     /// this token via `tokio::select!` and exits cleanly between iterations.
@@ -72,7 +72,7 @@ impl PipelineConfig {
         db_pool: db::DbPool,
         initial_tokens: Vec<(TokenId, Option<String>)>,
         admin_token: Option<String>,
-        symbol_map: SharedSymbolMap,
+        token_map: SharedTokenMap,
         cancel: CancellationToken,
         last_sync_unix_seconds: Arc<AtomicI64>,
     ) -> Self {
@@ -85,7 +85,7 @@ impl PipelineConfig {
             admin_port: engine.admin_port,
             admin_token,
             triangular_enabled: engine.triangular_enabled,
-            symbol_map,
+            token_map,
             cancel,
             last_sync_unix_seconds,
         }
@@ -269,7 +269,7 @@ pub fn prepare_db(config: &PipelineConfig) -> Result<()> {
     db::seed_tokens_from_config(&config.db_pool, &config.initial_tokens)?;
     {
         let loaded = db::load_token_symbols(&config.db_pool)?;
-        let mut map = crate::price::write_symbol_map(&config.symbol_map);
+        let mut map = crate::price::write_token_map(&config.token_map);
         *map = loaded;
     }
     Ok(())
@@ -301,12 +301,12 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     router_hooks: Option<matcher::RouterHooks>,
 ) -> CoreHandles {
     // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
-    let price_pool = config.db_pool.clone();
+    let price_token_map = config.token_map.clone();
     let price_interval = config.price_interval;
     let price_cancel = config.cancel.clone();
     let price_handle = tokio::task::spawn_local(async move {
         tokio::select! {
-            _ = price::run_price_feed(price_client, price_pool, price_tx, precise_tx, last_price_update, price_interval) => {}
+            _ = price::run_price_feed(price_client, price_token_map, price_tx, precise_tx, last_price_update, price_interval) => {}
             _ = price_cancel.cancelled() => {}
         }
     });
@@ -336,7 +336,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     let admin_state = Arc::new(AdminState::new(
         config.db_pool.clone(),
         subscribe_tx,
-        config.symbol_map.clone(),
+        config.token_map.clone(),
     ));
     let admin_router = admin_state.router(config.admin_token.clone().map(Arc::new));
     let admin_port = config.admin_port;
@@ -620,8 +620,8 @@ mod tests {
         db::seed_tokens_from_config(&pool, &[(token_a, None), (token_b, None)]).unwrap();
 
         let (subscribe_tx, _rx) = mpsc::channel::<(TokenId, TokenId)>(8);
-        let symbol_map = Arc::new(RwLock::new(HashMap::new()));
-        let state = AdminState::new(pool, subscribe_tx, symbol_map);
+        let token_map = Arc::new(RwLock::new(HashMap::new()));
+        let state = AdminState::new(pool, subscribe_tx, token_map);
 
         let loaded = state.load_tokens_from_db().unwrap();
         assert_eq!(loaded.len(), 2);

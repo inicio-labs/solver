@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
 use crate::db::{self, DbPool};
-use crate::price::SharedSymbolMap;
+use crate::price::SharedTokenMap;
 use crate::types::TokenId;
 
 /// Command sent to the subscribe task: subscribe both directions of a pair
@@ -36,16 +36,16 @@ pub struct AdminState {
     /// In-memory faucet-id → external-symbol cache, shared with `HttpPriceClient`.
     /// Mutated atomically alongside DB writes so the price client always sees
     /// the latest mapping without a DB read per fetch.
-    symbol_map: SharedSymbolMap,
+    token_map: SharedTokenMap,
 }
 
 impl AdminState {
     pub fn new(
         pool: DbPool,
         subscribe_tx: SubscribeSender,
-        symbol_map: SharedSymbolMap,
+        token_map: SharedTokenMap,
     ) -> Self {
-        Self { pool, subscribe_tx, symbol_map }
+        Self { pool, subscribe_tx, token_map }
     }
 
     /// Build the admin router.
@@ -73,7 +73,7 @@ impl AdminState {
 
     /// Update the in-memory symbol cache. Lock held briefly, no awaits.
     fn set_cache(&self, token: TokenId, symbol: Option<String>) {
-        let mut map = crate::price::write_symbol_map(&self.symbol_map);
+        let mut map = crate::price::write_token_map(&self.token_map);
         match symbol {
             Some(s) => {
                 map.insert(token, s);
@@ -274,15 +274,15 @@ mod tests {
 
     const TEST_TOKEN: &str = "test-admin-token";
 
-    fn make_state_with_map() -> (Arc<AdminState>, SharedSymbolMap) {
+    fn make_state_with_map() -> (Arc<AdminState>, SharedTokenMap) {
         let pool = db::init_db(&unique_db_url(), 1).unwrap();
         // Tests don't exercise the subscribe path; create a channel whose
         // receiver is dropped immediately. Sends will fail but admin handlers
         // log and continue.
         let (subscribe_tx, _) = mpsc::channel::<(TokenId, TokenId)>(8);
-        let symbol_map: SharedSymbolMap = Arc::new(RwLock::new(HashMap::new()));
-        let state = Arc::new(AdminState::new(pool, subscribe_tx, symbol_map.clone()));
-        (state, symbol_map)
+        let token_map: SharedTokenMap = Arc::new(RwLock::new(HashMap::new()));
+        let state = Arc::new(AdminState::new(pool, subscribe_tx, token_map.clone()));
+        (state, token_map)
     }
 
     pub fn make_state() -> Arc<AdminState> {
@@ -301,7 +301,7 @@ mod tests {
     }
 
     /// Returns (server, cache) so tests can inspect the in-memory cache.
-    fn test_server_with_cache() -> (TestServer, SharedSymbolMap) {
+    fn test_server_with_cache() -> (TestServer, SharedTokenMap) {
         let (state, cache) = make_state_with_map();
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));

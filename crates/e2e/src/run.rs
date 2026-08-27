@@ -80,7 +80,7 @@ pub async fn run(secs: u64) -> Result<()> {
     let mut prices: PriceSnapshot = HashMap::new();
     prices.insert(token_a, PRICE_CENTS);
     prices.insert(token_b, PRICE_CENTS);
-    let make_price = move |_symbol_map, _api_key| {
+    let make_price = move |_token_map, _api_key| {
         Ok(Box::new(MockPriceClient::new(prices)) as Box<dyn PriceClient + Send + Sync>)
     };
 

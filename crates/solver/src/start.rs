@@ -26,7 +26,7 @@ use crate::config::SolverConfig;
 use crate::db;
 use crate::matcher::RouterHooks;
 use crate::pipeline::{self, PipelineConfig};
-use crate::price::{PriceClient, SharedSymbolMap};
+use crate::price::{PriceClient, SharedTokenMap};
 use crate::types::TokenId;
 
 /// Build a `current_thread` tokio runtime + `LocalSet` and run `fut` to
@@ -72,7 +72,7 @@ pub(crate) fn run_on_local_runtime<F: std::future::Future<Output = ()>>(
 pub async fn start(
     factory: Arc<dyn ClientFactory>,
     make_price_client: impl FnOnce(
-        SharedSymbolMap,
+        SharedTokenMap,
         Option<String>,
     ) -> Result<Box<dyn PriceClient + Send + Sync>>,
     solver_id: AccountId,
@@ -95,13 +95,13 @@ pub async fn start(
 
     // 3. Shared symbol map. `prepare_db` hydrates it from DB after seeding,
     //    so initialising with an empty map is fine.
-    let symbol_map = Arc::new(RwLock::new(HashMap::new()));
+    let token_map = Arc::new(RwLock::new(HashMap::new()));
 
     // 4. Price client built via the injected builder (prod = HttpPriceClient
     //    with this symbol map + API key; tests inject a MockPriceClient).
-    //    `start` keeps ownership of `symbol_map` (shared with admin) and only
+    //    `start` keeps ownership of `token_map` (shared with admin) and only
     //    hands a clone to the builder.
-    let price_client = make_price_client(symbol_map.clone(), coingecko_api_key)
+    let price_client = make_price_client(token_map.clone(), coingecko_api_key)
         .context("build price client")?;
 
     // 5. Flatten configured pairs → token list with optional symbols.
@@ -134,7 +134,7 @@ pub async fn start(
         db_pool.clone(),
         initial_tokens,
         admin_token,
-        symbol_map,
+        token_map,
         cancel.clone(),
         last_sync_handle.clone(),
     );

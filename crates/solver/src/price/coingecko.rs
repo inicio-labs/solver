@@ -1,36 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use crate::price::{PriceClient, PriceData, PreciseSnapshot};
+use crate::price::{read_token_map, PriceClient, PriceData, PreciseSnapshot, SharedTokenMap};
 use crate::types::TokenId;
-
-/// Shared, in-memory faucet-id → external-symbol mapping. Hydrated from DB
-/// at boot; admin handlers update both DB and this cache atomically so the
-/// price client always sees the latest mapping without a DB read per fetch.
-pub type SharedSymbolMap = Arc<RwLock<HashMap<TokenId, String>>>;
-
-/// Acquire a read guard on the shared symbol map, recovering from lock
-/// poisoning instead of panicking.
-///
-/// A `std::sync::RwLock` stays poisoned permanently once any thread panics
-/// while holding it, so `.read().expect(..)` would turn one unrelated panic
-/// into a *permanent* crash source on every subsequent price fetch / admin
-/// call. The protected value is only a `HashMap<TokenId, String>`; a panic
-/// by a prior holder cannot leave it in an invariant-violating state, so
-/// recovering the guard via `PoisonError::into_inner()` is strictly safe
-/// and makes poisoning a non-event.
-pub fn read_symbol_map(m: &SharedSymbolMap) -> RwLockReadGuard<'_, HashMap<TokenId, String>> {
-    m.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Write-guard counterpart of [`read_symbol_map`]; same poison-recovery
-/// rationale.
-pub fn write_symbol_map(m: &SharedSymbolMap) -> RwLockWriteGuard<'_, HashMap<TokenId, String>> {
-    m.write().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Default public CoinGecko "simple price" endpoint. Override per-deployment via
 /// `[engine].price_api_base_url` (e.g. a self-hosted or mock price service for
@@ -40,7 +14,7 @@ pub const COINGECKO_BASE: &str = "https://api.coingecko.com/api/v3/simple/price"
 pub struct HttpPriceClient {
     http: reqwest::Client,
     api_key: Option<String>,
-    symbol_map: SharedSymbolMap,
+    token_map: SharedTokenMap,
     base: String,
     /// CoinGecko `vs_currencies` (quote currency), e.g. `"usd"`. Also the key of
     /// the per-id price object in the response.
@@ -56,10 +30,10 @@ pub struct HttpPriceClient {
 /// (`solver::price::build_http_price_client`) instead of an inline closure
 /// with an explicit trait-object `as` cast.
 pub fn build_http_price_client(
-    symbol_map: SharedSymbolMap,
+    token_map: SharedTokenMap,
     api_key: Option<String>,
 ) -> Result<Box<dyn PriceClient + Send + Sync>> {
-    Ok(Box::new(HttpPriceClient::new(symbol_map, api_key)?))
+    Ok(Box::new(HttpPriceClient::new(token_map, api_key)?))
 }
 
 /// Like [`build_http_price_client`] but with an explicit base URL + quote
@@ -67,12 +41,12 @@ pub fn build_http_price_client(
 /// CoinGecko-compatible endpoint (devnet/local). `vs_currency` is CoinGecko's
 /// `vs_currencies` (e.g. `"usd"`).
 pub fn build_http_price_client_with_base(
-    symbol_map: SharedSymbolMap,
+    token_map: SharedTokenMap,
     api_key: Option<String>,
     base: String,
     vs_currency: String,
 ) -> Result<Box<dyn PriceClient + Send + Sync>> {
-    Ok(Box::new(HttpPriceClient::new_with_base(symbol_map, api_key, base, vs_currency)?))
+    Ok(Box::new(HttpPriceClient::new_with_base(token_map, api_key, base, vs_currency)?))
 }
 
 impl HttpPriceClient {
@@ -82,8 +56,8 @@ impl HttpPriceClient {
     /// Fallible: building the underlying `reqwest` client can fail if the
     /// system TLS backend cannot initialise. Surfaced as an error so the
     /// caller can fail startup cleanly rather than panic+abort.
-    pub fn new(symbol_map: SharedSymbolMap, api_key: Option<String>) -> Result<Self> {
-        Self::new_with_base(symbol_map, api_key, COINGECKO_BASE.to_string(), "usd".to_string())
+    pub fn new(token_map: SharedTokenMap, api_key: Option<String>) -> Result<Self> {
+        Self::new_with_base(token_map, api_key, COINGECKO_BASE.to_string(), "usd".to_string())
     }
 
     /// Construct a client targeting a custom CoinGecko-compatible base URL +
@@ -92,7 +66,7 @@ impl HttpPriceClient {
     /// must answer `GET {base}?ids=<csv>&vs_currencies=<vs>&precision=full` with
     /// `{"<id>":{"<vs>":<f64>}}`.
     pub fn new_with_base(
-        symbol_map: SharedSymbolMap,
+        token_map: SharedTokenMap,
         api_key: Option<String>,
         base: String,
         vs_currency: String,
@@ -104,7 +78,7 @@ impl HttpPriceClient {
         Ok(Self {
             http,
             api_key,
-            symbol_map,
+            token_map,
             base,
             vs_currency,
         })
@@ -118,7 +92,7 @@ impl PriceClient for HttpPriceClient {
         //    matched entries (small HashMap) avoids holding the lock across
         //    the awaited HTTP call.
         let requested: HashMap<TokenId, String> = {
-            let map = read_symbol_map(&self.symbol_map);
+            let map = read_token_map(&self.token_map);
             tokens
                 .iter()
                 .filter_map(|t| map.get(t).map(|s| (*t, s.clone())))
@@ -180,6 +154,7 @@ impl PriceClient for HttpPriceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, RwLock};
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -195,7 +170,7 @@ mod tests {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
     }
 
-    fn shared_map(entries: Vec<(TokenId, &str)>) -> SharedSymbolMap {
+    fn shared_map(entries: Vec<(TokenId, &str)>) -> SharedTokenMap {
         let mut m = HashMap::new();
         for (t, s) in entries {
             m.insert(t, s.to_string());

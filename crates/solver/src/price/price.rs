@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
-use crate::db::{self, DbPool};
 use crate::matching::price_feed::{PriceFeed, UsdCents};
+use crate::price::coingecko::{read_symbol_map, SharedSymbolMap};
 use crate::types::TokenId;
 
 /// Matcher-facing price snapshot: token (faucet) ID → USD price in whole cents.
@@ -80,27 +80,23 @@ fn to_cents(precise: &PreciseSnapshot) -> PriceSnapshot {
         .collect()
 }
 
-/// Run the price fetching loop. Each successful poll broadcasts BOTH the cents
-/// snapshot (matcher) and the precise snapshot (price API), and bumps
-/// `last_price_update` to the current unix time. A failed poll leaves the last
-/// good snapshots in place and does NOT advance the timestamp (so the API can
-/// detect staleness).
+/// Run the price fetching loop. The token set comes from the in-memory
+/// `symbol_map` (hydrated at boot, kept current by admin write-through), so the
+/// loop never reads the DB. Each successful poll broadcasts the cents snapshot
+/// (matcher) and the precise snapshot (price API) and bumps `last_price_update`.
+/// A failed poll keeps the last good snapshots and does NOT advance the
+/// timestamp, so the API can detect staleness.
 pub async fn run_price_feed(
     client: impl PriceClient,
-    pool: DbPool,
+    symbol_map: SharedSymbolMap,
     price_tx: watch::Sender<PriceSnapshot>,
     precise_tx: watch::Sender<PreciseSnapshot>,
     last_price_update: Arc<AtomicI64>,
     interval: Duration,
 ) {
     loop {
-        let tokens = match db::load_registered_tokens(&pool) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to load tokens from DB");
-                vec![]
-            }
-        };
+        // Guard drops at the end of this statement, so the lock is never held across the await.
+        let tokens: Vec<TokenId> = read_symbol_map(&symbol_map).keys().copied().collect();
         match client.fetch_prices(&tokens).await {
             Ok(precise) => {
                 let _ = price_tx.send(to_cents(&precise));

@@ -301,12 +301,12 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     router_hooks: Option<matcher::RouterHooks>,
 ) -> CoreHandles {
     // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
-    let price_pool = config.db_pool.clone();
+    let price_symbol_map = config.symbol_map.clone();
     let price_interval = config.price_interval;
     let price_cancel = config.cancel.clone();
     let price_handle = tokio::task::spawn_local(async move {
         tokio::select! {
-            _ = price::run_price_feed(price_client, price_pool, price_tx, precise_tx, last_price_update, price_interval) => {}
+            _ = price::run_price_feed(price_client, price_symbol_map, price_tx, precise_tx, last_price_update, price_interval) => {}
             _ = price_cancel.cancelled() => {}
         }
     });

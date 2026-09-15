@@ -193,13 +193,19 @@ pub async fn run(client: &mut MockClient, cfg: &MockConfig) -> Result<()> {
         "mock.account_id",
     )?;
     let solver_id = parse_id(&cfg.settings.solver_account_id, "solver_account_id")?;
+    let fee_faucet = cfg
+        .settings
+        .fee_faucet_id
+        .as_deref()
+        .map(|id| parse_id(id, "fee_faucet_id"))
+        .transpose()?;
 
     subscribe_pairs(client, cfg).await?;
     tracing::info!(pairs = cfg.pairs.len(), "mock mirror running");
 
     let mut rng_state = cfg.settings.seed;
     loop {
-        if let Err(e) = tick(client, cfg, mock_id, solver_id, &mut rng_state).await {
+        if let Err(e) = tick(client, cfg, mock_id, solver_id, fee_faucet, &mut rng_state).await {
             tracing::warn!(error = %e, "tick failed; will retry next interval");
         }
         tokio::select! {
@@ -217,6 +223,7 @@ async fn tick(
     cfg: &MockConfig,
     mock_id: AccountId,
     solver_id: AccountId,
+    fee_faucet: Option<AccountId>,
     rng_state: &mut u64,
 ) -> Result<()> {
     let summary = client.sync_state().await.map_err(|e| anyhow!("sync_state: {e}"))?;
@@ -273,6 +280,25 @@ async fn tick(
             .map_err(|e| anyhow!("counter offered asset: {e}"))?;
         let requested = FungibleAsset::new(order.offered_faucet, counter_requested)
             .map_err(|e| anyhow!("counter requested asset: {e}"))?;
+        // Countering an order that asks for the fee token pays that token out.
+        // Keep the reserve so the mirror can still pay fees for claims and
+        // other counters afterwards.
+        if fee_faucet == Some(order.requested_faucet) && cfg.settings.fee_reserve > 0 {
+            match client.account_reader(mock_id).get_balance(order.requested_faucet).await {
+                Ok(balance) => {
+                    let balance = u64::from(balance);
+                    if balance.saturating_sub(counter_offered) < cfg.settings.fee_reserve {
+                        tracing::warn!(
+                            balance, counter_offered, reserve = cfg.settings.fee_reserve,
+                            order = ?note_id,
+                            "skip order: countering it would dip into the fee reserve"
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "fee-reserve balance check failed; countering anyway"),
+            }
+        }
         considered += 1;
 
         // Build the counter note ONCE so its serial (hence note id) is fixed

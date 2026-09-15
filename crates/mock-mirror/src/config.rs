@@ -78,6 +78,14 @@ pub struct SettingsCfg {
     pub seed: u64,
     /// Hard guardrail: must be explicitly `true` to run against a mainnet RPC.
     pub allow_mainnet: bool,
+    /// Faucet of the chain's fee token (native MIDEN on the 0.16 testnet). With
+    /// `fee_reserve`, a counter that offers this token never takes the balance
+    /// below the reserve, so the mirror can always pay transaction fees.
+    #[serde(default)]
+    pub fee_faucet_id: Option<String>,
+    /// Base units of the fee token kept back for fees (see `fee_faucet_id`).
+    #[serde(default)]
+    pub fee_reserve: u64,
 }
 
 #[derive(Debug, Deserialize)]

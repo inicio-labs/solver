@@ -30,13 +30,13 @@ use miden_client::auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::note::NoteType;
-use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
+use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient, VerifyingRpcClient};
 use miden_client::{Client, RemoteTransactionProver};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use miden_protocol::address::{Address, NetworkId};
 use miden_protocol::asset::FungibleAsset;
-use rand::RngCore;
+use miden_standards::account::auth::Approver;
 use tracing_subscriber::EnvFilter;
 
 use config::MockConfig;
@@ -170,7 +170,10 @@ async fn build_client(
 ) -> Result<(Client<FilesystemKeyStore>, Arc<FilesystemKeyStore>)> {
     let endpoint = Endpoint::try_from(cfg.rpc.endpoint.as_str())
         .map_err(|e| anyhow::anyhow!("parse endpoint: {e}"))?;
-    let rpc: Arc<dyn NodeRpcClient> = Arc::new(GrpcClient::new(&endpoint, cfg.rpc.timeout_ms));
+    // `ClientBuilder::rpc` doesn't add node-response verification (only
+    // `.grpc_client` does), so wrap the gRPC client ourselves.
+    let rpc: Arc<dyn NodeRpcClient> =
+        Arc::new(VerifyingRpcClient::new(GrpcClient::new(&endpoint, cfg.rpc.timeout_ms)));
     let keystore = Arc::new(
         FilesystemKeyStore::new(PathBuf::from(&cfg.mock.keystore_path)).context("open keystore")?,
     );
@@ -192,20 +195,23 @@ async fn build_client(
 
 /// Create a fresh **public** wallet for the mock, persist its key + account into
 /// the configured keystore/store, and print the address. The account is deployed
-/// lazily on its first transaction; the user funds it out-of-band by minting the
-/// public faucets to the printed `mdev…` address.
+/// lazily on its first transaction; the user funds it out-of-band by sending the
+/// tokens it trades, plus MIDEN for fees (every 0.16 transaction pays one), to the
+/// printed address.
 async fn provision(cfg: &MockConfig) -> Result<()> {
     let (mut client, keystore) = build_client(cfg).await?;
 
     let key = AuthSecretKey::new_falcon512_poseidon2();
-    let auth = AuthSingleSig::new(key.public_key().to_commitment(), AuthSchemeId::Falcon512Poseidon2);
+    let auth = AuthSingleSig::new(Approver::new(
+        key.public_key().to_commitment(),
+        AuthSchemeId::Falcon512Poseidon2,
+    ));
 
-    let mut seed = [0u8; 32];
-    client.rng().fill_bytes(&mut seed);
+    let seed: [u8; 32] = rand::random();
 
     let account = AccountBuilder::new(seed)
         .account_type(AccountType::Public)
-        .with_auth_component(auth)
+        .with_component(auth)
         .with_component(BasicWallet)
         .build_with_schema_commitment()
         .context("build wallet account")?;
@@ -235,7 +241,7 @@ async fn provision(cfg: &MockConfig) -> Result<()> {
     }
     println!("\nNext steps:");
     println!("  1. set  [mock] account_id = \"{hex}\"  in your config");
-    println!("  2. fund this account by minting IBTC / IUSDT / IETH / IMIDEN");
+    println!("  2. fund it with the tokens it trades plus MIDEN for fees, as PUBLIC notes,");
     println!("     from your faucet to:  {bech32}");
     println!("  3. run:  mock-mirror run <config>\n");
     Ok(())

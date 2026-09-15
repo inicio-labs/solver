@@ -165,7 +165,7 @@ fn parse_pswap(note: &Note) -> Option<UserOrder> {
     }
     let pswap = PswapNote::try_from(note).ok()?;
     let offered = pswap.offered_asset();
-    let requested = pswap.storage().requested_asset();
+    let requested = pswap.storage().min_requested_asset();
     let offered_amount: u64 = offered.amount().into();
     let requested_amount: u64 = requested.amount().into();
     if offered_amount == 0 || requested_amount == 0 {
@@ -310,11 +310,12 @@ async fn tick(
     // top it up.
     for item in &cfg.inventory {
         let faucet = parse_id(&item.faucet_id, "inventory.faucet_id")?;
-        let balance = client
+        let balance: u64 = client
             .account_reader(mock_id)
             .get_balance(faucet)
             .await
-            .map_err(|e| anyhow!("get_balance: {e}"))?;
+            .map_err(|e| anyhow!("get_balance: {e}"))?
+            .into();
         if balance < item.low_water {
             tracing::warn!(
                 %faucet, balance, low_water = item.low_water,
@@ -338,7 +339,7 @@ fn build_counter_note(
 ) -> Result<Note> {
     let rng = client.rng();
     let storage = PswapNoteStorage::builder()
-        .requested_asset(requested)
+        .min_requested_asset(requested)
         .creator_account_id(mock_id)
         .payback_note_type(NoteType::Public)
         .build();

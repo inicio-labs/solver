@@ -3,25 +3,22 @@ members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-
 resolver = "2"
 
 [workspace.dependencies]
-# Pinned to the released v0.15.2 client tag + the protocol 0.15.3 it depends on
-# (miden-client v0.15.2's manifest declares miden-protocol = "0.15.3"). The
-# client is only published as a git tag (not on crates.io); the protocol crates
-# ARE on crates.io at 0.15.3 and must be used from there so they unify with the
-# client's own protocol dependency. (v0.15.2 is the client release that fixes
-# the v0.15.1↔0.15.3 TransportNote mismatch.)
+# Miden 0.16 line: the client and protocol crates are all on crates.io at 0.16.1
+# (the client's own manifest declares miden-protocol/-standards/-tx = "0.16", so
+# everything unifies on 0.16.1). VM crates are 0.29.x. MSRV 1.98.1 — see
+# rust-toolchain.toml.
 #
 # NO "testing" feature on the production miden-client/miden-protocol deps — it
-# gates miden-client's `test_rpc_api` and protocol test utilities. Tests
+# gates miden-client's test helpers and protocol test utilities. Tests
 # re-enable it in `[dev-dependencies]` (see crates/solver); resolver = "2" keeps
 # it out of the production build.
-miden-client = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2", default-features = false, features = ["std", "tonic"] }
-miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client", tag = "v0.15.2" }
-miden-protocol = { version = "0.15.3", default-features = false }
-miden-standards = "0.15.3"
-miden-testing = "0.15.3"
-# VM layer that protocol 0.15.3 uses (miden-client v0.15.2 → miden-processor 0.23).
-miden-core = "0.23"
-miden-crypto = "0.25"
+miden-client = { version = "0.16.1", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = "0.16.1"
+miden-protocol = { version = "0.16.1", default-features = false }
+miden-standards = "0.16.1"
+miden-testing = "0.16.1"
+miden-core = "0.29.1"
+miden-crypto = "0.29.1"
 
 [package]
 name = "solver-bin"

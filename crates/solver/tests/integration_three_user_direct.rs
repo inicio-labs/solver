@@ -23,6 +23,7 @@ use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
 use miden_client::testing::common::{
+    TestClient,
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
@@ -54,8 +55,8 @@ async fn three_user_direct_matching() -> Result<()> {
             // 2. USER Client: owns alice/bob/charlie + USDC/ETH faucets.
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
             let mut user_client =
-                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?;
+                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
+                    .await?);
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -195,12 +196,12 @@ async fn three_user_direct_matching() -> Result<()> {
             //    and the solver process reloads it on start.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut solver_client = build_test_client(
+                let mut solver_client = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 solver_client
                     .ensure_genesis_in_place()
                     .await

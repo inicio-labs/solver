@@ -17,6 +17,9 @@ timeout_ms = 10000
 [solver]
 # Hex account ID of the solver's on-chain account. REQUIRED — replace with
 # your solver account. (Placeholder; the binary will fail to start with this.)
+# Create one with `solver-bin provision-account`. On Miden 0.16 the solver pays
+# a fee in the native asset for every settlement, so fund it before starting:
+# send native tokens to it as a PUBLIC note, then run `solver-bin fund-account`.
 account_id = "0x<your_solver_account_id_hex>"
 # Filesystem keystore directory holding the solver account's Falcon key.
 # Relative paths resolve against the process working directory.
@@ -48,15 +51,15 @@ fetch_interval_ms = 3000
 # price snapshot until the budget resets. For sustained production, either
 # bump this interval, switch providers, or upgrade to a paid CoinGecko tier.
 price_interval_ms = 5000
-# Whether the triangular (3-cycle) matching phase runs. Set to false to
-# disable the O(T³) enumeration if you have many registered tokens and only
-# need direct (pairwise) matching. Defaults to true if omitted.
-triangular_enabled = true
+# Whether the triangular (3-cycle) matching phase runs. On Miden 0.16 builds it
+# is forced off at load, with a warning: the triangular path doesn't enforce the
+# PSWAP `min_fill_step` floor yet, and one sub-floor fill would fail the whole
+# settlement transaction. Direct (pairwise) matching always runs.
+triangular_enabled = false
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
 admin_port = 3001
-# Run the Miden client in debug mode (MASM debug instrumentation).
-# Useful on testnet for diagnosing transaction execution. MUST be false on
-# mainnet. Defaults to false when omitted.
+# debug_mode is ignored since Miden 0.16 (miden-client removed debug mode); a
+# warning is logged if it is set.
 # debug_mode = false
 # Observability HTTP server port (binds 127.0.0.1 only). Exposes
 # `/health` (liveness — always 200) and `/readyz` (readiness — 200 if DB is

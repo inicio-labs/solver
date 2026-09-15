@@ -22,6 +22,9 @@ pub struct OrderBook<F: PriceFeed> {
     /// to matching) but their `Order` struct is kept in `orders`. Maps the
     /// note id → (DEX it was offered to, unix-millis it was parked at).
     parked: HashMap<OrderId, (DexId, u64)>,
+    /// Per-order `min_fill_step` from the note (absent = 0). The direct-matching
+    /// planner enforces `min(step, requested)` on each order's total fill per tick.
+    min_fill_steps: HashMap<OrderId, Amount>,
     /// Time-ordered queue of parks, for O(expiring) TTL reactivation. Parking
     /// happens in tick-time order so `parked_at` is monotonically non-decreasing
     /// and the queue stays sorted; a consumed note leaves only a tombstone here
@@ -41,6 +44,7 @@ impl<F: PriceFeed> OrderBook<F> {
             incoming_adjacency: HashMap::new(),
             active_pair_count: HashMap::new(),
             parked: HashMap::new(),
+            min_fill_steps: HashMap::new(),
             park_queue: VecDeque::new(),
             protocol_balances: HashMap::new(),
             tokens: HashSet::new(),
@@ -50,7 +54,7 @@ impl<F: PriceFeed> OrderBook<F> {
 
     // === Orders ===
 
-    /// Add a user order to the book.
+    /// Add a user order to the book (no minimum fill).
     pub fn add_user_order(
         &mut self,
         note_id: OrderId,
@@ -58,6 +62,19 @@ impl<F: PriceFeed> OrderBook<F> {
         requested_token: TokenId,
         offered: Amount,
         requested: Amount,
+    ) {
+        self.add_user_order_with_min_fill(note_id, offered_token, requested_token, offered, requested, 0);
+    }
+
+    /// Add a user order carrying the note's `min_fill_step` (`0` = no floor).
+    pub fn add_user_order_with_min_fill(
+        &mut self,
+        note_id: OrderId,
+        offered_token: TokenId,
+        requested_token: TokenId,
+        offered: Amount,
+        requested: Amount,
+        min_fill_step: Amount,
     ) {
         // Idempotent on note_id: if the order is already live in the index, do
         // nothing — avoids a double-count / duplicate FIFO entry if the same id
@@ -68,6 +85,11 @@ impl<F: PriceFeed> OrderBook<F> {
             return;
         }
         self.parked.remove(&note_id);
+        if min_fill_step > 0 {
+            self.min_fill_steps.insert(note_id, min_fill_step);
+        } else {
+            self.min_fill_steps.remove(&note_id);
+        }
 
         let order = Order {
             id: note_id,
@@ -128,6 +150,7 @@ impl<F: PriceFeed> OrderBook<F> {
     /// For filled orders, prefer `cleanup_if_filled` to keep state accessible.
     pub fn remove_order(&mut self, order_id: OrderId) {
         let Some(order) = self.orders.remove(&order_id) else { return };
+        self.min_fill_steps.remove(&order_id);
 
         // A parked note was already pulled out of the index and decremented from
         // the active counter at park time — just drop it from `orders`. Its
@@ -364,6 +387,29 @@ impl<F: PriceFeed> OrderBook<F> {
         self.cleanup_if_filled(b_id);
 
         Some(result)
+    }
+
+    /// Smallest total fill the PSWAP script accepts for `order` in one
+    /// consumption: `min(min_fill_step, requested)`; `0` when the note sets none.
+    pub fn min_fill_floor(&self, order: &Order) -> Amount {
+        self.min_fill_steps.get(&order.id).copied().unwrap_or(0).min(order.requested)
+    }
+
+    /// Commit a direct-matching pair plan: write back the planned order states,
+    /// credit the surplus, and de-index completed orders. The planner works on
+    /// clones and hands over only a plan in which every order meets its floor,
+    /// so this is that phase's single write path (the `apply_match` analogue).
+    pub fn apply_pair_plan(&mut self, orders: Vec<Order>, surplus: [(TokenId, Amount); 2]) {
+        let ids: Vec<OrderId> = orders.iter().map(|o| o.id).collect();
+        for order in orders {
+            self.orders.insert(order.id, order);
+        }
+        for (token, amount) in surplus {
+            self.add_protocol_balance(token, amount);
+        }
+        for id in ids {
+            self.cleanup_if_filled(id);
+        }
     }
 
     // === Protocol Balance ===

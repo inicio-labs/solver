@@ -214,6 +214,7 @@ pub async fn start(
         channels.subscribe_rx,
         Duration::from_millis(config.engine.fetch_interval_ms),
         last_sync_handle,
+        solver_id,
     )?;
     let (executor_thread, exec_ready_rx) = crate::executor::spawn_executor_thread(
         factory.clone(),

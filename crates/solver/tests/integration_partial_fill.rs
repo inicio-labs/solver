@@ -26,6 +26,7 @@ use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
 use miden_client::testing::common::{
+    TestClient,
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
@@ -55,7 +56,7 @@ async fn partial_fill_repro() -> Result<()> {
             // USER client: 2 faucets (IBTC, IUSDT) + maker + taker wallets.
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
             let mut user_client =
-                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?;
+                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?);
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -121,12 +122,12 @@ async fn partial_fill_repro() -> Result<()> {
             // SOLVER account (throwaway client provisions it on disk, then drops).
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = build_test_client(
+                let mut sc = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;

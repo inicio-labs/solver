@@ -73,12 +73,13 @@ pub async fn run_matcher(
             Ok(loaded) => {
                 let n = loaded.len();
                 for order in loaded {
-                    engine.book.add_user_order(
+                    engine.book.add_user_order_with_min_fill(
                         order.note_id,
                         order.offered_token,
                         order.requested_token,
                         order.offered_amount,
                         order.requested_amount,
+                        order.min_fill_step,
                     );
                     arrivals.insert(order.note_id, now_unix());
                     raw_notes.insert(order.note_id, order.raw_note_data);
@@ -115,12 +116,13 @@ pub async fn run_matcher(
             arrivals.remove(&note_id);
         }
         while let Ok(order) = order_rx.try_recv() {
-            engine.book.add_user_order(
+            engine.book.add_user_order_with_min_fill(
                 order.note_id,
                 order.offered_token,
                 order.requested_token,
                 order.offered_amount,
                 order.requested_amount,
+                order.min_fill_step,
             );
             arrivals.entry(order.note_id).or_insert_with(now_unix);
             raw_notes.insert(order.note_id, order.raw_note_data);
@@ -455,6 +457,7 @@ mod tests {
                 requested_token: iusdt(),
                 offered_amount: 110_000_000, // 1.1 IMIDEN = $2.20
                 requested_amount: 2_000_000, // 2 IUSDT = $2.00 → +10% generous
+                min_fill_step: 0,
                 raw_note_data: vec![1, 2, 3, 4],
             })
             .await
@@ -569,6 +572,7 @@ mod tests {
                 requested_token: iusdt(),
                 offered_amount: 110_000_000,
                 requested_amount: 2_000_000,
+                min_fill_step: 0,
                 raw_note_data: note_bytes.clone(),
             })
             .await
@@ -746,6 +750,7 @@ mod tests {
                 requested_token: iusdt(),
                 offered_amount: 100_000_000,
                 requested_amount: 200_000_000,
+                min_fill_step: 0,
                 raw_note_data: vec![1],
             })
             .await
@@ -757,6 +762,7 @@ mod tests {
                 requested_token: imiden(),
                 offered_amount: 210_000_000,
                 requested_amount: 100_000_000,
+                min_fill_step: 0,
                 raw_note_data: vec![2],
             })
             .await
@@ -818,6 +824,7 @@ mod tests {
                 requested_token: iusdt(),
                 offered_amount: 110_000_000,
                 requested_amount: 2_000_000,
+                min_fill_step: 0,
                 raw_note_data: vec![9],
             })
             .await

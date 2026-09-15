@@ -28,6 +28,7 @@ use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
 use miden_client::testing::common::{
+    TestClient,
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
@@ -61,7 +62,7 @@ async fn setup_chain_with_three_pswaps() -> Result<TriangularSetup> {
     // User Client (test driver): faucets + alice/bob/charlie.
     let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
     let mut user_client =
-        build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?;
+        TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?);
     user_client
         .ensure_genesis_in_place()
         .await
@@ -163,7 +164,7 @@ async fn submit_pswap(
 
 struct TriangularSetup {
     rpc: Arc<MockRpcApi>,
-    _user_client: Client<FilesystemKeyStore>,
+    _user_client: TestClient,
     _user_temp: TempDir,
     usdc_id: AccountId,
     eth_id: AccountId,
@@ -269,12 +270,12 @@ async fn provision_solver(
     solver_keystore_path: &std::path::Path,
     solver_store_path: &std::path::Path,
 ) -> Result<AccountId> {
-    let mut c = build_test_client(
+    let mut c = TestClient::new(build_test_client(
         rpc.clone(),
         solver_keystore_path.to_path_buf(),
         solver_store_path.to_path_buf(),
     )
-    .await?;
+    .await?);
     c.ensure_genesis_in_place()
         .await
         .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;

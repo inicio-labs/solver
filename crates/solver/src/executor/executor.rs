@@ -13,6 +13,7 @@ use miden_protocol::{
     asset::{Asset, FungibleAsset},
     crypto::utils::{Deserializable, Serializable, SliceReader},
     note::{Note, NoteRecipient},
+    transaction::InputNote,
 };
 use miden_standards::note::PswapNote;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -36,6 +37,16 @@ const INITIAL_RPC_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Maximum per-attempt backoff sleep. Caps `INITIAL_RPC_BACKOFF * 2^n`.
 const MAX_RPC_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Upper bound on one transaction's fee, in multiples of the verification base
+/// fee: `fee = base × (⌊log2 cycles⌋ + 1)` ≤ 30 × base at the 2^29 cycle cap,
+/// and the auth procedure may reserve up to 2×.
+const FEE_HEADROOM_MULTIPLIER: u64 = 64;
+
+/// How long a batch the executor hands back unsettled (no fee headroom, or
+/// failed preparation) waits before its orders return to the matcher, so a
+/// persistent condition isn't rebuilt and rejected every tick.
+const HELD_REFEED_DELAY: Duration = Duration::from_secs(30);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -82,8 +93,17 @@ fn is_transient_rpc_error(err: &ClientError) -> bool {
 /// Each `.build()` call consumes its builder, so we call this fresh per
 /// submit attempt during the backoff loop.
 fn build_tx_request(components: &BatchComponents) -> Result<TransactionRequest> {
+    // Every batch note is consumed unauthenticated, from the solver's own copy.
+    // `input_notes` would substitute the executor store's copy whenever it holds an
+    // inclusion proof, and that copy can have its attachments stripped (see
+    // crates/solver/pswap-attachment-corruption-report.md); a PSWAP note id commits
+    // to its attachments, so the batch would fail with `InputNoteNotInBlock`.
+    let inputs = components
+        .input_notes
+        .iter()
+        .map(|(note, args)| (InputNote::unauthenticated(note.clone()), *args));
     let mut builder = TransactionRequestBuilder::new()
-        .input_notes(components.input_notes.clone())
+        .explicit_input_notes(inputs)
         .expected_output_recipients(components.expected_output_recipients.clone());
 
     if !components.surplus_assets.is_empty() {
@@ -185,6 +205,10 @@ fn prepare_batch_components(
         let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
             .map_err(|e| anyhow!("failed to create fill asset: {}", e))?;
 
+        // Both-zero args make the script fall back to a vault-funded full fill.
+        if filled.requested_filled == 0 {
+            bail!("zero fill for note {}", filled.note_id);
+        }
         let note_args = PswapNote::create_args(0, filled.requested_filled)
             .map_err(|e| anyhow!("failed to create note args: {}", e))?;
 
@@ -252,6 +276,7 @@ fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder>
         requested_token: parsed.requested_faucet_id,
         offered_amount: parsed.offered_amount,
         requested_amount: parsed.requested_amount,
+        min_fill_step: parsed.min_fill_step,
         raw_note_data: filled.raw_note_data.clone(),
     })
 }
@@ -350,7 +375,7 @@ async fn log_batch_consume_diagnostics(
                 format!(
                     "faucet={} amount={}",
                     p.storage().requested_faucet_id(),
-                    p.storage().requested_asset().amount().as_u64()
+                    p.storage().min_requested_asset().amount().as_u64()
                 ),
             ),
             None => ("<non-PSWAP (p2id payback?)>".to_string(), "<n/a>".to_string()),
@@ -543,7 +568,31 @@ async fn execute_batch(
     order_tx: &mpsc::Sender<IngestOrder>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let (components, input_notes_only) = prepare_batch_components(batch, solver_id)?;
+    let (components, input_notes_only) = match prepare_batch_components(batch, solver_id) {
+        Ok(parts) => parts,
+        Err(e) => {
+            // Nothing is marked Settling yet and the matcher dropped these orders on
+            // emit, so hand back every order whose note still parses — otherwise
+            // they're stranded until the next restart. Delayed, so a batch that
+            // fails deterministically isn't rebuilt every tick.
+            let orders: Vec<IngestOrder> = batch
+                .filled_notes
+                .iter()
+                .filter_map(|filled| {
+                    let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)).ok()?;
+                    rebuild_ingest_order(filled, &note).ok()
+                })
+                .collect();
+            tracing::error!(
+                error = %e,
+                refed = orders.len(),
+                notes = batch.filled_notes.len(),
+                "batch preparation failed; re-feeding its orders after a pause"
+            );
+            refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY);
+            return Err(e);
+        }
+    };
 
     // Collect source order ids for the status transitions.
     let source_note_ids: Vec<Vec<u8>> = batch
@@ -551,6 +600,20 @@ async fn execute_batch(
         .iter()
         .map(|f| f.note_id.to_bytes().to_vec())
         .collect();
+
+    // Fee pre-flight (Miden 0.16): each settlement's fee is paid in the native
+    // asset from the solver's own vault. Nothing is marked Settling yet, so on a
+    // shortfall hand the orders back after a pause.
+    if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
+        match rebuild_all_orders(batch, &input_notes_only) {
+            Ok(orders) => refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY),
+            Err(re) => tracing::error!(
+                error = %re,
+                "rebuild for fee-starved re-feed failed; orders recoverable only at next boot"
+            ),
+        }
+        return Err(e);
+    }
 
     // Mark as Settling before submitting so a crash after submit can be recovered.
     {
@@ -651,6 +714,62 @@ async fn execute_batch(
     }
 }
 
+/// `Err` when the chain charges a fee and the solver's fee-asset balance is below
+/// one settlement's worst case. The balance comes from the local store, so it lags
+/// the chain by up to one sync interval. A failed lookup is logged and lets the
+/// batch through — the submit itself is the real check.
+async fn check_fee_headroom(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Result<()> {
+    let fees = miden_adapter.lock().await.fee_parameters().await;
+    let (fee_faucet, base_fee) = match fees {
+        Ok(Some(params)) => params,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, "fee parameters unavailable; skipping fee pre-flight");
+            return Ok(());
+        }
+    };
+    if base_fee == 0 {
+        return Ok(());
+    }
+    let need = u64::from(base_fee) * FEE_HEADROOM_MULTIPLIER;
+    let balance = client.lock().await.account_reader(solver_id).get_balance(fee_faucet).await;
+    match balance {
+        Ok(have) if have.as_u64() < need => bail!(
+            "solver fee-asset balance {} is below the {need} one settlement may cost \
+             (fee faucet {fee_faucet}); fund the solver account",
+            have.as_u64()
+        ),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, "solver fee-asset balance unavailable; skipping fee pre-flight");
+            Ok(())
+        }
+    }
+}
+
+/// Hand orders back to the matcher after `delay`, without blocking the executor.
+/// Used when the executor holds a batch it can't settle yet. On shutdown the
+/// orders stay `Active` in the DB (they were never marked Settling) and the next
+/// boot rehydrates them.
+fn refeed_later(
+    order_tx: &mpsc::Sender<IngestOrder>,
+    cancel: &CancellationToken,
+    orders: Vec<IngestOrder>,
+    delay: Duration,
+) {
+    let (order_tx, cancel) = (order_tx.clone(), cancel.clone());
+    tokio::task::spawn_local(async move {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = tokio::time::sleep(delay) => refeed_orders(&order_tx, orders).await,
+        }
+    });
+}
+
 /// Best-effort revert of a batch's orders back to `Active`. Used by the
 /// RpcExhausted path. If the UPDATE fails (write pool exhausted), the orders
 /// stay in `Settling` until next-boot recovery cleans them up — we log loudly.
@@ -739,6 +858,21 @@ pub(crate) fn spawn_executor_thread(
                         client: executor_shared.clone(),
                         rpc: exec_rpc,
                     }));
+
+                // Miden 0.16 seals transaction inputs against synced chain headers, so
+                // an unsynced client can't submit. Sync once before accepting batches;
+                // the periodic sync task below sleeps before its first tick.
+                if let Err(e) = executor_adapter.lock().await.sync_state().await {
+                    let _ = exec_ready_tx.send(Err(e.context("initial executor sync")));
+                    return;
+                }
+                match executor_adapter.lock().await.fee_parameters().await {
+                    Ok(Some((faucet, base_fee))) => {
+                        tracing::info!(fee_faucet = %faucet, base_fee, "chain fee parameters");
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "could not read chain fee parameters at boot"),
+                }
 
                 let run_client = executor_shared.clone();
                 let run_adapter = executor_adapter.clone();

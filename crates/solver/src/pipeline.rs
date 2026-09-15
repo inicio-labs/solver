@@ -382,6 +382,7 @@ pub struct IngestHandles {
 /// INGEST thread's LocalSet. Subscribes all configured pairs first (uses the
 /// ingest adapter), then spawns the relay + ingest loops. Must be called from
 /// within the ingest thread's `LocalSet`.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_ingest_tasks(
     adapter: Arc<Mutex<dyn MidenClient>>,
     db_pool: db::DbPool,
@@ -391,6 +392,7 @@ pub async fn spawn_ingest_tasks(
     ingest_interval: Duration,
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicI64>,
+    solver_id: miden_protocol::account::AccountId,
 ) -> Result<IngestHandles> {
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
@@ -432,6 +434,7 @@ pub async fn spawn_ingest_tasks(
             ingest_interval,
             cancel,
             last_sync_unix_seconds,
+            solver_id,
         )
         .await;
     });

@@ -26,12 +26,13 @@ use diesel::prelude::*;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
 use miden_client::testing::common::{
+    TestClient,
     insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
 };
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_protocol::account::AccountType;
-use miden_protocol::asset::FungibleAsset;
+use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::utils::Serializable;
 use miden_testing::MockChain;
 use solver::config::{
@@ -68,8 +69,8 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    `dave` (external consumer — NOT the solver).
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
             let mut user_client =
-                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?;
+                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
+                    .await?);
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -131,12 +132,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             // 5. Provision the solver account (throwaway client persists it).
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = build_test_client(
+                let mut sc = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
@@ -245,7 +246,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    1 ETH in, 100 USDC out). Solver is NOT involved.
             let consumed_ok = if tracked {
                 let consume_request = TransactionRequestBuilder::new()
-                    .build_pswap_consume(&pswap_note, dave_id, 1, 0)
+                    .build_pswap_consume(&pswap_note, dave_id, AssetAmount::new(1).expect("valid amount"), AssetAmount::ZERO)
                     .map_err(|e| anyhow::anyhow!("dave build_pswap_consume: {e}"))?;
                 Box::pin(user_client.submit_new_transaction(dave_id, consume_request))
                     .await

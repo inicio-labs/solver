@@ -82,6 +82,9 @@ pub struct Order {
     pub offered_amount: u64,
     pub requested_faucet_id: AccountId,
     pub requested_amount: u64,
+    /// Per-fill floor from the note (`0` = none): the script rejects a
+    /// consumption whose total fill is below `min(min_fill_step, requested_amount)`.
+    pub min_fill_step: u64,
     pub creator_id: AccountId,
 }
 
@@ -94,11 +97,12 @@ impl Order {
         let offered_faucet_id = offered_asset.faucet_id();
         let offered_amount: u64 = offered_asset.amount().into();
 
-        let requested_asset = pswap.storage().requested_asset();
+        let requested_asset = pswap.storage().min_requested_asset();
         let requested_faucet_id = requested_asset.faucet_id();
         let requested_amount: u64 = requested_asset.amount().into();
 
         let creator_id = pswap.storage().creator_account_id();
+        let min_fill_step = pswap.storage().min_fill_step().as_u64();
 
         if offered_amount == 0 || requested_amount == 0 {
             return Err(anyhow!("order has zero amount (offered={offered_amount}, requested={requested_amount})"));
@@ -110,6 +114,7 @@ impl Order {
             offered_amount,
             requested_faucet_id,
             requested_amount,
+            min_fill_step,
             creator_id,
         })
     }
@@ -123,6 +128,8 @@ pub struct IngestOrder {
     pub requested_token: TokenId,
     pub offered_amount: Amount,
     pub requested_amount: Amount,
+    /// The note's `min_fill_step` (see [`Order::min_fill_step`]).
+    pub min_fill_step: Amount,
     pub raw_note_data: Vec<u8>,
 }
 

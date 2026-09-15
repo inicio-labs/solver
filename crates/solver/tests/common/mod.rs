@@ -16,11 +16,14 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
+use miden_client::rpc::encryption::TransactionEncryptionKey;
 use miden_client::rpc::NodeRpcClient;
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::Client;
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::dsa::eddsa_25519_sha512::KeyExchangeKey;
 use miden_testing::MockChain;
 use tempfile::TempDir;
 
@@ -38,14 +41,37 @@ pub async fn build_test_client(
     );
     let rpc_dyn: Arc<dyn NodeRpcClient> = rpc;
 
-    ClientBuilder::new()
+    let mut client = ClientBuilder::new()
         .rpc(rpc_dyn)
         .sqlite_store(store_path)
         .authenticator(keystore)
-        .in_debug_mode(true.into())
         .build()
         .await
-        .map_err(|e| anyhow!("ClientBuilder::build: {e}"))
+        .map_err(|e| anyhow!("ClientBuilder::build: {e}"))?;
+    seed_encryption_key(&mut client).await?;
+    Ok(client)
+}
+
+/// Miden 0.16 seals every submitted transaction's inputs against the validators'
+/// encryption key, which `MockRpcApi` does not serve (it can't produce the
+/// validator attestation). Seed an unattested key instead: the mock never unseals,
+/// so any key bound to this chain's genesis works.
+async fn seed_encryption_key(client: &mut Client<FilesystemKeyStore>) -> Result<()> {
+    client.ensure_genesis_in_place().await.map_err(|e| anyhow!("genesis: {e}"))?;
+    let (genesis, _) = client
+        .get_block_header_by_num(BlockNumber::GENESIS)
+        .await
+        .map_err(|e| anyhow!("genesis header: {e}"))?
+        .ok_or_else(|| anyhow!("genesis header missing after ensure_genesis_in_place"))?;
+    let key = TransactionEncryptionKey::new_unattested(
+        b"mock".to_vec(),
+        KeyExchangeKey::new().public_key(),
+        genesis.commitment(),
+    );
+    client
+        .seed_transaction_encryption_key(key)
+        .await
+        .map_err(|e| anyhow!("seed encryption key: {e}"))
 }
 
 /// Build a keyless **ingest** `Client<FilesystemKeyStore>` backed by the same
@@ -61,7 +87,6 @@ pub async fn build_test_ingest_client(
     ClientBuilder::new()
         .rpc(rpc_dyn)
         .sqlite_store(store_path)
-        .in_debug_mode(true.into())
         .build()
         .await
         .map_err(|e| anyhow!("ClientBuilder::build (ingest): {e}"))

@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
+use miden_protocol::note::Note;
 
 use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
 use crate::db::models::*;
@@ -214,12 +215,26 @@ pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<
             .map_err(|e| anyhow::anyhow!("invalid offered_asset in DB: {e}"))?;
         let requested_token = TokenId::read_from(&mut SliceReader::new(&order_row.requested_asset))
             .map_err(|e| anyhow::anyhow!("invalid requested_asset in DB: {e}"))?;
+        // `min_fill_step` isn't a column: read it from the stored note. A row whose
+        // note doesn't parse could never settle, so skip it rather than failing the
+        // whole hydration.
+        let parsed = Note::read_from(&mut SliceReader::new(&raw_data))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .and_then(|note| crate::types::Order::from_note(&note));
+        let min_fill_step = match parsed {
+            Ok(order) => order.min_fill_step,
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping active order whose stored note does not parse");
+                continue;
+            }
+        };
         out.push(IngestOrder {
             note_id,
             offered_token,
             requested_token,
             offered_amount: order_row.offered_amount as u64,
             requested_amount: order_row.requested_amount as u64,
+            min_fill_step,
             raw_note_data: raw_data,
         });
     }

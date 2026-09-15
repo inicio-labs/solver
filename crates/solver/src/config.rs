@@ -85,9 +85,8 @@ pub struct EngineConfig {
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
-    /// Whether to run the Miden client in debug mode. Enables MASM debug
-    /// instrumentation. Useful for testnet diagnostics; MUST be `false` for
-    /// mainnet. Defaults to `false` when omitted from `solver.toml`.
+    /// Ignored since Miden 0.16 (miden-client removed debug mode); kept so
+    /// existing `solver.toml` files still parse. A warning is logged if set.
     #[serde(default)]
     pub debug_mode: bool,
     /// TCP port the observability HTTP server binds on `127.0.0.1`. Exposes
@@ -272,9 +271,10 @@ impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        let config: SolverConfig =
+        let mut config: SolverConfig =
             toml::from_str(&content).context("Failed to parse config file")?;
         config.validate()?;
+        config.apply_miden_016_overrides();
         Ok(config)
     }
 
@@ -290,6 +290,23 @@ impl SolverConfig {
             "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
         );
         Ok(())
+    }
+
+    /// Settings this build can't honour on Miden 0.16, forced off with a warning.
+    /// - `triangular_enabled`: the 3-cycle path fills via `Order::fill` directly and
+    ///   doesn't enforce PSWAP `min_fill_step`, so one sub-floor fill would fail the
+    ///   whole batch transaction.
+    /// - `debug_mode`: miden-client 0.16 removed client debug mode.
+    fn apply_miden_016_overrides(&mut self) {
+        if self.engine.triangular_enabled {
+            tracing::warn!(
+                "engine.triangular_enabled forced to false: triangular matching does not enforce PSWAP min_fill_step yet"
+            );
+            self.engine.triangular_enabled = false;
+        }
+        if self.engine.debug_mode {
+            tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
+        }
     }
 
     pub fn save(&self, path: &str) -> Result<()> {

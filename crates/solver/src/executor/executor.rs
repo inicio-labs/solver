@@ -15,7 +15,7 @@ use miden_protocol::{
     note::{Note, NoteRecipient},
     transaction::InputNote,
 };
-use miden_standards::note::PswapNote;
+use miden_standards::note::{NoteConsumptionStatus, P2idNote, P2ideNote, PswapNote};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +47,12 @@ const FEE_HEADROOM_MULTIPLIER: u64 = 64;
 /// failed preparation) waits before its orders return to the matcher, so a
 /// persistent condition isn't rebuilt and rejected every tick.
 const HELD_REFEED_DELAY: Duration = Duration::from_secs(30);
+
+/// Most incoming notes claimed into the solver's vault in one transaction.
+const MAX_CLAIM_NOTES: usize = 16;
+
+/// After a failed claim, how long the sync loop waits before trying again.
+const CLAIM_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -751,6 +757,110 @@ async fn check_fee_headroom(
     }
 }
 
+/// Incoming P2ID/P2IDE notes worth claiming into the solver's vault. On a
+/// fee-charging chain each must carry at least one settlement's worst-case fee
+/// in the fee asset, so a claim never costs more than it brings in and dust
+/// notes can't drain the solver through claim fees. `fee` is `None` when the
+/// client can't report fee parameters (mocks); then everything qualifies.
+/// Only P2ID/P2IDE: the executor store also holds PSWAP remainders the solver
+/// created, which it can consume but must not.
+fn select_claimable(notes: Vec<Note>, fee: Option<(AccountId, u32)>) -> Vec<Note> {
+    let (p2id, p2ide) = (P2idNote::script_root(), P2ideNote::script_root());
+    notes
+        .into_iter()
+        .filter(|note| {
+            let root = note.recipient().script().root();
+            root == p2id || root == p2ide
+        })
+        .filter(|note| match fee {
+            Some((fee_faucet, base_fee)) if base_fee > 0 => {
+                let fee_amount: u64 = note
+                    .assets()
+                    .iter_fungible()
+                    .filter(|asset| asset.faucet_id() == fee_faucet)
+                    .map(|asset| u64::from(asset.amount()))
+                    .sum();
+                fee_amount >= u64::from(base_fee) * FEE_HEADROOM_MULTIPLIER
+            }
+            _ => true,
+        })
+        .take(MAX_CLAIM_NOTES)
+        .collect()
+}
+
+/// Whether the solver can spend a note now. Time-locked notes wait for a later
+/// tick: one note that can't be spent yet would fail the whole claim.
+fn spendable_now(status: &NoteConsumptionStatus) -> bool {
+    matches!(
+        status,
+        NoteConsumptionStatus::Consumable | NoteConsumptionStatus::ConsumableWithAuthorization
+    )
+}
+
+/// Consume the notes paying the solver (see [`select_claimable`]) in one
+/// transaction, so funding the solver is just sending it tokens. A new
+/// account's first claim also deploys it. Returns how many notes were claimed.
+async fn claim_incoming_funds(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Result<usize> {
+    let records = client
+        .lock()
+        .await
+        .get_consumable_notes(Some(solver_id))
+        .await
+        .context("list consumable notes")?;
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let notes: Vec<Note> = records
+        .into_iter()
+        .filter(|(_, statuses)| {
+            statuses.iter().any(|(account, status)| *account == solver_id && spendable_now(status))
+        })
+        .filter_map(|(record, _)| TryInto::<Note>::try_into(record).ok())
+        .collect();
+    let fee = miden_adapter
+        .lock()
+        .await
+        .fee_parameters()
+        .await
+        .context("read fee parameters")?;
+    let notes = select_claimable(notes, fee);
+    if notes.is_empty() {
+        return Ok(0);
+    }
+
+    let count = notes.len();
+    let request = TransactionRequestBuilder::new()
+        .build_consume_notes(notes)
+        .context("build claim request")?;
+    let tx_id = client
+        .lock()
+        .await
+        .submit_new_transaction(solver_id, request)
+        .await
+        .context("submit claim transaction")?;
+    tracing::info!(%tx_id, notes = count, "claimed incoming funds into the solver account");
+    Ok(count)
+}
+
+/// Run one claim. On failure, log it and return when the next attempt may run.
+async fn claim_or_back_off(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Option<tokio::time::Instant> {
+    match claim_incoming_funds(client, miden_adapter, solver_id).await {
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "claiming incoming funds failed; retrying in 60 s");
+            Some(tokio::time::Instant::now() + CLAIM_RETRY_DELAY)
+        }
+    }
+}
+
 /// Hand orders back to the matcher after `delay`, without blocking the executor.
 /// Used when the executor holds a batch it can't settle yet. On shutdown the
 /// orders stay `Active` in the DB (they were never marked Settling) and the next
@@ -892,15 +1002,26 @@ pub(crate) fn spawn_executor_thread(
                 });
 
                 let sync_adapter = executor_adapter.clone();
+                let sync_client = executor_shared.clone();
                 let sync_cancel = exec_cancel.clone();
                 let mut executor_sync_handle = tokio::task::spawn_local(async move {
+                    // Claim funds sent while the solver was down (a new account's first
+                    // claim also deploys it), then again after every successful sync.
+                    // Claiming here, not before readiness, keeps a slow proof from
+                    // delaying startup. A failed claim backs off.
+                    let mut claim_retry_at = claim_or_back_off(&sync_client, &sync_adapter, solver_id).await;
                     loop {
                         tokio::select! {
                             _ = sync_cancel.cancelled() => break,
                             _ = tokio::time::sleep(exec_sync_interval) => {
                                 if let Err(e) = sync_adapter.lock().await.sync_state().await {
                                     tracing::warn!(error = %e, "executor-client tagless sync failed; will retry next tick");
+                                    continue;
                                 }
+                                if claim_retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
+                                    continue;
+                                }
+                                claim_retry_at = claim_or_back_off(&sync_client, &sync_adapter, solver_id).await;
                             }
                         }
                     }
@@ -946,3 +1067,90 @@ pub(crate) fn spawn_executor_thread(
         .context("spawn executor thread")?;
     Ok((executor_thread, exec_ready_rx))
 }
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use miden_protocol::asset::{Asset, FungibleAsset};
+    use miden_protocol::crypto::rand::RandomCoin;
+    use miden_protocol::note::{NoteId, NoteType};
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
+    };
+    use miden_protocol::Word;
+
+    const BASE_FEE: u32 = 7;
+
+    fn fee_faucet() -> AccountId {
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
+    }
+
+    fn other_faucet() -> AccountId {
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()
+    }
+
+    /// A public P2ID note paying the solver `amount` of `faucet`.
+    fn p2id(faucet: AccountId, amount: u64, rng: &mut RandomCoin) -> Note {
+        P2idNote::builder()
+            .sender(faucet)
+            .target(ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE.try_into().unwrap())
+            .assets(vec![Asset::Fungible(FungibleAsset::new(faucet, amount).unwrap())])
+            .note_type(NoteType::Public)
+            .generate_serial_number(rng)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn ids(notes: &[Note]) -> Vec<NoteId> {
+        notes.iter().map(Note::id).collect()
+    }
+
+    /// Only notes carrying at least one settlement's worst-case fee in the fee
+    /// asset are claimed, so dust can't drain the solver through claim fees.
+    #[test]
+    fn claims_only_notes_worth_their_claim_fee() {
+        let mut rng = RandomCoin::new(Word::default());
+        let need = u64::from(BASE_FEE) * FEE_HEADROOM_MULTIPLIER;
+        let enough = p2id(fee_faucet(), need, &mut rng);
+        let dust = p2id(fee_faucet(), need - 1, &mut rng);
+        let no_fee_asset = p2id(other_faucet(), 1_000_000, &mut rng);
+
+        let picked = select_claimable(vec![enough.clone(), dust, no_fee_asset], Some((fee_faucet(), BASE_FEE)));
+
+        assert_eq!(ids(&picked), vec![enough.id()]);
+    }
+
+    /// With no fee to pay (or no fee parameters reported), every incoming P2ID
+    /// qualifies.
+    #[test]
+    fn a_fee_free_chain_claims_every_incoming_note() {
+        let mut rng = RandomCoin::new(Word::default());
+        let notes = vec![p2id(fee_faucet(), 1, &mut rng), p2id(other_faucet(), 1, &mut rng)];
+
+        assert_eq!(select_claimable(notes.clone(), Some((fee_faucet(), 0))).len(), 2);
+        assert_eq!(select_claimable(notes, None).len(), 2);
+    }
+
+    /// Time-locked notes are left for a later tick instead of failing the claim.
+    #[test]
+    fn only_notes_spendable_now_are_claimed() {
+        use miden_protocol::block::BlockNumber;
+        assert!(spendable_now(&NoteConsumptionStatus::Consumable));
+        assert!(spendable_now(&NoteConsumptionStatus::ConsumableWithAuthorization));
+        assert!(!spendable_now(&NoteConsumptionStatus::ConsumableAfter(BlockNumber::from(10_u32))));
+        assert!(!spendable_now(&NoteConsumptionStatus::UnconsumableConditions));
+        assert!(!spendable_now(&NoteConsumptionStatus::NeverConsumable("not for us".into())));
+    }
+
+    #[test]
+    fn claims_are_capped_per_transaction() {
+        let mut rng = RandomCoin::new(Word::default());
+        let notes: Vec<Note> =
+            (0..MAX_CLAIM_NOTES + 5).map(|_| p2id(fee_faucet(), 1_000_000, &mut rng)).collect();
+
+        assert_eq!(select_claimable(notes, Some((fee_faucet(), BASE_FEE))).len(), MAX_CLAIM_NOTES);
+    }
+}
+

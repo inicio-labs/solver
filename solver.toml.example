@@ -18,8 +18,9 @@ timeout_ms = 10000
 # Hex account ID of the solver's on-chain account. REQUIRED — replace with
 # your solver account. (Placeholder; the binary will fail to start with this.)
 # Create one with `solver-bin provision-account`. On Miden 0.16 the solver pays
-# a fee in the native asset for every settlement, so fund it before starting:
-# send native tokens to it as a PUBLIC note, then run `solver-bin fund-account`.
+# a fee in the native asset for every settlement: send native tokens to it as a
+# PUBLIC note. The solver claims incoming funds by itself, at boot and on every
+# sync (`solver-bin fund-account` claims them without starting the solver).
 account_id = "0x<your_solver_account_id_hex>"
 # Filesystem keystore directory holding the solver account's Falcon key.
 # Relative paths resolve against the process working directory.

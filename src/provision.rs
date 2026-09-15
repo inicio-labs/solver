@@ -4,8 +4,9 @@
 //! On 0.16 every transaction pays a fee in the native asset from the account's own
 //! vault, so a brand-new account can't deploy with an empty one. The flow is:
 //! `provision-account` → send native tokens to the printed account as a PUBLIC note
-//! (e.g. from the testnet faucet) → `fund-account`, whose single transaction
-//! consumes those notes and so deploys and funds the account at once.
+//! (e.g. from the testnet faucet) → start the solver, which claims incoming notes
+//! at boot and on every sync (its first claim also deploys the account).
+//! `fund-account` does the same claim once, without starting the solver.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -66,12 +67,14 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
     println!("solver account created");
     println!("  account_id = \"{}\"   # set this as [solver] account_id", id.to_hex());
     println!("  address    = {address}");
-    println!("next: send native fee tokens to it as a PUBLIC note, then run `solver-bin fund-account`");
+    println!("next: send native fee tokens to it as a PUBLIC note; the solver claims them automatically");
+    println!("      when it runs (or `solver-bin fund-account` claims them now, without starting it)");
     Ok(())
 }
 
 /// Consume every note waiting for the solver account (the first such transaction
-/// also deploys it), then wait until the fee-asset balance shows up.
+/// also deploys it), then wait until the fee-asset balance shows up. The running
+/// solver does this by itself; this is for claiming without starting it.
 pub async fn fund_account(config: &SolverConfig) -> Result<()> {
     let solver_id = AccountId::from_hex(&config.solver.account_id)
         .with_context(|| format!("invalid solver account_id {:?}", config.solver.account_id))?;

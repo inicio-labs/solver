@@ -28,6 +28,7 @@ pub struct OrderRow {
     pub offered_amount: i64,
     pub timestamp: i64,
     pub status: String,
+    pub priority_seq: i64,
 }
 
 impl OrderRow {

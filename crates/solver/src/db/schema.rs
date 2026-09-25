@@ -23,6 +23,7 @@ diesel::table! {
         offered_amount -> BigInt,
         timestamp -> BigInt,
         status -> Text,
+        priority_seq -> BigInt,
     }
 }
 

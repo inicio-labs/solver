@@ -1,11 +1,11 @@
-use anyhow::Result;
-use miden_protocol::crypto::utils::Serializable;
-use miden_protocol::note::NoteId;
+use anyhow::{Context, Result};
+use miden_protocol::crypto::utils::{Deserializable, Serializable};
+use miden_protocol::note::{Note, NoteId};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -188,7 +188,7 @@ pub struct PipelineChannels {
     pub consumed_rx: mpsc::Receiver<NoteId>,
     pub price_tx: watch::Sender<PriceSnapshot>,
     pub price_rx: watch::Receiver<PriceSnapshot>,
-    /// Full-precision price side-channel — consumed only by the price-query API.
+    /// Exact references for opt-in clearing and f64 values for the price API.
     pub precise_tx: watch::Sender<PreciseSnapshot>,
     pub precise_rx: watch::Receiver<PreciseSnapshot>,
     /// Top-of-book snapshot (matcher → swap-eta API), latest-wins.
@@ -299,6 +299,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     router_hooks: Option<matcher::RouterHooks>,
+    clearing: Option<matcher::ClearingRuntime>,
 ) -> CoreHandles {
     // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
     let price_token_map = config.token_map.clone();
@@ -327,6 +328,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
             triangular_enabled,
             swap_snapshot_tx,
             router_hooks,
+            clearing,
             matcher_cancel,
         )
         .await;
@@ -393,9 +395,15 @@ pub async fn spawn_ingest_tasks(
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicI64>,
     solver_id: miden_protocol::account::AccountId,
+    clearing_bootstrap: Option<oneshot::Sender<matcher::ClearingBootstrap>>,
 ) -> Result<IngestHandles> {
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
+
+    if let Some(sender) = clearing_bootstrap {
+        let bootstrap = reconcile_clearing_book(&db_pool, &mut *adapter.lock().await).await?;
+        sender.send(bootstrap).map_err(|_| anyhow::anyhow!("clearing matcher stopped before startup reconciliation"))?;
+    }
 
     // Subscribe-relay task: admin (on the main thread) sends (offered,
     // requested) tuples across the channel; this task applies them via the
@@ -445,6 +453,50 @@ pub async fn spawn_ingest_tasks(
     })
 }
 
+/// This is the clearer’s only database hydration. Fail closed if the chain
+/// cannot confirm whether persisted inputs have already been consumed.
+async fn reconcile_clearing_book(
+    pool: &db::DbPool,
+    client: &mut dyn MidenClient,
+) -> Result<matcher::ClearingBootstrap> {
+    let (mut orders, decimals) = {
+        let mut conn = pool.read_conn()?;
+        let orders = db::load_active_orders_with_notes(&mut conn)?;
+        let mut decimals = HashMap::new();
+        for token in db::get_registered_tokens(&mut conn)? {
+            if let Some(value) = token.decimals {
+                decimals.insert(
+                    TokenId::read_from_bytes(&token.token_id)?,
+                    u8::try_from(value)?,
+                );
+            }
+        }
+        (orders, decimals)
+    };
+    let mut consumed = std::collections::HashSet::new();
+    // Bound each RPC request and its temporary deserialized notes.
+    for chunk in orders.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
+        let notes = chunk
+            .iter()
+            .map(|order| Note::read_from_bytes(&order.raw_note_data))
+            .collect::<Result<Vec<_>, _>>()
+            .context("deserialize persisted clearing notes")?;
+        consumed.extend(
+            client
+                .check_consumed_notes(&notes)
+                .await
+                .context("reconcile clearing notes against chain")?,
+        );
+    }
+    if !consumed.is_empty() {
+        let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
+        let mut conn = pool.write_conn()?;
+        db::mark_orders_onchain_nullified(&mut conn, &ids)?;
+        orders.retain(|order| !consumed.contains(&order.note_id));
+    }
+    Ok(matcher::ClearingBootstrap { orders, decimals })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +530,103 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let url = format!("file:pipelinetest{}?mode=memory&cache=shared", n);
         db::init_db(&url, 1).expect("failed to create in-memory DB")
+    }
+
+    fn persist_clearing_notes(pool: &db::DbPool) -> Vec<NoteId> {
+        use crate::db::models::{NoteRow, OrderRow};
+        use crate::types::{Order, OrderStatus};
+        use miden_protocol::asset::{AssetAmount, FungibleAsset};
+        use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+        use miden_protocol::note::NoteType;
+        use miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
+        use miden_protocol::Word;
+        use miden_standards::note::{PswapNote, PswapNoteStorage};
+        let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+            .try_into()
+            .unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let mut conn = pool.write_conn().unwrap();
+        let mut ids = Vec::new();
+        for token in [test_token_a(), test_token_b()] {
+            db::register_token(&mut conn, &token.to_bytes(), None).unwrap();
+            db::set_token_metadata(&mut conn, &token.to_bytes(), Some(6), None).unwrap();
+        }
+        for _ in 0..2 {
+            let note: Note = PswapNote::builder()
+                .sender(creator)
+                .storage(
+                    PswapNoteStorage::builder()
+                        .creator_account_id(creator)
+                        .min_requested_asset(FungibleAsset::new(test_token_b(), 18).unwrap())
+                        .min_fill_step(AssetAmount::new(1).unwrap())
+                        .build(),
+                )
+                .serial_number(rng.draw_word())
+                .note_type(NoteType::Public)
+                .offered_asset(FungibleAsset::new(test_token_a(), 10).unwrap())
+                .build()
+                .unwrap()
+                .into();
+            let order = Order::from_note(&note).unwrap();
+            db::insert_notes_batch(
+                &mut conn,
+                &[NoteRow {
+                    note_id: note.id().to_bytes(),
+                    account_id: creator.to_bytes(),
+                    raw_data: note.to_bytes(),
+                }],
+                &[OrderRow {
+                    note_id: note.id().to_bytes(),
+                    account_id: creator.to_bytes(),
+                    requested_asset: order.requested_faucet_id.to_bytes(),
+                    requested_amount: order.requested_amount as i64,
+                    offered_asset: order.offered_faucet_id.to_bytes(),
+                    offered_amount: order.offered_amount as i64,
+                    timestamp: 1,
+                    status: OrderStatus::Active.as_str().to_owned(),
+                    priority_seq: 0,
+                }],
+                1,
+            )
+            .unwrap();
+            ids.push(note.id());
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn clearing_bootstrap_removes_consumed_notes_and_preserves_fifo_and_decimals() {
+        let pool = test_db_pool();
+        let ids = persist_clearing_notes(&pool);
+        let before = db::load_active_orders_with_notes(&mut pool.read_conn().unwrap()).unwrap();
+        let mut client = MockMidenClient::new();
+        client.mark_consumed_silent(vec![ids[0]]);
+        let bootstrap = reconcile_clearing_book(&pool, &mut client).await.unwrap();
+        assert_eq!(bootstrap.orders.len(), 1);
+        assert_eq!(bootstrap.orders[0].note_id, ids[1]);
+        assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
+        assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
+        assert_eq!(
+            db::load_active_orders_with_notes(&mut pool.read_conn().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_bootstrap_fails_closed_on_nullifier_rpc_error() {
+        let pool = test_db_pool();
+        persist_clearing_notes(&pool);
+        let mut client = MockMidenClient::new();
+        client.fail_consumed_check = true;
+        assert!(reconcile_clearing_book(&pool, &mut client).await.is_err());
+        assert_eq!(
+            db::load_active_orders_with_notes(&mut pool.read_conn().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

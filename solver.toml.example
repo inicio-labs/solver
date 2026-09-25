@@ -57,6 +57,14 @@ price_interval_ms = 5000
 # PSWAP `min_fill_step` floor yet, and one sub-floor fill would fail the whole
 # settlement transaction. Direct (pairwise) matching always runs.
 triangular_enabled = false
+# Set this to opt into exact-price PSWAP pair clearing instead of the legacy
+# internal matcher. Omit it until the pair's provider prices and on-chain token
+# decimals are available; stale/missing prices cause the pair to wait.
+# External RFQ routing must remain disabled in this mode; market makers can
+# provide liquidity with ordinary PSWAP notes in the batch.
+# clearing_fee_ppm = 1000
+# clearing_max_source_age_secs = 60  # provider timestamp age, not HTTP fetch age
+# clearing_max_source_skew_secs = 30 # difference between the two asset timestamps
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
 admin_port = 3001
 # debug_mode is ignored since Miden 0.16 (miden-client removed debug mode); a

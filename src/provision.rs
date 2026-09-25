@@ -53,7 +53,10 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
 
     let keystore = FilesystemKeyStore::new(PathBuf::from(&config.solver.keystore_path))
         .context("open keystore")?;
-    keystore.add_key(&key, account.id()).await.context("add solver key to keystore")?;
+    keystore
+        .add_key(&key, account.id())
+        .await
+        .context("add solver key to keystore")?;
     client
         .add_account(&account, false)
         .await
@@ -65,10 +68,17 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
         Err(e) => format!("(unavailable: {e})"),
     };
     println!("solver account created");
-    println!("  account_id = \"{}\"   # set this as [solver] account_id", id.to_hex());
+    println!(
+        "  account_id = \"{}\"   # set this as [solver] account_id",
+        id.to_hex()
+    );
     println!("  address    = {address}");
-    println!("next: send native fee tokens to it as a PUBLIC note; the solver claims them automatically");
-    println!("      when it runs (or `solver-bin fund-account` claims them now, without starting it)");
+    println!(
+        "next: send native fee tokens to it as a PUBLIC note; the solver claims them automatically"
+    );
+    println!(
+        "      when it runs (or `solver-bin fund-account` claims them now, without starting it)"
+    );
     Ok(())
 }
 
@@ -106,14 +116,21 @@ pub async fn fund_account(config: &SolverConfig) -> Result<()> {
         .submit_new_transaction(solver_id, request)
         .await
         .context("submit consume transaction")?;
-    println!("submitted {tx_id}: consuming {count} note(s) into {}", solver_id.to_hex());
+    println!(
+        "submitted {tx_id}: consuming {count} note(s) into {}",
+        solver_id.to_hex()
+    );
 
     let (header, _) = factory
         .rpc()?
         .get_block_header_by_number(None, false)
         .await
         .context("fetch chain-tip header")?;
-    let fee_faucet = header.fee_parameters().fee_faucet_id();
+    let protocol_config = client
+        .get_protocol_config(header.protocol_config_commitment())
+        .await
+        .context("load protocol config for chain tip")?;
+    let fee_faucet = protocol_config.fee_asset_id().faucet_id();
     for _ in 0..FUND_POLL_ATTEMPTS {
         tokio::time::sleep(FUND_POLL_INTERVAL).await;
         client.sync_state().await.context("sync with the node")?;
@@ -123,7 +140,11 @@ pub async fn fund_account(config: &SolverConfig) -> Result<()> {
             .await
             .context("read fee-asset balance")?;
         if balance.as_u64() > 0 {
-            println!("fee-asset balance: {} (fee faucet {})", balance.as_u64(), fee_faucet.to_hex());
+            println!(
+                "fee-asset balance: {} (fee faucet {})",
+                balance.as_u64(),
+                fee_faucet.to_hex()
+            );
             return Ok(());
         }
     }

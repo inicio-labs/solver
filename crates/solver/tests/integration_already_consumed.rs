@@ -25,10 +25,7 @@ use anyhow::Result;
 use diesel::prelude::*;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
-use miden_client::testing::common::{
-    TestClient,
-    insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
-};
+use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_protocol::account::AccountType;
@@ -75,33 +72,32 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                 .ensure_genesis_in_place()
                 .await
                 .map_err(|e| anyhow::anyhow!("user genesis: {e}"))?;
-            let user_keystore =
-                miden_client::keystore::FilesystemKeyStore::new(user_keystore_path.clone())
-                    .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
             let (usdc, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
+                user_client.insert_account(AccountSetup::faucet(mode).auth_scheme(scheme)).await?;
             let (eth, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
+                user_client.insert_account(AccountSetup::faucet(mode).auth_scheme(scheme)).await?;
             let (alice, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+                user_client.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
             let (dave, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+                user_client.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
             let usdc_id = usdc.id();
             let eth_id = eth.id();
             let dave_id = dave.id();
             println!("[test] alice={} dave={}", alice.id().to_hex(), dave_id.to_hex());
+            rpc.prove_block();
+            user_client.sync_state().await?;
 
             // 3. Fund alice with USDC (to offer) and dave with ETH (to fill).
-            mint_and_consume(&mut user_client, alice.id(), usdc_id, NoteType::Public).await;
+            user_client.mint_and_consume(alice.id(), usdc_id, NoteType::Public).await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("sync after alice mint: {e}"))?;
-            mint_and_consume(&mut user_client, dave_id, eth_id, NoteType::Public).await;
+            user_client.mint_and_consume(dave_id, eth_id, NoteType::Public).await?;
             rpc.prove_block();
             user_client
                 .sync_state()
@@ -141,10 +137,8 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let ks =
-                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                        .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
-                let (acct, _) = insert_new_wallet(&mut sc, mode, &ks, scheme).await?;
+                let (acct, _) =
+                    sc.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
                 acct.id()
             };
 
@@ -186,6 +180,9 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
                     triangular_enabled: false,
+                    clearing_fee_ppm: None,
+                    clearing_max_source_age_secs: 60,
+                    clearing_max_source_skew_secs: 30,
                     admin_port: 0,
                     debug_mode: false,
                     obs_port: 0,
@@ -234,6 +231,9 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    tracked the PSWAP (row `active` in its DB).
             let mut tracked = false;
             for _ in 0..400 {
+                if solver_handle.is_finished() {
+                    break;
+                }
                 if order_status(&solver_db_path, &note_key).as_deref() == Some("active") {
                     tracked = true;
                     break;
@@ -262,6 +262,9 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             let mut final_status = order_status(&solver_db_path, &note_key);
             if consumed_ok {
                 for _ in 0..600 {
+                    if solver_handle.is_finished() {
+                        break;
+                    }
                     final_status = order_status(&solver_db_path, &note_key);
                     if final_status.as_deref() == Some("onchain_nullified") {
                         break;

@@ -163,7 +163,7 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
 
     // ── Prepare consume-asset-script for surplus ──
     // Surplus: 6000 USDC in - 4800 USDC out = 1200 USDC
-    let surplus_asset = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 1200)?);
+    let surplus_asset: Asset = FungibleAsset::new(usdc_faucet.id(), 1200)?.into();
     let consume_data = ConsumeAssetScript::prepare(&[surplus_asset]);
     let tx_script = ConsumeAssetScript::tx_script();
 
@@ -197,26 +197,24 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     assert_eq!(output_notes.num_notes(), 4, "expected 4 P2ID output notes");
 
     // Solver vault: +1200 USDC surplus (from consume-asset-script)
-    // `account_patch` carries absolute post-transaction amounts (Miden 0.16). The
+    // `account_patch` carries absolute post-transaction amounts. The
     // solver wallet starts empty, so its updated balance IS the surplus received.
     let vault_patch = executed_transaction.account_patch().vault();
     let added: Vec<Asset> = vault_patch.updated_assets().collect();
 
     let usdc_surplus: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == usdc_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(usdc_surplus, 1200, "solver should receive 1200 USDC surplus");
 
     let eth_surplus: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == eth_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == eth_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(eth_surplus, 0, "no ETH surplus expected");
 

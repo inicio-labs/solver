@@ -90,7 +90,7 @@ fn harness_vs(
     }
     let mut snap = PreciseSnapshot::new();
     for (id, usd) in prices {
-        snap.insert(*id, PriceData { usd: *usd });
+        snap.insert(*id, PriceData { usd: *usd, exact_reference: None, source_updated_at_unix_ms: None, observed_at_unix_ms: 0 });
     }
     let (_tx, rx) = watch::channel(snap); // rx retains the value after _tx drops
     let (_stx, swap_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
@@ -146,7 +146,7 @@ fn swap_server_with_update(
     }
     let mut snap = PreciseSnapshot::new();
     for (id, usd) in prices {
-        snap.insert(*id, PriceData { usd: *usd });
+        snap.insert(*id, PriceData { usd: *usd, exact_reference: None, source_updated_at_unix_ms: None, observed_at_unix_ms: 0 });
     }
     let (_tx, precise_rx) = watch::channel(snap);
     let (_stx, swap_rx) = watch::channel(Arc::new(snapshot));

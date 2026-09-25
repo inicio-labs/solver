@@ -82,6 +82,16 @@ pub struct EngineConfig {
     /// the same. Disable to skip the O(T³) enumeration on large token sets.
     #[serde(default = "default_true")]
     pub triangular_enabled: bool,
+    /// Opt into exact-price, two-sided PSWAP clearing. When omitted the legacy
+    /// matcher remains active. The value is also the eligibility edge in ppm.
+    #[serde(default)]
+    pub clearing_fee_ppm: Option<u32>,
+    /// Maximum age of each provider's own price timestamp when clearing.
+    #[serde(default = "default_clearing_source_age_secs")]
+    pub clearing_max_source_age_secs: u64,
+    /// Maximum difference between the two provider price timestamps.
+    #[serde(default = "default_clearing_source_skew_secs")]
+    pub clearing_max_source_skew_secs: u64,
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
@@ -203,6 +213,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_clearing_source_age_secs() -> u64 {
+    60
+}
+
+fn default_clearing_source_skew_secs() -> u64 {
+    30
+}
+
 fn default_admin_port() -> u16 {
     3001
 }
@@ -289,6 +307,13 @@ impl SolverConfig {
             !self.engine.price_vs_currency.trim().is_empty(),
             "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
         );
+        if let Some(fee) = self.engine.clearing_fee_ppm {
+            anyhow::ensure!(
+                fee < crate::clearing::PPM_DENOMINATOR,
+                "engine.clearing_fee_ppm must be below {}",
+                crate::clearing::PPM_DENOMINATOR
+            );
+        }
         Ok(())
     }
 

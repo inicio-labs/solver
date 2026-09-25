@@ -30,7 +30,7 @@ solver = { path = "../solver" }
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-rand = "0.9"
+rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

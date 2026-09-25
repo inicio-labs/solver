@@ -51,6 +51,17 @@ const HELD_REFEED_DELAY: Duration = Duration::from_secs(30);
 /// Most incoming notes claimed into the solver's vault in one transaction.
 const MAX_CLAIM_NOTES: usize = 16;
 
+/// A PSWAP creates a payback and at most one remainder; reserve one output
+/// for authentication's transaction fee. Never split a solvent match group.
+const MAX_SETTLEMENT_INPUTS: usize = {
+    let output_bound = (miden_protocol::MAX_OUTPUT_NOTES_PER_TX - 1) / 2;
+    if miden_protocol::MAX_INPUT_NOTES_PER_TX < output_bound {
+        miden_protocol::MAX_INPUT_NOTES_PER_TX
+    } else {
+        output_bound
+    }
+};
+
 /// After a failed claim, how long the sync loop waits before trying again.
 const CLAIM_RETRY_DELAY: Duration = Duration::from_secs(60);
 
@@ -253,10 +264,11 @@ fn prepare_batch_components(
             let amount = u64::try_from(*net).map_err(|_| {
                 anyhow!("surplus exceeds u64 range for token {:?}: {}", token, net)
             })?;
-            surplus_assets.push(Asset::Fungible(
+            surplus_assets.push(
                 FungibleAsset::new(*token, amount)
-                    .map_err(|e| anyhow!("surplus asset: {}", e))?,
-            ));
+                    .map_err(|e| anyhow!("surplus asset: {}", e))?
+                    .into(),
+            );
         }
     }
 
@@ -278,6 +290,7 @@ fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder>
         .context("failed to re-parse Note for re-feed")?;
     Ok(IngestOrder {
         note_id: filled.note_id,
+        priority_seq: filled.priority_seq,
         offered_token: parsed.offered_faucet_id,
         requested_token: parsed.requested_faucet_id,
         offered_amount: parsed.offered_amount,
@@ -494,7 +507,7 @@ pub async fn run_executor(
         // Cancellation is only checked BETWEEN batches. Once execute_batch
         // starts, only the backoff sleep is cancel-aware — the on-chain submit
         // runs to completion before a result is observed.
-        let batch = tokio::select! {
+        let mut batch = tokio::select! {
             _ = cancel.cancelled() => break,
             opt = exec_rx.recv() => match opt {
                 Some(b) => b,
@@ -506,27 +519,105 @@ pub async fn run_executor(
             continue;
         }
 
-        let result = execute_batch(
-            &client,
-            &miden_adapter,
-            solver_id,
-            &pool,
-            &batch,
-            &order_tx,
-            &cancel,
-        )
-        .await;
-
-        match result {
-            Ok(_) => {
-                tracing::info!(notes = batch.filled_notes.len(), "batch executed successfully");
-                record_settlement(&batch, &mut stats, &stats_tx);
+        let transactions = match split_batch(&mut batch) {
+            Ok(transactions) => transactions,
+            Err(error) => {
+                tracing::error!(%error, "cannot split execution batch safely; returning orders");
+                refeed_unprepared(&batch, &order_tx, &cancel);
+                continue;
             }
-            Err(e) => tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed"),
+        };
+        for batch in transactions {
+            if cancel.is_cancelled() {
+                // Unsubmitted groups remain Active in the DB for boot recovery.
+                break;
+            }
+            let result = execute_batch(
+                &client,
+                &miden_adapter,
+                solver_id,
+                &pool,
+                &batch,
+                &order_tx,
+                &cancel,
+            )
+            .await;
+
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        notes = batch.filled_notes.len(),
+                        "batch executed successfully"
+                    );
+                    record_settlement(&batch, &mut stats, &stats_tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed")
+                }
+            }
         }
     }
 
     tracing::info!("executor shutting down");
+}
+
+/// Pack consecutive independently solvent groups without copying note bytes.
+/// Validate all boundaries before moving anything out of the caller's batch.
+fn split_batch(batch: &mut ExecutionBatch) -> Result<Vec<ExecutionBatch>> {
+    let total = batch.filled_notes.len();
+    let ends: &[usize] = if batch.group_ends.is_empty() {
+        std::slice::from_ref(&total)
+    } else {
+        &batch.group_ends
+    };
+    let mut previous = 0;
+    let mut packed = 0;
+    let mut sizes = Vec::new();
+    for &end in ends {
+        anyhow::ensure!(
+            end > previous && end <= total,
+            "invalid execution group boundary"
+        );
+        let size = end - previous;
+        anyhow::ensure!(
+            size <= MAX_SETTLEMENT_INPUTS,
+            "indivisible match group exceeds transaction note limit"
+        );
+        if packed + size > MAX_SETTLEMENT_INPUTS {
+            sizes.push(packed);
+            packed = 0;
+        }
+        packed += size;
+        previous = end;
+    }
+    anyhow::ensure!(previous == total, "execution groups do not cover all notes");
+    if packed > 0 {
+        sizes.push(packed);
+    }
+    let mut notes = std::mem::take(&mut batch.filled_notes).into_iter();
+    Ok(sizes
+        .into_iter()
+        .map(|size| ExecutionBatch {
+            filled_notes: notes.by_ref().take(size).collect(),
+            group_ends: Vec::new(),
+        })
+        .collect())
+}
+
+fn refeed_unprepared(
+    batch: &ExecutionBatch,
+    order_tx: &mpsc::Sender<IngestOrder>,
+    cancel: &CancellationToken,
+) {
+    let orders = batch
+        .filled_notes
+        .iter()
+        .filter_map(|filled| {
+            let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)).ok()?;
+            rebuild_ingest_order(filled, &note).ok()
+        })
+        .collect();
+    refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY);
 }
 
 /// After a successful settlement, record each note's settlement duration
@@ -581,21 +672,12 @@ async fn execute_batch(
             // emit, so hand back every order whose note still parses — otherwise
             // they're stranded until the next restart. Delayed, so a batch that
             // fails deterministically isn't rebuilt every tick.
-            let orders: Vec<IngestOrder> = batch
-                .filled_notes
-                .iter()
-                .filter_map(|filled| {
-                    let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)).ok()?;
-                    rebuild_ingest_order(filled, &note).ok()
-                })
-                .collect();
             tracing::error!(
                 error = %e,
-                refed = orders.len(),
                 notes = batch.filled_notes.len(),
                 "batch preparation failed; re-feeding its orders after a pause"
             );
-            refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY);
+            refeed_unprepared(batch, order_tx, cancel);
             return Err(e);
         }
     };
@@ -1071,14 +1153,15 @@ pub(crate) fn spawn_executor_thread(
 #[cfg(test)]
 mod claim_tests {
     use super::*;
-    use miden_protocol::asset::{Asset, FungibleAsset};
-    use miden_protocol::crypto::rand::RandomCoin;
+    use miden_protocol::asset::{AssetAmount, FungibleAsset};
+    use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::{NoteId, NoteType};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
     };
     use miden_protocol::Word;
+    use miden_standards::note::PswapNoteStorage;
 
     const BASE_FEE: u32 = 7;
 
@@ -1095,7 +1178,7 @@ mod claim_tests {
         P2idNote::builder()
             .sender(faucet)
             .target(ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE.try_into().unwrap())
-            .assets(vec![Asset::Fungible(FungibleAsset::new(faucet, amount).unwrap())])
+            .assets(vec![FungibleAsset::new(faucet, amount).unwrap()])
             .note_type(NoteType::Public)
             .generate_serial_number(rng)
             .build()
@@ -1105,6 +1188,177 @@ mod claim_tests {
 
     fn ids(notes: &[Note]) -> Vec<NoteId> {
         notes.iter().map(Note::id).collect()
+    }
+
+    #[test]
+    fn executor_rechecks_surplus_before_and_after_splitting() {
+        let base = fee_faucet();
+        let quote = other_faucet();
+        let solver_id = ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+            .try_into()
+            .unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let creator =
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+                .try_into()
+                .unwrap();
+        let mut make_note = |offered, requested| -> Note {
+            let storage = PswapNoteStorage::builder()
+                .min_requested_asset(requested)
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build();
+            PswapNote::builder()
+                .sender(solver_id)
+                .storage(storage)
+                .serial_number(rng.draw_word())
+                .note_type(NoteType::Public)
+                .offered_asset(offered)
+                .build()
+                .unwrap()
+                .into()
+        };
+        let seller = make_note(
+            FungibleAsset::new(base, 11).unwrap(),
+            FungibleAsset::new(quote, 18).unwrap(),
+        );
+        let buyer = make_note(
+            FungibleAsset::new(quote, 22).unwrap(),
+            FungibleAsset::new(base, 10).unwrap(),
+        );
+        let batch = ExecutionBatch {
+            group_ends: Vec::new(),
+            filled_notes: [(seller, 20), (buyer, 10)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (note, requested_filled))| FilledNote {
+                    note_id: note.id(),
+                    priority_seq: index as u64 + 1,
+                    requested_filled,
+                    raw_note_data: note.to_bytes(),
+                    arrival_unix: 1,
+                })
+                .collect(),
+        };
+        let (components, notes) = prepare_batch_components(&batch, solver_id).unwrap();
+        assert_eq!(notes.len(), 2);
+        let residual: HashMap<_, _> = components
+            .surplus_assets
+            .into_iter()
+            .filter_map(|asset| {
+                asset
+                    .as_fungible()
+                    .map(|fungible| (fungible.faucet_id(), fungible.amount().as_u64()))
+            })
+            .collect();
+        assert_eq!(residual.get(&base), Some(&1));
+        assert_eq!(residual.get(&quote), Some(&2));
+
+        // Cross the transaction bound with independently solvent groups of
+        // real, distinct PSWAP notes, not just synthetic note-count metadata.
+        let mut combined = ExecutionBatch {
+            filled_notes: Vec::new(),
+            group_ends: Vec::new(),
+        };
+        for _ in 0..=MAX_SETTLEMENT_INPUTS / 2 {
+            let seller = make_note(
+                FungibleAsset::new(base, 11).unwrap(),
+                FungibleAsset::new(quote, 18).unwrap(),
+            );
+            let buyer = make_note(
+                FungibleAsset::new(quote, 22).unwrap(),
+                FungibleAsset::new(base, 10).unwrap(),
+            );
+            for (note, payment) in [(seller, 20), (buyer, 10)] {
+                combined.filled_notes.push(FilledNote {
+                    note_id: note.id(),
+                    priority_seq: combined.filled_notes.len() as u64 + 1,
+                    requested_filled: payment,
+                    raw_note_data: note.to_bytes(),
+                    arrival_unix: 1,
+                });
+            }
+            combined.group_ends.push(combined.filled_notes.len());
+        }
+        let transactions = split_batch(&mut combined).unwrap();
+        assert_eq!(transactions.len(), 2);
+        for tx in transactions {
+            let (components, _) = prepare_batch_components(&tx, solver_id).unwrap();
+            assert!(components.input_notes.len() <= miden_protocol::MAX_INPUT_NOTES_PER_TX);
+            assert!(
+                components.expected_output_recipients.len() + 1
+                    <= miden_protocol::MAX_OUTPUT_NOTES_PER_TX
+            );
+        }
+    }
+
+    fn sized_batch(group_sizes: &[usize]) -> ExecutionBatch {
+        let mut group_ends = Vec::new();
+        let mut filled_notes = Vec::new();
+        for &size in group_sizes {
+            for _ in 0..size {
+                let index = filled_notes.len() as u64 + 1;
+                filled_notes.push(FilledNote {
+                    note_id: NoteId::try_from_hex(&format!("0x{index:064x}")).unwrap(),
+                    priority_seq: index,
+                    requested_filled: 1,
+                    raw_note_data: Vec::new(),
+                    arrival_unix: 1,
+                });
+            }
+            group_ends.push(filled_notes.len());
+        }
+        ExecutionBatch {
+            filled_notes,
+            group_ends,
+        }
+    }
+
+    #[test]
+    fn executor_splits_all_five_pairs_without_splitting_counterparties() {
+        let group_size = crate::clearing::ClearingConfig::default().max_orders_per_side * 2;
+        let mut batch = sized_batch(&[group_size; 5]);
+        let expected: Vec<_> = batch.filled_notes.iter().map(|note| note.note_id).collect();
+        let transactions = split_batch(&mut batch).unwrap();
+        assert!(transactions.len() > 1);
+        for tx in &transactions {
+            assert!(tx.filled_notes.len() <= MAX_SETTLEMENT_INPUTS);
+            assert_eq!(tx.filled_notes.len() % group_size, 0);
+        }
+        assert_eq!(
+            transactions
+                .iter()
+                .flat_map(|tx| tx.filled_notes.iter().map(|note| note.note_id))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(batch.filled_notes.is_empty());
+    }
+
+    #[test]
+    fn executor_packs_small_pairs_together_and_preserves_legacy_batches() {
+        for grouped in [true, false] {
+            let mut batch = sized_batch(&[2, 2, 2]);
+            if !grouped {
+                batch.group_ends.clear();
+            }
+            let transactions = split_batch(&mut batch).unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(transactions[0].filled_notes.len(), 6);
+        }
+    }
+
+    #[test]
+    fn executor_rejects_invalid_boundaries_without_losing_notes() {
+        for ends in [vec![2, 2], vec![2, 5], vec![2], vec![0, 4]] {
+            let mut batch = sized_batch(&[2, 2]);
+            batch.group_ends = ends;
+            assert!(split_batch(&mut batch).is_err());
+            assert_eq!(batch.filled_notes.len(), 4);
+        }
+        let mut oversized = sized_batch(&[MAX_SETTLEMENT_INPUTS + 1]);
+        assert!(split_batch(&mut oversized).is_err());
+        assert_eq!(oversized.filled_notes.len(), MAX_SETTLEMENT_INPUTS + 1);
     }
 
     /// Only notes carrying at least one settlement's worst-case fee in the fee
@@ -1153,4 +1407,3 @@ mod claim_tests {
         assert_eq!(select_claimable(notes, Some((fee_faucet(), BASE_FEE))).len(), MAX_CLAIM_NOTES);
     }
 }
-

@@ -110,7 +110,7 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     )?;
 
     // Surplus: 100 USDC offered by Alice - 80 USDC sent to Bob = 20 USDC for solver
-    let surplus_asset = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 20)?);
+    let surplus_asset: Asset = FungibleAsset::new(usdc_faucet.id(), 20)?.into();
     let consume_data: ConsumeAssetData = ConsumeAssetScript::prepare(&[surplus_asset]);
     let tx_script = ConsumeAssetScript::tx_script();
 
@@ -134,17 +134,16 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     assert_eq!(output_notes.num_notes(), 2, "Expected 2 P2ID output notes");
 
     // Verify solver's vault delta: should receive 20 USDC surplus
-    // `account_patch` carries absolute post-transaction amounts (Miden 0.16). The
+    // `account_patch` carries absolute post-transaction amounts. The
     // solver wallet starts empty, so its updated balance IS the surplus received.
     let vault_patch = executed_transaction.account_patch().vault();
     let added: Vec<Asset> = vault_patch.updated_assets().collect();
 
     let usdc_added: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == usdc_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(usdc_added, 20, "Solver should receive 20 USDC surplus");
 

@@ -124,6 +124,8 @@ impl Order {
 #[derive(Debug, Clone)]
 pub struct IngestOrder {
     pub note_id: OrderId,
+    /// Durable ingestion FIFO sequence, independent of restart order.
+    pub priority_seq: u64,
     pub offered_token: TokenId,
     pub requested_token: TokenId,
     pub offered_amount: Amount,
@@ -137,6 +139,7 @@ pub struct IngestOrder {
 #[derive(Debug, Clone)]
 pub struct FilledNote {
     pub note_id: OrderId,
+    pub priority_seq: u64,
     pub requested_filled: Amount,
     pub raw_note_data: Vec<u8>,
     /// When the matcher first observed this order (stamped in-memory, not from
@@ -149,4 +152,8 @@ pub struct FilledNote {
 #[derive(Debug, Clone)]
 pub struct ExecutionBatch {
     pub filled_notes: Vec<FilledNote>,
+    /// Exclusive ends of independently solvent groups. The executor may split
+    /// only between these boundaries, never between counterparties in a group.
+    /// Empty means the whole batch is indivisible (legacy matching).
+    pub group_ends: Vec<usize>,
 }

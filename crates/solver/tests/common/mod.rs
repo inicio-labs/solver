@@ -234,17 +234,15 @@ where
 /// Sum of fungible-asset balances of `faucet` held in `account_id`'s vault,
 /// reading from the latest committed MockChain state.
 pub fn vault_balance(chain: &MockChain, account_id: AccountId, faucet: AccountId) -> u64 {
-    use miden_protocol::asset::Asset;
     chain
         .committed_account(account_id)
         .map(|account| {
             account
                 .vault()
                 .assets()
-                .filter_map(|asset| match asset {
-                    Asset::Fungible(f) if f.faucet_id() == faucet => Some(u64::from(f.amount())),
-                    _ => None,
-                })
+                .filter_map(|asset| asset.as_fungible())
+                .filter(|asset| asset.faucet_id() == faucet)
+                .map(|asset| asset.amount().as_u64())
                 .sum::<u64>()
         })
         .unwrap_or(0)

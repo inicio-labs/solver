@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod order;
 pub mod config;
 pub mod swap_eta;
+pub mod clearing;
 
 pub mod client_factory;
 pub use client_factory::ClientFactory;
@@ -21,4 +22,3 @@ pub mod executor;
 pub mod start;
 
 pub use start::start;
-

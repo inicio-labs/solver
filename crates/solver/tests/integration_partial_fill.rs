@@ -25,10 +25,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
-use miden_client::testing::common::{
-    TestClient,
-    insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
-};
+use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_protocol::account::AccountType;
@@ -61,33 +58,36 @@ async fn partial_fill_repro() -> Result<()> {
                 .ensure_genesis_in_place()
                 .await
                 .map_err(|e| anyhow::anyhow!("user genesis: {e}"))?;
-            let user_keystore =
-                miden_client::keystore::FilesystemKeyStore::new(user_keystore_path.clone())
-                    .map_err(|e| anyhow::anyhow!("user keystore: {e}"))?;
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
-            let (ibtc, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (iusdt, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (maker1, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (maker2, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (taker_full, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (taker_half, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+            let (ibtc, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (iusdt, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (maker1, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (maker2, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (taker_full, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (taker_half, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
 
             // Fund: makers get IBTC, takers get IUSDT (1000 units each).
             for w in [maker1.id(), maker2.id()] {
-                mint_and_consume(&mut user_client, w, ibtc.id(), NoteType::Public).await;
+                user_client.mint_and_consume(w, ibtc.id(), NoteType::Public).await?;
                 rpc.prove_block();
                 user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync ibtc: {e}"))?;
             }
             for w in [taker_full.id(), taker_half.id()] {
-                mint_and_consume(&mut user_client, w, iusdt.id(), NoteType::Public).await;
+                user_client.mint_and_consume(w, iusdt.id(), NoteType::Public).await?;
                 rpc.prove_block();
                 user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync iusdt: {e}"))?;
             }
@@ -131,10 +131,9 @@ async fn partial_fill_repro() -> Result<()> {
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let sks =
-                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                        .map_err(|e| anyhow::anyhow!("solver keystore: {e}"))?;
-                let (sa, _) = insert_new_wallet(&mut sc, mode, &sks, scheme).await?;
+                let (sa, _) = sc
+                    .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                    .await?;
                 sa.id()
             };
             println!("[test] solver={}", solver_id.to_hex());
@@ -172,6 +171,9 @@ async fn partial_fill_repro() -> Result<()> {
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
                     triangular_enabled: false, // isolate the DIRECT partial fill
+                    clearing_fee_ppm: None,
+                    clearing_max_source_age_secs: 60,
+                    clearing_max_source_skew_secs: 30,
                     admin_port: 0,
                     debug_mode: false,
                     obs_port: 0,

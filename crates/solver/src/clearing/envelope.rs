@@ -14,27 +14,24 @@ pub(crate) struct ReachableFillMap {
 }
 
 impl ReachableFillMap {
+    /// Build F[i] backward: each row contains every total reachable using
+    /// orders i onward, including the choice to skip any of those orders.
+    /// The cap sums liquidity from multiple notes and may exceed AssetAmount::MAX.
     pub(crate) fn build(
         orders: &[MatchOrder<'_>],
         config: &ClearingConfig,
-        maximum_fill: u128,
+        maximum_total_fill: u128,
     ) -> Result<Self, ClearingError> {
-        let suffix_count = orders
-            .len()
-            .checked_add(1)
-            .ok_or(ClearingError::ArithmeticOverflow)?;
+        // The extra row is F[n] = {0}: the total reachable with no orders left.
+        let row_count = orders.len() + 1;
         let mut map = Self {
-            intervals: Vec::with_capacity(config.max_total_intervals.min(suffix_count)),
-            rows: Vec::with_capacity(suffix_count),
+            intervals: Vec::with_capacity(config.max_total_intervals.min(row_count)),
+            rows: Vec::with_capacity(row_count),
         };
-        let zero = FillInterval {
-            minimum: U256::ZERO,
-            maximum: U256::ZERO,
-        };
-        map.push_row(vec![zero], config.max_total_intervals)?;
+        map.push_row(vec![FillInterval::default()], config.max_total_intervals)?;
 
         for order in orders.iter().rev() {
-            map.add_order(order.fill_interval(), maximum_fill, config)?;
+            map.add_order(order.fill_interval(), maximum_total_fill, config)?;
         }
         map.rows.reverse();
         Ok(map)
@@ -44,13 +41,15 @@ impl ReachableFillMap {
         &self.intervals[self.rows.last().expect("initial row exists").clone()]
     }
 
+    /// Form F[i] from F[i+1]: keep later totals (skip this order), or add one
+    /// fill from this order's interval to each later total (use this order).
     fn add_order(
         &mut self,
         order_fills: FillInterval,
-        maximum_fill: u128,
+        maximum_total_fill: u128,
         config: &ClearingConfig,
     ) -> Result<(), ClearingError> {
-        let maximum = U256::from(maximum_fill);
+        let maximum = U256::from(maximum_total_fill);
         let mut reachable = RangeSetBlaze::<u128>::new();
         for &later in self.last_row() {
             for interval in [
@@ -75,13 +74,7 @@ impl ReachableFillMap {
                 ResourceLimitKind::IntervalsPerRow,
             ));
         }
-        let row = reachable
-            .ranges()
-            .map(|range| FillInterval {
-                minimum: U256::from(*range.start()),
-                maximum: U256::from(*range.end()),
-            })
-            .collect();
+        let row = reachable.ranges().map(FillInterval::from).collect();
         self.push_row(row, config.max_total_intervals)
     }
 
@@ -108,15 +101,15 @@ impl ReachableFillMap {
         let range = self
             .rows
             .get(order_index)
-            .ok_or(ClearingError::InternalInvariant("missing reachable suffix"))?
+            .ok_or(ClearingError::InternalInvariant("missing reachable row"))?
             .clone();
         self.intervals
             .get(range)
-            .ok_or(ClearingError::InternalInvariant("invalid reachable suffix"))
+            .ok_or(ClearingError::InternalInvariant("invalid reachable row"))
     }
 
-    /// Return the greatest reachable buyer-base target whose one-time floor at
-    /// the clearing price is reachable by the seller-quote map.
+    /// Find the largest buyer fill whose price-converted amount is reachable
+    /// by the seller. Integer buyer fills can leave gaps after conversion.
     pub(crate) fn maximum_common_fill(
         &self,
         buyer_fills: &Self,
@@ -124,49 +117,53 @@ impl ReachableFillMap {
     ) -> Result<Option<(U256, U256)>, ClearingError> {
         let seller_intervals = self.fills_from(0)?;
         let buyer_intervals = buyer_fills.fills_from(0)?;
-        let mut seller_index = 0;
-        let mut buyer_index = 0;
-        let mut best = None;
+        let mut seller_count = seller_intervals.len();
+        let mut buyer_count = buyer_intervals.len();
 
-        while let (Some(seller), Some(buyer)) = (
-            seller_intervals.get(seller_index),
-            buyer_intervals.get(buyer_index),
-        ) {
-            // a <= floor(P*q) <= b iff ceil(a/P) <= q <= ceil((b+1)/P)-1.
-            let lower = price.base_for_quote_ceil(seller.minimum)?;
-            let after_maximum = seller
-                .maximum
-                .checked_add(U256::ONE)
-                .ok_or(ClearingError::ArithmeticOverflow)?;
-            let upper_exclusive = price.base_for_quote_ceil(after_maximum)?;
-            if upper_exclusive > U256::ZERO {
-                let upper = upper_exclusive - U256::ONE;
-                let overlap_minimum = lower.max(buyer.minimum);
-                let overlap_maximum = upper.min(buyer.maximum);
-                if overlap_minimum <= overlap_maximum
-                    && price.quote_for_base_floor(overlap_maximum)? > U256::ZERO
-                {
-                    best = Some(overlap_maximum);
+        // Both rows are sorted. Walk from their largest intervals so the first
+        // valid buyer fill is the maximum-volume match.
+        while seller_count > 0 && buyer_count > 0 {
+            let seller = seller_intervals[seller_count - 1];
+            let buyer = buyer_intervals[buyer_count - 1];
+            let buyer_minimum_quote = price.quote_for_base_floor(buyer.minimum)?;
+            let buyer_maximum_quote = price.quote_for_base_floor(buyer.maximum)?;
+
+            if buyer_minimum_quote > seller.maximum {
+                buyer_count -= 1;
+                continue;
+            }
+            if buyer_maximum_quote < seller.minimum {
+                seller_count -= 1;
+                continue;
+            }
+
+            // Find the largest actual buyer fill whose floor(P * fill) is at
+            // most the seller's maximum. Converted endpoints alone are not
+            // enough: at P=2, buyer fills [1,2] produce {2,4}, not [2,4].
+            let mut low = buyer.minimum;
+            let mut high = buyer.maximum;
+            while low < high {
+                let middle = low + (high - low).div_ceil(U256::from(2u8));
+                if price.quote_for_base_floor(middle)? <= seller.maximum {
+                    low = middle;
+                } else {
+                    high = middle - U256::ONE;
                 }
             }
-            if upper_exclusive == U256::ZERO || upper_exclusive - U256::ONE < buyer.maximum {
-                seller_index += 1;
-            } else {
-                buyer_index += 1;
+            let seller_quote = price.quote_for_base_floor(low)?;
+            if seller_quote >= seller.minimum && seller_quote > U256::ZERO {
+                return Ok(Some((low, seller_quote)));
             }
-        }
 
-        match best {
-            Some(buyer_base_target) => Ok(Some((
-                buyer_base_target,
-                price.quote_for_base_floor(buyer_base_target)?,
-            ))),
-            None => Ok(None),
+            // No buyer fill in this interval lands inside the seller interval.
+            // Any lower buyer fill is also below it, so try a lower seller row.
+            seller_count -= 1;
         }
+        Ok(None)
     }
 
-    /// Select the lexicographically largest per-order fill vector for a fixed
-    /// target. Each order receives as much as suffix feasibility permits.
+    /// Allocate a fixed target in price-time order. A better-ranked order gets
+    /// its largest fill that the later orders can still complete, or is skipped.
     pub(crate) fn allocate_by_priority(
         &self,
         orders: &[MatchOrder<'_>],
@@ -178,31 +175,27 @@ impl ReachableFillMap {
         let mut remaining = target;
         let mut allocations = Vec::with_capacity(orders.len());
         for (index, order) in orders.iter().enumerate() {
-            let later_fills = self.fills_from(index + 1)?;
             let order_fills = order.fill_interval();
-            let selected = if remaining >= order_fills.minimum {
-                let minimum_remainder = if remaining > order_fills.maximum {
-                    remaining - order_fills.maximum
-                } else {
-                    U256::ZERO
-                };
-                let maximum_remainder = remaining - order_fills.minimum;
+            if remaining < order_fills.minimum {
+                allocations.push(U256::ZERO);
+                continue;
+            }
+
+            // A smaller feasible remainder means a larger fill for this order.
+            // F[i+1] includes every combination of later fills and skips.
+            let minimum_remainder = remaining.saturating_sub(order_fills.maximum);
+            let maximum_remainder = remaining - order_fills.minimum;
+            let later_fills = self.fills_from(index + 1)?;
+            if let Some(remainder) =
                 first_reachable(later_fills, minimum_remainder, maximum_remainder)
-                    .map(|remainder| remaining - remainder)
+            {
+                allocations.push(remaining - remainder);
+                remaining = remainder;
             } else {
-                None
-            };
-            let fill = if let Some(fill) = selected {
-                fill
-            } else if first_reachable(later_fills, remaining, remaining).is_some() {
-                U256::ZERO
-            } else {
-                return Err(ClearingError::InternalInvariant(
-                    "no feasible priority allocation",
-                ));
-            };
-            remaining -= fill;
-            allocations.push(fill);
+                // Because remaining is reachable in F[i], the skip branch
+                // must be feasible when the fill branch is not.
+                allocations.push(U256::ZERO);
+            }
         }
         if remaining != U256::ZERO {
             return Err(ClearingError::InternalInvariant(
@@ -213,6 +206,8 @@ impl ReachableFillMap {
     }
 }
 
+/// Find the smallest reachable remainder in a range. The rows are sorted, so
+/// binary search locates the first possible interval without scanning values.
 fn first_reachable(intervals: &[FillInterval], minimum: U256, maximum: U256) -> Option<U256> {
     if minimum > maximum {
         return None;
@@ -226,6 +221,33 @@ fn first_reachable(intervals: &[FillInterval], minimum: U256, maximum: U256) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::asset::AssetAmount;
+
+    #[test]
+    fn aggregate_cap_can_exceed_one_asset_amount() {
+        let amount = u128::from(AssetAmount::MAX.as_u64());
+        let mut map = ReachableFillMap {
+            intervals: vec![FillInterval {
+                minimum: U256::ZERO,
+                maximum: U256::ZERO,
+            }],
+            rows: vec![0..1],
+        };
+        let order = FillInterval {
+            minimum: U256::from(amount),
+            maximum: U256::from(amount),
+        };
+
+        map.add_order(order, amount * 2, &ClearingConfig::default())
+            .unwrap();
+        map.add_order(order, amount * 2, &ClearingConfig::default())
+            .unwrap();
+
+        assert_eq!(
+            map.last_row().last().unwrap().maximum,
+            U256::from(amount * 2)
+        );
+    }
 
     #[test]
     fn sparse_union_keeps_real_gaps() {
@@ -360,6 +382,28 @@ mod tests {
             intervals,
             rows: vec![0..end],
         }
+    }
+
+    #[test]
+    fn buyer_conversion_checks_reachable_values_not_just_interval_endpoints() {
+        let buyers = map_from_mask((1 << 1) | (1 << 2));
+        let price = BatchPrice::from_ratio(2, 1).unwrap();
+
+        // Buyer fills [1,2] convert to {2,4}; 3 lies between the endpoints
+        // but is not a possible converted fill.
+        let seller_three = map_from_mask(1 << 3);
+        assert_eq!(
+            seller_three.maximum_common_fill(&buyers, price).unwrap(),
+            None
+        );
+
+        let seller_two_or_three = map_from_mask((1 << 2) | (1 << 3));
+        assert_eq!(
+            seller_two_or_three
+                .maximum_common_fill(&buyers, price)
+                .unwrap(),
+            Some((U256::from(1u8), U256::from(2u8)))
+        );
     }
 
     #[test]

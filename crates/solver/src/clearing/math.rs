@@ -187,10 +187,6 @@ impl BatchPrice {
     pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
         mul_div_floor(base, self.quote_units, self.base_units)
     }
-
-    pub(crate) fn base_for_quote_ceil(self, quote: U256) -> Result<U256, ClearingError> {
-        mul_div_ceil(quote, self.base_units, self.quote_units)
-    }
 }
 
 #[cfg(test)]

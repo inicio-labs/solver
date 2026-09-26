@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::ops::RangeInclusive;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
@@ -163,10 +164,19 @@ pub(crate) enum OrderSide {
     BuyBase,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FillInterval {
     pub minimum: U256,
     pub maximum: U256,
+}
+
+impl From<RangeInclusive<u128>> for FillInterval {
+    fn from(range: RangeInclusive<u128>) -> Self {
+        Self {
+            minimum: U256::from(*range.start()),
+            maximum: U256::from(*range.end()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

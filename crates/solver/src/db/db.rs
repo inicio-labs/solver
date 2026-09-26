@@ -1,12 +1,12 @@
 use anyhow::Result;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
 use diesel::sqlite::SqliteConnection;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+const SCHEMA: &str = include_str!("../../schema.sql");
 
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
@@ -67,8 +67,7 @@ pub fn init_db(database_url: &str, read_pool_size: u32) -> Result<DbPool> {
         .build(ConnectionManager::<SqliteConnection>::new(database_url))?;
 
     let mut conn = write_pool.get()?;
-    conn.run_pending_migrations(MIGRATIONS)
-        .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
+    conn.batch_execute(SCHEMA)?;
 
     Ok(DbPool { write: write_pool, read: read_pool })
 }
@@ -436,6 +435,18 @@ mod tests {
         let mut conn = pool.write_conn().unwrap();
         let block = get_last_fetched_block(&mut conn).unwrap();
         assert_eq!(block, 0);
+    }
+
+    #[test]
+    fn fresh_schema_can_run_again_without_resetting_state() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        diesel::sql_query("UPDATE sync_state SET last_fetched_block = 42 WHERE id = 1")
+            .execute(&mut conn)
+            .unwrap();
+
+        conn.batch_execute(SCHEMA).unwrap();
+        assert_eq!(get_last_fetched_block(&mut conn).unwrap(), 42);
     }
 
     #[test]

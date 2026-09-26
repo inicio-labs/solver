@@ -236,6 +236,39 @@ mod tests {
         PairMatcher::new(batch, config).clear().unwrap()
     }
 
+    fn allocate_seller_fills(domains: &[(u64, u64)], target: u64) -> Vec<U256> {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let orders = domains
+            .iter()
+            .enumerate()
+            .map(|(index, &(maximum, minimum))| {
+                order(
+                    FungibleAsset::new(base, maximum).unwrap(),
+                    FungibleAsset::new(quote, maximum).unwrap(),
+                    minimum,
+                    index as u64 + 1,
+                    &mut rng,
+                )
+            })
+            .collect::<Vec<_>>();
+        let price = BatchPrice::from_ratio(1, 1).unwrap();
+        let prepared = orders
+            .iter()
+            .map(|order| {
+                order
+                    .prepare_if_eligible(OrderSide::SellBase, price, 0)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let map =
+            ReachableFillMap::build(&prepared, &ClearingConfig::default(), u128::from(target))
+                .unwrap();
+        map.allocate_by_priority(&prepared, U256::from(target))
+            .unwrap()
+    }
+
     #[test]
     fn ingested_note_adapter_checks_identity_amounts_and_fifo() {
         let (base, quote) = assets();
@@ -485,6 +518,22 @@ mod tests {
         let settled = plan.to_execution_batch(&input, &arrivals).unwrap();
         assert_eq!(settled.filled_notes[0].note_id, early_id);
         assert_eq!(settled.filled_notes.len(), 2);
+    }
+
+    #[test]
+    fn priority_allocation_fills_best_order_then_skips_unsupported_minimum() {
+        assert_eq!(
+            allocate_seller_fills(&[(8, 4), (10, 9), (4, 3)], 10),
+            [U256::from(7u8), U256::ZERO, U256::from(3u8)]
+        );
+    }
+
+    #[test]
+    fn priority_allocation_skips_when_minimum_fits_but_later_orders_cannot_complete() {
+        assert_eq!(
+            allocate_seller_fills(&[(6, 4), (7, 7)], 7),
+            [U256::ZERO, U256::from(7u8)]
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ impl ConsumeAssetScript {
     /// Prepares the commitment and advice map for consuming assets
     /// into the executing account's vault.
     ///
-    /// The advice map entry contains: `[num_assets, asset_key_0..., asset_value_0..., ...]`
+    /// The advice map entry contains: `[num_assets, asset_id_0..., asset_value_0..., ...]`
     /// The commitment is a Poseidon2 hash of this data, reversed for stack ordering.
     pub fn prepare(assets: &[Asset]) -> ConsumeAssetData {
         assert!(!assets.is_empty(), "must provide at least one asset");
@@ -61,7 +61,7 @@ impl ConsumeAssetScript {
         advice_felts.push(Felt::new(num_assets).expect("asset count fits in the field"));
 
         for asset in assets {
-            let key_word = asset.to_key_word();
+            let key_word = asset.to_id_word();
             let value_word = asset.to_value_word();
             advice_felts.extend(key_word);
             advice_felts.extend(value_word);

@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
+use serde_json::value::RawValue;
 
+use crate::clearing::ReferencePrice;
 use crate::price::{read_token_map, PriceClient, PriceData, PreciseSnapshot, SharedTokenMap};
 use crate::types::TokenId;
 
@@ -63,8 +65,9 @@ impl HttpPriceClient {
     /// Construct a client targeting a custom CoinGecko-compatible base URL +
     /// quote currency — e.g. a self-hosted or **mock** price service for
     /// devnet/local. `new` defaults to [`COINGECKO_BASE`] + `"usd"`. The endpoint
-    /// must answer `GET {base}?ids=<csv>&vs_currencies=<vs>&precision=full` with
-    /// `{"<id>":{"<vs>":<f64>}}`.
+    /// must answer `GET {base}?ids=<csv>&vs_currencies=<vs>&precision=full`
+    /// with a numeric price and `last_updated_at` (UNIX seconds) per id for
+    /// opt-in clearing. Legacy matching can use responses without a timestamp.
     pub fn new_with_base(
         token_map: SharedTokenMap,
         api_key: Option<String>,
@@ -107,7 +110,7 @@ impl PriceClient for HttpPriceClient {
         let ids: Vec<&str> = requested.values().map(|s| s.as_str()).collect();
         let ids_csv = ids.join(",");
         let url = format!(
-            "{}?ids={ids_csv}&vs_currencies={}&precision=full",
+            "{}?ids={ids_csv}&vs_currencies={}&precision=full&include_last_updated_at=true",
             self.base, self.vs_currency
         );
 
@@ -132,8 +135,9 @@ impl PriceClient for HttpPriceClient {
         if !status.is_success() {
             return Err(anyhow!("coingecko returned status {}", status));
         }
-        // Response shape: { "<id>": { "<vs_currency>": <f64> }, ... }
-        let body: HashMap<String, HashMap<String, f64>> =
+        // Preserve the JSON number spelling: converting through f64 here
+        // would make the clearing price inexact before the matcher sees it.
+        let body: HashMap<String, HashMap<String, Box<RawValue>>> =
             resp.json().await.context("parse coingecko response")?;
 
         // 3. Map symbols back to TokenIds; keep the full-precision value. Drop any
@@ -141,11 +145,23 @@ impl PriceClient for HttpPriceClient {
         //    (excluded from matching) rather than corrupting it.
         let mut out = PreciseSnapshot::new();
         for (token, symbol) in &requested {
-            if let Some(usd) = body.get(symbol.as_str()).and_then(|m| m.get(&self.vs_currency)) {
-                if usd.is_finite() && *usd >= 0.0 {
-                    out.insert(*token, PriceData { usd: *usd });
-                }
+            let Some(values) = body.get(symbol.as_str()) else { continue };
+            let Some(raw) = values.get(&self.vs_currency) else { continue };
+            let number = raw.get();
+            let Ok(usd) = number.parse::<f64>() else { continue };
+            if !usd.is_finite() || usd < 0.0 {
+                continue;
             }
+            let source_updated_at_unix_ms = values
+                .get("last_updated_at")
+                .and_then(|raw| raw.get().parse::<u64>().ok())
+                .and_then(|seconds| seconds.checked_mul(1_000));
+            out.insert(*token, PriceData {
+                usd,
+                exact_reference: ReferencePrice::from_json_number(number).ok(),
+                source_updated_at_unix_ms,
+                observed_at_unix_ms: 0,
+            });
         }
         Ok(out)
     }
@@ -178,6 +194,18 @@ mod tests {
         Arc::new(RwLock::new(m))
     }
 
+    #[test]
+    fn response_numbers_retain_exact_decimal_spelling() {
+        let body: HashMap<String, HashMap<String, Box<RawValue>>> =
+            serde_json::from_str(r#"{"ethereum":{"usd":3942.1700000001}}"#).unwrap();
+        let raw = body["ethereum"]["usd"].get();
+        assert_eq!(raw, "3942.1700000001");
+        assert_eq!(
+            ReferencePrice::from_json_number(raw).unwrap(),
+            ReferencePrice::from_decimal("3942.1700000001").unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn fetch_prices_returns_mapped_cents_for_known_tokens() {
         let server = MockServer::start().await;
@@ -185,7 +213,7 @@ mod tests {
             .and(path("/simple/price"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(r#"{"usd-coin":{"usd":1.0},"ethereum":{"usd":3942.17}}"#),
+                    .set_body_string(r#"{"usd-coin":{"usd":1.0,"last_updated_at":1700000000},"ethereum":{"usd":3942.17,"last_updated_at":1700000001}}"#),
             )
             .mount(&server)
             .await;
@@ -205,6 +233,14 @@ mod tests {
 
         assert_eq!(prices.get(&token_a()).map(|d| d.usd), Some(1.0));
         assert_eq!(prices.get(&token_b()).map(|d| d.usd), Some(3942.17));
+        assert_eq!(
+            prices.get(&token_a()).and_then(|d| d.source_updated_at_unix_ms),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            prices.get(&token_b()).and_then(|d| d.source_updated_at_unix_ms),
+            Some(1_700_000_001_000)
+        );
     }
 
     #[tokio::test]

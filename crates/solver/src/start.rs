@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client_factory::ClientFactory;
 use crate::config::SolverConfig;
 use crate::db;
-use crate::matcher::RouterHooks;
+use crate::matcher::{ClearingRuntime, RouterHooks};
 use crate::pipeline::{self, PipelineConfig};
 use crate::price::{PriceClient, SharedTokenMap};
 use crate::types::TokenId;
@@ -161,6 +161,46 @@ pub async fn start(
         None
     };
 
+    let mut clearing_bootstrap = None;
+    let clearing = if let Some(protocol_fee_ppm) = config.engine.clearing_fee_ppm {
+        anyhow::ensure!(
+            !config.engine.router_enabled,
+            "router_enabled must be false while exact pair clearing is enabled"
+        );
+        anyhow::ensure!(
+            protocol_fee_ppm < crate::clearing::PPM_DENOMINATOR,
+            "clearing_fee_ppm must be below {}",
+            crate::clearing::PPM_DENOMINATOR
+        );
+        let pairs = config
+            .pairs
+            .iter()
+            .map(|pair| {
+                Ok((
+                    AccountId::from_hex(&pair.asset_x_faucet_id)?,
+                    AccountId::from_hex(&pair.asset_y_faucet_id)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (bootstrap_tx, bootstrap_rx) = tokio::sync::oneshot::channel();
+        clearing_bootstrap = Some(bootstrap_tx);
+        Some(ClearingRuntime {
+            bootstrap: bootstrap_rx,
+            prices: channels.precise_rx.clone(),
+            pairs,
+            config: crate::clearing::ClearingConfig {
+                protocol_fee_ppm,
+                ..crate::clearing::ClearingConfig::default()
+            },
+            max_price_age_ms: config.engine.price_staleness_secs.saturating_mul(1_000),
+            max_source_age_ms: config.engine.clearing_max_source_age_secs.saturating_mul(1_000),
+            max_source_skew_ms: config.engine.clearing_max_source_skew_secs.saturating_mul(1_000),
+            solver_id,
+        })
+    } else {
+        None
+    };
+
     // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's
     //     LocalSet — the main coordination thread.
     let core = pipeline::spawn_core_services(
@@ -176,6 +216,7 @@ pub async fn start(
         channels.swap_snapshot_tx,
         channels.subscribe_tx,
         router_hooks,
+        clearing,
     );
 
     // 11. Observability server (Send; on the main thread).
@@ -214,6 +255,8 @@ pub async fn start(
         channels.subscribe_rx,
         Duration::from_millis(config.engine.fetch_interval_ms),
         last_sync_handle,
+        solver_id,
+        clearing_bootstrap,
     )?;
     let (executor_thread, exec_ready_rx) = crate::executor::spawn_executor_thread(
         factory.clone(),

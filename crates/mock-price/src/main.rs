@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{Query, State};
@@ -178,6 +179,10 @@ async fn simple_price(
     refresh(&s).await; // pick up any file edits
     let ids = q.get("ids").map(String::as_str).unwrap_or("");
     let map = s.prices.read().await;
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut rng = rand::rng();
     let mut out = Map::new();
     for id in ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -190,7 +195,7 @@ async fn simple_price(
         } else {
             base
         };
-        out.insert(id.to_string(), json!({ "usd": usd }));
+        out.insert(id.to_string(), json!({ "usd": usd, "last_updated_at": updated_at }));
     }
     Json(Value::Object(out))
 }

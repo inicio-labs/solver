@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use miden_client::{
     builder::ClientBuilder,
     keystore::FilesystemKeyStore,
-    rpc::{Endpoint, GrpcClient, NodeRpcClient},
+    rpc::{Endpoint, GrpcClient, NodeRpcClient, VerifyingRpcClient},
     Client, RemoteTransactionProver,
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
@@ -13,14 +13,13 @@ use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use solver::config::SolverConfig;
 
 /// Production [`solver::ClientFactory`]. Holds only `Send` config
-/// (endpoint string, timeout, paths, debug flag) so it can be cloned into
+/// (endpoint string, timeout, paths) so it can be cloned into
 /// each client OS thread; `build_*` run on the owning thread and construct
 /// the RPC client + miden `Client` there, so the `!Send` `Client` and the
 /// tonic gRPC internals never cross a thread boundary.
 pub(crate) struct ProdClientFactory {
     endpoint: String,
     timeout_ms: u64,
-    debug: bool,
     ingest_store_path: String,
     executor_store_path: String,
     keystore_path: String,
@@ -32,7 +31,6 @@ impl ProdClientFactory {
         Self {
             endpoint: config.rpc.endpoint.clone(),
             timeout_ms: config.rpc.timeout_ms,
-            debug: config.engine.debug_mode,
             ingest_store_path: config.solver.ingest_store_path.clone(),
             executor_store_path: config.solver.executor_store_path.clone(),
             keystore_path: config.solver.keystore_path.clone(),
@@ -51,7 +49,6 @@ impl solver::ClientFactory for ProdClientFactory {
         ClientBuilder::new()
             .rpc(self.rpc()?)
             .sqlite_store(PathBuf::from(&self.ingest_store_path))
-            .in_debug_mode(self.debug.into())
             .build()
             .await
             .context("Failed to build ingest (keyless) Miden client")
@@ -68,8 +65,7 @@ impl solver::ClientFactory for ProdClientFactory {
         let mut builder = ClientBuilder::new()
             .rpc(self.rpc()?)
             .sqlite_store(PathBuf::from(&self.executor_store_path))
-            .authenticator(keystore)
-            .in_debug_mode(self.debug.into());
+            .authenticator(keystore);
         // Offload proving to a remote prover when configured (the executor is
         // the only client that proves; ingest never submits transactions).
         if let Some(url) = &self.prover_endpoint {
@@ -81,9 +77,13 @@ impl solver::ClientFactory for ProdClientFactory {
     /// Standalone gRPC client at the configured endpoint — the same node the
     /// ingest/executor clients talk to. Lets the zombie-note classification
     /// path query nullifier commit heights without `Client::test_rpc_api()`.
+    ///
+    /// Wrapped in [`VerifyingRpcClient`]: `ClientBuilder::rpc` adds no response
+    /// verification itself (only `grpc_client` does), and both clients are
+    /// built from this.
     fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
         let endpoint = Endpoint::try_from(self.endpoint.as_str())
             .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
-        Ok(Arc::new(GrpcClient::new(&endpoint, self.timeout_ms)))
+        Ok(Arc::new(VerifyingRpcClient::new(GrpcClient::new(&endpoint, self.timeout_ms))))
     }
 }

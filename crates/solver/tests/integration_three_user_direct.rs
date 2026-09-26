@@ -22,9 +22,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
-use miden_client::testing::common::{
-    insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
-};
+use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_protocol::account::AccountType;
@@ -54,28 +52,30 @@ async fn three_user_direct_matching() -> Result<()> {
             // 2. USER Client: owns alice/bob/charlie + USDC/ETH faucets.
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
             let mut user_client =
-                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?;
+                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
+                    .await?);
             user_client
                 .ensure_genesis_in_place()
                 .await
                 .map_err(|e| anyhow::anyhow!("user genesis: {e}"))?;
-            let user_keystore =
-                miden_client::keystore::FilesystemKeyStore::new(user_keystore_path.clone())
-                    .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
-
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
-            let (usdc, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (eth, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (alice, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (bob, _) = insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (charlie, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+            let (usdc, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (eth, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (alice, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (bob, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (charlie, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
 
             println!(
                 "[test] usdc={}, eth={}, alice={}, bob={}, charlie={}",
@@ -88,21 +88,21 @@ async fn three_user_direct_matching() -> Result<()> {
 
             // 3. Fund users via mint+consume → prove → sync. Each round commits
             //    one block; sync_state pulls the new state into the user Client.
-            mint_and_consume(&mut user_client, alice.id(), usdc.id(), NoteType::Public).await;
+            user_client.mint_and_consume(alice.id(), usdc.id(), NoteType::Public).await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("user sync after alice mint: {e}"))?;
 
-            mint_and_consume(&mut user_client, bob.id(), eth.id(), NoteType::Public).await;
+            user_client.mint_and_consume(bob.id(), eth.id(), NoteType::Public).await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("user sync after bob mint: {e}"))?;
 
-            mint_and_consume(&mut user_client, charlie.id(), usdc.id(), NoteType::Public).await;
+            user_client.mint_and_consume(charlie.id(), usdc.id(), NoteType::Public).await?;
             rpc.prove_block();
             user_client
                 .sync_state()
@@ -195,21 +195,19 @@ async fn three_user_direct_matching() -> Result<()> {
             //    and the solver process reloads it on start.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut solver_client = build_test_client(
+                let mut solver_client = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 solver_client
                     .ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let solver_keystore =
-                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                        .map_err(|e| anyhow::anyhow!("solver FilesystemKeyStore::new: {e}"))?;
-                let (solver_account, _) =
-                    insert_new_wallet(&mut solver_client, mode, &solver_keystore, scheme).await?;
+                let (solver_account, _) = solver_client
+                    .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                    .await?;
                 solver_account.id()
                 // solver_client dropped here: account + key persisted to disk.
             };
@@ -256,6 +254,9 @@ async fn three_user_direct_matching() -> Result<()> {
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
                     triangular_enabled: true,
+                    clearing_fee_ppm: None,
+                    clearing_max_source_age_secs: 60,
+                    clearing_max_source_skew_secs: 30,
                     admin_port: 0,
                     debug_mode: false,
                     obs_port: 0,

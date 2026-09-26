@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
-use miden_client::testing::common::insert_new_wallet;
+use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_protocol::account::AccountType;
 use miden_testing::MockChain;
@@ -34,25 +34,21 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
             // signature (executor build fails before it's ever used).
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = build_test_client(
+                let mut sc = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let ks =
-                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                        .map_err(|e| anyhow::anyhow!("FilesystemKeyStore::new: {e}"))?;
-                let (acct, _) = insert_new_wallet(
-                    &mut sc,
-                    AccountType::Public,
-                    &ks,
-                    AuthSchemeId::Falcon512Poseidon2,
-                )
-                .await?;
+                let (acct, _) = sc
+                    .insert_account(
+                        AccountSetup::wallet(AccountType::Public)
+                            .auth_scheme(AuthSchemeId::Falcon512Poseidon2),
+                    )
+                    .await?;
                 acct.id()
             };
 
@@ -86,6 +82,9 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
                     triangular_enabled: false,
+                    clearing_fee_ppm: None,
+                    clearing_max_source_age_secs: 60,
+                    clearing_max_source_skew_secs: 30,
                     admin_port: 0,
                     debug_mode: false,
                     obs_port: 0,

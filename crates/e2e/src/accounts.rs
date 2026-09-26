@@ -6,26 +6,23 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use miden_client::account::component::{
-    BasicWallet,
-    BurnPolicyConfig,
-    FungibleFaucet,
-    MintPolicyConfig,
-    PolicyRegistration,
-    TokenPolicyManager,
+    BasicWallet, BurnPolicy, FungibleFaucet, MintPolicy, TokenPolicyManager,
 };
 use miden_client::account::{AccountBuilder, AccountBuilderSchemaCommitmentExt, AccountType};
-use miden_client::auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig};
+use miden_client::auth::{Approver, AuthSchemeId, AuthSecretKey, AuthSingleSig};
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::note::Note;
 use miden_client::store::{NoteFilter, TransactionFilter};
-use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder, TransactionStatus};
+use miden_client::transaction::{
+    PswapTransactionData, TransactionRequestBuilder, TransactionStatus,
+};
 use miden_client::Client;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::{AssetAmount, FungibleAsset, TokenSymbol};
 use miden_protocol::note::NoteType;
 use miden_protocol::transaction::TransactionId;
 use miden_standards::account::faucets::TokenName;
-use rand::RngCore;
+use rand::Rng;
 
 type DevClient = Client<FilesystemKeyStore>;
 
@@ -40,21 +37,27 @@ pub async fn create_wallet(
     keystore: &FilesystemKeyStore,
 ) -> Result<AccountId> {
     let key = AuthSecretKey::new_falcon512_poseidon2();
-    let auth = AuthSingleSig::new(key.public_key().to_commitment(), SCHEME);
+    let auth = AuthSingleSig::new(Approver::new(key.public_key().to_commitment(), SCHEME));
 
     let mut seed = [0u8; 32];
     client.rng().fill_bytes(&mut seed);
 
     let account = AccountBuilder::new(seed)
         .account_type(AccountType::Public)
-        .with_auth_component(auth)
+        .with_component(auth)
         .with_component(BasicWallet)
         .build_with_schema_commitment()
         .context("build wallet account")?;
 
     let id = account.id();
-    keystore.add_key(&key, id).await.context("add wallet key to keystore")?;
-    client.add_account(&account, false).await.context("add wallet to client store")?;
+    keystore
+        .add_key(&key, id)
+        .await
+        .context("add wallet key to keystore")?;
+    client
+        .add_account(&account, false)
+        .await
+        .context("add wallet to client store")?;
     Ok(id)
 }
 
@@ -70,7 +73,7 @@ pub async fn create_faucet(
     max_supply: u64,
 ) -> Result<AccountId> {
     let key = AuthSecretKey::new_falcon512_poseidon2();
-    let auth = AuthSingleSig::new(key.public_key().to_commitment(), SCHEME);
+    let auth = AuthSingleSig::new(Approver::new(key.public_key().to_commitment(), SCHEME));
 
     let mut seed = [0u8; 32];
     client.rng().fill_bytes(&mut seed);
@@ -85,23 +88,28 @@ pub async fn create_faucet(
         .build()
         .context("build faucet component")?;
 
-    let policy = TokenPolicyManager::new()
-        .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
-        .context("mint policy")?
-        .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
-        .context("burn policy")?;
+    let policy = TokenPolicyManager::builder()
+        .active_mint_policy(MintPolicy::allow_all())
+        .active_burn_policy(BurnPolicy::allow_all())
+        .build();
 
     let account = AccountBuilder::new(seed)
         .account_type(AccountType::Public)
-        .with_auth_component(auth)
+        .with_component(auth)
         .with_component(faucet)
         .with_components(policy)
         .build_with_schema_commitment()
         .context("build faucet account")?;
 
     let id = account.id();
-    keystore.add_key(&key, id).await.context("add faucet key to keystore")?;
-    client.add_account(&account, false).await.context("add faucet to client store")?;
+    keystore
+        .add_key(&key, id)
+        .await
+        .context("add faucet key to keystore")?;
+    client
+        .add_account(&account, false)
+        .await
+        .context("add faucet to client store")?;
     Ok(id)
 }
 
@@ -140,7 +148,13 @@ pub async fn create_pswap(
 ) -> Result<(TransactionId, Note)> {
     let data = PswapTransactionData::new(creator_id, offered, requested);
     let request = TransactionRequestBuilder::new()
-        .build_pswap_create(&data, NoteType::Public, NoteType::Public, None, client.rng())
+        .build_pswap_create(
+            &data,
+            NoteType::Public,
+            NoteType::Public,
+            None,
+            client.rng(),
+        )
         .context("build pswap-create request")?;
     let note = request
         .expected_output_own_notes()
@@ -181,18 +195,26 @@ pub async fn committed_input_notes(client: &DevClient) -> Result<Vec<Note>> {
 }
 
 /// On-chain balance of `faucet_id`'s asset in `account_id`'s vault.
-pub async fn balance(client: &DevClient, account_id: AccountId, faucet_id: AccountId) -> Result<u64> {
+pub async fn balance(
+    client: &DevClient,
+    account_id: AccountId,
+    faucet_id: AccountId,
+) -> Result<u64> {
     client
         .account_reader(account_id)
         .get_balance(faucet_id)
         .await
         .with_context(|| format!("read balance of {faucet_id} in {account_id}"))
+        .map(|amount| amount.as_u64())
 }
 
 /// Sync the client and block until `tx_id` is committed (or discarded → error).
 pub async fn wait_for_tx(client: &mut DevClient, tx_id: TransactionId) -> Result<()> {
     loop {
-        client.sync_state().await.context("sync while waiting for tx")?;
+        client
+            .sync_state()
+            .await
+            .context("sync while waiting for tx")?;
         let tracked = client
             .get_transactions(TransactionFilter::Ids(vec![tx_id]))
             .await

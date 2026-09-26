@@ -9,6 +9,7 @@ use solver::config::SolverConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod client_factory;
+mod provision;
 use client_factory::ProdClientFactory;
 
 /// Initialise the global `tracing` subscriber.
@@ -47,10 +48,12 @@ fn init_tracing() {
     }
 }
 
-/// CLI surface: a single optional `--config <PATH>`. Precedence is
-/// clap-native — explicit flag > `$SOLVER_CONFIG` env > the `solver.toml`
-/// default. `--help`/`--version` are auto-generated; an unknown flag or
-/// `--config` with no value is a clap usage error (non-zero exit).
+/// CLI surface: an optional `--config <PATH>` plus two operator subcommands,
+/// `provision-account` and `fund-account` (see [`provision`]); with no
+/// subcommand the solver runs. Config precedence is clap-native — explicit
+/// flag > `$SOLVER_CONFIG` env > the `solver.toml` default. `--help`/`--version`
+/// are auto-generated; an unknown flag or `--config` with no value is a clap
+/// usage error (non-zero exit).
 fn cli() -> clap::Command {
     clap::Command::new("solver-bin")
         .version(env!("CARGO_PKG_VERSION"))
@@ -60,7 +63,16 @@ fn cli() -> clap::Command {
                 .value_name("PATH")
                 .env("SOLVER_CONFIG")
                 .default_value("solver.toml")
+                .global(true)
                 .help("Path to the TOML config file"),
+        )
+        .subcommand(
+            clap::Command::new("provision-account")
+                .about("Create the solver account in the executor store and keystore, and print its id"),
+        )
+        .subcommand(
+            clap::Command::new("fund-account")
+                .about("Consume the notes sent to the solver account, which deploys and funds it"),
         )
 }
 
@@ -69,14 +81,19 @@ async fn run() -> Result<()> {
     init_tracing();
 
     // Parses argv; `--help` / `--version` / usage errors print and exit here.
-    let config_path = cli()
-        .get_matches()
+    let matches = cli().get_matches();
+    let config_path = matches
         .get_one::<String>("config")
         .expect("`config` always has a default_value")
         .clone();
 
     let config = SolverConfig::load(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
+    match matches.subcommand_name() {
+        Some("provision-account") => return provision::provision_account(&config).await,
+        Some("fund-account") => return provision::fund_account(&config).await,
+        _ => {}
+    }
     let solver_id = AccountId::from_hex(&config.solver.account_id)
         .with_context(|| format!("invalid solver account_id {:?}", config.solver.account_id))?;
 

@@ -4,6 +4,7 @@ use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
 use miden_client::rpc::NodeRpcClient;
 use miden_client::Client;
+use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
@@ -60,6 +61,13 @@ pub trait MidenClient {
     /// by id. Returns `None` if the account isn't a public faucet / doesn't
     /// exist. Keyless — no signing, no pre-tracking.
     async fn fetch_token_metadata(&mut self, faucet_id: TokenId) -> Result<Option<(u8, String)>>;
+
+    /// The chain tip's fee parameters `(fee faucet, verification base fee)`, or
+    /// `None` when this client can't report them — mocks, which skip the
+    /// executor's fee pre-flight.
+    async fn fee_parameters(&mut self) -> Result<Option<(TokenId, u32)>> {
+        Ok(None)
+    }
 }
 
 /// Run the note ingestion loop.
@@ -67,6 +75,7 @@ pub trait MidenClient {
 /// Each tick: sync → fetch new notes by ID → filter PSWAP → atomic DB insert → send to channel.
 /// On a successful tick the `last_sync_unix_seconds` atomic is bumped so the
 /// observability `/readyz` endpoint can detect a stalled ingest.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ingest(
     client: Arc<Mutex<dyn MidenClient>>,
     pool: DbPool,
@@ -75,6 +84,7 @@ pub async fn run_ingest(
     interval: Duration,
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicI64>,
+    solver_id: AccountId,
 ) {
     loop {
         // Finish-the-unit shutdown: `ingest_once` is deliberately NOT wrapped
@@ -85,7 +95,7 @@ pub async fn run_ingest(
         // on `cancel` whether it fired during the preceding `ingest_once` or
         // during the idle wait. Worst-case shutdown delay is one `ingest_once`,
         // bounded by the per-call RPC timeout (`rpc.timeout_ms`).
-        match ingest_once(&client, &pool, &order_tx, &consumed_tx).await {
+        match ingest_once(&client, &pool, &order_tx, &consumed_tx, solver_id).await {
             Ok(()) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -116,6 +126,7 @@ async fn ingest_once(
     pool: &DbPool,
     order_tx: &mpsc::Sender<IngestOrder>,
     consumed_tx: &mpsc::Sender<NoteId>,
+    solver_id: AccountId,
 ) -> Result<()> {
     let SyncResult {
         block_num,
@@ -170,6 +181,15 @@ async fn ingest_once(
             }
         };
 
+        // A note naming the solver as its creator takes PSWAP's reclaim branch when
+        // the solver consumes it: the offered asset lands in the solver's vault and
+        // no payback note is created, so the batch's expected outputs never appear
+        // and the whole batch fails — every tick, at a fee each time.
+        if order.creator_id == solver_id {
+            tracing::warn!(note_id = %note.id(), "skipping PSWAP note whose creator is the solver account");
+            continue;
+        }
+
         let note_id_bytes = note.id().to_bytes().to_vec();
 
         let mut raw_data = Vec::new();
@@ -193,14 +213,17 @@ async fn ingest_once(
                 .unwrap_or_default()
                 .as_secs() as i64,
             status: OrderStatus::Active.as_str().to_string(),
+            priority_seq: 0, // assigned by the DB trigger on first insert
         });
 
         ingest_orders.push(IngestOrder {
             note_id: note.id(),
+            priority_seq: 0, // replaced with the persisted sequence after insert
             offered_token: order.offered_faucet_id,
             requested_token: order.requested_faucet_id,
             offered_amount: order.offered_amount,
             requested_amount: order.requested_amount,
+            min_fill_step: order.min_fill_step,
             raw_note_data: raw_data,
         });
     }
@@ -223,8 +246,9 @@ async fn ingest_once(
     // 5. Forward only first-seen orders to the matcher. Backpressure via the
     //    bounded channel; an error means the matcher has shut down.
     let mut forwarded = 0usize;
-    for order in ingest_orders {
-        if inserted.contains(order.note_id.to_bytes().as_slice()) {
+    for mut order in ingest_orders {
+        if let Some(&priority_seq) = inserted.get(order.note_id.to_bytes().as_slice()) {
+            order.priority_seq = priority_seq;
             order_tx
                 .send(order)
                 .await
@@ -404,6 +428,20 @@ impl MidenClient for MidenClientAdapter {
             .map_err(|e| anyhow!("fetch_remote_token_metadata failed: {e}"))?;
         Ok(meta.map(|m| (m.decimals, m.symbol)))
     }
+
+    async fn fee_parameters(&mut self) -> Result<Option<(TokenId, u32)>> {
+        let (header, _) = self
+            .rpc
+            .get_block_header_by_number(None, false)
+            .await
+            .map_err(|e| anyhow!("fetch chain-tip header: {e}"))?;
+        let fees = header.fee_parameters();
+        let config = self.client.lock().await
+            .get_protocol_config(header.protocol_config_commitment())
+            .await
+            .map_err(|e| anyhow!("load protocol config for chain tip: {e}"))?;
+        Ok(Some((config.fee_asset_id().faucet_id(), fees.verification_base_fee())))
+    }
 }
 
 /// Spawn the keyless **ingest** OS thread: own `current_thread` runtime +
@@ -424,6 +462,8 @@ pub(crate) fn spawn_ingest_thread(
     subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
     last_sync: Arc<AtomicI64>,
+    solver_id: AccountId,
+    clearing_bootstrap: Option<oneshot::Sender<crate::matcher::ClearingBootstrap>>,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<Result<()>>();
     let ingest_factory = factory;
@@ -465,6 +505,8 @@ pub(crate) fn spawn_ingest_thread(
                     ingest_interval,
                     ingest_cancel.clone(),
                     ingest_last_sync,
+                    solver_id,
+                    clearing_bootstrap,
                 )
                 .await
                 {
@@ -532,6 +574,7 @@ pub mod tests {
         /// Set of note IDs that should be reported as consumed by
         /// `check_consumed_notes`. Persistent — represents on-chain state.
         consumed_set: HashSet<NoteId>,
+        pub fail_consumed_check: bool,
         /// Canned on-chain metadata returned by `fetch_token_metadata`
         /// (`None` = the faucet has no public metadata).
         token_metadata: Option<(u8, String)>,
@@ -544,6 +587,7 @@ pub mod tests {
                 block: 0,
                 pending_consumed: Vec::new(),
                 consumed_set: HashSet::new(),
+                fail_consumed_check: false,
                 token_metadata: None,
             }
         }
@@ -594,6 +638,7 @@ pub mod tests {
         }
 
         async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>> {
+            anyhow::ensure!(!self.fail_consumed_check, "mock nullifier RPC unavailable");
             Ok(notes
                 .iter()
                 .map(|n| n.id())

@@ -3,30 +3,39 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::matching::price_feed::{PriceFeed, UsdCents};
+use crate::clearing::ReferencePrice;
 use crate::price::{read_token_map, SharedTokenMap};
 use crate::types::TokenId;
 
-/// Matcher-facing price snapshot: token (faucet) ID → USD price in whole cents.
-/// This integer representation is the fund-critical path's source of truth.
+/// Legacy-matcher snapshot: token (faucet) ID → USD price in whole cents.
 pub type PriceSnapshot = HashMap<TokenId, UsdCents>;
 
-/// Full-precision price for a token (the public price-query API only). Kept
-/// OUT of the matcher path so floats never enter settlement.
+/// One token's wallet-API price and independently parsed exact clearing price.
+/// Only `exact_reference` may enter clearing arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PriceData {
     /// Price in the quote currency at full precision (CoinGecko `precision=full`).
     pub usd: f64,
+    /// Original provider number, parsed without `f64`. Clearing requires this;
+    /// `None` keeps API-only prices usable but never admits them to settlement.
+    pub exact_reference: Option<ReferencePrice>,
+    /// Provider's own last-update timestamp, not the local HTTP fetch time.
+    /// Clearing requires it; API-only and legacy prices may omit it.
+    pub source_updated_at_unix_ms: Option<u64>,
+    /// Local observation time assigned to every token in one completed fetch.
+    /// Zero means this value has not been published by the price-feed loop.
+    pub observed_at_unix_ms: u64,
 }
 
-/// Token → full-precision price, broadcast on a side channel for the price API.
+/// Token → price data, published once for the wallet API and clearing.
 pub type PreciseSnapshot = HashMap<TokenId, PriceData>;
 
-/// Trait abstracting the price service. Returns full-precision values; the
-/// matcher's cents snapshot is derived in [`run_price_feed`].
+/// Trait abstracting the price service. The legacy matcher's cents snapshot is
+/// derived in [`run_price_feed`]; exact clearing uses `exact_reference` only.
 #[async_trait]
 pub trait PriceClient: Send {
     async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PreciseSnapshot>;
@@ -42,7 +51,17 @@ impl MockPriceClient {
     pub fn new(prices: PriceSnapshot) -> Self {
         let prices = prices
             .into_iter()
-            .map(|(t, cents)| (t, PriceData { usd: cents as f64 / 100.0 }))
+            .map(|(t, cents)| {
+                (
+                    t,
+                    PriceData {
+                        usd: cents as f64 / 100.0,
+                        exact_reference: ReferencePrice::from_ratio(cents, 100).ok(),
+                        source_updated_at_unix_ms: None,
+                        observed_at_unix_ms: 0,
+                    },
+                )
+            })
             .collect();
         Self { prices }
     }
@@ -83,8 +102,8 @@ fn to_cents(precise: &PreciseSnapshot) -> PriceSnapshot {
 /// Run the price fetching loop. The token set comes from the in-memory
 /// `token_map` (hydrated at boot, kept current by admin write-through), so the
 /// loop never reads the DB. Each successful poll publishes the current prices
-/// twice — a whole-cents map for the matcher (the fund path uses integers,
-/// never floats) and a full-precision map for the price API — and bumps
+/// twice — a whole-cents map for the legacy matcher and one snapshot retaining
+/// exact references for clearing plus f64 prices for the wallet API — and bumps
 /// `last_price_update`. A failed poll keeps the last good prices and does NOT
 /// advance the timestamp, so the API can detect staleness.
 pub async fn run_price_feed(
@@ -99,12 +118,14 @@ pub async fn run_price_feed(
         // Guard drops at the end of this statement, so the lock is never held across the await.
         let tokens: Vec<TokenId> = read_token_map(&token_map).keys().copied().collect();
         match client.fetch_prices(&tokens).await {
-            Ok(precise) => {
+            Ok(mut precise) => {
+                let observed_at_unix_ms = crate::types::now_millis();
+                for data in precise.values_mut() {
+                    data.observed_at_unix_ms = observed_at_unix_ms;
+                }
                 let _ = price_tx.send(to_cents(&precise));
                 let _ = precise_tx.send(precise);
-                if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                    last_price_update.store(d.as_secs() as i64, Ordering::Relaxed);
-                }
+                last_price_update.store((observed_at_unix_ms / 1_000) as i64, Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "price fetch failed; matcher continues with last good snapshot");

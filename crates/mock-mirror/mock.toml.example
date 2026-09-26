@@ -42,6 +42,10 @@ sync_interval_ms = 3000
 seed = 42
 # Guardrail: must be true to run against a mainnet RPC. This is a test harness.
 allow_mainnet = false
+# Fee token (native MIDEN on the 0.16 testnet) and how much of it to keep for
+# transaction fees: counters that offer this token never go below the reserve.
+fee_faucet_id = "0x18101fa522c174b165efd4f70a0385"
+fee_reserve = 1000000   # 1 MIDEN (6 decimals)
 
 # One [[pairs]] per market to make. Both directions are subscribed. Use the
 # faucet ids (hex) of your tokens. Example: quote everything in IUSDT.

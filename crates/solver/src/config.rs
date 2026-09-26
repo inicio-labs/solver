@@ -82,12 +82,21 @@ pub struct EngineConfig {
     /// the same. Disable to skip the O(T³) enumeration on large token sets.
     #[serde(default = "default_true")]
     pub triangular_enabled: bool,
+    /// Opt into exact-price, two-sided PSWAP clearing. When omitted the legacy
+    /// matcher remains active. The value is also the eligibility edge in ppm.
+    #[serde(default)]
+    pub clearing_fee_ppm: Option<u32>,
+    /// Maximum age of each provider's own price timestamp when clearing.
+    #[serde(default = "default_clearing_source_age_secs")]
+    pub clearing_max_source_age_secs: u64,
+    /// Maximum difference between the two provider price timestamps.
+    #[serde(default = "default_clearing_source_skew_secs")]
+    pub clearing_max_source_skew_secs: u64,
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
-    /// Whether to run the Miden client in debug mode. Enables MASM debug
-    /// instrumentation. Useful for testnet diagnostics; MUST be `false` for
-    /// mainnet. Defaults to `false` when omitted from `solver.toml`.
+    /// Ignored since Miden 0.16 (miden-client removed debug mode); kept so
+    /// existing `solver.toml` files still parse. A warning is logged if set.
     #[serde(default)]
     pub debug_mode: bool,
     /// TCP port the observability HTTP server binds on `127.0.0.1`. Exposes
@@ -204,6 +213,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_clearing_source_age_secs() -> u64 {
+    60
+}
+
+fn default_clearing_source_skew_secs() -> u64 {
+    30
+}
+
 fn default_admin_port() -> u16 {
     3001
 }
@@ -272,9 +289,10 @@ impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        let config: SolverConfig =
+        let mut config: SolverConfig =
             toml::from_str(&content).context("Failed to parse config file")?;
         config.validate()?;
+        config.apply_miden_016_overrides();
         Ok(config)
     }
 
@@ -289,7 +307,31 @@ impl SolverConfig {
             !self.engine.price_vs_currency.trim().is_empty(),
             "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
         );
+        if let Some(fee) = self.engine.clearing_fee_ppm {
+            anyhow::ensure!(
+                fee < crate::clearing::PPM_DENOMINATOR,
+                "engine.clearing_fee_ppm must be below {}",
+                crate::clearing::PPM_DENOMINATOR
+            );
+        }
         Ok(())
+    }
+
+    /// Settings this build can't honour on Miden 0.16, forced off with a warning.
+    /// - `triangular_enabled`: the 3-cycle path fills via `Order::fill` directly and
+    ///   doesn't enforce PSWAP `min_fill_step`, so one sub-floor fill would fail the
+    ///   whole batch transaction.
+    /// - `debug_mode`: miden-client 0.16 removed client debug mode.
+    fn apply_miden_016_overrides(&mut self) {
+        if self.engine.triangular_enabled {
+            tracing::warn!(
+                "engine.triangular_enabled forced to false: triangular matching does not enforce PSWAP min_fill_step yet"
+            );
+            self.engine.triangular_enabled = false;
+        }
+        if self.engine.debug_mode {
+            tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
+        }
     }
 
     pub fn save(&self, path: &str) -> Result<()> {

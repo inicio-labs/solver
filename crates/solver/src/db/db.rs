@@ -1,14 +1,15 @@
 use anyhow::Result;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
 use diesel::sqlite::SqliteConnection;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+const SCHEMA: &str = include_str!("../../schema.sql");
 
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
+use miden_protocol::note::Note;
 
 use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
 use crate::db::models::*;
@@ -66,8 +67,7 @@ pub fn init_db(database_url: &str, read_pool_size: u32) -> Result<DbPool> {
         .build(ConnectionManager::<SqliteConnection>::new(database_url))?;
 
     let mut conn = write_pool.get()?;
-    conn.run_pending_migrations(MIGRATIONS)
-        .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
+    conn.batch_execute(SCHEMA)?;
 
     Ok(DbPool { write: write_pool, read: read_pool })
 }
@@ -85,8 +85,8 @@ pub fn get_last_fetched_block(conn: &mut SqliteConnection) -> Result<u64> {
 /// Atomic batch insert: notes + orders + advance block cursor.
 ///
 /// Uses INSERT OR IGNORE so re-fetched notes are safely skipped. Returns the
-/// set of `orders.note_id` byte-vecs that were *actually* inserted by this
-/// call (rows-affected == 1). Duplicates (already-known orders) are excluded
+/// map of `orders.note_id` to persisted FIFO sequence for rows actually
+/// inserted by this call (rows-affected == 1). Duplicates are excluded
 /// from the returned set — callers use this to forward each order to the
 /// matcher exactly once, durably, without an in-memory dedup set.
 pub fn insert_notes_batch(
@@ -94,20 +94,29 @@ pub fn insert_notes_batch(
     new_notes: &[NoteRow],
     new_orders: &[OrderRow],
     block_number: u64,
-) -> Result<HashSet<Vec<u8>>> {
+) -> Result<HashMap<Vec<u8>, u64>> {
     conn.transaction(|conn| {
         for note in new_notes {
             diesel::insert_or_ignore_into(notes::table)
                 .values(note)
                 .execute(conn)?;
         }
-        let mut inserted = HashSet::new();
+        let mut inserted = HashMap::new();
         for order in new_orders {
             let affected = diesel::insert_or_ignore_into(orders::table)
                 .values(order)
                 .execute(conn)?;
             if affected == 1 {
-                inserted.insert(order.note_id.clone());
+                let sequence: i64 = orders::table
+                    .find(&order.note_id)
+                    .select(orders::priority_seq)
+                    .first(conn)?;
+                let sequence = u64::try_from(sequence)
+                    .map_err(|_| anyhow::anyhow!("invalid persisted FIFO sequence"))?;
+                if sequence == 0 {
+                    anyhow::bail!("missing persisted FIFO sequence after insert");
+                }
+                inserted.insert(order.note_id.clone(), sequence);
             }
         }
         diesel::update(sync_state::table.find(1))
@@ -203,6 +212,7 @@ pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<
     let rows: Vec<(OrderRow, Vec<u8>)> = orders::table
         .inner_join(notes::table.on(orders::note_id.eq(notes::note_id)))
         .filter(orders::status.eq(OrderStatus::Active.as_str()))
+        .order(orders::priority_seq.asc())
         .select((OrderRow::as_select(), notes::raw_data))
         .load(conn)?;
 
@@ -214,12 +224,32 @@ pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<
             .map_err(|e| anyhow::anyhow!("invalid offered_asset in DB: {e}"))?;
         let requested_token = TokenId::read_from(&mut SliceReader::new(&order_row.requested_asset))
             .map_err(|e| anyhow::anyhow!("invalid requested_asset in DB: {e}"))?;
+        // `min_fill_step` isn't a column: read it from the stored note. A row whose
+        // note doesn't parse could never settle, so skip it rather than failing the
+        // whole hydration.
+        let parsed = Note::read_from(&mut SliceReader::new(&raw_data))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .and_then(|note| crate::types::Order::from_note(&note));
+        let min_fill_step = match parsed {
+            Ok(order) => order.min_fill_step,
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping active order whose stored note does not parse");
+                continue;
+            }
+        };
+        let priority_seq = u64::try_from(order_row.priority_seq)
+            .map_err(|_| anyhow::anyhow!("invalid persisted FIFO sequence"))?;
+        if priority_seq == 0 {
+            anyhow::bail!("active order lacks persisted FIFO sequence");
+        }
         out.push(IngestOrder {
             note_id,
+            priority_seq,
             offered_token,
             requested_token,
             offered_amount: order_row.offered_amount as u64,
             requested_amount: order_row.requested_amount as u64,
+            min_fill_step,
             raw_note_data: raw_data,
         });
     }
@@ -408,6 +438,18 @@ mod tests {
     }
 
     #[test]
+    fn fresh_schema_can_run_again_without_resetting_state() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        diesel::sql_query("UPDATE sync_state SET last_fetched_block = 42 WHERE id = 1")
+            .execute(&mut conn)
+            .unwrap();
+
+        conn.batch_execute(SCHEMA).unwrap();
+        assert_eq!(get_last_fetched_block(&mut conn).unwrap(), 42);
+    }
+
+    #[test]
     fn test_insert_notes_batch() {
         let pool = test_pool();
         let mut conn = pool.write_conn().unwrap();
@@ -427,6 +469,7 @@ mod tests {
             offered_amount: 1000,
             timestamp: 1000,
             status: OrderStatus::Active.as_str().to_string(),
+            priority_seq: 0,
         };
 
         insert_notes_batch(&mut conn, &[note], &[order], 42).unwrap();
@@ -458,6 +501,7 @@ mod tests {
             offered_amount: 200,
             timestamp: 100,
             status: OrderStatus::Active.as_str().to_string(),
+            priority_seq: 0,
         };
 
         insert_notes_batch(&mut conn, &[note], &[order], 1).unwrap();
@@ -518,18 +562,50 @@ mod tests {
             offered_amount: 1,
             timestamp: 1,
             status: OrderStatus::Active.as_str().to_string(),
+            priority_seq: 0,
         };
 
         let first =
             insert_notes_batch(&mut conn, &[note.clone()], &[order.clone()], 1).unwrap();
         assert_eq!(first.len(), 1);
-        assert!(first.contains(&vec![9, 9, 9]));
+        assert!(first.contains_key(&vec![9, 9, 9]));
+        assert_eq!(first[&vec![9, 9, 9]], 1);
 
         let second = insert_notes_batch(&mut conn, &[note], &[order], 2).unwrap();
         assert!(
             second.is_empty(),
             "re-inserting a known order must report zero newly-inserted note_ids"
         );
+        let persisted: i64 = orders::table
+            .find(vec![9, 9, 9])
+            .select(orders::priority_seq)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(persisted, 1);
+
+        // A removed highest-priority row must not let a later note inherit
+        // its sequence (SQLite may reuse the deleted rowid).
+        diesel::delete(orders::table.find(vec![9, 9, 9]))
+            .execute(&mut conn)
+            .unwrap();
+        let later_note = NoteRow {
+            note_id: vec![8, 8, 8],
+            account_id: vec![1],
+            raw_data: vec![2],
+        };
+        let later_order = OrderRow {
+            note_id: later_note.note_id.clone(),
+            account_id: vec![1],
+            requested_asset: vec![1],
+            requested_amount: 1,
+            offered_asset: vec![1],
+            offered_amount: 1,
+            timestamp: 2,
+            status: OrderStatus::Active.as_str().to_string(),
+            priority_seq: 0,
+        };
+        let later = insert_notes_batch(&mut conn, &[later_note], &[later_order], 3).unwrap();
+        assert_eq!(later[&vec![8, 8, 8]], 2);
     }
 
     #[test]
@@ -604,6 +680,7 @@ mod tests {
             offered_amount: 1,
             timestamp: 1,
             status: status.as_str().to_string(),
+            priority_seq: 0,
         };
         insert_notes_batch(conn, &[note], &[order], 1).unwrap();
     }

@@ -18,9 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
-use miden_client::testing::common::{
-    insert_new_fungible_faucet, insert_new_wallet, mint_and_consume,
-};
+use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_protocol::account::AccountType;
@@ -42,34 +40,35 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
 
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
             let mut user_client =
-                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?;
+                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
+                    .await?);
             user_client
                 .ensure_genesis_in_place()
                 .await
                 .map_err(|e| anyhow::anyhow!("user genesis: {e}"))?;
-            let user_keystore =
-                miden_client::keystore::FilesystemKeyStore::new(user_keystore_path.clone())
-                    .map_err(|e| anyhow::anyhow!("user FilesystemKeyStore::new: {e}"))?;
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
             // `foo` is the UNPRICED token; `eth` is priced.
-            let (foo, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (eth, _) =
-                insert_new_fungible_faucet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (alice, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
-            let (bob, _) =
-                insert_new_wallet(&mut user_client, mode, &user_keystore, scheme).await?;
+            let (foo, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (eth, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (alice, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (bob, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
             let foo_id = foo.id();
             let eth_id = eth.id();
 
-            mint_and_consume(&mut user_client, alice.id(), foo_id, NoteType::Public).await;
+            user_client.mint_and_consume(alice.id(), foo_id, NoteType::Public).await?;
             rpc.prove_block();
             user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync a: {e}"))?;
-            mint_and_consume(&mut user_client, bob.id(), eth_id, NoteType::Public).await;
+            user_client.mint_and_consume(bob.id(), eth_id, NoteType::Public).await?;
             rpc.prove_block();
             user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync b: {e}"))?;
 
@@ -100,19 +99,18 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
 
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = build_test_client(
+                let mut sc = TestClient::new(build_test_client(
                     rpc.clone(),
                     solver_keystore_path.clone(),
                     solver_store_path.clone(),
                 )
-                .await?;
+                .await?);
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let ks =
-                    miden_client::keystore::FilesystemKeyStore::new(solver_keystore_path.clone())
-                        .map_err(|e| anyhow::anyhow!("FilesystemKeyStore::new: {e}"))?;
-                let (acct, _) = insert_new_wallet(&mut sc, mode, &ks, scheme).await?;
+                let (acct, _) = sc
+                    .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                    .await?;
                 acct.id()
             };
             let ingest_store = solver_temp.path().join("ingest_store.sqlite3");
@@ -147,6 +145,9 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
                     triangular_enabled: false,
+                    clearing_fee_ppm: None,
+                    clearing_max_source_age_secs: 60,
+                    clearing_max_source_skew_secs: 30,
                     admin_port: 0,
                     debug_mode: false,
                     obs_port: 0,

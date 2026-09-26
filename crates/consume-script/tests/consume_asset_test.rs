@@ -51,7 +51,7 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
 
     // Alice's PSWAP note: offers 100 USDC, requests 10 ETH
     let alice_storage = PswapNoteStorage::builder()
-        .requested_asset(FungibleAsset::new(eth_faucet.id(), 10)?)
+        .min_requested_asset(FungibleAsset::new(eth_faucet.id(), 10)?)
         .creator_account_id(alice.id())
         .build();
     let alice_note: Note = PswapNote::builder()
@@ -66,7 +66,7 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
 
     // Bob's PSWAP note: offers 10 ETH, requests 80 USDC
     let bob_storage = PswapNoteStorage::builder()
-        .requested_asset(FungibleAsset::new(usdc_faucet.id(), 80)?)
+        .min_requested_asset(FungibleAsset::new(usdc_faucet.id(), 80)?)
         .creator_account_id(bob.id())
         .build();
     let bob_note: Note = PswapNote::builder()
@@ -110,17 +110,18 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     )?;
 
     // Surplus: 100 USDC offered by Alice - 80 USDC sent to Bob = 20 USDC for solver
-    let surplus_asset = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 20)?);
+    let surplus_asset: Asset = FungibleAsset::new(usdc_faucet.id(), 20)?.into();
     let consume_data: ConsumeAssetData = ConsumeAssetScript::prepare(&[surplus_asset]);
     let tx_script = ConsumeAssetScript::tx_script();
 
     let tx_context = mock_chain
-        .build_tx_context(solver.id(), &[alice_note.id(), bob_note.id()], &[])?
+        .build_transaction(solver.id())
+        .authenticated_input_notes([alice_note.id(), bob_note.id()])
         .tx_script(tx_script)
         .tx_script_args(consume_data.commitment_arg)
-        .extend_advice_map([consume_data.advice_map_entry])
+        .add_advice_map_entry(consume_data.advice_map_entry.0, consume_data.advice_map_entry.1)
         .extend_note_args(note_args_map)
-        .extend_expected_output_notes(vec![
+        .expected_output_notes(vec![
             RawOutputNote::Full(alice_p2id),
             RawOutputNote::Full(bob_p2id),
         ])
@@ -133,15 +134,16 @@ async fn consume_asset_script_captures_surplus() -> anyhow::Result<()> {
     assert_eq!(output_notes.num_notes(), 2, "Expected 2 P2ID output notes");
 
     // Verify solver's vault delta: should receive 20 USDC surplus
-    let vault_delta = executed_transaction.account_delta().vault();
-    let added: Vec<Asset> = vault_delta.added_assets().collect();
+    // `account_patch` carries absolute post-transaction amounts. The
+    // solver wallet starts empty, so its updated balance IS the surplus received.
+    let vault_patch = executed_transaction.account_patch().vault();
+    let added: Vec<Asset> = vault_patch.updated_assets().collect();
 
     let usdc_added: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == usdc_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(usdc_added, 20, "Solver should receive 20 USDC surplus");
 

@@ -1,4 +1,4 @@
-use miden::standards::wallets::basic->wallet
+use miden::standards::wallets::basic as wallet
 use miden::core::sys
 use miden::protocol::asset
 
@@ -14,14 +14,15 @@ use miden::protocol::asset
 # Stack on entry: [COMMITMENT_ARG, ...]
 #   COMMITMENT_ARG = reversed(COMMITMENT_KEY) for stack ordering.
 #
-# Advice map: { COMMITMENT_KEY: [ASSET_KEY_0, ASSET_VALUE_0, ASSET_KEY_1, ASSET_VALUE_1, ...] }
-#   Each asset = ASSET_KEY(4 felts) + ASSET_VALUE(4 felts) = 2 words.
+# Advice map: { COMMITMENT_KEY: [ASSET_ID_0, ASSET_VALUE_0, ASSET_ID_1, ASSET_VALUE_1, ...] }
+#   Each asset = ASSET_ID(4 felts) + ASSET_VALUE(4 felts) = 2 words.
 #   Total words must be even (pairs of words).
 
 # Memory addresses for temporary asset storage
 const ASSET_MEM_PTR = 500
 
-begin
+@transaction_script
+pub proc main
     # Stack: [COMMITMENT_ARG, pad...]
     # Reverse back to get the original commitment key order.
     swap movup.2 movup.3
@@ -81,9 +82,9 @@ begin
 
     dup.1 neq.0
     while.true
-        # Load ASSET_KEY word from advice stack
+        # Load ASSET_ID word from advice stack
         padw adv_loadw
-        # => [ASSET_KEY, write_ptr, remaining, num_assets, pad...]
+        # => [ASSET_ID, write_ptr, remaining, num_assets, pad...]
 
         # Store to memory
         dup.4 mem_storew_le dropw
@@ -124,11 +125,11 @@ begin
     while.true
         # Load asset from memory using asset::load (KEY at ptr, VALUE at ptr+4)
         dup exec.asset::load
-        # => [ASSET_KEY, ASSET_VALUE, read_ptr, num_assets, pad...]
+        # => [ASSET_ID, ASSET_VALUE, read_ptr, num_assets, pad...]
 
-        # Build 16-element call frame: [ASSET_KEY, ASSET_VALUE, pad(8)]
+        # Build 16-element call frame: [ASSET_ID, ASSET_VALUE, pad(8)]
         padw padw swapdw
-        # => [ASSET_KEY, ASSET_VALUE, pad(8), read_ptr, num_assets, pad...]
+        # => [ASSET_ID, ASSET_VALUE, pad(8), read_ptr, num_assets, pad...]
 
         call.wallet::receive_asset
         # => [pad(16), read_ptr, num_assets, pad...]

@@ -24,7 +24,7 @@ fn create_pswap_note(
     rng: &mut impl FeltRng,
 ) -> Note {
     let storage = PswapNoteStorage::builder()
-        .requested_asset(requested_asset)
+        .min_requested_asset(requested_asset)
         .creator_account_id(sender_id)
         .build();
     PswapNote::builder()
@@ -163,7 +163,7 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
 
     // ── Prepare consume-asset-script for surplus ──
     // Surplus: 6000 USDC in - 4800 USDC out = 1200 USDC
-    let surplus_asset = Asset::Fungible(FungibleAsset::new(usdc_faucet.id(), 1200)?);
+    let surplus_asset: Asset = FungibleAsset::new(usdc_faucet.id(), 1200)?.into();
     let consume_data = ConsumeAssetScript::prepare(&[surplus_asset]);
     let tx_script = ConsumeAssetScript::tx_script();
 
@@ -176,12 +176,13 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     ];
 
     let tx_context = mock_chain
-        .build_tx_context(solver.id(), &input_note_ids, &[])?
+        .build_transaction(solver.id())
+        .authenticated_input_notes(input_note_ids)
         .tx_script(tx_script)
         .tx_script_args(consume_data.commitment_arg)
-        .extend_advice_map([consume_data.advice_map_entry])
+        .add_advice_map_entry(consume_data.advice_map_entry.0, consume_data.advice_map_entry.1)
         .extend_note_args(note_args_map)
-        .extend_expected_output_notes(vec![
+        .expected_output_notes(vec![
             RawOutputNote::Full(alice_p2id_1),
             RawOutputNote::Full(alice_p2id_2),
             RawOutputNote::Full(bob_p2id_1),
@@ -196,24 +197,24 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     assert_eq!(output_notes.num_notes(), 4, "expected 4 P2ID output notes");
 
     // Solver vault: +1200 USDC surplus (from consume-asset-script)
-    let vault_delta = executed_transaction.account_delta().vault();
-    let added: Vec<Asset> = vault_delta.added_assets().collect();
+    // `account_patch` carries absolute post-transaction amounts. The
+    // solver wallet starts empty, so its updated balance IS the surplus received.
+    let vault_patch = executed_transaction.account_patch().vault();
+    let added: Vec<Asset> = vault_patch.updated_assets().collect();
 
     let usdc_surplus: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == usdc_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == usdc_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(usdc_surplus, 1200, "solver should receive 1200 USDC surplus");
 
     let eth_surplus: u64 = added
         .iter()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == eth_faucet.id() => Some(u64::from(f.amount())),
-            _ => None,
-        })
+        .filter_map(Asset::as_fungible)
+        .filter(|asset| asset.faucet_id() == eth_faucet.id())
+        .map(|asset| asset.amount().as_u64())
         .sum();
     assert_eq!(eth_surplus, 0, "no ETH surplus expected");
 

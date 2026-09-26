@@ -13,8 +13,9 @@ use miden_protocol::{
     asset::{Asset, FungibleAsset},
     crypto::utils::{Deserializable, Serializable, SliceReader},
     note::{Note, NoteRecipient},
+    transaction::InputNote,
 };
-use miden_standards::note::PswapNote;
+use miden_standards::note::{NoteConsumptionStatus, P2idNote, P2ideNote, PswapNote};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +37,33 @@ const INITIAL_RPC_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Maximum per-attempt backoff sleep. Caps `INITIAL_RPC_BACKOFF * 2^n`.
 const MAX_RPC_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Upper bound on one transaction's fee, in multiples of the verification base
+/// fee: `fee = base × (⌊log2 cycles⌋ + 1)` ≤ 30 × base at the 2^29 cycle cap,
+/// and the auth procedure may reserve up to 2×.
+const FEE_HEADROOM_MULTIPLIER: u64 = 64;
+
+/// How long a batch the executor hands back unsettled (no fee headroom, or
+/// failed preparation) waits before its orders return to the matcher, so a
+/// persistent condition isn't rebuilt and rejected every tick.
+const HELD_REFEED_DELAY: Duration = Duration::from_secs(30);
+
+/// Most incoming notes claimed into the solver's vault in one transaction.
+const MAX_CLAIM_NOTES: usize = 16;
+
+/// A PSWAP creates a payback and at most one remainder; reserve one output
+/// for authentication's transaction fee. Never split a solvent match group.
+const MAX_SETTLEMENT_INPUTS: usize = {
+    let output_bound = (miden_protocol::MAX_OUTPUT_NOTES_PER_TX - 1) / 2;
+    if miden_protocol::MAX_INPUT_NOTES_PER_TX < output_bound {
+        miden_protocol::MAX_INPUT_NOTES_PER_TX
+    } else {
+        output_bound
+    }
+};
+
+/// After a failed claim, how long the sync loop waits before trying again.
+const CLAIM_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -82,8 +110,17 @@ fn is_transient_rpc_error(err: &ClientError) -> bool {
 /// Each `.build()` call consumes its builder, so we call this fresh per
 /// submit attempt during the backoff loop.
 fn build_tx_request(components: &BatchComponents) -> Result<TransactionRequest> {
+    // Every batch note is consumed unauthenticated, from the solver's own copy.
+    // `input_notes` would substitute the executor store's copy whenever it holds an
+    // inclusion proof, and that copy can have its attachments stripped (see
+    // crates/solver/pswap-attachment-corruption-report.md); a PSWAP note id commits
+    // to its attachments, so the batch would fail with `InputNoteNotInBlock`.
+    let inputs = components
+        .input_notes
+        .iter()
+        .map(|(note, args)| (InputNote::unauthenticated(note.clone()), *args));
     let mut builder = TransactionRequestBuilder::new()
-        .input_notes(components.input_notes.clone())
+        .explicit_input_notes(inputs)
         .expected_output_recipients(components.expected_output_recipients.clone());
 
     if !components.surplus_assets.is_empty() {
@@ -185,6 +222,10 @@ fn prepare_batch_components(
         let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
             .map_err(|e| anyhow!("failed to create fill asset: {}", e))?;
 
+        // Both-zero args make the script fall back to a vault-funded full fill.
+        if filled.requested_filled == 0 {
+            bail!("zero fill for note {}", filled.note_id);
+        }
         let note_args = PswapNote::create_args(0, filled.requested_filled)
             .map_err(|e| anyhow!("failed to create note args: {}", e))?;
 
@@ -223,10 +264,11 @@ fn prepare_batch_components(
             let amount = u64::try_from(*net).map_err(|_| {
                 anyhow!("surplus exceeds u64 range for token {:?}: {}", token, net)
             })?;
-            surplus_assets.push(Asset::Fungible(
+            surplus_assets.push(
                 FungibleAsset::new(*token, amount)
-                    .map_err(|e| anyhow!("surplus asset: {}", e))?,
-            ));
+                    .map_err(|e| anyhow!("surplus asset: {}", e))?
+                    .into(),
+            );
         }
     }
 
@@ -248,10 +290,12 @@ fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder>
         .context("failed to re-parse Note for re-feed")?;
     Ok(IngestOrder {
         note_id: filled.note_id,
+        priority_seq: filled.priority_seq,
         offered_token: parsed.offered_faucet_id,
         requested_token: parsed.requested_faucet_id,
         offered_amount: parsed.offered_amount,
         requested_amount: parsed.requested_amount,
+        min_fill_step: parsed.min_fill_step,
         raw_note_data: filled.raw_note_data.clone(),
     })
 }
@@ -350,7 +394,7 @@ async fn log_batch_consume_diagnostics(
                 format!(
                     "faucet={} amount={}",
                     p.storage().requested_faucet_id(),
-                    p.storage().requested_asset().amount().as_u64()
+                    p.storage().min_requested_asset().amount().as_u64()
                 ),
             ),
             None => ("<non-PSWAP (p2id payback?)>".to_string(), "<n/a>".to_string()),
@@ -463,7 +507,7 @@ pub async fn run_executor(
         // Cancellation is only checked BETWEEN batches. Once execute_batch
         // starts, only the backoff sleep is cancel-aware — the on-chain submit
         // runs to completion before a result is observed.
-        let batch = tokio::select! {
+        let mut batch = tokio::select! {
             _ = cancel.cancelled() => break,
             opt = exec_rx.recv() => match opt {
                 Some(b) => b,
@@ -475,27 +519,105 @@ pub async fn run_executor(
             continue;
         }
 
-        let result = execute_batch(
-            &client,
-            &miden_adapter,
-            solver_id,
-            &pool,
-            &batch,
-            &order_tx,
-            &cancel,
-        )
-        .await;
-
-        match result {
-            Ok(_) => {
-                tracing::info!(notes = batch.filled_notes.len(), "batch executed successfully");
-                record_settlement(&batch, &mut stats, &stats_tx);
+        let transactions = match split_batch(&mut batch) {
+            Ok(transactions) => transactions,
+            Err(error) => {
+                tracing::error!(%error, "cannot split execution batch safely; returning orders");
+                refeed_unprepared(&batch, &order_tx, &cancel);
+                continue;
             }
-            Err(e) => tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed"),
+        };
+        for batch in transactions {
+            if cancel.is_cancelled() {
+                // Unsubmitted groups remain Active in the DB for boot recovery.
+                break;
+            }
+            let result = execute_batch(
+                &client,
+                &miden_adapter,
+                solver_id,
+                &pool,
+                &batch,
+                &order_tx,
+                &cancel,
+            )
+            .await;
+
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        notes = batch.filled_notes.len(),
+                        "batch executed successfully"
+                    );
+                    record_settlement(&batch, &mut stats, &stats_tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch execution failed")
+                }
+            }
         }
     }
 
     tracing::info!("executor shutting down");
+}
+
+/// Pack consecutive independently solvent groups without copying note bytes.
+/// Validate all boundaries before moving anything out of the caller's batch.
+fn split_batch(batch: &mut ExecutionBatch) -> Result<Vec<ExecutionBatch>> {
+    let total = batch.filled_notes.len();
+    let ends: &[usize] = if batch.group_ends.is_empty() {
+        std::slice::from_ref(&total)
+    } else {
+        &batch.group_ends
+    };
+    let mut previous = 0;
+    let mut packed = 0;
+    let mut sizes = Vec::new();
+    for &end in ends {
+        anyhow::ensure!(
+            end > previous && end <= total,
+            "invalid execution group boundary"
+        );
+        let size = end - previous;
+        anyhow::ensure!(
+            size <= MAX_SETTLEMENT_INPUTS,
+            "indivisible match group exceeds transaction note limit"
+        );
+        if packed + size > MAX_SETTLEMENT_INPUTS {
+            sizes.push(packed);
+            packed = 0;
+        }
+        packed += size;
+        previous = end;
+    }
+    anyhow::ensure!(previous == total, "execution groups do not cover all notes");
+    if packed > 0 {
+        sizes.push(packed);
+    }
+    let mut notes = std::mem::take(&mut batch.filled_notes).into_iter();
+    Ok(sizes
+        .into_iter()
+        .map(|size| ExecutionBatch {
+            filled_notes: notes.by_ref().take(size).collect(),
+            group_ends: Vec::new(),
+        })
+        .collect())
+}
+
+fn refeed_unprepared(
+    batch: &ExecutionBatch,
+    order_tx: &mpsc::Sender<IngestOrder>,
+    cancel: &CancellationToken,
+) {
+    let orders = batch
+        .filled_notes
+        .iter()
+        .filter_map(|filled| {
+            let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)).ok()?;
+            rebuild_ingest_order(filled, &note).ok()
+        })
+        .collect();
+    refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY);
 }
 
 /// After a successful settlement, record each note's settlement duration
@@ -543,7 +665,22 @@ async fn execute_batch(
     order_tx: &mpsc::Sender<IngestOrder>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let (components, input_notes_only) = prepare_batch_components(batch, solver_id)?;
+    let (components, input_notes_only) = match prepare_batch_components(batch, solver_id) {
+        Ok(parts) => parts,
+        Err(e) => {
+            // Nothing is marked Settling yet and the matcher dropped these orders on
+            // emit, so hand back every order whose note still parses — otherwise
+            // they're stranded until the next restart. Delayed, so a batch that
+            // fails deterministically isn't rebuilt every tick.
+            tracing::error!(
+                error = %e,
+                notes = batch.filled_notes.len(),
+                "batch preparation failed; re-feeding its orders after a pause"
+            );
+            refeed_unprepared(batch, order_tx, cancel);
+            return Err(e);
+        }
+    };
 
     // Collect source order ids for the status transitions.
     let source_note_ids: Vec<Vec<u8>> = batch
@@ -551,6 +688,20 @@ async fn execute_batch(
         .iter()
         .map(|f| f.note_id.to_bytes().to_vec())
         .collect();
+
+    // Fee pre-flight (Miden 0.16): each settlement's fee is paid in the native
+    // asset from the solver's own vault. Nothing is marked Settling yet, so on a
+    // shortfall hand the orders back after a pause.
+    if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
+        match rebuild_all_orders(batch, &input_notes_only) {
+            Ok(orders) => refeed_later(order_tx, cancel, orders, HELD_REFEED_DELAY),
+            Err(re) => tracing::error!(
+                error = %re,
+                "rebuild for fee-starved re-feed failed; orders recoverable only at next boot"
+            ),
+        }
+        return Err(e);
+    }
 
     // Mark as Settling before submitting so a crash after submit can be recovered.
     {
@@ -651,6 +802,166 @@ async fn execute_batch(
     }
 }
 
+/// `Err` when the chain charges a fee and the solver's fee-asset balance is below
+/// one settlement's worst case. The balance comes from the local store, so it lags
+/// the chain by up to one sync interval. A failed lookup is logged and lets the
+/// batch through — the submit itself is the real check.
+async fn check_fee_headroom(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Result<()> {
+    let fees = miden_adapter.lock().await.fee_parameters().await;
+    let (fee_faucet, base_fee) = match fees {
+        Ok(Some(params)) => params,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, "fee parameters unavailable; skipping fee pre-flight");
+            return Ok(());
+        }
+    };
+    if base_fee == 0 {
+        return Ok(());
+    }
+    let need = u64::from(base_fee) * FEE_HEADROOM_MULTIPLIER;
+    let balance = client.lock().await.account_reader(solver_id).get_balance(fee_faucet).await;
+    match balance {
+        Ok(have) if have.as_u64() < need => bail!(
+            "solver fee-asset balance {} is below the {need} one settlement may cost \
+             (fee faucet {fee_faucet}); fund the solver account",
+            have.as_u64()
+        ),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, "solver fee-asset balance unavailable; skipping fee pre-flight");
+            Ok(())
+        }
+    }
+}
+
+/// Incoming P2ID/P2IDE notes worth claiming into the solver's vault. On a
+/// fee-charging chain each must carry at least one settlement's worst-case fee
+/// in the fee asset, so a claim never costs more than it brings in and dust
+/// notes can't drain the solver through claim fees. `fee` is `None` when the
+/// client can't report fee parameters (mocks); then everything qualifies.
+/// Only P2ID/P2IDE: the executor store also holds PSWAP remainders the solver
+/// created, which it can consume but must not.
+fn select_claimable(notes: Vec<Note>, fee: Option<(AccountId, u32)>) -> Vec<Note> {
+    let (p2id, p2ide) = (P2idNote::script_root(), P2ideNote::script_root());
+    notes
+        .into_iter()
+        .filter(|note| {
+            let root = note.recipient().script().root();
+            root == p2id || root == p2ide
+        })
+        .filter(|note| match fee {
+            Some((fee_faucet, base_fee)) if base_fee > 0 => {
+                let fee_amount: u64 = note
+                    .assets()
+                    .iter_fungible()
+                    .filter(|asset| asset.faucet_id() == fee_faucet)
+                    .map(|asset| u64::from(asset.amount()))
+                    .sum();
+                fee_amount >= u64::from(base_fee) * FEE_HEADROOM_MULTIPLIER
+            }
+            _ => true,
+        })
+        .take(MAX_CLAIM_NOTES)
+        .collect()
+}
+
+/// Whether the solver can spend a note now. Time-locked notes wait for a later
+/// tick: one note that can't be spent yet would fail the whole claim.
+fn spendable_now(status: &NoteConsumptionStatus) -> bool {
+    matches!(
+        status,
+        NoteConsumptionStatus::Consumable | NoteConsumptionStatus::ConsumableWithAuthorization
+    )
+}
+
+/// Consume the notes paying the solver (see [`select_claimable`]) in one
+/// transaction, so funding the solver is just sending it tokens. A new
+/// account's first claim also deploys it. Returns how many notes were claimed.
+async fn claim_incoming_funds(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Result<usize> {
+    let records = client
+        .lock()
+        .await
+        .get_consumable_notes(Some(solver_id))
+        .await
+        .context("list consumable notes")?;
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let notes: Vec<Note> = records
+        .into_iter()
+        .filter(|(_, statuses)| {
+            statuses.iter().any(|(account, status)| *account == solver_id && spendable_now(status))
+        })
+        .filter_map(|(record, _)| TryInto::<Note>::try_into(record).ok())
+        .collect();
+    let fee = miden_adapter
+        .lock()
+        .await
+        .fee_parameters()
+        .await
+        .context("read fee parameters")?;
+    let notes = select_claimable(notes, fee);
+    if notes.is_empty() {
+        return Ok(0);
+    }
+
+    let count = notes.len();
+    let request = TransactionRequestBuilder::new()
+        .build_consume_notes(notes)
+        .context("build claim request")?;
+    let tx_id = client
+        .lock()
+        .await
+        .submit_new_transaction(solver_id, request)
+        .await
+        .context("submit claim transaction")?;
+    tracing::info!(%tx_id, notes = count, "claimed incoming funds into the solver account");
+    Ok(count)
+}
+
+/// Run one claim. On failure, log it and return when the next attempt may run.
+async fn claim_or_back_off(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+) -> Option<tokio::time::Instant> {
+    match claim_incoming_funds(client, miden_adapter, solver_id).await {
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "claiming incoming funds failed; retrying in 60 s");
+            Some(tokio::time::Instant::now() + CLAIM_RETRY_DELAY)
+        }
+    }
+}
+
+/// Hand orders back to the matcher after `delay`, without blocking the executor.
+/// Used when the executor holds a batch it can't settle yet. On shutdown the
+/// orders stay `Active` in the DB (they were never marked Settling) and the next
+/// boot rehydrates them.
+fn refeed_later(
+    order_tx: &mpsc::Sender<IngestOrder>,
+    cancel: &CancellationToken,
+    orders: Vec<IngestOrder>,
+    delay: Duration,
+) {
+    let (order_tx, cancel) = (order_tx.clone(), cancel.clone());
+    tokio::task::spawn_local(async move {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = tokio::time::sleep(delay) => refeed_orders(&order_tx, orders).await,
+        }
+    });
+}
+
 /// Best-effort revert of a batch's orders back to `Active`. Used by the
 /// RpcExhausted path. If the UPDATE fails (write pool exhausted), the orders
 /// stay in `Settling` until next-boot recovery cleans them up — we log loudly.
@@ -740,6 +1051,21 @@ pub(crate) fn spawn_executor_thread(
                         rpc: exec_rpc,
                     }));
 
+                // Miden 0.16 seals transaction inputs against synced chain headers, so
+                // an unsynced client can't submit. Sync once before accepting batches;
+                // the periodic sync task below sleeps before its first tick.
+                if let Err(e) = executor_adapter.lock().await.sync_state().await {
+                    let _ = exec_ready_tx.send(Err(e.context("initial executor sync")));
+                    return;
+                }
+                match executor_adapter.lock().await.fee_parameters().await {
+                    Ok(Some((faucet, base_fee))) => {
+                        tracing::info!(fee_faucet = %faucet, base_fee, "chain fee parameters");
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "could not read chain fee parameters at boot"),
+                }
+
                 let run_client = executor_shared.clone();
                 let run_adapter = executor_adapter.clone();
                 let run_cancel = exec_cancel.clone();
@@ -758,15 +1084,26 @@ pub(crate) fn spawn_executor_thread(
                 });
 
                 let sync_adapter = executor_adapter.clone();
+                let sync_client = executor_shared.clone();
                 let sync_cancel = exec_cancel.clone();
                 let mut executor_sync_handle = tokio::task::spawn_local(async move {
+                    // Claim funds sent while the solver was down (a new account's first
+                    // claim also deploys it), then again after every successful sync.
+                    // Claiming here, not before readiness, keeps a slow proof from
+                    // delaying startup. A failed claim backs off.
+                    let mut claim_retry_at = claim_or_back_off(&sync_client, &sync_adapter, solver_id).await;
                     loop {
                         tokio::select! {
                             _ = sync_cancel.cancelled() => break,
                             _ = tokio::time::sleep(exec_sync_interval) => {
                                 if let Err(e) = sync_adapter.lock().await.sync_state().await {
                                     tracing::warn!(error = %e, "executor-client tagless sync failed; will retry next tick");
+                                    continue;
                                 }
+                                if claim_retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
+                                    continue;
+                                }
+                                claim_retry_at = claim_or_back_off(&sync_client, &sync_adapter, solver_id).await;
                             }
                         }
                     }
@@ -811,4 +1148,262 @@ pub(crate) fn spawn_executor_thread(
         })
         .context("spawn executor thread")?;
     Ok((executor_thread, exec_ready_rx))
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use miden_protocol::asset::{AssetAmount, FungibleAsset};
+    use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+    use miden_protocol::note::{NoteId, NoteType};
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
+    };
+    use miden_protocol::Word;
+    use miden_standards::note::PswapNoteStorage;
+
+    const BASE_FEE: u32 = 7;
+
+    fn fee_faucet() -> AccountId {
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
+    }
+
+    fn other_faucet() -> AccountId {
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()
+    }
+
+    /// A public P2ID note paying the solver `amount` of `faucet`.
+    fn p2id(faucet: AccountId, amount: u64, rng: &mut RandomCoin) -> Note {
+        P2idNote::builder()
+            .sender(faucet)
+            .target(ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE.try_into().unwrap())
+            .assets(vec![FungibleAsset::new(faucet, amount).unwrap()])
+            .note_type(NoteType::Public)
+            .generate_serial_number(rng)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn ids(notes: &[Note]) -> Vec<NoteId> {
+        notes.iter().map(Note::id).collect()
+    }
+
+    #[test]
+    fn executor_rechecks_surplus_before_and_after_splitting() {
+        let base = fee_faucet();
+        let quote = other_faucet();
+        let solver_id = ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+            .try_into()
+            .unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let creator =
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+                .try_into()
+                .unwrap();
+        let mut make_note = |offered, requested| -> Note {
+            let storage = PswapNoteStorage::builder()
+                .min_requested_asset(requested)
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build();
+            PswapNote::builder()
+                .sender(solver_id)
+                .storage(storage)
+                .serial_number(rng.draw_word())
+                .note_type(NoteType::Public)
+                .offered_asset(offered)
+                .build()
+                .unwrap()
+                .into()
+        };
+        let seller = make_note(
+            FungibleAsset::new(base, 11).unwrap(),
+            FungibleAsset::new(quote, 18).unwrap(),
+        );
+        let buyer = make_note(
+            FungibleAsset::new(quote, 22).unwrap(),
+            FungibleAsset::new(base, 10).unwrap(),
+        );
+        let batch = ExecutionBatch {
+            group_ends: Vec::new(),
+            filled_notes: [(seller, 20), (buyer, 10)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (note, requested_filled))| FilledNote {
+                    note_id: note.id(),
+                    priority_seq: index as u64 + 1,
+                    requested_filled,
+                    raw_note_data: note.to_bytes(),
+                    arrival_unix: 1,
+                })
+                .collect(),
+        };
+        let (components, notes) = prepare_batch_components(&batch, solver_id).unwrap();
+        assert_eq!(notes.len(), 2);
+        let residual: HashMap<_, _> = components
+            .surplus_assets
+            .into_iter()
+            .filter_map(|asset| {
+                asset
+                    .as_fungible()
+                    .map(|fungible| (fungible.faucet_id(), fungible.amount().as_u64()))
+            })
+            .collect();
+        assert_eq!(residual.get(&base), Some(&1));
+        assert_eq!(residual.get(&quote), Some(&2));
+
+        // Cross the transaction bound with independently solvent groups of
+        // real, distinct PSWAP notes, not just synthetic note-count metadata.
+        let mut combined = ExecutionBatch {
+            filled_notes: Vec::new(),
+            group_ends: Vec::new(),
+        };
+        for _ in 0..=MAX_SETTLEMENT_INPUTS / 2 {
+            let seller = make_note(
+                FungibleAsset::new(base, 11).unwrap(),
+                FungibleAsset::new(quote, 18).unwrap(),
+            );
+            let buyer = make_note(
+                FungibleAsset::new(quote, 22).unwrap(),
+                FungibleAsset::new(base, 10).unwrap(),
+            );
+            for (note, payment) in [(seller, 20), (buyer, 10)] {
+                combined.filled_notes.push(FilledNote {
+                    note_id: note.id(),
+                    priority_seq: combined.filled_notes.len() as u64 + 1,
+                    requested_filled: payment,
+                    raw_note_data: note.to_bytes(),
+                    arrival_unix: 1,
+                });
+            }
+            combined.group_ends.push(combined.filled_notes.len());
+        }
+        let transactions = split_batch(&mut combined).unwrap();
+        assert_eq!(transactions.len(), 2);
+        for tx in transactions {
+            let (components, _) = prepare_batch_components(&tx, solver_id).unwrap();
+            assert!(components.input_notes.len() <= miden_protocol::MAX_INPUT_NOTES_PER_TX);
+            assert!(
+                components.expected_output_recipients.len() + 1
+                    <= miden_protocol::MAX_OUTPUT_NOTES_PER_TX
+            );
+        }
+    }
+
+    fn sized_batch(group_sizes: &[usize]) -> ExecutionBatch {
+        let mut group_ends = Vec::new();
+        let mut filled_notes = Vec::new();
+        for &size in group_sizes {
+            for _ in 0..size {
+                let index = filled_notes.len() as u64 + 1;
+                filled_notes.push(FilledNote {
+                    note_id: NoteId::try_from_hex(&format!("0x{index:064x}")).unwrap(),
+                    priority_seq: index,
+                    requested_filled: 1,
+                    raw_note_data: Vec::new(),
+                    arrival_unix: 1,
+                });
+            }
+            group_ends.push(filled_notes.len());
+        }
+        ExecutionBatch {
+            filled_notes,
+            group_ends,
+        }
+    }
+
+    #[test]
+    fn executor_splits_all_five_pairs_without_splitting_counterparties() {
+        let group_size = crate::clearing::ClearingConfig::default().max_orders_per_side * 2;
+        let mut batch = sized_batch(&[group_size; 5]);
+        let expected: Vec<_> = batch.filled_notes.iter().map(|note| note.note_id).collect();
+        let transactions = split_batch(&mut batch).unwrap();
+        assert!(transactions.len() > 1);
+        for tx in &transactions {
+            assert!(tx.filled_notes.len() <= MAX_SETTLEMENT_INPUTS);
+            assert_eq!(tx.filled_notes.len() % group_size, 0);
+        }
+        assert_eq!(
+            transactions
+                .iter()
+                .flat_map(|tx| tx.filled_notes.iter().map(|note| note.note_id))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(batch.filled_notes.is_empty());
+    }
+
+    #[test]
+    fn executor_packs_small_pairs_together_and_preserves_legacy_batches() {
+        for grouped in [true, false] {
+            let mut batch = sized_batch(&[2, 2, 2]);
+            if !grouped {
+                batch.group_ends.clear();
+            }
+            let transactions = split_batch(&mut batch).unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(transactions[0].filled_notes.len(), 6);
+        }
+    }
+
+    #[test]
+    fn executor_rejects_invalid_boundaries_without_losing_notes() {
+        for ends in [vec![2, 2], vec![2, 5], vec![2], vec![0, 4]] {
+            let mut batch = sized_batch(&[2, 2]);
+            batch.group_ends = ends;
+            assert!(split_batch(&mut batch).is_err());
+            assert_eq!(batch.filled_notes.len(), 4);
+        }
+        let mut oversized = sized_batch(&[MAX_SETTLEMENT_INPUTS + 1]);
+        assert!(split_batch(&mut oversized).is_err());
+        assert_eq!(oversized.filled_notes.len(), MAX_SETTLEMENT_INPUTS + 1);
+    }
+
+    /// Only notes carrying at least one settlement's worst-case fee in the fee
+    /// asset are claimed, so dust can't drain the solver through claim fees.
+    #[test]
+    fn claims_only_notes_worth_their_claim_fee() {
+        let mut rng = RandomCoin::new(Word::default());
+        let need = u64::from(BASE_FEE) * FEE_HEADROOM_MULTIPLIER;
+        let enough = p2id(fee_faucet(), need, &mut rng);
+        let dust = p2id(fee_faucet(), need - 1, &mut rng);
+        let no_fee_asset = p2id(other_faucet(), 1_000_000, &mut rng);
+
+        let picked = select_claimable(vec![enough.clone(), dust, no_fee_asset], Some((fee_faucet(), BASE_FEE)));
+
+        assert_eq!(ids(&picked), vec![enough.id()]);
+    }
+
+    /// With no fee to pay (or no fee parameters reported), every incoming P2ID
+    /// qualifies.
+    #[test]
+    fn a_fee_free_chain_claims_every_incoming_note() {
+        let mut rng = RandomCoin::new(Word::default());
+        let notes = vec![p2id(fee_faucet(), 1, &mut rng), p2id(other_faucet(), 1, &mut rng)];
+
+        assert_eq!(select_claimable(notes.clone(), Some((fee_faucet(), 0))).len(), 2);
+        assert_eq!(select_claimable(notes, None).len(), 2);
+    }
+
+    /// Time-locked notes are left for a later tick instead of failing the claim.
+    #[test]
+    fn only_notes_spendable_now_are_claimed() {
+        use miden_protocol::block::BlockNumber;
+        assert!(spendable_now(&NoteConsumptionStatus::Consumable));
+        assert!(spendable_now(&NoteConsumptionStatus::ConsumableWithAuthorization));
+        assert!(!spendable_now(&NoteConsumptionStatus::ConsumableAfter(BlockNumber::from(10_u32))));
+        assert!(!spendable_now(&NoteConsumptionStatus::UnconsumableConditions));
+        assert!(!spendable_now(&NoteConsumptionStatus::NeverConsumable("not for us".into())));
+    }
+
+    #[test]
+    fn claims_are_capped_per_transaction() {
+        let mut rng = RandomCoin::new(Word::default());
+        let notes: Vec<Note> =
+            (0..MAX_CLAIM_NOTES + 5).map(|_| p2id(fee_faucet(), 1_000_000, &mut rng)).collect();
+
+        assert_eq!(select_claimable(notes, Some((fee_faucet(), BASE_FEE))).len(), MAX_CLAIM_NOTES);
+    }
 }

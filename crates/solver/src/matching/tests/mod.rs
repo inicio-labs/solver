@@ -8,6 +8,7 @@ mod test_experimental;
 mod test_experimental_v2;
 mod test_debug_surplus;
 mod test_proptest_adversarial;
+mod test_min_fill;
 
 use miden_protocol::account::AccountId;
 use miden_protocol::note::NoteId;

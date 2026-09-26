@@ -4,14 +4,9 @@ use miden_protocol::note::NoteId;
 use ruint::aliases::U256;
 use thiserror::Error;
 
-pub const PPM_DENOMINATOR: u32 = 1_000_000;
-pub const DEFAULT_MAX_ORDERS_PER_SIDE: usize = 100;
-pub const DEFAULT_MAX_INTERVALS_PER_ROW: usize = 1_000;
-pub const DEFAULT_MAX_TOTAL_INTERVALS_PER_SIDE: usize = 50_000;
-
 /// Quote-asset base units per one base-asset base unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExactPrice {
+pub struct BatchPrice {
     pub(crate) quote_units: U256,
     pub(crate) base_units: U256,
 }
@@ -21,38 +16,6 @@ pub struct ExactPrice {
 pub struct ReferencePrice {
     pub(crate) numerator: U256,
     pub(crate) denominator: U256,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ClearingConfig {
-    pub protocol_fee_ppm: u32,
-    pub max_orders_per_side: usize,
-    pub max_intervals_per_row: usize,
-    pub max_total_intervals: usize,
-}
-
-impl ClearingConfig {
-    pub(crate) fn validate(&self) -> Result<(), ClearingError> {
-        if self.protocol_fee_ppm >= PPM_DENOMINATOR
-            || self.max_orders_per_side == 0
-            || self.max_intervals_per_row == 0
-            || self.max_total_intervals == 0
-        {
-            return Err(ClearingError::InvalidConfig);
-        }
-        Ok(())
-    }
-}
-
-impl Default for ClearingConfig {
-    fn default() -> Self {
-        Self {
-            protocol_fee_ppm: 0,
-            max_orders_per_side: DEFAULT_MAX_ORDERS_PER_SIDE,
-            max_intervals_per_row: DEFAULT_MAX_INTERVALS_PER_ROW,
-            max_total_intervals: DEFAULT_MAX_TOTAL_INTERVALS_PER_SIDE,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,9 +30,8 @@ pub enum SkipReason {
     NoPositiveCross,
     ResourceLimit(ResourceLimitKind),
     Insolvent {
-        base_shortfall: U256,
-        quote_shortfall: U256,
-        candidate: Box<CandidatePlan>,
+        base_shortfall: u128,
+        quote_shortfall: u128,
     },
 }
 
@@ -81,8 +43,6 @@ pub enum ResourceLimitKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidOrderReason {
-    ZeroAmount,
-    UnsupportedAssetDirection,
     MissingPriority,
     MalformedRawNote,
     InconsistentIngestOrder,
@@ -107,10 +67,6 @@ pub enum ClearingError {
         #[source]
         source: NoteError,
     },
-    #[error("duplicate note ID {0}")]
-    DuplicateNoteId(NoteId),
-    #[error("duplicate FIFO sequence {0} within one side of the book")]
-    DuplicatePriority(u64),
     #[error("envelope resource limit: {0:?}")]
     ResourceLimit(ResourceLimitKind),
     #[error(transparent)]
@@ -134,8 +90,8 @@ pub struct OrderExecution {
 /// Batch totals may exceed the per-asset limit, so they cannot be AssetAmount.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PairAmounts {
-    pub base: U256,
-    pub quote: U256,
+    pub base: u128,
+    pub quote: u128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,9 +102,6 @@ pub struct SolverAccruals {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidatePlan {
-    pub clearing_price: ExactPrice,
-    pub buyer_base_target: U256,
-    pub seller_quote_target: U256,
     pub executions: Vec<OrderExecution>,
     pub released: PairAmounts,
     pub paid: PairAmounts,

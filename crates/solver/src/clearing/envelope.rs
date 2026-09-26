@@ -1,20 +1,23 @@
 use std::ops::Range;
 
+use range_set_blaze::RangeSetBlaze;
 use ruint::aliases::U256;
 
+use super::config::ClearingConfig;
 use super::order::{FillInterval, MatchOrder};
-use super::types::{ClearingConfig, ClearingError, ExactPrice, ResourceLimitKind};
+use super::types::{BatchPrice, ClearingError, ResourceLimitKind};
 
-/// Backward map of all comparison fills reachable from each order suffix.
+/// Backward map of comparison fills reachable from each order onward.
 pub(crate) struct ReachableFillMap {
     intervals: Vec<FillInterval>,
-    suffixes: Vec<Range<usize>>,
+    rows: Vec<Range<usize>>,
 }
 
 impl ReachableFillMap {
     pub(crate) fn build(
         orders: &[MatchOrder<'_>],
         config: &ClearingConfig,
+        maximum_fill: u128,
     ) -> Result<Self, ClearingError> {
         let suffix_count = orders
             .len()
@@ -22,33 +25,69 @@ impl ReachableFillMap {
             .ok_or(ClearingError::ArithmeticOverflow)?;
         let mut map = Self {
             intervals: Vec::with_capacity(config.max_total_intervals.min(suffix_count)),
-            suffixes: Vec::with_capacity(suffix_count),
+            rows: Vec::with_capacity(suffix_count),
         };
-        let zero = [FillInterval {
+        let zero = FillInterval {
             minimum: U256::ZERO,
             maximum: U256::ZERO,
-        }];
-        map.push_suffix(&zero, config.max_total_intervals)?;
-        let mut later_fills = zero.to_vec();
+        };
+        map.push_row(vec![zero], config.max_total_intervals)?;
 
         for order in orders.iter().rev() {
-            let mut reachable = Vec::with_capacity(later_fills.len().saturating_mul(2));
-            merge_with_order(
-                &later_fills,
-                order.fill_interval(),
-                &mut reachable,
-                config.max_intervals_per_row,
-            )?;
-            map.push_suffix(&reachable, config.max_total_intervals)?;
-            later_fills = reachable;
+            map.add_order(order.fill_interval(), maximum_fill, config)?;
         }
-        map.suffixes.reverse();
+        map.rows.reverse();
         Ok(map)
     }
 
-    fn push_suffix(
+    fn last_row(&self) -> &[FillInterval] {
+        &self.intervals[self.rows.last().expect("initial row exists").clone()]
+    }
+
+    fn add_order(
         &mut self,
-        reachable: &[FillInterval],
+        order_fills: FillInterval,
+        maximum_fill: u128,
+        config: &ClearingConfig,
+    ) -> Result<(), ClearingError> {
+        let maximum = U256::from(maximum_fill);
+        let mut reachable = RangeSetBlaze::<u128>::new();
+        for &later in self.last_row() {
+            for interval in [
+                later,
+                FillInterval {
+                    minimum: later.minimum.saturating_add(order_fills.minimum),
+                    maximum: later.maximum.saturating_add(order_fills.maximum),
+                },
+            ] {
+                if interval.minimum > maximum {
+                    continue;
+                }
+                let start = u128::try_from(interval.minimum)
+                    .map_err(|_| ClearingError::ArithmeticOverflow)?;
+                let end = u128::try_from(interval.maximum.min(maximum))
+                    .map_err(|_| ClearingError::ArithmeticOverflow)?;
+                reachable.ranges_insert(start..=end);
+            }
+        }
+        if reachable.ranges_len() > config.max_intervals_per_row {
+            return Err(ClearingError::ResourceLimit(
+                ResourceLimitKind::IntervalsPerRow,
+            ));
+        }
+        let row = reachable
+            .ranges()
+            .map(|range| FillInterval {
+                minimum: U256::from(*range.start()),
+                maximum: U256::from(*range.end()),
+            })
+            .collect();
+        self.push_row(row, config.max_total_intervals)
+    }
+
+    fn push_row(
+        &mut self,
+        mut reachable: Vec<FillInterval>,
         maximum_total: usize,
     ) -> Result<(), ClearingError> {
         let end = self.intervals.len().checked_add(reachable.len()).ok_or(
@@ -60,14 +99,14 @@ impl ReachableFillMap {
             ));
         }
         let start = self.intervals.len();
-        self.intervals.extend_from_slice(reachable);
-        self.suffixes.push(start..end);
+        self.intervals.append(&mut reachable);
+        self.rows.push(start..end);
         Ok(())
     }
 
     fn fills_from(&self, order_index: usize) -> Result<&[FillInterval], ClearingError> {
         let range = self
-            .suffixes
+            .rows
             .get(order_index)
             .ok_or(ClearingError::InternalInvariant("missing reachable suffix"))?
             .clone();
@@ -81,7 +120,7 @@ impl ReachableFillMap {
     pub(crate) fn maximum_common_fill(
         &self,
         buyer_fills: &Self,
-        price: ExactPrice,
+        price: BatchPrice,
     ) -> Result<Option<(U256, U256)>, ClearingError> {
         let seller_intervals = self.fills_from(0)?;
         let buyer_intervals = buyer_fills.fills_from(0)?;
@@ -174,76 +213,6 @@ impl ReachableFillMap {
     }
 }
 
-fn append_merged(
-    output: &mut Vec<FillInterval>,
-    next: FillInterval,
-    maximum_intervals: usize,
-) -> Result<(), ClearingError> {
-    if let Some(last) = output.last_mut() {
-        let adjacent_or_overlapping = last.maximum >= next.minimum
-            || last
-                .maximum
-                .checked_add(U256::ONE)
-                .is_none_or(|after| after >= next.minimum);
-        if adjacent_or_overlapping {
-            last.maximum = last.maximum.max(next.maximum);
-            return Ok(());
-        }
-    }
-    if output.len() >= maximum_intervals {
-        return Err(ClearingError::ResourceLimit(
-            ResourceLimitKind::IntervalsPerRow,
-        ));
-    }
-    output.push(next);
-    Ok(())
-}
-
-/// Linear merge of `later` and `later + order_fills`. The output remains
-/// sorted, disjoint, and adjacency-coalesced without expanding individual units.
-fn merge_with_order(
-    later: &[FillInterval],
-    order_fills: FillInterval,
-    output: &mut Vec<FillInterval>,
-    maximum_intervals: usize,
-) -> Result<(), ClearingError> {
-    let mut skipped_index = 0;
-    let mut filled_index = 0;
-    while skipped_index < later.len() || filled_index < later.len() {
-        let use_skipped = if skipped_index >= later.len() {
-            false
-        } else if filled_index >= later.len() {
-            true
-        } else {
-            let filled_minimum = later[filled_index]
-                .minimum
-                .checked_add(order_fills.minimum)
-                .ok_or(ClearingError::ArithmeticOverflow)?;
-            later[skipped_index].minimum <= filled_minimum
-        };
-        let next = if use_skipped {
-            let interval = later[skipped_index];
-            skipped_index += 1;
-            interval
-        } else {
-            let interval = FillInterval {
-                minimum: later[filled_index]
-                    .minimum
-                    .checked_add(order_fills.minimum)
-                    .ok_or(ClearingError::ArithmeticOverflow)?,
-                maximum: later[filled_index]
-                    .maximum
-                    .checked_add(order_fills.maximum)
-                    .ok_or(ClearingError::ArithmeticOverflow)?,
-            };
-            filled_index += 1;
-            interval
-        };
-        append_merged(output, next, maximum_intervals)?;
-    }
-    Ok(())
-}
-
 fn first_reachable(intervals: &[FillInterval], minimum: U256, maximum: U256) -> Option<U256> {
     if minimum > maximum {
         return None;
@@ -260,7 +229,6 @@ mod tests {
 
     #[test]
     fn sparse_union_keeps_real_gaps() {
-        let mut merged = Vec::new();
         let later = [
             FillInterval {
                 minimum: U256::ZERO,
@@ -271,18 +239,24 @@ mod tests {
                 maximum: U256::from(8u8),
             },
         ];
-        merge_with_order(
-            &later,
+        let mut map = ReachableFillMap {
+            intervals: later.to_vec(),
+            rows: vec![0..later.len()],
+        };
+        map.add_order(
             FillInterval {
                 minimum: U256::from(2u8),
                 maximum: U256::from(3u8),
             },
-            &mut merged,
-            10,
+            20,
+            &ClearingConfig {
+                max_intervals_per_row: 10,
+                ..ClearingConfig::default()
+            },
         )
         .unwrap();
         assert_eq!(
-            merged
+            map.last_row()
                 .iter()
                 .map(|interval| (interval.minimum, interval.maximum))
                 .collect::<Vec<_>>(),
@@ -291,6 +265,75 @@ mod tests {
                 (U256::from(2u8), U256::from(3u8)),
                 (U256::from(7u8), U256::from(11u8)),
             ]
+        );
+    }
+
+    #[test]
+    fn range_set_rows_match_exhaustive_fills_after_clipping() {
+        let config = ClearingConfig::default();
+        let mut map = ReachableFillMap {
+            intervals: vec![FillInterval {
+                minimum: U256::ZERO,
+                maximum: U256::ZERO,
+            }],
+            rows: vec![0..1],
+        };
+        let cap = 12u128;
+        let mut expected = std::collections::BTreeSet::from([0u128]);
+        for (minimum, maximum) in [(4u128, 6u128), (9, 10), (3, 4)] {
+            map.add_order(
+                FillInterval {
+                    minimum: U256::from(minimum),
+                    maximum: U256::from(maximum),
+                },
+                cap,
+                &config,
+            )
+            .unwrap();
+            let previous = expected.clone();
+            for existing in previous {
+                for fill in minimum..=maximum {
+                    if existing + fill <= cap {
+                        expected.insert(existing + fill);
+                    }
+                }
+            }
+            let actual: std::collections::BTreeSet<_> = map
+                .last_row()
+                .iter()
+                .flat_map(|interval| {
+                    u128::try_from(interval.minimum).unwrap()
+                        ..=u128::try_from(interval.maximum).unwrap()
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn wide_order_range_is_clipped_before_entering_the_range_set() {
+        let mut map = ReachableFillMap {
+            intervals: vec![FillInterval {
+                minimum: U256::ZERO,
+                maximum: U256::ZERO,
+            }],
+            rows: vec![0..1],
+        };
+        map.add_order(
+            FillInterval {
+                minimum: U256::from(2u8),
+                maximum: U256::MAX,
+            },
+            5,
+            &ClearingConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            map.last_row()
+                .iter()
+                .map(|interval| (interval.minimum, interval.maximum))
+                .collect::<Vec<_>>(),
+            [(U256::ZERO, U256::ZERO), (U256::from(2u8), U256::from(5u8))]
         );
     }
 
@@ -315,7 +358,7 @@ mod tests {
         let end = intervals.len();
         ReachableFillMap {
             intervals,
-            suffixes: vec![0..end],
+            rows: vec![0..end],
         }
     }
 
@@ -328,7 +371,7 @@ mod tests {
                 for quote_units in 1..=4u8 {
                     for base_units in 1..=4u8 {
                         let price =
-                            ExactPrice::from_ratio(u64::from(quote_units), u64::from(base_units))
+                            BatchPrice::from_ratio(u64::from(quote_units), u64::from(base_units))
                                 .unwrap();
                         let actual = sellers.maximum_common_fill(&buyers, price).unwrap();
                         let expected = (1..16u8).rev().find_map(|buyer_base| {

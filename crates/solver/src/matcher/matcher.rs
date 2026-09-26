@@ -250,7 +250,7 @@ pub(super) async fn internal_clear(
         else {
             continue;
         };
-        let batch = clearing::ExactPrice::from_reference_prices(
+        let batch = clearing::BatchPrice::from_reference_prices(
             base_price,
             quote_price,
             base_decimals,
@@ -264,7 +264,7 @@ pub(super) async fn internal_clear(
                 continue;
             }
         };
-        let plan = match PairMatcher::new(&batch, &runtime.config).and_then(PairMatcher::clear) {
+        let plan = match PairMatcher::new(&batch, &runtime.config).clear() {
             Ok(ClearingOutcome::Accepted(plan)) => plan,
             Ok(ClearingOutcome::Skipped(reason)) => {
                 match reason {
@@ -287,10 +287,10 @@ pub(super) async fn internal_clear(
                 continue;
             }
         };
-        let execution = match plan.to_execution_batch(&batch, runtime.solver_id, &book.arrivals) {
+        let execution = match plan.to_execution_batch(&batch, &book.arrivals) {
             Ok(execution) => execution,
             Err(error) => {
-                tracing::error!(%base, %quote, %error, "clearing payout verification failed");
+                tracing::error!(%base, %quote, %error, "clearing execution batch construction failed");
                 continue;
             }
         };

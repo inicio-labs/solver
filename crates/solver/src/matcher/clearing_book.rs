@@ -10,7 +10,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::matcher::{internal_clear, ClearingRuntime};
-use crate::clearing::{ClearingConfig, ClearingError, ExactPrice, Order, PairBatch};
+use crate::clearing::{
+    BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderSide, PairBatch,
+};
 use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
 use crate::types::{now_millis, now_unix, ExecutionBatch, IngestOrder, TokenId};
 
@@ -20,7 +22,8 @@ pub struct ClearingBootstrap {
     pub decimals: HashMap<TokenId, u8>,
 }
 
-/// Parse once on admission; maintain the exact price/FIFO index incrementally.
+/// Live ingestion and startup hydration reject zero amounts before admission.
+/// Parse once here and maintain the exact price/FIFO index incrementally.
 /// Both directions use requested/offered: lower is always better.
 #[derive(Default)]
 pub(super) struct ClearingBook {
@@ -38,10 +41,6 @@ impl ClearingBook {
         ensure!(
             parsed.pswap_note().storage().creator_account_id() != solver_id,
             "solver-created order"
-        );
-        ensure!(
-            order.offered_amount > 0 && order.requested_amount > 0,
-            "zero order amount"
         );
         let pair = (order.offered_token, order.requested_token);
         let key = (
@@ -74,15 +73,14 @@ impl ClearingBook {
         }
     }
 
-    pub fn admit(
-        &self,
+    fn admit<'a>(
+        &'a self,
         pair: (TokenId, TokenId),
-        base: AssetId,
-        quote: AssetId,
-        price: ExactPrice,
+        side: OrderSide,
+        price: BatchPrice,
         fee_ppm: u32,
         limit: usize,
-    ) -> Result<Vec<Order>, ClearingError> {
+    ) -> Result<Vec<MatchOrder<'a>>, ClearingError> {
         let mut selected = Vec::new();
         if let Some(index) = self.pairs.get(&pair) {
             for id in index.values().take(limit) {
@@ -90,44 +88,46 @@ impl ClearingBook {
                     .orders
                     .get(id)
                     .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
-                if !order.is_eligible_at(base, quote, price, fee_ppm)? {
-                    // Eligibility is monotone in this exact price ordering.
-                    break;
+                match order.prepare_if_eligible(side, price, fee_ppm)? {
+                    Some(prepared) => selected.push(prepared),
+                    None => {
+                        // Eligibility is monotone in this exact price ordering.
+                        break;
+                    }
                 }
-                selected.push(order.clone());
             }
         }
         Ok(selected)
     }
 
-    pub(super) fn build_pair_batch(
-        &self,
+    pub(super) fn build_pair_batch<'a>(
+        &'a self,
         base: TokenId,
         quote: TokenId,
-        price: ExactPrice,
+        price: BatchPrice,
         config: &ClearingConfig,
         selected: &HashSet<NoteId>,
-    ) -> Result<PairBatch, ClearingError> {
+    ) -> Result<PairBatch<'a>, ClearingError> {
+        config.validate()?;
         let base_asset = AssetId::new_fungible(base);
         let quote_asset = AssetId::new_fungible(quote);
-        let mut orders = self.admit(
+        let mut sell_orders = self.admit(
             (base, quote),
-            base_asset,
-            quote_asset,
+            OrderSide::SellBase,
             price,
             config.protocol_fee_ppm,
             config.max_orders_per_side,
         )?;
-        orders.extend(self.admit(
+        let mut buy_orders = self.admit(
             (quote, base),
-            base_asset,
-            quote_asset,
+            OrderSide::BuyBase,
             price,
             config.protocol_fee_ppm,
             config.max_orders_per_side,
-        )?);
-        orders.retain(|order| !selected.contains(&order.id()));
-        PairBatch::new(base_asset, quote_asset, price, orders)
+        )?;
+        sell_orders.retain(|order| !selected.contains(&order.order().id()));
+        buy_orders.retain(|order| !selected.contains(&order.order().id()));
+        PairBatch::new(base_asset, quote_asset, price, sell_orders, buy_orders)
     }
 
     fn snapshot(&self) -> SwapBookSnapshot {
@@ -264,14 +264,17 @@ mod tests {
             .unwrap()
     }
 
-    fn admit(book: &ClearingBook, buy: bool, limit: usize) -> Vec<Order> {
+    fn admit<'a>(book: &'a ClearingBook, buy: bool, limit: usize) -> Vec<MatchOrder<'a>> {
         let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
         let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
         book.admit(
             if buy { (b, a) } else { (a, b) },
-            AssetId::new_fungible(a),
-            AssetId::new_fungible(b),
-            ExactPrice::from_ratio(2, 1).unwrap(),
+            if buy {
+                OrderSide::BuyBase
+            } else {
+                OrderSide::SellBase
+            },
+            BatchPrice::from_ratio(2, 1).unwrap(),
             0,
             limit,
         )
@@ -299,13 +302,47 @@ mod tests {
             assert_eq!(
                 admitted
                     .iter()
-                    .map(Order::priority_sequence)
+                    .map(|order| order.order().priority_sequence())
                     .collect::<Vec<_>>(),
                 (1..=100).collect::<Vec<_>>()
             );
             assert_eq!(book.orders.len(), 150);
             assert_eq!(admit(&book, buy, 200).len(), 130);
         }
+    }
+
+    #[test]
+    fn pair_batch_keeps_eligible_seller_then_buyer() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut book = ClearingBook::default();
+        let seller = fixture(false, 10, 18, 2, &mut rng);
+        let ineligible_seller = fixture(false, 10, 21, 1, &mut rng);
+        let buyer = fixture(true, 22, 10, 4, &mut rng);
+        let ineligible_buyer = fixture(true, 19, 10, 3, &mut rng);
+        for order in [&buyer, &ineligible_seller, &seller, &ineligible_buyer] {
+            book.insert(order, solver()).unwrap();
+        }
+        let (base, quote) = (
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(),
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(),
+        );
+        let batch = book
+            .build_pair_batch(
+                base,
+                quote,
+                BatchPrice::from_ratio(2, 1).unwrap(),
+                &ClearingConfig::default(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            batch
+                .orders()
+                .iter()
+                .map(|order| order.order().id())
+                .collect::<Vec<_>>(),
+            vec![seller.note_id, buyer.note_id]
+        );
     }
 
     #[test]
@@ -322,7 +359,7 @@ mod tests {
         assert_eq!(
             admit(&book, false, 100)
                 .iter()
-                .map(Order::id)
+                .map(|order| order.order().id())
                 .collect::<Vec<_>>(),
             expected
         );
@@ -333,7 +370,7 @@ mod tests {
         assert_eq!(
             admit(&book, false, 100)
                 .iter()
-                .map(Order::id)
+                .map(|order| order.order().id())
                 .collect::<Vec<_>>(),
             expected
         );

@@ -6,11 +6,13 @@ use super::order::MatchOrder;
 use super::settlement::PairLedger;
 use super::types::{BatchPrice, ClearingError, ClearingOutcome, SkipReason};
 
+const PRIORITY_RETRY_PARTS: usize = 5;
+
 #[derive(Clone, Debug)]
 pub struct PairBatch<'a> {
     clearing_price: BatchPrice,
-    orders: Vec<MatchOrder<'a>>,
-    sell_count: usize,
+    sell_orders: Vec<MatchOrder<'a>>,
+    buy_orders: Vec<MatchOrder<'a>>,
 }
 
 impl<'a> PairBatch<'a> {
@@ -20,31 +22,21 @@ impl<'a> PairBatch<'a> {
         base: AssetId,
         quote: AssetId,
         clearing_price: BatchPrice,
-        mut sell_orders: Vec<MatchOrder<'a>>,
+        sell_orders: Vec<MatchOrder<'a>>,
         buy_orders: Vec<MatchOrder<'a>>,
     ) -> Result<Self, ClearingError> {
         if base == quote {
             return Err(ClearingError::InvalidConfig);
         }
-        let sell_count = sell_orders.len();
-        sell_orders.extend(buy_orders);
         Ok(Self {
             clearing_price,
-            orders: sell_orders,
-            sell_count,
+            sell_orders,
+            buy_orders,
         })
     }
 
-    pub(crate) fn orders(&self) -> &[MatchOrder<'a>] {
-        &self.orders
-    }
-
-    fn sell_orders(&self) -> &[MatchOrder<'a>] {
-        &self.orders[..self.sell_count]
-    }
-
-    fn buy_orders(&self) -> &[MatchOrder<'a>] {
-        &self.orders[self.sell_count..]
+    pub(crate) fn orders(&self) -> impl Iterator<Item = &MatchOrder<'a>> {
+        self.sell_orders.iter().chain(self.buy_orders.iter())
     }
 }
 
@@ -66,39 +58,84 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
         Self { batch, config }
     }
 
+    /// Drop a coarse block of the worst orders, then halve small prefixes.
+    /// With 100 orders this tries 100, 80, 60, 40, 20, 10, 5, 2, 1.
+    fn smaller_prefix(current: usize, step: usize) -> usize {
+        if current > step * 2 {
+            current - step
+        } else {
+            (current / 2).max(1)
+        }
+    }
+
     /// Maximize comparison volume at the frozen price, allocate that volume in
     /// price-time priority, and accept only an exactly solvent settlement.
     pub fn clear(self) -> Result<ClearingOutcome, ClearingError> {
-        let sell_orders = self.batch.sell_orders();
-        let buy_orders = self.batch.buy_orders();
-        if sell_orders.is_empty() || buy_orders.is_empty() {
+        let all_sell_orders = &self.batch.sell_orders;
+        let all_buy_orders = &self.batch.buy_orders;
+        if all_sell_orders.is_empty() || all_buy_orders.is_empty() {
             return Ok(ClearingOutcome::Skipped(SkipReason::NoEligibleCross));
         }
 
-        // No seller can receive more quote than buyers offer. For buyers,
-        // floor(P * comparison_base) may equal a seller's quote target even
-        // when comparison_base is slightly above sellers' offered base. Since
-        // every eligible seller has P >= 1 / AssetAmount::MAX, one maximum
-        // asset amount covers that rounding gap.
-        let seller_limit = Self::total_offered(&buy_orders)?;
-        let buyer_limit = Self::total_offered(&sell_orders)?
-            .checked_add(u128::from(AssetAmount::MAX.as_u64()))
-            .ok_or(ClearingError::ArithmeticOverflow)?;
+        let mut sell_count = all_sell_orders.len();
+        let mut buy_count = all_buy_orders.len();
+        let sell_step = (sell_count / PRIORITY_RETRY_PARTS).max(1);
+        let buy_step = (buy_count / PRIORITY_RETRY_PARTS).max(1);
 
-        let seller_fills = match ReachableFillMap::build(sell_orders, self.config, seller_limit) {
-            Ok(fills) => fills,
-            Err(ClearingError::ResourceLimit(limit)) => {
-                return Ok(ClearingOutcome::Skipped(SkipReason::ResourceLimit(limit)));
-            }
-            Err(error) => return Err(error),
+        let (sell_orders, buy_orders, seller_fills, buyer_fills) = loop {
+            let sell_orders = &all_sell_orders[..sell_count];
+            let buy_orders = &all_buy_orders[..buy_count];
+
+            // Recompute bounds after each trim. No seller can receive more
+            // quote than buyers offer. The buyer bound includes one maximum
+            // asset amount for floor(P * buyer_fill) rounding.
+            let seller_limit = Self::total_offered(buy_orders)?;
+            let buyer_limit = Self::total_offered(sell_orders)?
+                .checked_add(u128::from(AssetAmount::MAX.as_u64()))
+                .ok_or(ClearingError::ArithmeticOverflow)?;
+
+            let seller_fills = match ReachableFillMap::build(
+                sell_orders,
+                self.config.max_total_intervals,
+                seller_limit,
+            ) {
+                Ok(fills) => fills,
+                Err(ClearingError::ResourceLimit) if sell_count > 1 => {
+                    sell_count = Self::smaller_prefix(sell_count, sell_step);
+                    continue;
+                }
+                Err(ClearingError::ResourceLimit) => {
+                    return Ok(ClearingOutcome::Skipped(SkipReason::ResourceLimit));
+                }
+                Err(error) => return Err(error),
+            };
+            let buyer_fills = match ReachableFillMap::build(
+                buy_orders,
+                self.config.max_total_intervals,
+                buyer_limit,
+            ) {
+                Ok(fills) => fills,
+                Err(ClearingError::ResourceLimit) if buy_count > 1 => {
+                    buy_count = Self::smaller_prefix(buy_count, buy_step);
+                    continue;
+                }
+                Err(ClearingError::ResourceLimit) => {
+                    return Ok(ClearingOutcome::Skipped(SkipReason::ResourceLimit));
+                }
+                Err(error) => return Err(error),
+            };
+            break (sell_orders, buy_orders, seller_fills, buyer_fills);
         };
-        let buyer_fills = match ReachableFillMap::build(buy_orders, self.config, buyer_limit) {
-            Ok(fills) => fills,
-            Err(ClearingError::ResourceLimit(limit)) => {
-                return Ok(ClearingOutcome::Skipped(SkipReason::ResourceLimit(limit)));
-            }
-            Err(error) => return Err(error),
-        };
+        if sell_count < all_sell_orders.len() || buy_count < all_buy_orders.len() {
+            tracing::warn!(
+                sellers_admitted = all_sell_orders.len(),
+                sellers_used = sell_count,
+                buyers_admitted = all_buy_orders.len(),
+                buyers_used = buy_count,
+                max_total_intervals = self.config.max_total_intervals,
+                "clearing interval limit reduced the price-time candidate set"
+            );
+        }
         let Some((buyer_base_target, seller_quote_target)) =
             seller_fills.maximum_common_fill(&buyer_fills, self.batch.clearing_price)?
         else {
@@ -262,9 +299,12 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let map =
-            ReachableFillMap::build(&prepared, &ClearingConfig::default(), u128::from(target))
-                .unwrap();
+        let map = ReachableFillMap::build(
+            &prepared,
+            ClearingConfig::default().max_total_intervals,
+            u128::from(target),
+        )
+        .unwrap();
         map.allocate_by_priority(&prepared, U256::from(target))
             .unwrap()
     }
@@ -306,7 +346,7 @@ mod tests {
         .unwrap();
         let orders = vec![Order::from_ingest_order(&ingested).unwrap()];
         let input = batch(price, &orders);
-        assert_eq!(input.orders().len(), 1);
+        assert_eq!(input.orders().count(), 1);
         assert_eq!(input.clearing_price.quote_units, U256::from(2u8));
         ingested.requested_amount = 21;
         assert!(matches!(
@@ -364,7 +404,6 @@ mod tests {
         assert_eq!(plan.accruals.rounding_surplus, PairAmounts::default());
         let arrivals = input
             .orders()
-            .iter()
             .map(|order| (order.order().id(), 100))
             .collect();
         let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();
@@ -471,7 +510,6 @@ mod tests {
 
         let arrivals = input
             .orders()
-            .iter()
             .map(|order| (order.order().id(), 100))
             .collect();
         plan.to_execution_batch(&input, &arrivals).unwrap();
@@ -512,7 +550,6 @@ mod tests {
         assert_eq!(plan.candidate.executions.len(), 2);
         let arrivals = input
             .orders()
-            .iter()
             .map(|order| (order.order().id(), 100))
             .collect();
         let settled = plan.to_execution_batch(&input, &arrivals).unwrap();
@@ -534,6 +571,190 @@ mod tests {
             allocate_seller_fills(&[(6, 4), (7, 7)], 7),
             [U256::ZERO, U256::from(7u8)]
         );
+    }
+
+    #[test]
+    fn retry_prefix_keeps_best_orders_and_has_a_short_tail() {
+        let mut count = 100;
+        let mut tried = vec![count];
+        while count > 1 {
+            count = PairMatcher::smaller_prefix(count, 20);
+            tried.push(count);
+        }
+        assert_eq!(tried, [100, 80, 60, 40, 20, 10, 5, 2, 1]);
+    }
+
+    #[test]
+    fn seller_interval_limit_retries_without_removing_orders_from_the_batch() {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let better = order(
+            FungibleAsset::new(base, 5).unwrap(),
+            FungibleAsset::new(quote, 4).unwrap(),
+            4,
+            1,
+            &mut rng,
+        );
+        let better_id = better.id();
+        let worse = order(
+            FungibleAsset::new(base, 5).unwrap(),
+            FungibleAsset::new(quote, 5).unwrap(),
+            5,
+            2,
+            &mut rng,
+        );
+        let worse_id = worse.id();
+        let buyer = order(
+            FungibleAsset::new(quote, 5).unwrap(),
+            FungibleAsset::new(base, 5).unwrap(),
+            5,
+            3,
+            &mut rng,
+        );
+        let orders = [better, worse, buyer];
+        let input = batch(BatchPrice::from_ratio(1, 1).unwrap(), &orders);
+        let config = ClearingConfig {
+            max_total_intervals: 3,
+            ..ClearingConfig::default()
+        };
+
+        for _ in 0..2 {
+            let ClearingOutcome::Accepted(plan) = clear(&input, &config) else {
+                panic!("better seller should clear after trimming the worse seller");
+            };
+            assert_eq!(plan.candidate.executions.len(), 2);
+            assert_eq!(plan.candidate.executions[0].order_id, better_id);
+            assert!(plan
+                .candidate
+                .executions
+                .iter()
+                .all(|fill| fill.order_id != worse_id));
+            assert_eq!(input.orders().count(), 3);
+        }
+    }
+
+    #[test]
+    fn buyer_interval_limit_retries_without_removing_orders_from_the_batch() {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let seller = order(
+            FungibleAsset::new(base, 5).unwrap(),
+            FungibleAsset::new(quote, 5).unwrap(),
+            5,
+            1,
+            &mut rng,
+        );
+        let better = order(
+            FungibleAsset::new(quote, 6).unwrap(),
+            FungibleAsset::new(base, 5).unwrap(),
+            4,
+            2,
+            &mut rng,
+        );
+        let better_id = better.id();
+        let worse = order(
+            FungibleAsset::new(quote, 5).unwrap(),
+            FungibleAsset::new(base, 5).unwrap(),
+            5,
+            3,
+            &mut rng,
+        );
+        let worse_id = worse.id();
+        let orders = [seller, better, worse];
+        let input = batch(BatchPrice::from_ratio(1, 1).unwrap(), &orders);
+        let config = ClearingConfig {
+            max_total_intervals: 3,
+            ..ClearingConfig::default()
+        };
+
+        let ClearingOutcome::Accepted(plan) = clear(&input, &config) else {
+            panic!("better buyer should clear after trimming the worse buyer");
+        };
+        assert_eq!(plan.candidate.executions.len(), 2);
+        assert_eq!(plan.candidate.executions[1].order_id, better_id);
+        assert!(plan
+            .candidate
+            .executions
+            .iter()
+            .all(|fill| fill.order_id != worse_id));
+        assert_eq!(input.orders().count(), 3);
+    }
+
+    #[test]
+    fn hundred_sellers_retry_at_eighty_when_the_full_map_exceeds_budget() {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let mut orders = Vec::with_capacity(101);
+        for sequence in 1..=100 {
+            orders.push(order(
+                FungibleAsset::new(base, 5).unwrap(),
+                FungibleAsset::new(quote, 5).unwrap(),
+                5,
+                sequence,
+                &mut rng,
+            ));
+        }
+        let eightieth_id = orders[79].id();
+        let eighty_first_id = orders[80].id();
+        orders.push(order(
+            FungibleAsset::new(quote, 500).unwrap(),
+            FungibleAsset::new(base, 500).unwrap(),
+            5,
+            101,
+            &mut rng,
+        ));
+        let input = batch(BatchPrice::from_ratio(1, 1).unwrap(), &orders);
+        let config = ClearingConfig {
+            // 100 fixed-size sellers need 5,151 stored intervals; 80 need 3,321.
+            max_total_intervals: 4_000,
+            ..ClearingConfig::default()
+        };
+
+        let ClearingOutcome::Accepted(plan) = clear(&input, &config) else {
+            panic!("the best 80 sellers should still clear");
+        };
+        assert_eq!(plan.candidate.executions.len(), 81);
+        assert_eq!(plan.candidate.executions[79].order_id, eightieth_id);
+        assert!(plan
+            .candidate
+            .executions
+            .iter()
+            .all(|fill| fill.order_id != eighty_first_id));
+        assert_eq!(plan.candidate.released.base, 400);
+        assert_eq!(plan.candidate.paid.base, 400);
+        assert_eq!(input.orders().count(), 101);
+    }
+
+    #[test]
+    fn one_order_that_exceeds_the_interval_budget_reports_resource_limit() {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let orders = vec![
+            order(
+                FungibleAsset::new(base, 5).unwrap(),
+                FungibleAsset::new(quote, 5).unwrap(),
+                5,
+                1,
+                &mut rng,
+            ),
+            order(
+                FungibleAsset::new(quote, 5).unwrap(),
+                FungibleAsset::new(base, 5).unwrap(),
+                5,
+                2,
+                &mut rng,
+            ),
+        ];
+        let input = batch(BatchPrice::from_ratio(1, 1).unwrap(), &orders);
+        let config = ClearingConfig {
+            max_total_intervals: 2,
+            ..ClearingConfig::default()
+        };
+
+        assert!(matches!(
+            clear(&input, &config),
+            ClearingOutcome::Skipped(SkipReason::ResourceLimit)
+        ));
     }
 
     #[test]
@@ -606,7 +827,6 @@ mod tests {
 
         let arrivals = input
             .orders()
-            .iter()
             .map(|order| (order.order().id(), 100))
             .collect();
         let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();

@@ -268,8 +268,8 @@ pub(super) async fn internal_clear(
             Ok(ClearingOutcome::Accepted(plan)) => plan,
             Ok(ClearingOutcome::Skipped(reason)) => {
                 match reason {
-                    SkipReason::ResourceLimit(limit) => {
-                        tracing::warn!(%base, %quote, ?limit, "pair clearing resource limit exceeded");
+                    SkipReason::ResourceLimit => {
+                        tracing::warn!(%base, %quote, "pair clearing resource limit exceeded");
                     }
                     SkipReason::Insolvent {
                         base_shortfall,

@@ -28,17 +28,11 @@ pub enum ClearingOutcome {
 pub enum SkipReason {
     NoEligibleCross,
     NoPositiveCross,
-    ResourceLimit(ResourceLimitKind),
+    ResourceLimit,
     Insolvent {
         base_shortfall: u128,
         quote_shortfall: u128,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceLimitKind {
-    IntervalsPerRow,
-    TotalIntervals,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,8 +61,8 @@ pub enum ClearingError {
         #[source]
         source: NoteError,
     },
-    #[error("envelope resource limit: {0:?}")]
-    ResourceLimit(ResourceLimitKind),
+    #[error("envelope interval limit exceeded")]
+    ResourceLimit,
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error("arithmetic overflow")]

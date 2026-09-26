@@ -338,7 +338,6 @@ mod tests {
         assert_eq!(
             batch
                 .orders()
-                .iter()
                 .map(|order| order.order().id())
                 .collect::<Vec<_>>(),
             vec![seller.note_id, buyer.note_id]

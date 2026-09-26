@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::matching::price_feed::{PriceFeed, UsdCents};
-use crate::clearing::{ReferencePrice, Wide};
+use crate::clearing::ReferencePrice;
 use crate::price::{read_token_map, SharedTokenMap};
 use crate::types::TokenId;
 
@@ -56,10 +56,7 @@ impl MockPriceClient {
                     t,
                     PriceData {
                         usd: cents as f64 / 100.0,
-                        exact_reference: (cents > 0).then_some(ReferencePrice {
-                            numerator: Wide::from(cents),
-                            denominator: Wide::from(100u64),
-                        }),
+                        exact_reference: ReferencePrice::from_ratio(cents, 100).ok(),
                         source_updated_at_unix_ms: None,
                         observed_at_unix_ms: 0,
                     },

@@ -1,83 +1,85 @@
 use miden_protocol::asset::AssetAmount;
+use ruint::aliases::U256;
 
-use super::types::{ClearingError, ExactPrice, Ratio, ReferencePrice, Wide, PPM_DENOMINATOR};
+use super::types::{ClearingError, ExactPrice, ReferencePrice, PPM_DENOMINATOR};
 
-fn gcd(mut a: Wide, mut b: Wide) -> Wide {
-    while b != Wide::ZERO {
-        let next = a % b;
-        a = b;
-        b = next;
+pub(crate) fn greatest_common_divisor(mut left: U256, mut right: U256) -> U256 {
+    while right != U256::ZERO {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
     }
-    a
+    left
 }
 
-fn power_of_ten(decimals: u8) -> Result<Wide, ClearingError> {
-    let mut value = Wide::ONE;
+fn power_of_ten(decimals: u8) -> Result<U256, ClearingError> {
+    let mut value = U256::ONE;
     for _ in 0..decimals {
-        value = value
-            .checked_mul(Wide::from(10u8))
-            .ok_or(ClearingError::ArithmeticOverflow)?;
+        value = checked_mul(value, U256::from(10u8))?;
     }
     Ok(value)
 }
 
-pub(crate) fn mul_div_floor(a: Wide, b: Wide, divisor: Wide) -> Result<Wide, ClearingError> {
-    if divisor == Wide::ZERO {
-        return Err(ClearingError::ArithmeticOverflow);
-    }
-    Ok(a.checked_mul(b).ok_or(ClearingError::ArithmeticOverflow)? / divisor)
+pub(crate) fn checked_mul(left: U256, right: U256) -> Result<U256, ClearingError> {
+    left.checked_mul(right)
+        .ok_or(ClearingError::ArithmeticOverflow)
 }
 
-pub(crate) fn mul_div_ceil(a: Wide, b: Wide, divisor: Wide) -> Result<Wide, ClearingError> {
-    if divisor == Wide::ZERO {
+pub(crate) fn mul_div_floor(
+    amount: U256,
+    multiplier: U256,
+    divisor: U256,
+) -> Result<U256, ClearingError> {
+    if divisor == U256::ZERO {
         return Err(ClearingError::ArithmeticOverflow);
     }
-    let product = a.checked_mul(b).ok_or(ClearingError::ArithmeticOverflow)?;
+    Ok(checked_mul(amount, multiplier)? / divisor)
+}
+
+pub(crate) fn mul_div_ceil(
+    amount: U256,
+    multiplier: U256,
+    divisor: U256,
+) -> Result<U256, ClearingError> {
+    if divisor == U256::ZERO {
+        return Err(ClearingError::ArithmeticOverflow);
+    }
+    let product = checked_mul(amount, multiplier)?;
     let quotient = product / divisor;
-    if product % divisor == Wide::ZERO {
+    if product % divisor == U256::ZERO {
         Ok(quotient)
     } else {
         quotient
-            .checked_add(Wide::ONE)
+            .checked_add(U256::ONE)
             .ok_or(ClearingError::ArithmeticOverflow)
     }
 }
 
-pub(crate) fn asset_amount_from_wide(value: Wide) -> Result<AssetAmount, ClearingError> {
+pub(crate) fn to_asset_amount(value: U256) -> Result<AssetAmount, ClearingError> {
     let value = u64::try_from(value).map_err(|_| ClearingError::ArithmeticOverflow)?;
     Ok(AssetAmount::new(value)?)
 }
 
-pub(crate) fn ppm_floor(gross: Wide, rate_ppm: u32) -> Result<Wide, ClearingError> {
-    mul_div_floor(gross, Wide::from(rate_ppm), Wide::from(PPM_DENOMINATOR))
-}
-
-impl Ratio {
-    pub(crate) fn new(num: Wide, den: Wide) -> Result<Self, ClearingError> {
-        if den == Wide::ZERO || num < den {
-            return Err(ClearingError::InternalInvariant("scale ratio below one"));
-        }
-        let common = gcd(num, den);
-        Ok(Self {
-            num: num / common,
-            den: den / common,
-        })
-    }
-
-    /// Round down only when expanding a requested fill into the common
-    /// allocation coordinate.
-    pub(crate) fn scale_up_floor(self, amount: AssetAmount) -> Result<Wide, ClearingError> {
-        mul_div_floor(Wide::from(amount.as_u64()), self.num, self.den)
-    }
-
-    /// Round up only when converting a non-endpoint allocation back into an
-    /// actual note payment.
-    pub(crate) fn scale_down_ceil(self, scaled: Wide) -> Result<AssetAmount, ClearingError> {
-        asset_amount_from_wide(mul_div_ceil(scaled, self.den, self.num)?)
-    }
+pub(crate) fn ppm_floor(gross: U256, rate_ppm: u32) -> Result<U256, ClearingError> {
+    mul_div_floor(gross, U256::from(rate_ppm), U256::from(PPM_DENOMINATOR))
 }
 
 impl ReferencePrice {
+    pub fn from_ratio(numerator: u64, denominator: u64) -> Result<Self, ClearingError> {
+        Self::new(U256::from(numerator), U256::from(denominator))
+    }
+
+    fn new(numerator: U256, denominator: U256) -> Result<Self, ClearingError> {
+        if numerator == U256::ZERO || denominator == U256::ZERO {
+            return Err(ClearingError::InvalidOraclePrice);
+        }
+        let common = greatest_common_divisor(numerator, denominator);
+        Ok(Self {
+            numerator: numerator / common,
+            denominator: denominator / common,
+        })
+    }
+
     /// Parse a provider's decimal string exactly, e.g. Binance's
     /// `"123.45000000"`. Exponents, signs, and zero are rejected.
     pub fn from_decimal(raw: &str) -> Result<Self, ClearingError> {
@@ -87,29 +89,22 @@ impl ReferencePrice {
             None => (raw, ""),
         };
         if whole.is_empty()
-            || !whole.bytes().all(|c| c.is_ascii_digit())
-            || !fraction.bytes().all(|c| c.is_ascii_digit())
+            || !whole.bytes().all(|character| character.is_ascii_digit())
+            || !fraction.bytes().all(|character| character.is_ascii_digit())
         {
             return Err(ClearingError::InvalidOraclePrice);
         }
         let decimals =
             u8::try_from(fraction.len()).map_err(|_| ClearingError::InvalidOraclePrice)?;
         let denominator = power_of_ten(decimals).map_err(|_| ClearingError::InvalidOraclePrice)?;
-        let mut numerator = Wide::ZERO;
+        let mut numerator = U256::ZERO;
         for digit in whole.bytes().chain(fraction.bytes()) {
             numerator = numerator
-                .checked_mul(Wide::from(10u8))
-                .and_then(|value| value.checked_add(Wide::from(digit - b'0')))
+                .checked_mul(U256::from(10u8))
+                .and_then(|value| value.checked_add(U256::from(digit - b'0')))
                 .ok_or(ClearingError::InvalidOraclePrice)?;
         }
-        if numerator == Wide::ZERO {
-            return Err(ClearingError::InvalidOraclePrice);
-        }
-        let common = gcd(numerator, denominator);
-        Ok(Self {
-            numerator: numerator / common,
-            denominator: denominator / common,
-        })
+        Self::new(numerator, denominator)
     }
 
     /// Parse a JSON number without a floating-point round trip. Providers may
@@ -119,7 +114,7 @@ impl ReferencePrice {
         let Some(index) = exponent_at else {
             return Self::from_decimal(raw);
         };
-        let mut price = Self::from_decimal(&raw[..index])?;
+        let price = Self::from_decimal(&raw[..index])?;
         let exponent = &raw[index + 1..];
         let (negative, digits) = if let Some(digits) = exponent.strip_prefix('-') {
             (true, digits)
@@ -134,71 +129,54 @@ impl ReferencePrice {
             .map_err(|_| ClearingError::InvalidOraclePrice)?;
         let factor = power_of_ten(magnitude).map_err(|_| ClearingError::InvalidOraclePrice)?;
         if negative {
-            price.denominator = price
-                .denominator
-                .checked_mul(factor)
-                .ok_or(ClearingError::InvalidOraclePrice)?;
+            Self::new(price.numerator, checked_mul(price.denominator, factor)?)
         } else {
-            price.numerator = price
-                .numerator
-                .checked_mul(factor)
-                .ok_or(ClearingError::InvalidOraclePrice)?;
+            Self::new(checked_mul(price.numerator, factor)?, price.denominator)
         }
-        let common = gcd(price.numerator, price.denominator);
-        price.numerator /= common;
-        price.denominator /= common;
-        Ok(price)
+        .map_err(|_| ClearingError::InvalidOraclePrice)
     }
 }
 
 impl ExactPrice {
-    pub fn new(quote_units: Wide, base_units: Wide) -> Result<Self, ClearingError> {
-        if quote_units == Wide::ZERO || base_units == Wide::ZERO {
+    pub fn from_ratio(quote_units: u64, base_units: u64) -> Result<Self, ClearingError> {
+        Self::new(U256::from(quote_units), U256::from(base_units))
+    }
+
+    pub(crate) fn new(quote_units: U256, base_units: U256) -> Result<Self, ClearingError> {
+        if quote_units == U256::ZERO || base_units == U256::ZERO {
             return Err(ClearingError::InvalidPrice);
         }
-        let common = gcd(quote_units, base_units);
+        let common = greatest_common_divisor(quote_units, base_units);
         Ok(Self {
             quote_units: quote_units / common,
             base_units: base_units / common,
         })
     }
 
-    /// Both reference prices refer to one WHOLE token. Convert them to quote base
-    /// units per base base unit with on-chain decimals, exactly:
-    /// P = (base_ref / quote_ref) * 10^quote_decimals / 10^base_decimals.
-    /// Polaris must freeze the two source prices in one snapshot and enforce
-    /// its own maximum age and cross-price timestamp skew.
+    /// Both reference prices refer to one whole token. Convert them to quote
+    /// base units per base base unit with the on-chain token decimals.
     pub fn from_reference_prices(
         base_price: ReferencePrice,
         quote_price: ReferencePrice,
         base_decimals: u8,
         quote_decimals: u8,
     ) -> Result<Self, ClearingError> {
-        if base_price.numerator == Wide::ZERO
-            || base_price.denominator == Wide::ZERO
-            || quote_price.numerator == Wide::ZERO
-            || quote_price.denominator == Wide::ZERO
-        {
-            return Err(ClearingError::InvalidOraclePrice);
-        }
-        let quote_units = base_price
-            .numerator
-            .checked_mul(quote_price.denominator)
-            .and_then(|value| value.checked_mul(power_of_ten(quote_decimals).ok()?))
-            .ok_or(ClearingError::ArithmeticOverflow)?;
-        let base_units = base_price
-            .denominator
-            .checked_mul(quote_price.numerator)
-            .and_then(|value| value.checked_mul(power_of_ten(base_decimals).ok()?))
-            .ok_or(ClearingError::ArithmeticOverflow)?;
+        let quote_units = checked_mul(
+            checked_mul(base_price.numerator, quote_price.denominator)?,
+            power_of_ten(quote_decimals)?,
+        )?;
+        let base_units = checked_mul(
+            checked_mul(base_price.denominator, quote_price.numerator)?,
+            power_of_ten(base_decimals)?,
+        )?;
         Self::new(quote_units, base_units)
     }
 
-    pub(crate) fn quote_for_base_floor(self, base: Wide) -> Result<Wide, ClearingError> {
+    pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
         mul_div_floor(base, self.quote_units, self.base_units)
     }
 
-    pub(crate) fn base_for_quote_ceil(self, quote: Wide) -> Result<Wide, ClearingError> {
+    pub(crate) fn base_for_quote_ceil(self, quote: U256) -> Result<U256, ClearingError> {
         mul_div_ceil(quote, self.base_units, self.quote_units)
     }
 }
@@ -212,16 +190,15 @@ mod tests {
         let btc = ReferencePrice::from_decimal("100000.00000000").unwrap();
         let usdt = ReferencePrice::from_decimal("1").unwrap();
         let price = ExactPrice::from_reference_prices(btc, usdt, 8, 6).unwrap();
-        assert_eq!(price.quote_units, Wide::from(1_000u64));
-        assert_eq!(price.base_units, Wide::ONE);
-        // One BTC base unit corresponds to 1,000 USDT base units here.
+        assert_eq!(price.quote_units, U256::from(1_000u64));
+        assert_eq!(price.base_units, U256::ONE);
     }
 
     #[test]
     fn decimal_input_is_exact() {
         let price = ReferencePrice::from_decimal("0.00012500").unwrap();
-        assert_eq!(price.numerator, Wide::ONE);
-        assert_eq!(price.denominator, Wide::from(8_000u64));
+        assert_eq!(price.numerator, U256::ONE);
+        assert_eq!(price.denominator, U256::from(8_000u64));
         for invalid in ["0", "-1", "1e4", "1.", ".1", "1.2.3"] {
             assert!(ReferencePrice::from_decimal(invalid).is_err(), "{invalid}");
         }
@@ -230,11 +207,11 @@ mod tests {
     #[test]
     fn json_scientific_price_is_exact() {
         let price = ReferencePrice::from_json_number("1.2500e-4").unwrap();
-        assert_eq!(price.numerator, Wide::ONE);
-        assert_eq!(price.denominator, Wide::from(8_000u64));
+        assert_eq!(price.numerator, U256::ONE);
+        assert_eq!(price.denominator, U256::from(8_000u64));
         let price = ReferencePrice::from_json_number("1.25E+4").unwrap();
-        assert_eq!(price.numerator, Wide::from(12_500u64));
-        assert_eq!(price.denominator, Wide::ONE);
+        assert_eq!(price.numerator, U256::from(12_500u64));
+        assert_eq!(price.denominator, U256::ONE);
         for invalid in ["1e", "1e-", "1e999", "1e2e3", "-1e2"] {
             assert!(
                 ReferencePrice::from_json_number(invalid).is_err(),

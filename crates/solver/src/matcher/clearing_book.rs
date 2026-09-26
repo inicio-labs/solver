@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::matcher::{internal_clear, ClearingRuntime};
-use crate::clearing::{self, AdmittedPswap, ClearingError, ExactPrice};
+use crate::clearing::{ClearingConfig, ClearingError, ExactPrice, Order, PairBatch};
 use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
 use crate::types::{now_millis, now_unix, ExecutionBatch, IngestOrder, TokenId};
 
@@ -24,7 +24,7 @@ pub struct ClearingBootstrap {
 /// Both directions use requested/offered: lower is always better.
 #[derive(Default)]
 pub(super) struct ClearingBook {
-    orders: HashMap<NoteId, AdmittedPswap>,
+    orders: HashMap<NoteId, Order>,
     pairs: HashMap<(TokenId, TokenId), BTreeMap<(RateKey, u64), NoteId>>,
     pub arrivals: HashMap<NoteId, u64>,
 }
@@ -34,9 +34,9 @@ impl ClearingBook {
         if self.orders.contains_key(&order.note_id) {
             return Ok(());
         }
-        let parsed = AdmittedPswap::from_ingest_order(order)?;
+        let parsed = Order::from_ingest_order(order)?;
         ensure!(
-            parsed.note.storage().creator_account_id() != solver_id,
+            parsed.pswap_note().storage().creator_account_id() != solver_id,
             "solver-created order"
         );
         ensure!(
@@ -58,13 +58,13 @@ impl ClearingBook {
 
     pub fn remove(&mut self, id: NoteId) {
         if let Some(order) = self.orders.remove(&id) {
-            let offered = order.note.offered_asset();
-            let requested = order.note.storage().min_requested_asset();
+            let offered = order.offered_asset();
+            let requested = order.requested_asset();
             let pair = (offered.faucet_id(), requested.faucet_id());
             if let Some(index) = self.pairs.get_mut(&pair) {
                 index.remove(&(
                     RateKey::new(requested.amount().as_u64(), offered.amount().as_u64()),
-                    order.priority_seq,
+                    order.priority_sequence(),
                 ));
                 if index.is_empty() {
                     self.pairs.remove(&pair);
@@ -78,10 +78,11 @@ impl ClearingBook {
         &self,
         pair: (TokenId, TokenId),
         base: AssetId,
+        quote: AssetId,
         price: ExactPrice,
         fee_ppm: u32,
         limit: usize,
-    ) -> Result<Vec<AdmittedPswap>, ClearingError> {
+    ) -> Result<Vec<Order>, ClearingError> {
         let mut selected = Vec::new();
         if let Some(index) = self.pairs.get(&pair) {
             for id in index.values().take(limit) {
@@ -89,7 +90,7 @@ impl ClearingBook {
                     .orders
                     .get(id)
                     .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
-                if !clearing::order_is_eligible(order, base, price, fee_ppm)? {
+                if !order.is_eligible_at(base, quote, price, fee_ppm)? {
                     // Eligibility is monotone in this exact price ordering.
                     break;
                 }
@@ -97,6 +98,36 @@ impl ClearingBook {
             }
         }
         Ok(selected)
+    }
+
+    pub(super) fn build_pair_batch(
+        &self,
+        base: TokenId,
+        quote: TokenId,
+        price: ExactPrice,
+        config: &ClearingConfig,
+        selected: &HashSet<NoteId>,
+    ) -> Result<PairBatch, ClearingError> {
+        let base_asset = AssetId::new_fungible(base);
+        let quote_asset = AssetId::new_fungible(quote);
+        let mut orders = self.admit(
+            (base, quote),
+            base_asset,
+            quote_asset,
+            price,
+            config.protocol_fee_ppm,
+            config.max_orders_per_side,
+        )?;
+        orders.extend(self.admit(
+            (quote, base),
+            base_asset,
+            quote_asset,
+            price,
+            config.protocol_fee_ppm,
+            config.max_orders_per_side,
+        )?);
+        orders.retain(|order| !selected.contains(&order.id()));
+        PairBatch::new(base_asset, quote_asset, price, orders)
     }
 
     fn snapshot(&self) -> SwapBookSnapshot {
@@ -109,7 +140,7 @@ impl ClearingBook {
                     .take_while(|((other, _), _)| *other == rate)
                     .filter_map(|(_, id)| self.orders.get(id))
                     .fold(0u64, |sum, order| {
-                        sum.saturating_add(order.note.offered_asset().amount().as_u64())
+                        sum.saturating_add(order.offered_asset().amount().as_u64())
                     });
                 Some((pair, BestLevel { rate, volume }))
             })
@@ -173,7 +204,6 @@ pub(super) async fn run_clearer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clearing::Wide;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::{
         rand::{FeltRng, RandomCoin},
@@ -234,16 +264,14 @@ mod tests {
             .unwrap()
     }
 
-    fn admit(book: &ClearingBook, buy: bool, limit: usize) -> Vec<AdmittedPswap> {
+    fn admit(book: &ClearingBook, buy: bool, limit: usize) -> Vec<Order> {
         let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
         let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
         book.admit(
             if buy { (b, a) } else { (a, b) },
             AssetId::new_fungible(a),
-            ExactPrice {
-                quote_units: Wide::from(2),
-                base_units: Wide::from(1),
-            },
+            AssetId::new_fungible(b),
+            ExactPrice::from_ratio(2, 1).unwrap(),
             0,
             limit,
         )
@@ -269,7 +297,10 @@ mod tests {
             }
             let admitted = admit(&book, buy, 100);
             assert_eq!(
-                admitted.iter().map(|o| o.priority_seq).collect::<Vec<_>>(),
+                admitted
+                    .iter()
+                    .map(Order::priority_sequence)
+                    .collect::<Vec<_>>(),
                 (1..=100).collect::<Vec<_>>()
             );
             assert_eq!(book.orders.len(), 150);
@@ -291,7 +322,7 @@ mod tests {
         assert_eq!(
             admit(&book, false, 100)
                 .iter()
-                .map(|o| o.note_id)
+                .map(Order::id)
                 .collect::<Vec<_>>(),
             expected
         );
@@ -302,7 +333,7 @@ mod tests {
         assert_eq!(
             admit(&book, false, 100)
                 .iter()
-                .map(|o| o.note_id)
+                .map(Order::id)
                 .collect::<Vec<_>>(),
             expected
         );

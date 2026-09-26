@@ -1,6 +1,5 @@
 use miden_protocol::note::NoteId;
 use miden_protocol::account::AccountId;
-use miden_protocol::asset::AssetId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +7,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{self, DbPool};
-use crate::clearing::{self, ClearingConfig, ClearingOutcome, PairBatch, ReferencePrice, SkipReason};
+use crate::clearing::{
+    self, ClearingConfig, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
+};
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::matching::types::{Order, SwapBookSnapshot};
@@ -249,36 +250,13 @@ pub(super) async fn internal_clear(
         else {
             continue;
         };
-        let batch = (|| -> Result<PairBatch, clearing::ClearingError> {
-            let price = clearing::ExactPrice::from_reference_prices(
-                base_price,
-                quote_price,
-                base_decimals,
-                quote_decimals,
-            )?;
-            let base_asset = AssetId::new_fungible(base);
-            let mut orders = book.admit(
-                (base, quote),
-                base_asset,
-                price,
-                runtime.config.protocol_fee_ppm,
-                runtime.config.max_orders_per_side,
-            )?;
-            orders.extend(book.admit(
-                (quote, base),
-                base_asset,
-                price,
-                runtime.config.protocol_fee_ppm,
-                runtime.config.max_orders_per_side,
-            )?);
-            orders.retain(|order| !selected.contains(&order.note_id));
-            Ok(PairBatch {
-                base: base_asset,
-                quote: AssetId::new_fungible(quote),
-                clearing_price: price,
-                orders,
-            })
-        })();
+        let batch = clearing::ExactPrice::from_reference_prices(
+            base_price,
+            quote_price,
+            base_decimals,
+            quote_decimals,
+        )
+        .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config, &selected));
         let batch = match batch {
             Ok(batch) => batch,
             Err(error) => {
@@ -286,7 +264,7 @@ pub(super) async fn internal_clear(
                 continue;
             }
         };
-        let plan = match clearing::clear_pair(&batch, &runtime.config) {
+        let plan = match PairMatcher::new(&batch, &runtime.config).and_then(PairMatcher::clear) {
             Ok(ClearingOutcome::Accepted(plan)) => plan,
             Ok(ClearingOutcome::Skipped(reason)) => {
                 match reason {

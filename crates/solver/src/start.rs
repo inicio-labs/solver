@@ -32,10 +32,7 @@ use crate::types::TokenId;
 /// Build a `current_thread` tokio runtime + `LocalSet` and run `fut` to
 /// completion on it. Used as the body of each client OS thread so the `!Send`
 /// `Client` it constructs never crosses a thread boundary.
-pub(crate) fn run_on_local_runtime<F: std::future::Future<Output = ()>>(
-    thread_name: &str,
-    fut: F,
-) {
+pub(crate) fn run_on_local_runtime<F: std::future::Future<Output = ()>>(thread_name: &str, fut: F) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -79,9 +76,13 @@ pub async fn start(
     config: SolverConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // Internal worker failure must not look like an operator-requested stop.
+    // Cancelling this child stops the pipeline without cancelling its parent.
+    let shutdown_requested = cancel;
+    let cancel = shutdown_requested.child_token();
     // 1. DB pool (caller-owned so HttpPriceClient + executor can share it).
-    let db_pool = db::init_db(&config.solver.app_db_path, config.solver.read_pool_size)
-        .context("init_db")?;
+    let db_pool =
+        db::init_db(&config.solver.app_db_path, config.solver.read_pool_size).context("init_db")?;
 
     // 2. Env-sourced secrets.
     let admin_token = std::env::var("SOLVER_ADMIN_TOKEN").ok();
@@ -101,8 +102,8 @@ pub async fn start(
     //    with this symbol map + API key; tests inject a MockPriceClient).
     //    `start` keeps ownership of `token_map` (shared with admin) and only
     //    hands a clone to the builder.
-    let price_client = make_price_client(token_map.clone(), coingecko_api_key)
-        .context("build price client")?;
+    let price_client =
+        make_price_client(token_map.clone(), coingecko_api_key).context("build price client")?;
 
     // 5. Flatten configured pairs → token list with optional symbols.
     let mut initial_tokens: Vec<(TokenId, Option<String>)> = Vec::new();
@@ -122,10 +123,8 @@ pub async fn start(
     // 7. Build the observability state. The shared `last_sync` atomic is
     //    initialised to `now()` here so /readyz is healthy during the boot
     //    grace period before the first sync completes.
-    let obs_state = crate::obs::ObsState::new(
-        db_pool.clone(),
-        config.engine.readiness_freshness_secs,
-    );
+    let obs_state =
+        crate::obs::ObsState::new(db_pool.clone(), config.engine.readiness_freshness_secs);
     let last_sync_handle = obs_state.last_sync_handle();
 
     // 8. Build the PipelineConfig.
@@ -193,8 +192,14 @@ pub async fn start(
                 ..crate::clearing::ClearingConfig::default()
             },
             max_price_age_ms: config.engine.price_staleness_secs.saturating_mul(1_000),
-            max_source_age_ms: config.engine.clearing_max_source_age_secs.saturating_mul(1_000),
-            max_source_skew_ms: config.engine.clearing_max_source_skew_secs.saturating_mul(1_000),
+            max_source_age_ms: config
+                .engine
+                .clearing_max_source_age_secs
+                .saturating_mul(1_000),
+            max_source_skew_ms: config
+                .engine
+                .clearing_max_source_skew_secs
+                .saturating_mul(1_000),
             solver_id,
         })
     } else {
@@ -206,8 +211,7 @@ pub async fn start(
     let core = pipeline::spawn_core_services(
         &pipeline_config,
         price_client,
-        channels.order_rx,
-        channels.consumed_rx,
+        channels.book_rx,
         channels.price_tx,
         channels.price_rx,
         channels.precise_tx,
@@ -250,21 +254,32 @@ pub async fn start(
         factory.clone(),
         db_pool.clone(),
         cancel.clone(),
-        channels.order_tx.clone(),
-        channels.consumed_tx,
+        channels.book_tx.clone(),
         channels.subscribe_rx,
         Duration::from_millis(config.engine.fetch_interval_ms),
         last_sync_handle,
         solver_id,
         clearing_bootstrap,
     )?;
+    // Finish durable-note recovery and book hydration before the executor can
+    // confirm/reactivate attempts. This prevents a stale startup snapshot from
+    // overwriting an outcome produced concurrently with hydration.
+    let ingest_ready = match ingest_ready_rx.await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("ingest thread exited before signalling readiness")),
+    };
+    if let Err(error) = ingest_ready {
+        cancel.cancel();
+        let _ = tokio::task::spawn_blocking(move || ingest_thread.join()).await;
+        return Err(error).context("ingest startup recovery failed");
+    }
     let (executor_thread, exec_ready_rx) = crate::executor::spawn_executor_thread(
         factory.clone(),
         db_pool.clone(),
         cancel.clone(),
         solver_id,
         channels.exec_rx,
-        channels.order_tx.clone(),
+        channels.book_tx.clone(),
         channels.stats_tx,
         Duration::from_millis(config.engine.fetch_interval_ms),
     )?;
@@ -351,20 +366,23 @@ pub async fn start(
     //     tasks spawned) before startup is considered successful. Any build /
     //     subscribe failure -> cancel everything, join, return the error.
     let startup: Result<()> = async {
-        match ingest_ready_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(anyhow!("ingest thread exited before signalling readiness")),
-        }
         match exec_ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(anyhow!("executor thread exited before signalling readiness")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "executor thread exited before signalling readiness"
+                ))
+            }
         }
         match price_api_ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(anyhow!("price-api thread exited before signalling readiness")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "price-api thread exited before signalling readiness"
+                ))
+            }
         }
         if let Some(rx) = router_ready_rx {
             match rx.await {
@@ -432,5 +450,9 @@ pub async fn start(
         }
     })
     .await;
+    anyhow::ensure!(
+        shutdown_requested.is_cancelled(),
+        "critical solver worker stopped unexpectedly"
+    );
     Ok(())
 }

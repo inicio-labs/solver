@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
 use diesel::sqlite::SqliteConnection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = include_str!("../../schema.sql");
@@ -11,9 +11,9 @@ const SCHEMA: &str = include_str!("../../schema.sql");
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
-use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
 use crate::db::models::*;
 use crate::db::schema::*;
+use crate::types::{BookUpdate, IngestOrder, OrderId, OrderStatus, TokenId};
 
 pub type DbConn = r2d2::PooledConnection<ConnectionManager<SqliteConnection>>;
 
@@ -33,13 +33,37 @@ impl DbPool {
     pub fn read_conn(&self) -> Result<DbConn, r2d2::PoolError> {
         self.read.get()
     }
+
+    /// Reserve channel capacity before writing. Commit and publish while holding
+    /// the single writer connection, with no await between them. Concurrent
+    /// observers therefore publish in database order. A process crash in this
+    /// tiny gap is repaired by startup hydration, not by an in-memory retry.
+    pub async fn update_book(
+        &self,
+        sender: &tokio::sync::mpsc::Sender<BookUpdate>,
+        update: impl FnOnce(&mut SqliteConnection) -> Result<BookUpdate>,
+    ) -> Result<()> {
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| anyhow::anyhow!("matcher channel closed"))?;
+        let mut conn = self.write_conn()?;
+        let outcome = conn.transaction(|conn| update(conn))?;
+        if !outcome.is_empty() {
+            permit.send(outcome);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 struct WalCustomizer;
 
 impl r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for WalCustomizer {
-    fn on_acquire(&self, conn: &mut SqliteConnection) -> std::result::Result<(), diesel::r2d2::Error> {
+    fn on_acquire(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> std::result::Result<(), diesel::r2d2::Error> {
         diesel::sql_query("PRAGMA journal_mode=WAL")
             .execute(conn)
             .map_err(diesel::r2d2::Error::QueryError)?;
@@ -69,7 +93,10 @@ pub fn init_db(database_url: &str, read_pool_size: u32) -> Result<DbPool> {
     let mut conn = write_pool.get()?;
     conn.batch_execute(SCHEMA)?;
 
-    Ok(DbPool { write: write_pool, read: read_pool })
+    Ok(DbPool {
+        write: write_pool,
+        read: read_pool,
+    })
 }
 
 // ── Sync State ───────────────────────────────────────────────────────────────
@@ -169,6 +196,293 @@ pub fn update_orders_status(
     Ok(count)
 }
 
+/// All inputs of one locally executed transaction are reserved together.
+/// This write happens after proof but before network submission.
+pub fn prepare_settlement(
+    conn: &mut SqliteConnection,
+    attempt: &SettlementAttemptRow,
+    inputs: &[SettlementInputRow],
+) -> Result<()> {
+    conn.transaction(|conn| {
+        diesel::insert_into(settlement_attempts::table)
+            .values(attempt)
+            .execute(conn)?;
+        for input in inputs {
+            ensure!(
+                input.tx_id == attempt.tx_id,
+                "settlement input has wrong transaction ID"
+            );
+            let changed = diesel::update(
+                orders::table
+                    .find(&input.parent_note_id)
+                    .filter(orders::status.eq(OrderStatus::Active.as_str())),
+            )
+            .set(orders::status.eq(OrderStatus::Settling.as_str()))
+            .execute(conn)?;
+            ensure!(changed == 1, "settlement input is not active");
+        }
+        diesel::insert_into(settlement_inputs::table)
+            .values(inputs)
+            .execute(conn)?;
+        Ok(())
+    })
+}
+
+pub fn mark_settlement_submitted(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<()> {
+    diesel::update(
+        settlement_attempts::table
+            .find(tx_id)
+            .filter(settlement_attempts::status.eq("prepared")),
+    )
+    .set(settlement_attempts::status.eq("submitted"))
+    .execute(conn)?;
+    Ok(())
+}
+
+pub fn mark_settlement_uncertain(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<()> {
+    diesel::update(
+        settlement_attempts::table
+            .find(tx_id)
+            .filter(settlement_attempts::status.ne("confirmed")),
+    )
+    .set(settlement_attempts::status.eq("uncertain"))
+    .execute(conn)?;
+    Ok(())
+}
+
+/// Remember a definite rejection before the fallible nullifier check. Recovery
+/// completes classification instead of resubmitting a known rejected attempt.
+pub fn mark_settlement_rejected(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<()> {
+    diesel::update(
+        settlement_attempts::table
+            .find(tx_id)
+            .filter(settlement_attempts::status.ne("confirmed")),
+    )
+    .set(settlement_attempts::status.eq("rejected"))
+    .execute(conn)?;
+    Ok(())
+}
+
+pub fn unresolved_settlements(conn: &mut SqliteConnection) -> Result<Vec<SettlementAttemptRow>> {
+    Ok(settlement_attempts::table
+        .filter(settlement_attempts::status.ne("confirmed"))
+        .select(SettlementAttemptRow::as_select())
+        .load(conn)?)
+}
+
+/// One committed output is enough to prove inclusion of the whole atomic
+/// transaction, including full fills that have no remainder note.
+pub fn settlement_payback_id(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<OrderId> {
+    let bytes: Vec<u8> = settlement_inputs::table
+        .filter(settlement_inputs::tx_id.eq(tx_id))
+        .select(settlement_inputs::payback_note_id)
+        .first(conn)?;
+    Ok(OrderId::read_from(&mut SliceReader::new(&bytes))?)
+}
+
+pub fn settlement_parents(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<Vec<IngestOrder>> {
+    let parent_ids: Vec<Vec<u8>> = settlement_inputs::table
+        .filter(settlement_inputs::tx_id.eq(tx_id))
+        .select(settlement_inputs::parent_note_id)
+        .load(conn)?;
+    let mut parents = Vec::with_capacity(parent_ids.len());
+    for id in parent_ids {
+        let (row, raw): (OrderRow, Vec<u8>) = orders::table
+            .inner_join(notes::table.on(orders::note_id.eq(notes::note_id)))
+            .filter(orders::note_id.eq(&id))
+            .select((OrderRow::as_select(), notes::raw_data))
+            .first(conn)?;
+        parents.push(row.into_ingest(raw)?);
+    }
+    Ok(parents)
+}
+
+pub fn finish_discarded_settlement(
+    conn: &mut SqliteConnection,
+    tx_id: &[u8],
+    consumed: &HashSet<OrderId>,
+) -> Result<BookUpdate> {
+    conn.transaction(|conn| {
+        let status: String = settlement_attempts::table
+            .find(tx_id)
+            .select(settlement_attempts::status)
+            .first(conn)?;
+        if status == "confirmed" {
+            return Ok(BookUpdate::default());
+        }
+        let parents = settlement_parents(conn, tx_id)?;
+        let mut update = BookUpdate::default();
+        for parent in parents {
+            let current: String = orders::table
+                .find(parent.note_id.to_bytes().as_slice())
+                .select(orders::status)
+                .first(conn)?;
+            // Never undo a terminal state observed after the RPC snapshot.
+            if current != OrderStatus::Settling.as_str() {
+                continue;
+            }
+            let status = if consumed.contains(&parent.note_id) {
+                update.removed.push(parent.note_id);
+                OrderStatus::OnchainNullified
+            } else {
+                update.active.push(parent.clone());
+                OrderStatus::Active
+            };
+            diesel::update(orders::table.find(parent.note_id.to_bytes().as_slice()))
+                .set(orders::status.eq(status.as_str()))
+                .execute(conn)?;
+        }
+        diesel::delete(settlement_inputs::table.filter(settlement_inputs::tx_id.eq(tx_id)))
+            .execute(conn)?;
+        diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
+        Ok(update)
+    })
+}
+
+/// Delayed/pre-submission re-feeds must not resurrect an order that ingestion
+/// consumed, or a different attempt reserved, while the re-feed was waiting.
+pub fn active_book_update(
+    conn: &mut SqliteConnection,
+    candidates: Vec<IngestOrder>,
+) -> Result<BookUpdate> {
+    let ids: Vec<_> = candidates
+        .iter()
+        .map(|order| order.note_id.to_bytes().to_vec())
+        .collect();
+    let active: HashSet<Vec<u8>> = orders::table
+        .filter(orders::note_id.eq_any(ids))
+        .filter(orders::status.eq(OrderStatus::Active.as_str()))
+        .select(orders::note_id)
+        .load::<Vec<u8>>(conn)?
+        .into_iter()
+        .collect();
+    Ok(BookUpdate {
+        removed: Vec::new(),
+        active: candidates
+            .into_iter()
+            .filter(|order| active.contains(order.note_id.to_bytes().as_slice()))
+            .collect(),
+    })
+}
+
+impl SettlementInputRow {
+    fn child_order(&self, priority_seq: u64) -> Result<Option<IngestOrder>> {
+        let (Some(child_id), Some(raw_note_data)) = (&self.child_note_id, &self.child_note_data)
+        else {
+            return Ok(None);
+        };
+        let note = Note::read_from(&mut SliceReader::new(raw_note_data))?;
+        ensure!(
+            note.id().to_bytes().as_slice() == child_id,
+            "settlement child ID mismatch"
+        );
+        let parsed = crate::types::Order::from_note(&note)?;
+        Ok(Some(IngestOrder {
+            note_id: note.id(),
+            priority_seq,
+            offered_token: parsed.offered_faucet_id,
+            requested_token: parsed.requested_faucet_id,
+            offered_amount: parsed.offered_amount,
+            requested_amount: parsed.requested_amount,
+            min_fill_step: parsed.min_fill_step,
+            raw_note_data: raw_note_data.clone(),
+        }))
+    }
+}
+
+/// Commit the parent→child handoff in one SQLite transaction. A second
+/// observer of the same confirmation gets an empty result and sends nothing.
+pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<BookUpdate> {
+    conn.transaction(|conn| {
+        let status: String = settlement_attempts::table
+            .find(tx_id)
+            .select(settlement_attempts::status)
+            .first(conn)?;
+        if status == "confirmed" {
+            return Ok(BookUpdate {
+                removed: Vec::new(),
+                active: Vec::new(),
+            });
+        }
+        ensure!(
+            matches!(
+                status.as_str(),
+                "prepared" | "submitted" | "uncertain" | "rejected"
+            ),
+            "invalid settlement status for confirmation"
+        );
+
+        let inputs: Vec<SettlementInputRow> = settlement_inputs::table
+            .filter(settlement_inputs::tx_id.eq(tx_id))
+            .select(SettlementInputRow::as_select())
+            .load(conn)?;
+        let mut activation = BookUpdate {
+            removed: Vec::new(),
+            active: Vec::new(),
+        };
+        for input in inputs {
+            let parent: OrderRow = orders::table
+                .find(&input.parent_note_id)
+                .select(OrderRow::as_select())
+                .first(conn)?;
+            let parent_id = OrderId::read_from(&mut SliceReader::new(&input.parent_note_id))?;
+            activation.removed.push(parent_id);
+            if let Some(child) = input.child_order(u64::try_from(parent.priority_seq)?)? {
+                let note = Note::read_from(&mut SliceReader::new(&child.raw_note_data))?;
+                let parsed = crate::types::Order::from_note(&note)?;
+                diesel::insert_or_ignore_into(notes::table)
+                    .values(NoteRow {
+                        note_id: child.note_id.to_bytes().to_vec(),
+                        account_id: parsed.creator_id.to_bytes().to_vec(),
+                        raw_data: child.raw_note_data.clone(),
+                    })
+                    .execute(conn)?;
+                diesel::insert_or_ignore_into(orders::table)
+                    .values(OrderRow {
+                        note_id: child.note_id.to_bytes().to_vec(),
+                        account_id: parsed.creator_id.to_bytes().to_vec(),
+                        requested_asset: child.requested_token.to_bytes().to_vec(),
+                        requested_amount: i64::try_from(child.requested_amount)?,
+                        offered_asset: child.offered_token.to_bytes().to_vec(),
+                        offered_amount: i64::try_from(child.offered_amount)?,
+                        timestamp: parent.timestamp,
+                        status: OrderStatus::Active.as_str().to_string(),
+                        priority_seq: parent.priority_seq,
+                    })
+                    .execute(conn)?;
+                let status: String = orders::table
+                    .find(child.note_id.to_bytes().as_slice())
+                    .select(orders::status)
+                    .first(conn)?;
+                if status == OrderStatus::Active.as_str() {
+                    activation.active.push(child);
+                }
+            }
+            diesel::update(orders::table.find(&input.parent_note_id))
+                .set(orders::status.eq(OrderStatus::Executed.as_str()))
+                .execute(conn)?;
+        }
+        diesel::update(settlement_attempts::table.find(tx_id))
+            .set(settlement_attempts::status.eq("confirmed"))
+            .execute(conn)?;
+        Ok(activation)
+    })
+}
+
+/// A synced child note proves that its expected output was included. Return
+/// `None` for ordinary notes; return an empty activation for a duplicate.
+pub fn confirm_expected_remainder(
+    conn: &mut SqliteConnection,
+    child_id: &[u8],
+) -> Result<Option<BookUpdate>> {
+    let tx_id: Option<Vec<u8>> = settlement_inputs::table
+        .filter(settlement_inputs::child_note_id.eq(child_id))
+        .select(settlement_inputs::tx_id)
+        .first(conn)
+        .optional()?;
+    tx_id.map(|id| confirm_settlement(conn, &id)).transpose()
+}
+
 /// Mark orders as `OnchainNullified` (terminal) — used when ingest detects
 /// a nullifier on-chain via `sync_state.consumed_notes`, or when the
 /// executor's per-note nullifier check after a tx error identifies which
@@ -179,28 +493,39 @@ pub fn mark_orders_onchain_nullified(
     conn: &mut SqliteConnection,
     note_ids: &[Vec<u8>],
 ) -> Result<usize> {
+    if note_ids.is_empty() {
+        return Ok(0);
+    }
+    // An input from our own unresolved transaction is reconciled by its tx ID.
+    // A nullifier alone cannot tell whether our submission committed or some
+    // competing consumer won, so do not downgrade it here.
+    let reserved: HashSet<Vec<u8>> = settlement_inputs::table
+        .inner_join(
+            settlement_attempts::table.on(settlement_inputs::tx_id.eq(settlement_attempts::tx_id)),
+        )
+        .filter(settlement_inputs::parent_note_id.eq_any(note_ids))
+        .filter(settlement_attempts::status.ne("confirmed"))
+        .select(settlement_inputs::parent_note_id)
+        .load::<Vec<u8>>(conn)?
+        .into_iter()
+        .collect();
+    let external: Vec<&Vec<u8>> = note_ids
+        .iter()
+        .filter(|id| !reserved.contains(*id))
+        .collect();
+    if external.is_empty() {
+        return Ok(0);
+    }
     let count = diesel::update(
         orders::table
-            .filter(orders::note_id.eq_any(note_ids))
-            .filter(orders::status.eq_any([
-                OrderStatus::Active.as_str(),
-                OrderStatus::Settling.as_str(),
-            ])),
+            .filter(orders::note_id.eq_any(external))
+            .filter(
+                orders::status
+                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+            ),
     )
     .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
     .execute(conn)?;
-    Ok(count)
-}
-
-/// Boot-time recovery: any orders left in `Settling` from a previous run are
-/// reset to `Active` so the matcher can re-consider them. A perfect recovery
-/// would reconcile against the chain; this is the conservative fallback
-/// (re-submission of an already-consumed note is rejected by the on-chain
-/// script, so this is safe).
-pub fn reset_all_settling_to_active(conn: &mut SqliteConnection) -> Result<usize> {
-    let count = diesel::update(orders::table.filter(orders::status.eq(OrderStatus::Settling.as_str())))
-        .set(orders::status.eq(OrderStatus::Active.as_str()))
-        .execute(conn)?;
     Ok(count)
 }
 
@@ -218,40 +543,13 @@ pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<
 
     let mut out = Vec::with_capacity(rows.len());
     for (order_row, raw_data) in rows {
-        let note_id = OrderId::read_from(&mut SliceReader::new(&order_row.note_id))
-            .map_err(|e| anyhow::anyhow!("invalid note_id in DB: {e}"))?;
-        let offered_token = TokenId::read_from(&mut SliceReader::new(&order_row.offered_asset))
-            .map_err(|e| anyhow::anyhow!("invalid offered_asset in DB: {e}"))?;
-        let requested_token = TokenId::read_from(&mut SliceReader::new(&order_row.requested_asset))
-            .map_err(|e| anyhow::anyhow!("invalid requested_asset in DB: {e}"))?;
-        // `min_fill_step` isn't a column: read it from the stored note. A row whose
-        // note doesn't parse could never settle, so skip it rather than failing the
-        // whole hydration.
-        let parsed = Note::read_from(&mut SliceReader::new(&raw_data))
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .and_then(|note| crate::types::Order::from_note(&note));
-        let min_fill_step = match parsed {
-            Ok(order) => order.min_fill_step,
+        match order_row.into_ingest(raw_data) {
+            Ok(order) if order.priority_seq > 0 => out.push(order),
+            Ok(_) => anyhow::bail!("active order lacks persisted FIFO sequence"),
             Err(e) => {
                 tracing::warn!(error = %e, "skipping active order whose stored note does not parse");
-                continue;
             }
-        };
-        let priority_seq = u64::try_from(order_row.priority_seq)
-            .map_err(|_| anyhow::anyhow!("invalid persisted FIFO sequence"))?;
-        if priority_seq == 0 {
-            anyhow::bail!("active order lacks persisted FIFO sequence");
         }
-        out.push(IngestOrder {
-            note_id,
-            priority_seq,
-            offered_token,
-            requested_token,
-            offered_amount: order_row.offered_amount as u64,
-            requested_amount: order_row.requested_amount as u64,
-            min_fill_step,
-            raw_note_data: raw_data,
-        });
     }
     Ok(out)
 }
@@ -321,14 +619,13 @@ pub fn set_token_metadata(
     decimals: Option<i32>,
     ticker: Option<&str>,
 ) -> Result<bool> {
-    let updated = diesel::update(
-        registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)),
-    )
-    .set((
-        registered_tokens::decimals.eq(decimals),
-        registered_tokens::ticker.eq(ticker.map(|s| s.to_string())),
-    ))
-    .execute(conn)?;
+    let updated =
+        diesel::update(registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)))
+            .set((
+                registered_tokens::decimals.eq(decimals),
+                registered_tokens::ticker.eq(ticker.map(|s| s.to_string())),
+            ))
+            .execute(conn)?;
     Ok(updated > 0)
 }
 
@@ -360,11 +657,10 @@ pub fn update_token_symbol(
     symbol: Option<&str>,
 ) -> Result<bool> {
     let new_value = symbol.map(|s| s.to_string());
-    let updated = diesel::update(
-        registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)),
-    )
-    .set(registered_tokens::external_symbol.eq(new_value))
-    .execute(conn)?;
+    let updated =
+        diesel::update(registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)))
+            .set(registered_tokens::external_symbol.eq(new_value))
+            .execute(conn)?;
     Ok(updated > 0)
 }
 
@@ -375,7 +671,9 @@ pub fn load_token_symbols(pool: &DbPool) -> Result<HashMap<TokenId, String>> {
     let rows = get_registered_tokens(&mut conn)?;
     let mut out = HashMap::new();
     for row in rows {
-        let Some(symbol) = row.external_symbol else { continue };
+        let Some(symbol) = row.external_symbol else {
+            continue;
+        };
         let token = TokenId::read_from(&mut SliceReader::new(&row.token_id))
             .map_err(|e| anyhow::anyhow!("invalid token in DB: {e}"))?;
         out.insert(token, symbol);
@@ -385,10 +683,9 @@ pub fn load_token_symbols(pool: &DbPool) -> Result<HashMap<TokenId, String>> {
 
 /// Returns true if deleted, false if not found.
 pub fn unregister_token(conn: &mut SqliteConnection, token_id: &[u8]) -> Result<bool> {
-    let deleted = diesel::delete(
-        registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)),
-    )
-    .execute(conn)?;
+    let deleted =
+        diesel::delete(registered_tokens::table.filter(registered_tokens::token_id.eq(token_id)))
+            .execute(conn)?;
 
     Ok(deleted > 0)
 }
@@ -424,6 +721,221 @@ pub fn seed_tokens_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::asset::{AssetAmount, FungibleAsset};
+    use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+    use miden_protocol::note::NoteType;
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+    };
+    use miden_protocol::Word;
+    use miden_standards::note::{PswapNote, PswapNoteStorage};
+
+    fn partial_note_pair() -> (Note, Note) {
+        let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+        let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+            .try_into()
+            .unwrap();
+        let solver = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2
+            .try_into()
+            .unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let parent: Note = PswapNote::builder()
+            .sender(creator)
+            .storage(
+                PswapNoteStorage::builder()
+                    .min_requested_asset(FungibleAsset::new(requested, 10).unwrap())
+                    .min_fill_step(AssetAmount::new(1).unwrap())
+                    .creator_account_id(creator)
+                    .build(),
+            )
+            .serial_number(rng.draw_word())
+            .note_type(NoteType::Public)
+            .offered_asset(FungibleAsset::new(offered, 10).unwrap())
+            .build()
+            .unwrap()
+            .into();
+        let (_, remainder) = PswapNote::try_from(&parent)
+            .unwrap()
+            .execute(
+                solver,
+                None,
+                Some(FungibleAsset::new(requested, 5).unwrap()),
+            )
+            .unwrap();
+        (parent, Note::from(remainder.unwrap()))
+    }
+
+    fn prepared_fixture(conn: &mut SqliteConnection) -> (Note, Note, Vec<u8>, i64) {
+        let (parent, child) = partial_note_pair();
+        let parsed = crate::types::Order::from_note(&parent).unwrap();
+        let parent_id = parent.id().to_bytes().to_vec();
+        insert_notes_batch(
+            conn,
+            &[NoteRow {
+                note_id: parent_id.clone(),
+                account_id: parsed.creator_id.to_bytes().to_vec(),
+                raw_data: parent.to_bytes(),
+            }],
+            &[OrderRow {
+                note_id: parent_id.clone(),
+                account_id: parsed.creator_id.to_bytes().to_vec(),
+                requested_asset: parsed.requested_faucet_id.to_bytes().to_vec(),
+                requested_amount: 10,
+                offered_asset: parsed.offered_faucet_id.to_bytes().to_vec(),
+                offered_amount: 10,
+                timestamp: 1,
+                status: "active".into(),
+                priority_seq: 0,
+            }],
+            1,
+        )
+        .unwrap();
+        let priority = get_active_orders(conn).unwrap()[0].priority_seq;
+        let tx_id = vec![7u8; 32];
+        prepare_settlement(
+            conn,
+            &SettlementAttemptRow {
+                tx_id: tx_id.clone(),
+                tx_result: vec![1],
+                status: "prepared".into(),
+            },
+            &[SettlementInputRow {
+                tx_id: tx_id.clone(),
+                parent_note_id: parent_id.clone(),
+                payback_note_id: vec![8u8; 32],
+                child_note_id: Some(child.id().to_bytes().to_vec()),
+                child_note_data: Some(child.to_bytes()),
+            }],
+        )
+        .unwrap();
+        (parent, child, tx_id, priority)
+    }
+
+    #[test]
+    fn confirmed_remainder_inherits_priority_once() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        let (parent, child, tx_id, priority) = prepared_fixture(&mut conn);
+        assert_eq!(
+            settlement_payback_id(&mut conn, &tx_id).unwrap().to_bytes(),
+            [8u8; 32]
+        );
+        assert_eq!(
+            mark_orders_onchain_nullified(&mut conn, &[parent.id().to_bytes().to_vec()]).unwrap(),
+            0
+        );
+
+        let first = confirm_expected_remainder(&mut conn, child.id().to_bytes().as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.removed, vec![parent.id()]);
+        assert_eq!(first.active.len(), 1);
+        assert_eq!(first.active[0].priority_seq, priority as u64);
+        let duplicate = confirm_settlement(&mut conn, &tx_id).unwrap();
+        assert!(duplicate.removed.is_empty() && duplicate.active.is_empty());
+        mark_settlement_submitted(&mut conn, &tx_id).unwrap();
+        mark_settlement_uncertain(&mut conn, &tx_id).unwrap();
+        let status: String = settlement_attempts::table
+            .find(&tx_id)
+            .select(settlement_attempts::status)
+            .first(&mut conn)
+            .unwrap();
+        assert_eq!(status, "confirmed");
+        let live = get_active_orders(&mut conn).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].note_id, child.id().to_bytes());
+        assert_eq!(live[0].priority_seq, priority);
+    }
+
+    #[test]
+    fn rejected_cleanup_rolls_back_parent_and_attempt_together() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        let (parent, _, tx_id, _) = prepared_fixture(&mut conn);
+        mark_settlement_rejected(&mut conn, &tx_id).unwrap();
+        conn.batch_execute(
+            "CREATE TRIGGER reject_cleanup BEFORE DELETE ON settlement_attempts
+            BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;",
+        )
+        .unwrap();
+        assert!(finish_discarded_settlement(&mut conn, &tx_id, &HashSet::new()).is_err());
+        assert!(get_active_orders(&mut conn).unwrap().is_empty());
+        assert_eq!(
+            unresolved_settlements(&mut conn).unwrap()[0].status,
+            "rejected"
+        );
+        assert_eq!(
+            settlement_parents(&mut conn, &tx_id).unwrap()[0].note_id,
+            parent.id()
+        );
+
+        conn.batch_execute("DROP TRIGGER reject_cleanup;").unwrap();
+        let update = finish_discarded_settlement(&mut conn, &tx_id, &HashSet::new()).unwrap();
+        assert_eq!(update.active[0].note_id, parent.id());
+        assert!(unresolved_settlements(&mut conn).unwrap().is_empty());
+        assert!(settlement_parents(&mut conn, &tx_id).unwrap().is_empty());
+        assert_eq!(get_active_orders(&mut conn).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_matcher_does_not_commit_confirmation() {
+        let pool = test_pool();
+        let (_, _, tx_id, _) = prepared_fixture(&mut pool.write_conn().unwrap());
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        assert!(pool
+            .update_book(&sender, |conn| confirm_settlement(conn, &tx_id))
+            .await
+            .is_err());
+        assert_eq!(
+            unresolved_settlements(&mut pool.write_conn().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn full_matcher_queue_waits_before_database_transition() {
+        let pool = test_pool();
+        let (parent, child, tx_id, priority) = prepared_fixture(&mut pool.write_conn().unwrap());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(BookUpdate::default()).await.unwrap();
+        let publish = pool.update_book(&sender, |conn| confirm_settlement(conn, &tx_id));
+        tokio::pin!(publish);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut publish)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            unresolved_settlements(&mut pool.write_conn().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        receiver.recv().await.unwrap();
+        publish.await.unwrap();
+        let outcome = receiver.recv().await.unwrap();
+        assert_eq!(outcome.removed, vec![parent.id()]);
+        assert_eq!(outcome.active[0].note_id, child.id());
+        assert_eq!(outcome.active[0].priority_seq, priority as u64);
+    }
+
+    #[test]
+    fn delayed_refeed_cannot_resurrect_consumed_order() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        let (parent, _, tx_id, _) = prepared_fixture(&mut conn);
+        let update = finish_discarded_settlement(&mut conn, &tx_id, &HashSet::new()).unwrap();
+        mark_orders_onchain_nullified(&mut conn, &[parent.id().to_bytes().to_vec()]).unwrap();
+        assert!(active_book_update(&mut conn, update.active)
+            .unwrap()
+            .is_empty());
+    }
 
     fn test_pool() -> DbPool {
         init_db(":memory:", 1).expect("failed to create test DB")
@@ -565,8 +1077,7 @@ mod tests {
             priority_seq: 0,
         };
 
-        let first =
-            insert_notes_batch(&mut conn, &[note.clone()], &[order.clone()], 1).unwrap();
+        let first = insert_notes_batch(&mut conn, &[note.clone()], &[order.clone()], 1).unwrap();
         assert_eq!(first.len(), 1);
         assert!(first.contains_key(&vec![9, 9, 9]));
         assert_eq!(first[&vec![9, 9, 9]], 1);
@@ -701,11 +1212,8 @@ mod tests {
         seed_order(&mut conn, &[1, 1, 1], OrderStatus::Active);
         seed_order(&mut conn, &[2, 2, 2], OrderStatus::Settling);
 
-        let updated = mark_orders_onchain_nullified(
-            &mut conn,
-            &[vec![1, 1, 1], vec![2, 2, 2]],
-        )
-        .unwrap();
+        let updated =
+            mark_orders_onchain_nullified(&mut conn, &[vec![1, 1, 1], vec![2, 2, 2]]).unwrap();
         assert_eq!(updated, 2);
 
         assert_eq!(order_status(&mut conn, &[1, 1, 1]), "onchain_nullified");
@@ -722,8 +1230,7 @@ mod tests {
 
         seed_order(&mut conn, &[3, 3, 3], OrderStatus::Executed);
 
-        let updated =
-            mark_orders_onchain_nullified(&mut conn, &[vec![3, 3, 3]]).unwrap();
+        let updated = mark_orders_onchain_nullified(&mut conn, &[vec![3, 3, 3]]).unwrap();
         assert_eq!(updated, 0, "Executed row must not be downgraded");
         assert_eq!(order_status(&mut conn, &[3, 3, 3]), "executed");
     }

@@ -28,6 +28,24 @@ diesel::table! {
 }
 
 diesel::table! {
+    settlement_attempts (tx_id) {
+        tx_id -> Binary,
+        tx_result -> Binary,
+        status -> Text,
+    }
+}
+
+diesel::table! {
+    settlement_inputs (tx_id, parent_note_id) {
+        tx_id -> Binary,
+        parent_note_id -> Binary,
+        payback_note_id -> Binary,
+        child_note_id -> Nullable<Binary>,
+        child_note_data -> Nullable<Binary>,
+    }
+}
+
+diesel::table! {
     generated_notes (note_id) {
         note_id -> Binary,
         account_id -> Binary,
@@ -48,4 +66,12 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(sync_state, notes, orders, generated_notes, registered_tokens);
+diesel::allow_tables_to_appear_in_same_query!(
+    sync_state,
+    notes,
+    orders,
+    settlement_attempts,
+    settlement_inputs,
+    generated_notes,
+    registered_tokens,
+);

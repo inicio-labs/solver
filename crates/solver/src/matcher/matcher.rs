@@ -1,4 +1,3 @@
-use miden_protocol::note::NoteId;
 use miden_protocol::account::AccountId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -6,18 +5,18 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::{self, DbPool};
 use crate::clearing::{
     self, ClearingConfig, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
 };
+use crate::db::{self, DbPool};
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::matching::types::{Order, SwapBookSnapshot};
 use crate::price::{PreciseSnapshot, PriceSnapshot, WatchPriceFeed};
 use crate::router::{select_notes, Pair, QuotesSnapshot, RouteBatch, RoutedNote};
 // `now_unix` / `UnixSecs` come from here (deduped — was a local copy).
+use super::clearing_book::{run_clearer, ClearingBook, ClearingBootstrap};
 use crate::types::*;
-use super::clearing_book::{ClearingBook, ClearingBootstrap, run_clearer};
 
 /// Hooks that enable the external-liquidity pass in the matcher tick. When the
 /// router is disabled these are absent and the matcher behaves exactly as before.
@@ -52,7 +51,7 @@ pub struct ClearingRuntime {
 /// (e.g. crash between DB write and channel send) are still considered.
 /// DB is the source of truth; in-memory state is rebuildable from it.
 ///
-/// Each tick: drain consumed (the one removal path) → drain new orders →
+/// Each tick: apply ordered book updates →
 /// reactivate timed-out parked notes → run internal matching (→ executor) →
 /// run the external pass (→ router), if enabled. The external pass and
 /// reactivation run on EVERY tick (no early `continue`), since the
@@ -62,8 +61,7 @@ pub struct ClearingRuntime {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_matcher(
     pool: DbPool,
-    mut order_rx: mpsc::Receiver<IngestOrder>,
-    mut consumed_rx: mpsc::Receiver<NoteId>,
+    mut book_rx: mpsc::Receiver<BookUpdate>,
     price_rx: watch::Receiver<PriceSnapshot>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
@@ -76,7 +74,15 @@ pub async fn run_matcher(
     cancel: CancellationToken,
 ) {
     if let Some(runtime) = clearing {
-        run_clearer(order_rx, consumed_rx, exec_tx, match_interval, swap_snapshot_tx, runtime, cancel).await;
+        run_clearer(
+            book_rx,
+            exec_tx,
+            match_interval,
+            swap_snapshot_tx,
+            runtime,
+            cancel,
+        )
+        .await;
         return;
     }
     let feed = WatchPriceFeed::from_watch(&price_rx);
@@ -135,36 +141,52 @@ pub async fn run_matcher(
             last_now
         };
 
-        // Sync the book with inbound events: drop consumed notes, add new orders.
-        while let Ok(note_id) = consumed_rx.try_recv() {
-            engine.book.remove_order(note_id);
-            raw_notes.remove(&note_id);
-            priority_seqs.remove(&note_id);
-            arrivals.remove(&note_id);
-        }
-        while let Ok(order) = order_rx.try_recv() {
-            engine.book.add_user_order_with_min_fill(
-                order.note_id,
-                order.offered_token,
-                order.requested_token,
-                order.offered_amount,
-                order.requested_amount,
-                order.min_fill_step,
-            );
-            arrivals.entry(order.note_id).or_insert_with(now_unix);
-            priority_seqs.insert(order.note_id, order.priority_seq);
-            raw_notes.insert(order.note_id, order.raw_note_data);
+        // Each committed update removes parents and activates remainders together.
+        for _ in 0..book_rx.len() {
+            let Ok(update) = book_rx.try_recv() else {
+                break;
+            };
+            for note_id in update.removed {
+                engine.book.remove_order(note_id);
+                raw_notes.remove(&note_id);
+                priority_seqs.remove(&note_id);
+                arrivals.remove(&note_id);
+            }
+            for order in update.active {
+                engine.book.add_user_order_with_min_fill(
+                    order.note_id,
+                    order.offered_token,
+                    order.requested_token,
+                    order.offered_amount,
+                    order.requested_amount,
+                    order.min_fill_step,
+                );
+                arrivals.entry(order.note_id).or_insert_with(now_unix);
+                priority_seqs.insert(order.note_id, order.priority_seq);
+                raw_notes.insert(order.note_id, order.raw_note_data);
+            }
         }
 
         // 1. Reactivate parked notes whose DEX no-showed past the in-flight TTL.
         if let Some(r) = router.as_ref() {
-            for (id, dex) in engine.book.reactivate_parked_older_than(r.inflight_ttl_ms, now) {
+            for (id, dex) in engine
+                .book
+                .reactivate_parked_older_than(r.inflight_ttl_ms, now)
+            {
                 tracing::debug!(note = %id, dex, "parked note timed out; reactivated");
             }
         }
 
         // 2. Internal matching (→ executor).
-        let stop = internal_match(&mut engine, &mut raw_notes, &mut priority_seqs, &mut arrivals, &price_rx, &exec_tx).await;
+        let stop = internal_match(
+            &mut engine,
+            &mut raw_notes,
+            &mut priority_seqs,
+            &mut arrivals,
+            &price_rx,
+            &exec_tx,
+        )
+        .await;
         if stop {
             return; // executor channel closed
         }
@@ -328,8 +350,10 @@ pub(super) async fn internal_clear(
         tracing::error!("executor channel closed during clearing");
         return true;
     }
+    // Keep the parents in memory but off the matchable index. A definite
+    // failure reactivates them; confirmation removes them permanently.
     for note_id in filled_ids {
-        book.remove(note_id);
+        book.deactivate(note_id);
     }
     false
 }
@@ -379,10 +403,19 @@ async fn internal_match(
             arrival_unix: arrivals.get(&order_id).copied().unwrap_or_else(now_unix),
         });
     }
-    if exec_tx.send(ExecutionBatch { filled_notes, group_ends: Vec::new() }).await.is_err() {
+    if exec_tx
+        .send(ExecutionBatch {
+            filled_notes,
+            group_ends: Vec::new(),
+        })
+        .await
+        .is_err()
+    {
         tracing::warn!("executor channel closed, matcher shutting down");
         return true;
     }
+    // The executor owns the pending batch. Keep its parents off the
+    // matchable index until a definite failure re-feeds them.
     for &order_id in &batch.filled_orders {
         engine.book.remove_order(order_id);
         raw_notes.remove(&order_id);
@@ -487,12 +520,12 @@ fn route_external<F: crate::matching::price_feed::PriceFeed>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use miden_protocol::crypto::utils::Serializable;
-    use crate::matching::types::DexId;
     use crate::matching::order_book::OrderBook;
-    use crate::price::WatchPriceFeed;
+    use crate::matching::types::DexId;
     use crate::price::PriceData;
+    use crate::price::WatchPriceFeed;
     use crate::router::Quote;
+    use miden_protocol::crypto::utils::Serializable;
     use miden_protocol::note::NoteId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -687,13 +720,24 @@ mod tests {
         assert_eq!(execution.filled_notes.len(), 4);
         assert_eq!(execution.group_ends, vec![2, 4]);
         assert!(exec_rx.try_recv().is_err());
-        assert!(book.arrivals.is_empty());
+        assert_eq!(book.arrivals.len(), 4);
+        assert!(!internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).await);
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "pending orders must not be dispatched twice"
+        );
     }
     /// A quote for the IMIDEN/IUSDT pair at base-unit rate 1/50 (requested-base per
     /// offered-base). Any note whose rate is at or below this is willing.
     fn quote_at_mid(dex: DexId, supply: Amount, expires_at: u64) -> Quote {
         // rate supply/demand = 1/50; `supply` is the capacity.
-        Quote { dex, pair: (imiden(), iusdt()), supply, demand: supply.saturating_mul(50), expires_at }
+        Quote {
+            dex,
+            pair: (imiden(), iusdt()),
+            supply,
+            demand: supply.saturating_mul(50),
+            expires_at,
+        }
     }
     // Group quotes into the published snapshot shape (by pair, rate-sorted like the router).
     fn snap(quotes: Vec<Quote>) -> QuotesSnapshot {
@@ -729,7 +773,12 @@ mod tests {
         // Offer 1.1 IMIDEN for 2 IUSDT — the DEX (quoting 1/50) is willing → exported.
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         assert_eq!(book.active_order_count(), 1);
-        let items = route_external(&mut book, &raw, &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]), 1_000);
+        let items = route_external(
+            &mut book,
+            &raw,
+            &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]),
+            1_000,
+        );
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].dex, 7);
@@ -747,10 +796,19 @@ mod tests {
         let id = nid(2);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         // The DEX accepts only 1/100 — below the note's rate → unwilling.
-        let q = Quote { dex: 7, pair: (imiden(), iusdt()), supply: 10_000_000, demand: 1_000_000_000, expires_at: u64::MAX };
+        let q = Quote {
+            dex: 7,
+            pair: (imiden(), iusdt()),
+            supply: 10_000_000,
+            demand: 1_000_000_000,
+            expires_at: u64::MAX,
+        };
         let items = route_external(&mut book, &raw, &snap(vec![q]), 1_000);
         assert!(items.is_empty());
-        assert!(!book.is_parked(id), "an unroutable order stays matchable internally");
+        assert!(
+            !book.is_parked(id),
+            "an unroutable order stays matchable internally"
+        );
         assert_eq!(book.active_order_count(), 1);
     }
 
@@ -759,7 +817,12 @@ mod tests {
         let id = nid(8);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         book.orders.get_mut(&id).unwrap().fill(1_000_000); // partial internal fill
-        let items = route_external(&mut book, &raw, &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]), 1_000);
+        let items = route_external(
+            &mut book,
+            &raw,
+            &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]),
+            1_000,
+        );
         assert!(items.is_empty(), "v1 routes whole notes only");
         assert!(!book.is_parked(id));
     }
@@ -769,7 +832,12 @@ mod tests {
         let id = nid(9);
         let (mut book, _raw) = book_with_order(id, 110_000_000, 2_000_000);
         // Candidate in the book, but its bytes are absent → skipped, not parked.
-        let items = route_external(&mut book, &HashMap::new(), &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]), 1_000);
+        let items = route_external(
+            &mut book,
+            &HashMap::new(),
+            &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]),
+            1_000,
+        );
         assert!(items.is_empty());
         assert!(!book.is_parked(id), "no raw bytes → not parked");
     }
@@ -779,7 +847,12 @@ mod tests {
         let id = nid(3);
         let (mut book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         // expires_at == now ⇒ stale (strict >).
-        let items = route_external(&mut book, &raw, &snap(vec![quote_at_mid(7, 10_000_000, 1_000)]), 1_000);
+        let items = route_external(
+            &mut book,
+            &raw,
+            &snap(vec![quote_at_mid(7, 10_000_000, 1_000)]),
+            1_000,
+        );
         assert!(items.is_empty());
         assert!(!book.is_parked(id));
     }
@@ -803,8 +876,7 @@ mod tests {
             set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
         }
 
-        let (order_tx, order_rx) = mpsc::channel(16);
-        let (_consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
+        let (book_tx, book_rx) = mpsc::channel(16);
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, mut exec_rx) = mpsc::channel(16);
         let (quotes_tx, quotes_rx) = watch::channel(Arc::new(HashMap::new()));
@@ -816,7 +888,11 @@ mod tests {
         prices.insert(iusdt(), 100);
         price_tx.send(prices).unwrap();
         quotes_tx
-            .send(Arc::new(snap(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)])))
+            .send(Arc::new(snap(vec![quote_at_mid(
+                1,
+                1_000_000_000,
+                u64::MAX,
+            )])))
             .unwrap();
 
         let hooks = RouterHooks {
@@ -825,19 +901,17 @@ mod tests {
             inflight_ttl_ms: 60_000,
         };
         let id = nid(777);
-        order_tx
-            .send(IngestOrder {
-                note_id: id,
-                priority_seq: 1,
-                offered_token: imiden(),
-                requested_token: iusdt(),
-                offered_amount: 110_000_000, // 1.1 IMIDEN = $2.20
-                requested_amount: 2_000_000, // 2 IUSDT = $2.00 → +10% generous
-                min_fill_step: 0,
-                raw_note_data: vec![1, 2, 3, 4],
-            })
-            .await
-            .unwrap();
+        let order = IngestOrder {
+            note_id: id,
+            priority_seq: 1,
+            offered_token: imiden(),
+            requested_token: iusdt(),
+            offered_amount: 110_000_000, // 1.1 IMIDEN = $2.20
+            requested_amount: 2_000_000, // 2 IUSDT = $2.00 → +10% generous
+            min_fill_step: 0,
+            raw_note_data: vec![1, 2, 3, 4],
+        };
+        book_tx.send(order.into()).await.unwrap();
 
         // Matcher is `spawn_local` in production (mirror that here).
         let local = tokio::task::LocalSet::new();
@@ -845,8 +919,7 @@ mod tests {
             .run_until(async move {
                 let task = tokio::task::spawn_local(run_matcher(
                     pool,
-                    order_rx,
-                    consumed_rx,
+                    book_rx,
                     price_rx,
                     exec_tx,
                     Duration::from_millis(10),
@@ -904,8 +977,7 @@ mod tests {
             set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
         }
 
-        let (order_tx, order_rx) = mpsc::channel(16);
-        let (_consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
+        let (book_tx, book_rx) = mpsc::channel(16);
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, _exec_rx) = mpsc::channel(16);
         // The router owns quotes_tx (publishes DEX quotes) + route_rx (delivers
@@ -942,19 +1014,17 @@ mod tests {
 
         // An unmatched order: offer 1.1 IMIDEN for 2 IUSDT — the DEX quote below
         // crosses the note's rate, so the note is willing and gets routed.
-        order_tx
-            .send(IngestOrder {
-                note_id: id,
-                priority_seq: 1,
-                offered_token: imiden(),
-                requested_token: iusdt(),
-                offered_amount: 110_000_000,
-                requested_amount: 2_000_000,
-                min_fill_step: 0,
-                raw_note_data: note_bytes.clone(),
-            })
-            .await
-            .unwrap();
+        let order = IngestOrder {
+            note_id: id,
+            priority_seq: 1,
+            offered_token: imiden(),
+            requested_token: iusdt(),
+            offered_amount: 110_000_000,
+            requested_amount: 2_000_000,
+            min_fill_step: 0,
+            raw_note_data: note_bytes.clone(),
+        };
+        book_tx.send(order.into()).await.unwrap();
 
         let hooks = RouterHooks {
             quotes_rx,
@@ -969,8 +1039,7 @@ mod tests {
             .run_until(async move {
                 let task = tokio::task::spawn_local(run_matcher(
                     pool,
-                    order_rx,
-                    consumed_rx,
+                    book_rx,
                     price_rx,
                     exec_tx,
                     Duration::from_millis(10),
@@ -1006,7 +1075,10 @@ mod tests {
                         _ => continue, // ignore any Ask/Error/reconnect noise
                     }
                 };
-                let Handover { note: got, fill_amount } = handover;
+                let Handover {
+                    note: got,
+                    fill_amount,
+                } = handover;
                 assert_eq!(fill_amount, 2_000_000, "full requested amount");
                 assert_eq!(got.id(), id, "the exact note we fed, decoded round-trip");
 
@@ -1042,8 +1114,11 @@ mod tests {
             set_token_metadata(&mut conn, &iusdt().to_bytes(), Some(6), None).unwrap();
         }
 
-        let (_qtx, quotes_rx) =
-            watch::channel(Arc::new(snap(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)])));
+        let (_qtx, quotes_rx) = watch::channel(Arc::new(snap(vec![quote_at_mid(
+            1,
+            1_000_000_000,
+            u64::MAX,
+        )])));
 
         // Capacity-1 handover channel, pre-filled → the first try_send is Full.
         let (route_tx, mut route_rx) = mpsc::channel::<RouteBatch>(1);
@@ -1062,14 +1137,24 @@ mod tests {
         // (1) Full channel → the handover is dropped and rolled back: unparked,
         //     back in internal matching. No hang, no penalty.
         external_pass(&mut engine, &raw, &hooks, 1_000);
-        assert!(!engine.book.is_parked(id), "dropped handover rolled back — note not left parked");
-        assert_eq!(engine.book.active_order_count(), 1, "note is eligible again");
+        assert!(
+            !engine.book.is_parked(id),
+            "dropped handover rolled back — note not left parked"
+        );
+        assert_eq!(
+            engine.book.active_order_count(),
+            1,
+            "note is eligible again"
+        );
 
         // (2) Drain the channel, retry → the note re-routes to the SAME DEX and is
         //     delivered. The drop cost it nothing.
         let _ = route_rx.try_recv(); // free the slot
         external_pass(&mut engine, &raw, &hooks, 2_000);
-        assert!(engine.book.is_parked(id), "after the drop the note re-routes to the same DEX");
+        assert!(
+            engine.book.is_parked(id),
+            "after the drop the note re-routes to the same DEX"
+        );
         let delivered = route_rx.try_recv().expect("handover delivered on retry");
         assert_eq!(delivered.items.len(), 1);
         assert_eq!(delivered.items[0].note_id, id);
@@ -1078,14 +1163,28 @@ mod tests {
     #[test]
     fn closed_route_channel_reported_and_unparked() {
         let id = nid(100);
-        let (_qtx, quotes_rx) = watch::channel(Arc::new(snap(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)])));
+        let (_qtx, quotes_rx) = watch::channel(Arc::new(snap(vec![quote_at_mid(
+            1,
+            1_000_000_000,
+            u64::MAX,
+        )])));
         let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(1);
         drop(route_rx); // receiver gone → channel closed
-        let hooks = RouterHooks { quotes_rx, route_tx, inflight_ttl_ms: 60_000 };
+        let hooks = RouterHooks {
+            quotes_rx,
+            route_tx,
+            inflight_ttl_ms: 60_000,
+        };
         let (book, raw) = book_with_order(id, 110_000_000, 2_000_000);
         let mut engine = MatchingEngine::new(book).with_triangular_enabled(false);
-        assert!(external_pass(&mut engine, &raw, &hooks, 1_000), "closed channel is reported");
-        assert!(!engine.book.is_parked(id), "note unparked on closed channel");
+        assert!(
+            external_pass(&mut engine, &raw, &hooks, 1_000),
+            "closed channel is reported"
+        );
+        assert!(
+            !engine.book.is_parked(id),
+            "note unparked on closed channel"
+        );
     }
 
     fn harness_db() -> (tempfile::NamedTempFile, DbPool) {
@@ -1108,8 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn run_matcher_internal_match_emits_exec_batch() {
         let (_tmp, pool) = harness_db();
-        let (order_tx, order_rx) = mpsc::channel(16);
-        let (_consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
+        let (book_tx, book_rx) = mpsc::channel(16);
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, mut exec_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
@@ -1122,40 +1220,35 @@ mod tests {
 
         // Maker offers 1 IMIDEN for 2 IUSDT; taker offers 2.1 IUSDT for 1 IMIDEN
         // → crossing with surplus, so direct matching fills both.
-        order_tx
-            .send(IngestOrder {
-                note_id: nid(1),
-                priority_seq: 1,
-                offered_token: imiden(),
-                requested_token: iusdt(),
-                offered_amount: 100_000_000,
-                requested_amount: 200_000_000,
-                min_fill_step: 0,
-                raw_note_data: vec![1],
-            })
-            .await
-            .unwrap();
-        order_tx
-            .send(IngestOrder {
-                note_id: nid(2),
-                priority_seq: 2,
-                offered_token: iusdt(),
-                requested_token: imiden(),
-                offered_amount: 210_000_000,
-                requested_amount: 100_000_000,
-                min_fill_step: 0,
-                raw_note_data: vec![2],
-            })
-            .await
-            .unwrap();
+        let maker = IngestOrder {
+            note_id: nid(1),
+            priority_seq: 1,
+            offered_token: imiden(),
+            requested_token: iusdt(),
+            offered_amount: 100_000_000,
+            requested_amount: 200_000_000,
+            min_fill_step: 0,
+            raw_note_data: vec![1],
+        };
+        let taker = IngestOrder {
+            note_id: nid(2),
+            priority_seq: 2,
+            offered_token: iusdt(),
+            requested_token: imiden(),
+            offered_amount: 210_000_000,
+            requested_amount: 100_000_000,
+            min_fill_step: 0,
+            raw_note_data: vec![2],
+        };
+        book_tx.send(maker.into()).await.unwrap();
+        book_tx.send(taker.into()).await.unwrap();
 
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
                 let task = tokio::task::spawn_local(run_matcher(
                     pool,
-                    order_rx,
-                    consumed_rx,
+                    book_rx,
                     price_rx,
                     exec_tx,
                     Duration::from_millis(10),
@@ -1182,8 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn run_matcher_reactivates_and_consumes_parked_note() {
         let (_tmp, pool) = harness_db();
-        let (order_tx, order_rx) = mpsc::channel(16);
-        let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(16);
+        let (book_tx, book_rx) = mpsc::channel(16);
         let (price_tx, price_rx) = watch::channel(PriceSnapshot::new());
         let (exec_tx, _exec_rx) = mpsc::channel(16);
         let (quotes_tx, quotes_rx) = watch::channel(Arc::new(HashMap::new()));
@@ -1195,23 +1287,25 @@ mod tests {
         prices.insert(iusdt(), 100);
         price_tx.send(prices).unwrap();
         quotes_tx
-            .send(Arc::new(snap(vec![quote_at_mid(1, 1_000_000_000, u64::MAX)])))
+            .send(Arc::new(snap(vec![quote_at_mid(
+                1,
+                1_000_000_000,
+                u64::MAX,
+            )])))
             .unwrap();
 
         let id = nid(50);
-        order_tx
-            .send(IngestOrder {
-                note_id: id,
-                priority_seq: 1,
-                offered_token: imiden(),
-                requested_token: iusdt(),
-                offered_amount: 110_000_000,
-                requested_amount: 2_000_000,
-                min_fill_step: 0,
-                raw_note_data: vec![9],
-            })
-            .await
-            .unwrap();
+        let order = IngestOrder {
+            note_id: id,
+            priority_seq: 1,
+            offered_token: imiden(),
+            requested_token: iusdt(),
+            offered_amount: 110_000_000,
+            requested_amount: 2_000_000,
+            min_fill_step: 0,
+            raw_note_data: vec![9],
+        };
+        book_tx.send(order.into()).await.unwrap();
 
         // Tiny in-flight TTL so the parked note reactivates quickly.
         let hooks = RouterHooks {
@@ -1224,8 +1318,7 @@ mod tests {
             .run_until(async move {
                 let task = tokio::task::spawn_local(run_matcher(
                     pool,
-                    order_rx,
-                    consumed_rx,
+                    book_rx,
                     price_rx,
                     exec_tx,
                     Duration::from_millis(10),
@@ -1248,7 +1341,13 @@ mod tests {
                     .unwrap();
                 assert_eq!(second.items[0].note_id, id);
                 // Now the order is consumed on-chain → release path runs.
-                consumed_tx.send(id).await.unwrap();
+                book_tx
+                    .send(BookUpdate {
+                        removed: vec![id],
+                        active: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 cancel.cancel();
                 let _ = task.await;
@@ -1266,7 +1365,12 @@ mod tests {
         assert!(!book.is_parked(id));
         // Empty book.
         let mut empty = OrderBook::new(WatchPriceFeed::new());
-        let items2 = route_external(&mut empty, &HashMap::new(), &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]), 1_000);
+        let items2 = route_external(
+            &mut empty,
+            &HashMap::new(),
+            &snap(vec![quote_at_mid(7, 10_000_000, u64::MAX)]),
+            1_000,
+        );
         assert!(items2.is_empty());
     }
 }

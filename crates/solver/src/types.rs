@@ -37,8 +37,8 @@ pub fn now_unix() -> UnixSecs {
 /// Order lifecycle status.
 ///
 /// `Settling` is the interval between submitting an on-chain settlement
-/// transaction and confirming its outcome. Crash recovery resets any
-/// `Settling` rows back to `Active` at boot.
+/// transaction and confirming its outcome. Recovery keeps unresolved
+/// transactions reserved until their outcome is known.
 ///
 /// `OnchainNullified` is terminal: ingest or executor observed that the
 /// note's nullifier is on-chain (consumed by another party, or by a
@@ -90,8 +90,8 @@ pub struct Order {
 
 impl Order {
     pub fn from_note(note: &Note) -> Result<Self> {
-        let pswap = PswapNote::try_from(note)
-            .map_err(|e| anyhow!("Failed to parse PSWAP note: {}", e))?;
+        let pswap =
+            PswapNote::try_from(note).map_err(|e| anyhow!("Failed to parse PSWAP note: {}", e))?;
 
         let offered_asset = pswap.offered_asset();
         let offered_faucet_id = offered_asset.faucet_id();
@@ -105,7 +105,9 @@ impl Order {
         let min_fill_step = pswap.storage().min_fill_step().as_u64();
 
         if offered_amount == 0 || requested_amount == 0 {
-            return Err(anyhow!("order has zero amount (offered={offered_amount}, requested={requested_amount})"));
+            return Err(anyhow!(
+                "order has zero amount (offered={offered_amount}, requested={requested_amount})"
+            ));
         }
 
         Ok(Order {
@@ -133,6 +135,29 @@ pub struct IngestOrder {
     /// The note's `min_fill_step` (see [`Order::min_fill_step`]).
     pub min_fill_step: Amount,
     pub raw_note_data: Vec<u8>,
+}
+
+/// One committed change to the book. Apply removals and activations without
+/// yielding, so a parent-to-remainder handoff cannot be matched halfway through.
+#[derive(Debug, Default)]
+pub struct BookUpdate {
+    pub removed: Vec<OrderId>,
+    pub active: Vec<IngestOrder>,
+}
+
+impl BookUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.active.is_empty()
+    }
+}
+
+impl From<IngestOrder> for BookUpdate {
+    fn from(order: IngestOrder) -> Self {
+        Self {
+            removed: Vec::new(),
+            active: vec![order],
+        }
+    }
 }
 
 /// A filled note with its fill amount, flowing from matcher → executor.

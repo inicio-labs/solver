@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::{Note, NoteId};
+use miden_protocol::note::Note;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -16,9 +16,9 @@ use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedTokenMap};
+use crate::router::{QuotesSnapshot, RouteBatch};
 use crate::swap_eta::SettlementStats;
-use crate::router::{RouteBatch, QuotesSnapshot};
-use crate::types::{ExecutionBatch, IngestOrder, TokenId};
+use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
 /// batches, consumed-note notifications), used by `create_channels`.
@@ -120,11 +120,7 @@ pub async fn subscribe_all_pairs(
 /// best-effort: on any RPC/DB error it logs and leaves the row NULL, so the next
 /// registration touching this token (or a restart) retries. Must run on the
 /// ingest thread — the only place the `!Send` Miden client lives.
-async fn ensure_token_metadata(
-    client: &mut dyn MidenClient,
-    pool: &db::DbPool,
-    token: TokenId,
-) {
+async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, token: TokenId) {
     let key = token.to_bytes();
 
     // Already cached? Check first so we never re-hit the RPC for a known token
@@ -133,7 +129,7 @@ async fn ensure_token_metadata(
         Ok(mut conn) => match db::get_registered_token(&mut conn, &key) {
             Ok(Some(row)) if row.decimals.is_some() => return, // already have it
             Ok(Some(_)) => {}                                  // registered, still missing → fetch
-            Ok(None) => return,                                // not registered → nothing to annotate
+            Ok(None) => return, // not registered → nothing to annotate
             Err(e) => {
                 tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
                 return;
@@ -159,7 +155,9 @@ async fn ensure_token_metadata(
                     tracing::info!(%token, decimals, ticker = %ticker, "fetched on-chain token metadata");
                 }
             }
-            Err(e) => tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed"),
+            Err(e) => {
+                tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed")
+            }
         },
         Ok(None) => {
             tracing::debug!(%token, "no on-chain metadata (private/non-faucet); will retry on next registration")
@@ -182,10 +180,8 @@ async fn ensure_token_metadata(
 /// Cross-thread channel endpoints, created once on the main thread and split
 /// between the main coordination thread and the client threads.
 pub struct PipelineChannels {
-    pub order_tx: mpsc::Sender<IngestOrder>,
-    pub order_rx: mpsc::Receiver<IngestOrder>,
-    pub consumed_tx: mpsc::Sender<NoteId>,
-    pub consumed_rx: mpsc::Receiver<NoteId>,
+    pub book_tx: mpsc::Sender<BookUpdate>,
+    pub book_rx: mpsc::Receiver<BookUpdate>,
     pub price_tx: watch::Sender<PriceSnapshot>,
     pub price_rx: watch::Receiver<PriceSnapshot>,
     /// Exact references for opt-in clearing and f64 values for the price API.
@@ -210,8 +206,7 @@ pub struct PipelineChannels {
 }
 
 pub fn create_channels() -> PipelineChannels {
-    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
-    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
+    let (book_tx, book_rx) = mpsc::channel::<BookUpdate>(PIPELINE_CHANNEL_BUF);
     let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
     // Two separate swap-eta feeds, NOT one combined channel: they have two
@@ -224,16 +219,16 @@ pub fn create_channels() -> PipelineChannels {
     // swap-eta handler in price_api.rs.
     let (swap_snapshot_tx, swap_snapshot_rx) =
         watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
-    let (stats_tx, stats_rx) = watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
+    let (stats_tx, stats_rx) =
+        watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
-    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
+    let (quotes_tx, quotes_rx) =
+        watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
     let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
-        order_tx,
-        order_rx,
-        consumed_tx,
-        consumed_rx,
+        book_tx,
+        book_rx,
         price_tx,
         price_rx,
         precise_tx,
@@ -253,19 +248,9 @@ pub fn create_channels() -> PipelineChannels {
     }
 }
 
-/// Boot recovery + token seed + symbol-map hydrate. Touches only the DB (no
-/// miden client), so it runs on the main thread before any client thread.
+/// Token seed + symbol-map hydrate. Outstanding settlements stay reserved
+/// until the executor reconciles them; resetting them could rematch a consumed parent.
 pub fn prepare_db(config: &PipelineConfig) -> Result<()> {
-    {
-        let mut conn = config.db_pool.write_conn()?;
-        let n = db::reset_all_settling_to_active(&mut conn)?;
-        if n > 0 {
-            tracing::info!(
-                count = n,
-                "boot recovery: reset Settling orders to Active for re-matching"
-            );
-        }
-    }
     db::seed_tokens_from_config(&config.db_pool, &config.initial_tokens)?;
     {
         let loaded = db::load_token_symbols(&config.db_pool)?;
@@ -289,8 +274,7 @@ pub struct CoreHandles {
 pub fn spawn_core_services<P: PriceClient + 'static>(
     config: &PipelineConfig,
     price_client: P,
-    order_rx: mpsc::Receiver<IngestOrder>,
-    consumed_rx: mpsc::Receiver<NoteId>,
+    book_rx: mpsc::Receiver<BookUpdate>,
     price_tx: watch::Sender<PriceSnapshot>,
     price_rx: watch::Receiver<PriceSnapshot>,
     precise_tx: watch::Sender<PreciseSnapshot>,
@@ -320,8 +304,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     let matcher_handle = tokio::task::spawn_local(async move {
         matcher::run_matcher(
             matcher_pool,
-            order_rx,
-            consumed_rx,
+            book_rx,
             price_rx,
             exec_tx,
             match_interval,
@@ -344,19 +327,19 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     let admin_port = config.admin_port;
     let admin_cancel = config.cancel.clone();
     let admin_handle = tokio::task::spawn_local(async move {
-        let listener =
-            match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        port = admin_port,
-                        error = %e,
-                        "failed to bind admin port; triggering graceful shutdown"
-                    );
-                    admin_cancel.cancel();
-                    return;
-                }
-            };
+        let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    port = admin_port,
+                    error = %e,
+                    "failed to bind admin port; triggering graceful shutdown"
+                );
+                admin_cancel.cancel();
+                return;
+            }
+        };
         let shutdown_cancel = admin_cancel.clone();
         if let Err(e) = axum::serve(listener, admin_router)
             .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
@@ -388,8 +371,7 @@ pub struct IngestHandles {
 pub async fn spawn_ingest_tasks(
     adapter: Arc<Mutex<dyn MidenClient>>,
     db_pool: db::DbPool,
-    order_tx: mpsc::Sender<IngestOrder>,
-    consumed_tx: mpsc::Sender<NoteId>,
+    book_tx: mpsc::Sender<BookUpdate>,
     mut subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
     cancel: CancellationToken,
@@ -401,8 +383,11 @@ pub async fn spawn_ingest_tasks(
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
 
     if let Some(sender) = clearing_bootstrap {
+        ingest::SyncResult::recover(&mut *adapter.lock().await, &db_pool, solver_id).await?;
         let bootstrap = reconcile_clearing_book(&db_pool, &mut *adapter.lock().await).await?;
-        sender.send(bootstrap).map_err(|_| anyhow::anyhow!("clearing matcher stopped before startup reconciliation"))?;
+        sender.send(bootstrap).map_err(|_| {
+            anyhow::anyhow!("clearing matcher stopped before startup reconciliation")
+        })?;
     }
 
     // Subscribe-relay task: admin (on the main thread) sends (offered,
@@ -437,8 +422,7 @@ pub async fn spawn_ingest_tasks(
         ingest::run_ingest(
             adapter,
             db_pool,
-            order_tx,
-            consumed_tx,
+            book_tx,
             ingest_interval,
             cancel,
             last_sync_unix_seconds,
@@ -500,6 +484,7 @@ async fn reconcile_clearing_book(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::note::NoteId;
     use std::collections::HashMap;
 
     use miden_protocol::account::AccountId;
@@ -853,7 +838,9 @@ mod tests {
         let key_a = token_a.to_bytes();
         {
             let mut conn = pool.read_conn().unwrap();
-            let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+            let row = db::get_registered_token(&mut conn, &key_a)
+                .unwrap()
+                .unwrap();
             assert!(row.decimals.is_none() && row.ticker.is_none());
         }
 
@@ -863,7 +850,9 @@ mod tests {
         subscribe_all_pairs(&pool, &mut mock_client).await.unwrap();
 
         let mut conn = pool.read_conn().unwrap();
-        let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+        let row = db::get_registered_token(&mut conn, &key_a)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.decimals, Some(8));
         assert_eq!(row.ticker.as_deref(), Some("MTA"));
     }

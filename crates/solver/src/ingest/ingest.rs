@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use diesel::{Connection, SqliteConnection};
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
-use miden_client::rpc::NodeRpcClient;
+use miden_client::rpc::{NodeRpcClient, RpcError};
 use miden_client::Client;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
@@ -22,7 +23,7 @@ use crate::client_factory::ClientFactory;
 use crate::db::models::{NoteRow, OrderRow};
 use crate::db::{self, DbPool};
 use crate::types::Order as PipelineOrder;
-use crate::types::{IngestOrder, OrderStatus, TokenId};
+use crate::types::{BookUpdate, IngestOrder, OrderStatus, TokenId};
 
 /// Result of a sync_state call — newly received notes plus IDs of notes
 /// whose nullifier was just observed on-chain. The matcher uses the
@@ -51,11 +52,18 @@ pub trait MidenClient {
     /// whose nullifiers just appeared on-chain.
     async fn sync_state(&mut self) -> Result<SyncResult>;
 
+    /// Included notes retained by the client, including notes discovered before
+    /// a crash interrupted persistence into the solver database.
+    async fn stored_notes(&mut self) -> Result<Vec<Note>>;
+
     /// Given a slice of notes the solver currently believes are matchable,
     /// return the subset whose nullifiers are already on-chain. Used by the
     /// executor after a non-RPC submit error to identify which input notes
     /// are zombies vs. which are still legitimately active.
     async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>>;
+
+    /// Whether a known settlement output has an inclusion record on-chain.
+    async fn note_is_included(&mut self, note_id: NoteId) -> Result<bool>;
 
     /// Fetch a public fungible faucet's on-chain metadata `(decimals, ticker)`
     /// by id. Returns `None` if the account isn't a public faucet / doesn't
@@ -79,23 +87,16 @@ pub trait MidenClient {
 pub async fn run_ingest(
     client: Arc<Mutex<dyn MidenClient>>,
     pool: DbPool,
-    order_tx: mpsc::Sender<IngestOrder>,
-    consumed_tx: mpsc::Sender<NoteId>,
+    book_tx: mpsc::Sender<BookUpdate>,
     interval: Duration,
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicI64>,
     solver_id: AccountId,
 ) {
     loop {
-        // Finish-the-unit shutdown: `ingest_once` is deliberately NOT wrapped
-        // in `select!`, so a started iteration always runs to completion and
-        // the consumed-notes DB write + channel sends for this sync are atomic
-        // (no reliance on `ingest_once` being drop-safe). Cancellation is
-        // observed *between* iterations by the bottom `select!`, which breaks
-        // on `cancel` whether it fired during the preceding `ingest_once` or
-        // during the idle wait. Worst-case shutdown delay is one `ingest_once`,
-        // bounded by the per-call RPC timeout (`rpc.timeout_ms`).
-        match ingest_once(&client, &pool, &order_tx, &consumed_tx, solver_id).await {
+        // An error after client sync may have advanced its durable cursor. Stop
+        // rather than silently losing that sync's events; boot replays stored notes.
+        match ingest_once(&client, &pool, &book_tx, solver_id).await {
             Ok(()) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -104,7 +105,9 @@ pub async fn run_ingest(
                 last_sync_unix_seconds.store(now, Ordering::Relaxed);
             }
             Err(e) => {
-                tracing::error!(error = %e, "ingest iteration failed");
+                tracing::error!(error = %e, "ingest failed; restarting for reconciliation");
+                cancel.cancel();
+                return;
             }
         }
         // The idle wait stays cancellable (and stays at the end so the first
@@ -124,148 +127,160 @@ pub async fn run_ingest(
 async fn ingest_once(
     client: &Arc<Mutex<dyn MidenClient>>,
     pool: &DbPool,
-    order_tx: &mpsc::Sender<IngestOrder>,
-    consumed_tx: &mpsc::Sender<NoteId>,
+    book_tx: &mpsc::Sender<BookUpdate>,
     solver_id: AccountId,
 ) -> Result<()> {
-    let SyncResult {
-        block_num,
-        new_notes,
-        consumed_notes,
-    } = {
-        let mut c = client.lock().await;
-        c.sync_state().await?
-    };
-
-    // Handle consumed notes BEFORE the new-notes path. DB write happens
-    // first so a crash between write and channel send leaves the DB
-    // authoritative; matcher's next-boot hydration sees terminal state.
-    if !consumed_notes.is_empty() {
-        let consumed_bytes: Vec<Vec<u8>> = consumed_notes
-            .iter()
-            .map(|id| id.to_bytes().to_vec())
-            .collect();
-        {
-            let mut conn = pool.write_conn()?;
-            let updated = db::mark_orders_onchain_nullified(&mut conn, &consumed_bytes)?;
-            if updated > 0 {
-                tracing::warn!(
-                    count = updated,
-                    "ingest marked orders OnchainNullified after sync"
-                );
-            }
-        }
-        for note_id in consumed_notes {
-            // Best-effort send. Matcher channel-closed means the matcher
-            // shut down; we keep ingesting (other tasks may still be live)
-            // but the in-memory book stops being maintained.
-            let _ = consumed_tx.send(note_id).await;
-        }
-    }
-
-    // 3. Filter PSWAP notes and parse into DB records + channel messages
-    let mut db_notes = Vec::new();
-    let mut db_orders = Vec::new();
-    let mut ingest_orders = Vec::new();
-
-    for note in &new_notes {
-        if note.recipient().script().root() != PswapNote::script_root() {
-            continue;
-        }
-
-        let order = match PipelineOrder::from_note(note) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(note_id = %note.id(), error = %e, "skipping unparseable PSWAP note");
-                continue;
-            }
-        };
-
-        // A note naming the solver as its creator takes PSWAP's reclaim branch when
-        // the solver consumes it: the offered asset lands in the solver's vault and
-        // no payback note is created, so the batch's expected outputs never appear
-        // and the whole batch fails — every tick, at a fee each time.
-        if order.creator_id == solver_id {
-            tracing::warn!(note_id = %note.id(), "skipping PSWAP note whose creator is the solver account");
-            continue;
-        }
-
-        let note_id_bytes = note.id().to_bytes().to_vec();
-
-        let mut raw_data = Vec::new();
-        note.write_into(&mut raw_data);
-
-        db_notes.push(NoteRow {
-            note_id: note_id_bytes.clone(),
-            account_id: order.creator_id.to_bytes().to_vec(),
-            raw_data: raw_data.clone(),
-        });
-
-        db_orders.push(OrderRow {
-            note_id: note_id_bytes,
-            account_id: order.creator_id.to_bytes().to_vec(),
-            requested_asset: order.requested_faucet_id.to_bytes().to_vec(),
-            requested_amount: order.requested_amount as i64,
-            offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
-            offered_amount: order.offered_amount as i64,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            status: OrderStatus::Active.as_str().to_string(),
-            priority_seq: 0, // assigned by the DB trigger on first insert
-        });
-
-        ingest_orders.push(IngestOrder {
-            note_id: note.id(),
-            priority_seq: 0, // replaced with the persisted sequence after insert
-            offered_token: order.offered_faucet_id,
-            requested_token: order.requested_faucet_id,
-            offered_amount: order.offered_amount,
-            requested_amount: order.requested_amount,
-            min_fill_step: order.min_fill_step,
-            raw_note_data: raw_data,
-        });
-    }
-
-    if db_notes.is_empty() {
-        return Ok(());
-    }
-
-    // 4. Atomic DB insert (notes + orders + block number). The returned set
-    //    is the orders that were *actually* inserted this call — i.e. seen
-    //    for the first time. Duplicates (already-known note_ids) are excluded
-    //    by the `orders` primary key. This is the durable, bounded dedup that
-    //    replaces the old in-memory `seen_notes` HashSet: a note enters the
-    //    matcher channel exactly once, at first commit, even across restarts.
-    let inserted = {
-        let mut conn = pool.write_conn()?;
-        db::insert_notes_batch(&mut conn, &db_notes, &db_orders, block_num)?
-    };
-
-    // 5. Forward only first-seen orders to the matcher. Backpressure via the
-    //    bounded channel; an error means the matcher has shut down.
-    let mut forwarded = 0usize;
-    for mut order in ingest_orders {
-        if let Some(&priority_seq) = inserted.get(order.note_id.to_bytes().as_slice()) {
-            order.priority_seq = priority_seq;
-            order_tx
-                .send(order)
-                .await
-                .map_err(|_| anyhow::anyhow!("matcher channel closed"))?;
-            forwarded += 1;
-        }
-    }
-    tracing::info!(
-        persisted = inserted.len(),
-        forwarded,
-        block = block_num,
-        "ingested PSWAP orders"
-    );
-
-    Ok(())
+    let sync = client.lock().await.sync_state().await?;
+    pool.update_book(book_tx, |conn| sync.persist(conn, solver_id))
+        .await
 }
 
+impl SyncResult {
+    /// Replay the client's durable discoveries, not only the next sync's delta.
+    /// RPC checks are bounded and happen before the SQLite transaction.
+    pub async fn recover(
+        client: &mut dyn MidenClient,
+        pool: &DbPool,
+        solver_id: AccountId,
+    ) -> Result<()> {
+        let mut sync = client.sync_state().await?;
+        sync.new_notes = client.stored_notes().await?;
+        for notes in sync
+            .new_notes
+            .chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX)
+        {
+            sync.consumed_notes
+                .extend(client.check_consumed_notes(notes).await?);
+        }
+        sync.persist(&mut *pool.write_conn()?, solver_id)?;
+        Ok(())
+    }
+
+    /// Persist one observed chain update as one transaction. Removals win over
+    /// additions when a sync both discovers and consumes the same remainder.
+    fn persist(self, conn: &mut SqliteConnection, solver_id: AccountId) -> Result<BookUpdate> {
+        conn.transaction(|conn| self.persist_notes(conn, solver_id))
+    }
+
+    fn persist_notes(
+        self,
+        conn: &mut SqliteConnection,
+        solver_id: AccountId,
+    ) -> Result<BookUpdate> {
+        let SyncResult {
+            block_num,
+            new_notes,
+            consumed_notes,
+        } = self;
+
+        // An included expected remainder confirms its whole settlement. Do this
+        // before processing nullifiers so our own parent becomes Executed rather
+        // than being mistaken for an externally consumed order.
+        let mut expected_children = HashSet::new();
+        let mut update = BookUpdate::default();
+        for note in &new_notes {
+            if let Some(outcome) =
+                db::confirm_expected_remainder(conn, note.id().to_bytes().as_slice())?
+            {
+                expected_children.insert(note.id());
+                update.removed.extend(outcome.removed);
+                update.active.extend(outcome.active);
+            }
+        }
+
+        // Parse ordinary PSWAP notes after recognizing linked remainders.
+        let mut db_notes = Vec::new();
+        let mut db_orders = Vec::new();
+        let mut ingest_orders = Vec::new();
+
+        for note in &new_notes {
+            if expected_children.contains(&note.id()) {
+                continue;
+            }
+            if note.recipient().script().root() != PswapNote::script_root() {
+                continue;
+            }
+
+            let order = match PipelineOrder::from_note(note) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(note_id = %note.id(), error = %e, "skipping unparseable PSWAP note");
+                    continue;
+                }
+            };
+
+            // A note naming the solver as its creator takes PSWAP's reclaim branch when
+            // the solver consumes it: the offered asset lands in the solver's vault and
+            // no payback note is created, so the batch's expected outputs never appear
+            // and the whole batch fails — every tick, at a fee each time.
+            if order.creator_id == solver_id {
+                tracing::warn!(note_id = %note.id(), "skipping PSWAP note whose creator is the solver account");
+                continue;
+            }
+
+            let note_id_bytes = note.id().to_bytes().to_vec();
+
+            let mut raw_data = Vec::new();
+            note.write_into(&mut raw_data);
+
+            db_notes.push(NoteRow {
+                note_id: note_id_bytes.clone(),
+                account_id: order.creator_id.to_bytes().to_vec(),
+                raw_data: raw_data.clone(),
+            });
+
+            db_orders.push(OrderRow {
+                note_id: note_id_bytes,
+                account_id: order.creator_id.to_bytes().to_vec(),
+                requested_asset: order.requested_faucet_id.to_bytes().to_vec(),
+                requested_amount: order.requested_amount as i64,
+                offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
+                offered_amount: order.offered_amount as i64,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                status: OrderStatus::Active.as_str().to_string(),
+                priority_seq: 0, // assigned by the DB trigger on first insert
+            });
+
+            ingest_orders.push(IngestOrder {
+                note_id: note.id(),
+                priority_seq: 0, // replaced with the persisted sequence after insert
+                offered_token: order.offered_faucet_id,
+                requested_token: order.requested_faucet_id,
+                offered_amount: order.offered_amount,
+                requested_amount: order.requested_amount,
+                min_fill_step: order.min_fill_step,
+                raw_note_data: raw_data,
+            });
+        }
+
+        // Insert notes, orders and the cursor together. The returned set contains
+        //    is the orders that were *actually* inserted this call — i.e. seen
+        //    for the first time. Duplicates (already-known note_ids) are excluded
+        //    by the `orders` primary key. This is the durable, bounded dedup that
+        //    replaces the old in-memory `seen_notes` HashSet: a note enters the
+        //    matcher channel exactly once, at first commit, even across restarts.
+        let inserted = db::insert_notes_batch(conn, &db_notes, &db_orders, block_num)?;
+
+        // Only newly inserted ordinary orders need an activation event.
+        for mut order in ingest_orders {
+            if let Some(&priority_seq) = inserted.get(order.note_id.to_bytes().as_slice()) {
+                order.priority_seq = priority_seq;
+                update.active.push(order);
+            }
+        }
+        let consumed: HashSet<_> = consumed_notes.into_iter().collect();
+        let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
+        db::mark_orders_onchain_nullified(conn, &consumed_bytes)?;
+        update
+            .active
+            .retain(|order| !consumed.contains(&order.note_id));
+        update.removed.extend(consumed);
+        Ok(update)
+    }
+}
 
 /// Adapter that wraps the real `miden_client::Client` behind our `MidenClient`
 /// trait abstraction. The same trait is implemented by `MockMidenClient` for
@@ -316,6 +331,34 @@ pub(crate) struct MidenClientAdapter {
 
 #[async_trait(?Send)]
 impl MidenClient for MidenClientAdapter {
+    async fn stored_notes(&mut self) -> Result<Vec<Note>> {
+        let mut records = self
+            .client
+            .lock()
+            .await
+            .get_input_notes(miden_client::store::NoteFilter::All)
+            .await?;
+        // Existing orders keep their persisted FIFO. Recover previously missed
+        // discoveries in client arrival order, with a stable tie-break on restart.
+        records.sort_by_key(|record| (record.created_at(), record.id()));
+        records
+            .iter()
+            .filter(|record| {
+                (record.is_authenticated() || record.is_consumed())
+                    && record.details().recipient().script().root() == PswapNote::script_root()
+            })
+            .map(|record| record.try_into().map_err(anyhow::Error::from))
+            .collect()
+    }
+
+    async fn note_is_included(&mut self, note_id: NoteId) -> Result<bool> {
+        match self.rpc.get_note_by_id(note_id).await {
+            Ok(_) => Ok(true),
+            Err(RpcError::NoteNotFound(_)) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> Result<()> {
         // PSWAP discovery tags only depend on faucet IDs; the amounts in the
         // FungibleAsset args to `create_tag` are placeholders.
@@ -361,16 +404,10 @@ impl MidenClient for MidenClientAdapter {
             match client.get_input_note(*note_id).await {
                 Ok(Some(record)) => match (&record).try_into() {
                     Ok(note) => new_notes.push(note),
-                    Err(e) => {
-                        tracing::error!(%note_id, error = %e, "InputNoteRecord → Note conversion failed")
-                    }
+                    Err(e) => return Err(anyhow!("cannot recover synced note {note_id}: {e}")),
                 },
-                Ok(None) => {
-                    tracing::warn!(%note_id, "note reported by sync but not in input-notes store");
-                }
-                Err(e) => {
-                    tracing::error!(%note_id, error = %e, "get_input_note failed");
-                }
+                Ok(None) => return Err(anyhow!("synced note {note_id} missing from client store")),
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -436,11 +473,17 @@ impl MidenClient for MidenClientAdapter {
             .await
             .map_err(|e| anyhow!("fetch chain-tip header: {e}"))?;
         let fees = header.fee_parameters();
-        let config = self.client.lock().await
+        let config = self
+            .client
+            .lock()
+            .await
             .get_protocol_config(header.protocol_config_commitment())
             .await
             .map_err(|e| anyhow!("load protocol config for chain tip: {e}"))?;
-        Ok(Some((config.fee_asset_id().faucet_id(), fees.verification_base_fee())))
+        Ok(Some((
+            config.fee_asset_id().faucet_id(),
+            fees.verification_base_fee(),
+        )))
     }
 }
 
@@ -457,8 +500,7 @@ pub(crate) fn spawn_ingest_thread(
     factory: Arc<dyn ClientFactory>,
     db_pool: DbPool,
     cancel: CancellationToken,
-    order_tx: mpsc::Sender<IngestOrder>,
-    consumed_tx: mpsc::Sender<NoteId>,
+    book_tx: mpsc::Sender<BookUpdate>,
     subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
     last_sync: Arc<AtomicI64>,
@@ -469,8 +511,7 @@ pub(crate) fn spawn_ingest_thread(
     let ingest_factory = factory;
     let ingest_db = db_pool;
     let ingest_cancel = cancel;
-    let ingest_order_tx = order_tx;
-    let ingest_consumed_tx = consumed_tx;
+    let ingest_book_tx = book_tx;
     let ingest_subscribe_rx = subscribe_rx;
     let ingest_last_sync: Arc<AtomicI64> = last_sync;
     let ingest_thread = thread::Builder::new()
@@ -499,8 +540,7 @@ pub(crate) fn spawn_ingest_thread(
                 let mut h = match crate::pipeline::spawn_ingest_tasks(
                     adapter,
                     ingest_db,
-                    ingest_order_tx,
-                    ingest_consumed_tx,
+                    ingest_book_tx,
                     ingest_subscribe_rx,
                     ingest_interval,
                     ingest_cancel.clone(),
@@ -518,8 +558,8 @@ pub(crate) fn spawn_ingest_thread(
                 };
                 let _ = ingest_ready_tx.send(Ok(()));
                 // If a task exits *unexpectedly* (not via cancel) the main
-                // coordination loop has no other signal — `order_tx` keeps
-                // other live senders, so its `order_rx` never closes and the
+                // coordination loop has no other signal — `book_tx` keeps
+                // other live senders, so its `book_rx` never closes and the
                 // matcher would silently run a stale book. Propagate a global
                 // shutdown (`ingest_cancel` is a clone of the root token).
                 tokio::select! {
@@ -563,10 +603,172 @@ pub(crate) fn spawn_ingest_thread(
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use diesel::connection::SimpleConnection;
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
+    };
+    use miden_protocol::{asset::AssetAmount, Word};
+    use miden_standards::note::PswapNoteStorage;
+
+    fn fixture() -> (Note, Note, AccountId) {
+        let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+            .try_into()
+            .unwrap();
+        let solver = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2
+            .try_into()
+            .unwrap();
+        let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        let parent: Note = PswapNote::builder()
+            .sender(creator)
+            .serial_number(Word::default())
+            .note_type(NoteType::Public)
+            .storage(
+                PswapNoteStorage::builder()
+                    .min_requested_asset(FungibleAsset::new(requested, 10).unwrap())
+                    .min_fill_step(AssetAmount::new(1).unwrap())
+                    .creator_account_id(creator)
+                    .build(),
+            )
+            .offered_asset(
+                FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(), 10)
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+            .into();
+        let (_, child) = PswapNote::try_from(&parent)
+            .unwrap()
+            .execute(
+                solver,
+                None,
+                Some(FungibleAsset::new(requested, 5).unwrap()),
+            )
+            .unwrap();
+        (parent, child.unwrap().into(), solver)
+    }
+
+    fn prepare(pool: &DbPool, parent: &Note, child: &Note, solver: AccountId) -> Vec<u8> {
+        let mut conn = pool.write_conn().unwrap();
+        SyncResult {
+            block_num: 1,
+            new_notes: vec![parent.clone()],
+            consumed_notes: vec![],
+        }
+        .persist(&mut conn, solver)
+        .unwrap();
+        let tx_id = vec![7; 32];
+        db::prepare_settlement(
+            &mut conn,
+            &db::models::SettlementAttemptRow {
+                tx_id: tx_id.clone(),
+                tx_result: vec![1],
+                status: "prepared".into(),
+            },
+            &[db::models::SettlementInputRow {
+                tx_id: tx_id.clone(),
+                parent_note_id: parent.id().to_bytes().to_vec(),
+                payback_note_id: vec![8; 32],
+                child_note_id: Some(child.id().to_bytes().to_vec()),
+                child_note_data: Some(child.to_bytes()),
+            }],
+        )
+        .unwrap();
+        tx_id
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_client_notes_missing_from_solver_database() {
+        let pool = db::init_db(":memory:", 1).unwrap();
+        let (parent, _, solver) = fixture();
+        let mut client = MockMidenClient::new();
+        client.add_notes(vec![parent.clone()], 10);
+        // Client sync committed, then the process died before solver persistence.
+        client.sync_state().await.unwrap();
+        assert!(client.sync_state().await.unwrap().new_notes.is_empty());
+        SyncResult::recover(&mut client, &pool, solver)
+            .await
+            .unwrap();
+        let first = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        assert_eq!(first.len(), 1);
+        SyncResult::recover(&mut client, &pool, solver)
+            .await
+            .unwrap();
+        let second = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].priority_seq, first[0].priority_seq);
+        client.mark_consumed_silent(vec![parent.id()]);
+        SyncResult::recover(&mut client, &pool, solver)
+            .await
+            .unwrap();
+        assert!(db::get_active_orders(&mut pool.write_conn().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_remainder_keeps_parent_priority() {
+        let pool = db::init_db(":memory:", 1).unwrap();
+        let (parent, child, solver) = fixture();
+        prepare(&pool, &parent, &child, solver);
+        let mut client = MockMidenClient::new();
+        client.add_notes(vec![child.clone()], 10);
+        client.sync_state().await.unwrap();
+        SyncResult::recover(&mut client, &pool, solver)
+            .await
+            .unwrap();
+        let live = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].note_id, child.id().to_bytes());
+        assert_eq!(live[0].priority_seq, 1);
+    }
+
+    #[test]
+    fn consumed_remainder_is_not_activated_in_same_sync() {
+        let pool = db::init_db(":memory:", 1).unwrap();
+        let (parent, child, solver) = fixture();
+        prepare(&pool, &parent, &child, solver);
+        let update = SyncResult {
+            block_num: 10,
+            new_notes: vec![child.clone()],
+            consumed_notes: vec![parent.id(), child.id()],
+        }
+        .persist(&mut pool.write_conn().unwrap(), solver)
+        .unwrap();
+        assert!(update.active.is_empty());
+        assert!(update.removed.contains(&child.id()));
+        assert!(db::get_active_orders(&mut pool.write_conn().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn sync_error_rolls_back_remainder_confirmation() {
+        let pool = db::init_db(":memory:", 1).unwrap();
+        let (parent, child, solver) = fixture();
+        prepare(&pool, &parent, &child, solver);
+        let mut conn = pool.write_conn().unwrap();
+        conn.batch_execute(
+            "CREATE TRIGGER reject_cursor BEFORE UPDATE ON sync_state
+            BEGIN SELECT RAISE(ABORT, 'injected cursor error'); END;",
+        )
+        .unwrap();
+        assert!(SyncResult {
+            block_num: 10,
+            new_notes: vec![child],
+            consumed_notes: vec![]
+        }
+        .persist(&mut conn, solver)
+        .is_err());
+        assert_eq!(db::unresolved_settlements(&mut conn).unwrap().len(), 1);
+        assert!(db::get_active_orders(&mut conn).unwrap().is_empty());
+    }
 
     /// Mock MidenClient for testing.
     pub struct MockMidenClient {
         notes: Vec<Note>,
+        stored: Vec<Note>,
         block: u64,
         /// Pre-staged consumed-note IDs returned by the next sync_state call.
         /// Drained on each sync so a single push delivers once.
@@ -584,6 +786,7 @@ pub mod tests {
         pub fn new() -> Self {
             Self {
                 notes: Vec::new(),
+                stored: Vec::new(),
                 block: 0,
                 pending_consumed: Vec::new(),
                 consumed_set: HashSet::new(),
@@ -598,6 +801,7 @@ pub mod tests {
         }
 
         pub fn add_notes(&mut self, notes: Vec<Note>, block: u64) {
+            self.stored.extend(notes.clone());
             self.notes.extend(notes);
             self.block = block;
         }
@@ -624,6 +828,13 @@ pub mod tests {
 
     #[async_trait(?Send)]
     impl MidenClient for MockMidenClient {
+        async fn stored_notes(&mut self) -> Result<Vec<Note>> {
+            Ok(self.stored.clone())
+        }
+        async fn note_is_included(&mut self, _note_id: NoteId) -> Result<bool> {
+            Ok(false)
+        }
+
         async fn subscribe_pair(&mut self, _offered: TokenId, _requested: TokenId) -> Result<()> {
             Ok(())
         }
@@ -632,7 +843,7 @@ pub mod tests {
             let consumed = std::mem::take(&mut self.pending_consumed);
             Ok(SyncResult {
                 block_num: self.block,
-                new_notes: self.notes.clone(),
+                new_notes: std::mem::take(&mut self.notes),
                 consumed_notes: consumed,
             })
         }
@@ -646,7 +857,10 @@ pub mod tests {
                 .collect())
         }
 
-        async fn fetch_token_metadata(&mut self, _faucet_id: TokenId) -> Result<Option<(u8, String)>> {
+        async fn fetch_token_metadata(
+            &mut self,
+            _faucet_id: TokenId,
+        ) -> Result<Option<(u8, String)>> {
             Ok(self.token_metadata.clone())
         }
     }

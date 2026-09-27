@@ -1,6 +1,9 @@
-use diesel::prelude::*;
 use crate::db::schema::*;
-use crate::types::OrderStatus;
+use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
+use anyhow::{anyhow, Result};
+use diesel::prelude::*;
+use miden_protocol::crypto::utils::{Deserializable, SliceReader};
+use miden_protocol::note::Note;
 
 #[derive(Queryable, Selectable, Insertable, Debug)]
 #[diesel(table_name = sync_state)]
@@ -40,6 +43,43 @@ impl OrderRow {
         self.status = status.as_str().to_string();
         self
     }
+
+    pub fn into_ingest(self, raw_note_data: Vec<u8>) -> Result<IngestOrder> {
+        let note = Note::read_from(&mut SliceReader::new(&raw_note_data))?;
+        let parsed = crate::types::Order::from_note(&note)?;
+        let note_id = OrderId::read_from(&mut SliceReader::new(&self.note_id))?;
+        if note.id() != note_id {
+            return Err(anyhow!("stored order and note IDs differ"));
+        }
+        Ok(IngestOrder {
+            note_id,
+            priority_seq: u64::try_from(self.priority_seq)?,
+            offered_token: TokenId::read_from(&mut SliceReader::new(&self.offered_asset))?,
+            requested_token: TokenId::read_from(&mut SliceReader::new(&self.requested_asset))?,
+            offered_amount: u64::try_from(self.offered_amount)?,
+            requested_amount: u64::try_from(self.requested_amount)?,
+            min_fill_step: parsed.min_fill_step,
+            raw_note_data,
+        })
+    }
+}
+
+#[derive(Queryable, Selectable, Insertable, Debug, Clone)]
+#[diesel(table_name = settlement_attempts)]
+pub struct SettlementAttemptRow {
+    pub tx_id: Vec<u8>,
+    pub tx_result: Vec<u8>,
+    pub status: String,
+}
+
+#[derive(Queryable, Selectable, Insertable, Debug, Clone)]
+#[diesel(table_name = settlement_inputs)]
+pub struct SettlementInputRow {
+    pub tx_id: Vec<u8>,
+    pub parent_note_id: Vec<u8>,
+    pub payback_note_id: Vec<u8>,
+    pub child_note_id: Option<Vec<u8>>,
+    pub child_note_data: Option<Vec<u8>>,
 }
 
 #[derive(Queryable, Selectable, Insertable, Debug, Clone)]

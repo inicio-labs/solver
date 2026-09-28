@@ -1,6 +1,8 @@
 use miden::standards::wallets::basic as wallet
+use {DEFAULT_EXPIRATION_BLOCK_DELTA} from miden::standards::expiration
 use miden::core::sys
 use miden::protocol::asset
+use miden::protocol::tx
 
 # CONSUME ASSET SCRIPT (Transaction Script)
 # =================================================================================================
@@ -24,6 +26,10 @@ const ASSET_MEM_PTR = 500
 @transaction_script
 pub proc main
     # Stack: [COMMITMENT_ARG, pad...]
+    # Custom scripts cannot use TransactionRequestBuilder::expiration_delta,
+    # so apply Miden's standard 20-block expiry here.
+    push.DEFAULT_EXPIRATION_BLOCK_DELTA exec.tx::update_expiration_block_delta
+
     # Reverse back to get the original commitment key order.
     swap movup.2 movup.3
     # => [COMMITMENT_KEY, pad...]

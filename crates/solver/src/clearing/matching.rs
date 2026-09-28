@@ -1,4 +1,4 @@
-use miden_protocol::asset::{AssetAmount, AssetId};
+use miden_protocol::asset::AssetAmount;
 
 use super::config::ClearingConfig;
 use super::envelope::ReachableFillMap;
@@ -19,20 +19,15 @@ impl<'a> PairBatch<'a> {
     /// The live book supplies both sides already price-eligible and sorted by
     /// price, then durable FIFO. The matcher does not revalidate that work.
     pub(crate) fn new(
-        base: AssetId,
-        quote: AssetId,
         clearing_price: BatchPrice,
         sell_orders: Vec<MatchOrder<'a>>,
         buy_orders: Vec<MatchOrder<'a>>,
-    ) -> Result<Self, ClearingError> {
-        if base == quote {
-            return Err(ClearingError::InvalidConfig);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             clearing_price,
             sell_orders,
             buy_orders,
-        })
+        }
     }
 
     pub(crate) fn orders(&self) -> impl Iterator<Item = &MatchOrder<'a>> {
@@ -174,10 +169,7 @@ mod tests {
     use super::*;
     use miden_protocol::account::AccountId;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
-    use miden_protocol::crypto::{
-        rand::{FeltRng, RandomCoin},
-        utils::Serializable,
-    };
+    use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::{Note, NoteType};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -186,10 +178,11 @@ mod tests {
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
     use ruint::aliases::U256;
+    use std::sync::Arc;
 
     use crate::clearing::{PairAmounts, ReferencePrice};
     use crate::matching::types::RateKey;
-    use crate::types::IngestOrder;
+    use crate::types::BookOrder;
 
     fn assets() -> (AccountId, AccountId) {
         (
@@ -226,7 +219,7 @@ mod tests {
     }
 
     fn batch<'a>(price: BatchPrice, orders: &'a [Order]) -> PairBatch<'a> {
-        let (base, quote) = assets();
+        let (base, _quote) = assets();
         let (mut sell_orders, mut buy_orders): (Vec<_>, Vec<_>) = orders
             .iter()
             .partition(|order| order.offered_asset().faucet_id() == base);
@@ -259,14 +252,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        PairBatch::new(
-            AssetId::new_fungible(base),
-            AssetId::new_fungible(quote),
-            price,
-            sell_orders,
-            buy_orders,
-        )
-        .unwrap()
+        PairBatch::new(price, sell_orders, buy_orders)
     }
 
     fn clear(batch: &PairBatch<'_>, config: &ClearingConfig) -> ClearingOutcome {
@@ -310,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn ingested_note_adapter_checks_identity_amounts_and_fifo() {
+    fn ingested_note_adapter_preserves_native_note_and_fifo() {
         let (base, quote) = assets();
         let mut rng = RandomCoin::new(Word::default());
         let original = order(
@@ -321,18 +307,13 @@ mod tests {
             &mut rng,
         );
         let note: Note = original.pswap_note().clone().into();
-        let mut ingested = IngestOrder {
-            note_id: original.id(),
+        let mut ingested = BookOrder {
             priority_seq: 7,
-            offered_token: base,
-            requested_token: quote,
-            offered_amount: 10,
-            requested_amount: 20,
-            min_fill_step: 5,
-            raw_note_data: note.to_bytes(),
+            arrival_unix: 1,
+            note: Arc::new(note),
         };
         assert_eq!(
-            Order::from_ingest_order(&ingested)
+            Order::from_book_order(&ingested)
                 .unwrap()
                 .priority_sequence(),
             7
@@ -344,22 +325,14 @@ mod tests {
             0,
         )
         .unwrap();
-        let orders = vec![Order::from_ingest_order(&ingested).unwrap()];
+        let orders = vec![Order::from_book_order(&ingested).unwrap()];
         let input = batch(price, &orders);
         assert_eq!(input.orders().count(), 1);
         assert_eq!(input.clearing_price.quote_units, U256::from(2u8));
-        ingested.requested_amount = 21;
-        assert!(matches!(
-            Order::from_ingest_order(&ingested),
-            Err(ClearingError::InvalidOrder {
-                reason: super::super::types::InvalidOrderReason::InconsistentIngestOrder,
-                ..
-            })
-        ));
-        ingested.requested_amount = 20;
+        assert_eq!(orders[0].id(), ingested.id());
         ingested.priority_seq = 0;
         assert!(matches!(
-            Order::from_ingest_order(&ingested),
+            Order::from_book_order(&ingested),
             Err(ClearingError::InvalidOrder {
                 reason: super::super::types::InvalidOrderReason::MissingPriority,
                 ..
@@ -402,11 +375,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.base, 1);
         assert_eq!(plan.accruals.realized_protocol_fee.quote, 2);
         assert_eq!(plan.accruals.rounding_surplus, PairAmounts::default());
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let execution_batch = plan.to_execution_batch(&input).unwrap();
         assert_eq!(execution_batch.filled_notes.len(), 2);
         assert_eq!(execution_batch.filled_notes[0].requested_filled, 20);
         assert_eq!(execution_batch.filled_notes[1].requested_filled, 10);
@@ -508,11 +477,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.base, 8);
         assert_eq!(plan.accruals.rounding_surplus.quote, 40);
 
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        plan.to_execution_batch(&input, &arrivals).unwrap();
+        plan.to_execution_batch(&input).unwrap();
     }
 
     #[test]
@@ -548,11 +513,7 @@ mod tests {
         };
         assert_eq!(plan.candidate.executions[0].order_id, early_id);
         assert_eq!(plan.candidate.executions.len(), 2);
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let settled = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let settled = plan.to_execution_batch(&input).unwrap();
         assert_eq!(settled.filled_notes[0].note_id, early_id);
         assert_eq!(settled.filled_notes.len(), 2);
     }
@@ -782,17 +743,10 @@ mod tests {
             .iter()
             .map(|order| {
                 let note: Note = order.pswap_note().clone().into();
-                let offered = order.offered_asset();
-                let requested = order.requested_asset();
-                IngestOrder {
-                    note_id: order.id(),
+                BookOrder {
                     priority_seq: order.priority_sequence(),
-                    offered_token: offered.faucet_id(),
-                    requested_token: requested.faucet_id(),
-                    offered_amount: offered.amount().as_u64(),
-                    requested_amount: requested.amount().as_u64(),
-                    min_fill_step: order.pswap_note().storage().min_fill_step().as_u64(),
-                    raw_note_data: note.to_bytes(),
+                    arrival_unix: 1,
+                    note: Arc::new(note),
                 }
             })
             .collect();
@@ -805,7 +759,7 @@ mod tests {
         .unwrap();
         let parsed = ingested
             .iter()
-            .map(Order::from_ingest_order)
+            .map(Order::from_book_order)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let input = batch(price, &parsed);
@@ -825,11 +779,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.quote, 1_200);
         assert_eq!(plan.accruals.rounding_surplus, PairAmounts::default());
 
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let execution_batch = plan.to_execution_batch(&input).unwrap();
         assert_eq!(execution_batch.filled_notes.len(), 200);
     }
 }

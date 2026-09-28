@@ -114,7 +114,7 @@ asset_y_external_symbol = "{ext_b}"
 pulse_interval_ms = 5000
 fetch_interval_ms = 3000
 price_interval_ms = 5000
-triangular_enabled = true
+clearing_fee_ppm = 0
 admin_port = 3001
 obs_port = 9090
 # Devnet test tokens aren't on public CoinGecko, so point the price client at

@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
+use std::sync::Arc;
+use thiserror::Error;
 
 /// Faucet ID identifying a token.
 pub type TokenId = AccountId;
@@ -11,6 +13,35 @@ pub type OrderId = NoteId;
 
 /// Token amount (u64 to match Miden's native asset amounts).
 pub type Amount = u64;
+
+/// Invalid state detected while preparing, storing, or recovering a settlement.
+#[derive(Debug, Error)]
+pub enum SettlementError {
+    #[error("settlement input belongs to a different transaction")]
+    InputTransactionMismatch,
+    #[error("settlement input order is not active")]
+    InputOrderNotActive,
+    #[error("settlement child ID does not match its note")]
+    ChildIdMismatch,
+    #[error("settlement cannot be confirmed from status {0}")]
+    InvalidConfirmationStatus(String),
+    #[error("expected payback {0} is absent from the executed outputs")]
+    MissingPayback(NoteId),
+    #[error("expected remainder {0} is absent from the executed outputs")]
+    MissingRemainder(NoteId),
+    #[error("recorded transaction ID does not match its transaction result")]
+    RecordedTransactionIdMismatch,
+    #[error("invalid execution group boundary {end} after {previous} for {total} notes")]
+    InvalidExecutionGroupBoundary {
+        previous: usize,
+        end: usize,
+        total: usize,
+    },
+    #[error("execution group has {size} inputs; maximum is {maximum}")]
+    ExecutionGroupTooLarge { size: usize, maximum: usize },
+    #[error("execution groups cover {covered} of {total} notes")]
+    IncompleteExecutionGroups { covered: usize, total: usize },
+}
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it). std has no
 /// single call for this — `SystemTime` + `duration_since(UNIX_EPOCH)` is idiomatic.
@@ -37,8 +68,8 @@ pub fn now_unix() -> UnixSecs {
 /// Order lifecycle status.
 ///
 /// `Settling` is the interval between submitting an on-chain settlement
-/// transaction and confirming its outcome. Crash recovery resets any
-/// `Settling` rows back to `Active` at boot.
+/// transaction and confirming its outcome. Recovery keeps unresolved
+/// transactions reserved until their outcome is known.
 ///
 /// `OnchainNullified` is terminal: ingest or executor observed that the
 /// note's nullifier is on-chain (consumed by another party, or by a
@@ -63,7 +94,7 @@ impl OrderStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "active" => Some(OrderStatus::Active),
             "settling" => Some(OrderStatus::Settling),
@@ -90,8 +121,8 @@ pub struct Order {
 
 impl Order {
     pub fn from_note(note: &Note) -> Result<Self> {
-        let pswap = PswapNote::try_from(note)
-            .map_err(|e| anyhow!("Failed to parse PSWAP note: {}", e))?;
+        let pswap =
+            PswapNote::try_from(note).map_err(|e| anyhow!("Failed to parse PSWAP note: {}", e))?;
 
         let offered_asset = pswap.offered_asset();
         let offered_faucet_id = offered_asset.faucet_id();
@@ -105,7 +136,9 @@ impl Order {
         let min_fill_step = pswap.storage().min_fill_step().as_u64();
 
         if offered_amount == 0 || requested_amount == 0 {
-            return Err(anyhow!("order has zero amount (offered={offered_amount}, requested={requested_amount})"));
+            return Err(anyhow!(
+                "order has zero amount (offered={offered_amount}, requested={requested_amount})"
+            ));
         }
 
         Ok(Order {
@@ -120,19 +153,44 @@ impl Order {
     }
 }
 
-/// An order with its raw note data, flowing from ingest → matcher.
+/// A shared note and its durable FIFO priority, flowing into the matcher.
 #[derive(Debug, Clone)]
-pub struct IngestOrder {
-    pub note_id: OrderId,
+pub struct BookOrder {
     /// Durable ingestion FIFO sequence, independent of restart order.
     pub priority_seq: u64,
-    pub offered_token: TokenId,
-    pub requested_token: TokenId,
-    pub offered_amount: Amount,
-    pub requested_amount: Amount,
-    /// The note's `min_fill_step` (see [`Order::min_fill_step`]).
-    pub min_fill_step: Amount,
-    pub raw_note_data: Vec<u8>,
+    /// First durable observation time. Re-feeds and remainders preserve it.
+    pub arrival_unix: UnixSecs,
+    pub note: Arc<Note>,
+}
+
+impl BookOrder {
+    pub fn id(&self) -> OrderId {
+        self.note.id()
+    }
+}
+
+/// One committed change to the book. Apply removals and activations without
+/// yielding, so a parent-to-remainder handoff cannot be matched halfway through.
+#[derive(Debug, Default)]
+pub struct BookUpdate {
+    pub removed: Vec<OrderId>,
+    pub active: Vec<BookOrder>,
+}
+
+impl BookUpdate {
+    /// Avoid waking the matcher for a transaction that changed no book entries.
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.active.is_empty()
+    }
+}
+
+impl From<BookOrder> for BookUpdate {
+    fn from(order: BookOrder) -> Self {
+        Self {
+            removed: Vec::new(),
+            active: vec![order],
+        }
+    }
 }
 
 /// A filled note with its fill amount, flowing from matcher → executor.
@@ -141,11 +199,21 @@ pub struct FilledNote {
     pub note_id: OrderId,
     pub priority_seq: u64,
     pub requested_filled: Amount,
-    pub raw_note_data: Vec<u8>,
-    /// When the matcher first observed this order (stamped in-memory, not from
-    /// the DB). Carried to the executor so it can record the settlement duration
-    /// (`settled − arrival`) for the in-memory swap-eta window.
+    pub note: Arc<Note>,
+    /// First durable observation time, carried through re-feeds and remainders
+    /// so the executor can record `settled - arrival` consistently.
     pub arrival_unix: UnixSecs,
+}
+
+impl FilledNote {
+    /// Re-activate the original note without re-parsing its terms.
+    pub fn to_book_order(&self) -> BookOrder {
+        BookOrder {
+            priority_seq: self.priority_seq,
+            arrival_unix: self.arrival_unix,
+            note: self.note.clone(),
+        }
+    }
 }
 
 /// A batch of matched orders to be executed together.
@@ -156,4 +224,13 @@ pub struct ExecutionBatch {
     /// only between these boundaries, never between counterparties in a group.
     /// Empty means the whole batch is indivisible (legacy matching).
     pub group_ends: Vec<usize>,
+}
+
+impl ExecutionBatch {
+    pub fn book_orders(&self) -> Vec<BookOrder> {
+        self.filled_notes
+            .iter()
+            .map(FilledNote::to_book_order)
+            .collect()
+    }
 }

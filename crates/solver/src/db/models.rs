@@ -1,6 +1,18 @@
-use diesel::prelude::*;
 use crate::db::schema::*;
-use crate::types::OrderStatus;
+use crate::types::{BookOrder, OrderId, OrderStatus};
+use anyhow::Result;
+use diesel::prelude::*;
+use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
+use miden_protocol::note::Note;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum StoredOrderError {
+    #[error("stored order and note IDs differ")]
+    NoteIdMismatch,
+    #[error("stored order terms differ from note")]
+    TermsMismatch,
+}
 
 #[derive(Queryable, Selectable, Insertable, Debug)]
 #[diesel(table_name = sync_state)]
@@ -33,13 +45,53 @@ pub struct OrderRow {
 
 impl OrderRow {
     pub fn order_status(&self) -> Option<OrderStatus> {
-        OrderStatus::from_str(&self.status)
+        OrderStatus::parse(&self.status)
     }
 
     pub fn with_status(mut self, status: OrderStatus) -> Self {
         self.status = status.as_str().to_string();
         self
     }
+
+    pub fn into_book_order(self, raw_note_data: Vec<u8>) -> Result<BookOrder> {
+        let note = Note::read_from(&mut SliceReader::new(&raw_note_data))?;
+        let parsed = crate::types::Order::from_note(&note)?;
+        let note_id = OrderId::read_from(&mut SliceReader::new(&self.note_id))?;
+        if note.id() != note_id {
+            return Err(StoredOrderError::NoteIdMismatch.into());
+        }
+        // Validate persisted metadata at the DB boundary, not on every book insert.
+        let terms_match = parsed.offered_faucet_id.to_bytes() == self.offered_asset
+            && parsed.requested_faucet_id.to_bytes() == self.requested_asset
+            && parsed.offered_amount == u64::try_from(self.offered_amount)?
+            && parsed.requested_amount == u64::try_from(self.requested_amount)?;
+        if !terms_match {
+            return Err(StoredOrderError::TermsMismatch.into());
+        }
+        Ok(BookOrder {
+            priority_seq: u64::try_from(self.priority_seq)?,
+            arrival_unix: u64::try_from(self.timestamp)?,
+            note: std::sync::Arc::new(note),
+        })
+    }
+}
+
+#[derive(Queryable, Selectable, Insertable, Debug, Clone)]
+#[diesel(table_name = settlement_attempts)]
+pub struct SettlementAttemptRow {
+    pub tx_id: Vec<u8>,
+    pub tx_result: Vec<u8>,
+    pub status: String,
+}
+
+#[derive(Queryable, Selectable, Insertable, Debug, Clone)]
+#[diesel(table_name = settlement_inputs)]
+pub struct SettlementInputRow {
+    pub tx_id: Vec<u8>,
+    pub parent_note_id: Vec<u8>,
+    pub payback_note_id: Vec<u8>,
+    pub child_note_id: Option<Vec<u8>>,
+    pub child_note_data: Option<Vec<u8>>,
 }
 
 #[derive(Queryable, Selectable, Insertable, Debug, Clone)]

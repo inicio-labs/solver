@@ -1,8 +1,7 @@
 # External Liquidity Routing (RFQ to other DEXes)
 
-**STATUS: IMPLEMENTED.** Router, matcher external pass, willingness-only selection,
-config, and the filler SDK are built and tested. Opt-in via `router_enabled`
-(default off).
+**STATUS: IMPLEMENTED.** RFQ transport, whole-note selection and the filler SDK
+are preserved alongside pair clearing. Opt-in via `router_enabled` (default off).
 
 **Owner:** solver team · **Audience:** solver team + operators (DEX/filler
 integrators want [filler-integration.md](filler-integration.md)).
@@ -36,9 +35,9 @@ selector + a websocket fan-out + the fill-watcher we already had.
 
 ## 2. Architecture
 
-The **router is only websocket transport.** Every order decision is made in the
-matcher, over the one in-memory order book. There is no second copy of the book and no
-DB poll in this path.
+The worker owns **one in-memory order book**. Pair clearing and RFQ selection are
+separate algorithms over its active index; neither owns a second book. The router
+server handles websocket transport. This path does not poll the database.
 
 ```
  DEX ──SUBSCRIBE/QUOTE──▶ router thread ──quotes_tx (watch)──▶ matcher (book owner)
@@ -53,15 +52,17 @@ DB poll in this path.
   connections + their latest quotes; merges quotes onto a `watch` channel for the
   matcher; routes handovers back to the right connection by `DexId`. Thin and `Send`;
   a blocked/slow DEX socket can never stall the matcher tick.
-- **Matcher external pass** (`crates/solver/src/matcher/matcher.rs`) — after internal
-  matching, on **every** tick: reactivate expired in-flight notes, read the cached
-  quotes, run `select_notes`, **park** each pick, and `try_send` a handover. No `.await`,
-  no socket I/O on the tick.
+- **Worker** (`crates/solver/src/matcher/matcher.rs`) — applies book updates, releases
+  expired RFQ reservations, runs pair clearing, then offers the remaining active
+  notes to RFQ. Orders reserved for the executor are excluded from RFQ.
+- **RFQ dispatch** (`crates/solver/src/router/routing.rs`) — selects whole notes,
+  reserves handover-channel space, then deactivates them and sends their bytes.
+  A full channel leaves the book unchanged; no socket I/O runs on the worker.
 - **Selection math** (`crates/solver/src/router/select.rs`) — `select_notes` is a pure,
   read-only, exact-integer function (the correctness core; see §4).
-- **Order book park/unpark** (`crates/solver/src/matching/order_book.rs`) — how a note
-  is taken out of internal matching while it's in flight to a DEX, without disturbing
-  the matching gates (see §3).
+- **Shared order book** (`crates/solver/src/matcher/clearing_book.rs`) — stores
+  native notes, active/inactive status and exact price/FIFO indexes. Both clearing
+  and RFQ use the same lifecycle methods.
 - **LP SDK** (`crates/lp-sdk`, `pswap-lp-sdk`) — the client DEXes (liquidity providers)
   use, and the home of the shared wire protocol (see §6).
 
@@ -69,48 +70,34 @@ DB poll in this path.
 
 | channel | dir | type | purpose |
 |---|---|---|---|
-| `quotes_tx/rx` | router→matcher | `watch<Arc<Vec<Quote>>>` | latest standing quotes `(dex,pair)→{price,qty,expires_at}` |
-| `handover_tx/rx` | matcher→router | `mpsc<Handover>` | picks (note id + fill + bytes) back to the DEX, via `try_send` |
+| `quotes_tx/rx` | router→matcher | `watch<Arc<QuotesSnapshot>>` | latest standing quotes `(dex,pair)→{price,qty,expires_at}` |
+| `route_tx/rx` | matcher→router | `mpsc<RouteBatch>` | picks (note id + fill + bytes) back to the DEX, via `try_send` |
 
 Wired in `pipeline.rs` (channels) and `start.rs` (router thread, readiness gate,
 shutdown join).
 
 ---
 
-## 3. In-flight = park / unpark
+## 3. In-flight reservations
 
-A note handed to a DEX must be invisible to internal matching until it's either
-consumed or times out — **without** corrupting the matching gates. We get that by
-reusing the book's own index machinery rather than inventing a parallel flag path.
+A routed note leaves the active price index but stays in the shared book. The same
+deactivation operation reserves internally matched notes for the executor.
 
-- **`park(id, dex, now)`** = remove the note from the rate index and decrement the
-  per-pair counter (exactly what `remove_order` already does), **but keep its `Order`
-  struct** in `orders`. A parked note is therefore not indexed and not counted —
-  identical to a removed one from the matcher's perspective. Consequence: `has_orders`,
-  `best_order`, and `apply_match` need **no change** — a parked note simply isn't there
-  to be returned.
-- **Reactivation is O(expiring), never O(book).** The book keeps
-  `parked: HashMap<OrderId,(DexId,parked_at)>` + a time-ordered
-  `park_queue: VecDeque<(parked_at, OrderId)>`. Parking happens in tick-time order, so
-  `parked_at` is monotonic and the queue is sorted for free.
-  `reactivate_parked_older_than(ttl, now)` pops the front while
-  `parked_at + ttl ≤ now` and stops at the first still-fresh entry (usually 0 pops); a
-  popped id no longer in `parked` is a consumed tombstone, skipped. It re-indexes the
-  surviving struct via the existing add path (note rejoins the back of its rate FIFO —
-  fair; it was "away") and returns `(id, dex)` (the `dex` it no-showed at, for logging).
-- **Exits from PARKED:** (a) **consume** — the DEX self-consumes → `consumed_rx` → drop
-  from `orders` (settled); (b) **no-show** — not consumed within `router_inflight_ttl_ms`
-  → reactivation re-indexes it (matchable + re-routable again, including to the same DEX);
-  (c) **rollback** — if the handover `try_send` is dropped (full/closed channel), the note
-  never reached the DEX, so it is **immediately unparked** (`OrderBook::unpark`) — a
-  dropped delivery costs nothing.
-- **One park-aware conditional:** the `consumed_rx` removal of an *already-parked* note
-  must not decrement the counter again (it was decremented at park) — just drop it from
-  `orders`. `add_user_order` is idempotent on note id as general defence.
+- **Handover:** RFQ first reserves channel space. It then deactivates all selected
+  notes and sends one handover without yielding. A full channel changes nothing;
+  a closed channel propagates an error to the worker supervisor.
+- **Expiry:** RFQ keeps a FIFO queue of dispatch times and checks only its expired
+  prefix. Surviving notes are reactivated with their original price/FIFO key.
+  Notes already removed by ingestion are no-ops; expiry cannot recreate them.
+- **On-chain consumption:** ingestion confirms the nullifier and sends a book
+  removal. The shared book drops the order, whether active or reserved.
+- **Executor confirmation:** one combined update removes the internal parents
+  and activates confirmed remainder notes. RFQ sees only the resulting active
+  book, never a half-applied parent-to-remainder transition.
 
-A note is in exactly one of {indexed · parked · gone} by construction, which is what
-delivers "internal matching and external routing never touch the same note." A property
-test asserts `active_order_count()` invariance across park→unpark and park→consume.
+The configured RFQ timeout is a local reservation policy, not proof that a DEX
+transaction failed. Set it above realistic consume latency. It does not reset
+internally settling notes, which follow executor confirmation/recovery instead.
 
 ---
 

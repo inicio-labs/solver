@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-
-use miden_protocol::note::NoteId;
-
 use crate::types::ExecutionBatch;
 
 use super::matching::PairBatch;
@@ -110,7 +106,6 @@ impl SettlementPlan {
     pub fn to_execution_batch(
         &self,
         batch: &PairBatch<'_>,
-        arrival_unix: &HashMap<NoteId, u64>,
     ) -> Result<ExecutionBatch, ClearingError> {
         let mut filled_notes = Vec::with_capacity(self.candidate.executions.len());
         // Matching emits executions in batch order, omitting skipped orders.
@@ -125,14 +120,7 @@ impl SettlementPlan {
             if order.id() != execution.order_id {
                 continue;
             }
-            let arrival =
-                arrival_unix
-                    .get(&order.id())
-                    .copied()
-                    .ok_or(ClearingError::InternalInvariant(
-                        "missing order arrival timestamp",
-                    ))?;
-            filled_notes.push(order.to_filled_note(execution, arrival));
+            filled_notes.push(order.to_filled_note(execution));
             next_execution = executions.next();
         }
         if next_execution.is_some() {

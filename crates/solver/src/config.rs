@@ -5,6 +5,17 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum ConfigError {
+    #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
+    InvalidPricePrecision(String),
+    #[error("engine.price_vs_currency must be non-empty")]
+    EmptyPriceCurrency,
+    #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
+    InvalidClearingFee { fee: u32, maximum: u32 },
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SolverConfig {
@@ -76,16 +87,9 @@ pub struct EngineConfig {
     /// so this only affects how stale the prices can get, not the matcher's
     /// tick rate.
     pub price_interval_ms: u64,
-    /// Whether the 3-edge cycle (triangular) matching phase runs each tick.
-    /// Direct (pairwise) matching always runs. Defaults to `true` when
-    /// omitted from `solver.toml` so existing configs continue to behave
-    /// the same. Disable to skip the O(T³) enumeration on large token sets.
-    #[serde(default = "default_true")]
-    pub triangular_enabled: bool,
-    /// Opt into exact-price, two-sided PSWAP clearing. When omitted the legacy
-    /// matcher remains active. The value is also the eligibility edge in ppm.
+    /// Protocol fee and minimum eligibility edge in ppm. Zero disables fees.
     #[serde(default)]
-    pub clearing_fee_ppm: Option<u32>,
+    pub clearing_fee_ppm: u32,
     /// Maximum age of each provider's own price timestamp when clearing.
     #[serde(default = "default_clearing_source_age_secs")]
     pub clearing_max_source_age_secs: u64,
@@ -209,10 +213,6 @@ impl PricePrecision {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_clearing_source_age_secs() -> u64 {
     60
 }
@@ -289,46 +289,34 @@ impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        let mut config: SolverConfig =
+        let config: SolverConfig =
             toml::from_str(&content).context("Failed to parse config file")?;
         config.validate()?;
-        config.apply_miden_016_overrides();
+        config.warn_ignored_settings();
         Ok(config)
     }
 
     /// Validate fields that have constrained domains (fail fast at boot).
-    fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            PricePrecision::parse(&self.engine.price_precision).is_some(),
-            "engine.price_precision must be \"full\" or an integer 0..=18, got {:?}",
-            self.engine.price_precision
-        );
-        anyhow::ensure!(
-            !self.engine.price_vs_currency.trim().is_empty(),
-            "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
-        );
-        if let Some(fee) = self.engine.clearing_fee_ppm {
-            anyhow::ensure!(
-                fee < crate::clearing::PPM_DENOMINATOR,
-                "engine.clearing_fee_ppm must be below {}",
-                crate::clearing::PPM_DENOMINATOR
-            );
+    fn validate(&self) -> std::result::Result<(), ConfigError> {
+        if PricePrecision::parse(&self.engine.price_precision).is_none() {
+            return Err(ConfigError::InvalidPricePrecision(
+                self.engine.price_precision.clone(),
+            ));
+        }
+        if self.engine.price_vs_currency.trim().is_empty() {
+            return Err(ConfigError::EmptyPriceCurrency);
+        }
+        if self.engine.clearing_fee_ppm >= crate::clearing::PPM_DENOMINATOR {
+            return Err(ConfigError::InvalidClearingFee {
+                fee: self.engine.clearing_fee_ppm,
+                maximum: crate::clearing::PPM_DENOMINATOR,
+            });
         }
         Ok(())
     }
 
-    /// Settings this build can't honour on Miden 0.16, forced off with a warning.
-    /// - `triangular_enabled`: the 3-cycle path fills via `Order::fill` directly and
-    ///   doesn't enforce PSWAP `min_fill_step`, so one sub-floor fill would fail the
-    ///   whole batch transaction.
-    /// - `debug_mode`: miden-client 0.16 removed client debug mode.
-    fn apply_miden_016_overrides(&mut self) {
-        if self.engine.triangular_enabled {
-            tracing::warn!(
-                "engine.triangular_enabled forced to false: triangular matching does not enforce PSWAP min_fill_step yet"
-            );
-            self.engine.triangular_enabled = false;
-        }
+    /// The Miden client no longer exposes debug mode.
+    fn warn_ignored_settings(&self) {
         if self.engine.debug_mode {
             tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
         }

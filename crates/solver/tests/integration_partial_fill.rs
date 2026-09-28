@@ -170,8 +170,7 @@ async fn partial_fill_repro() -> Result<()> {
                     pulse_interval_ms: 200,
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
-                    triangular_enabled: false, // isolate the DIRECT partial fill
-                    clearing_fee_ppm: None,
+                    clearing_fee_ppm: 0,
                     clearing_max_source_age_secs: 60,
                     clearing_max_source_skew_secs: 30,
                     admin_port: 0,

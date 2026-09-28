@@ -1,97 +1,122 @@
 use std::num::NonZeroU64;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
-use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use ruint::aliases::U256;
 
-use crate::types::{FilledNote, IngestOrder};
+use crate::types::{now_unix, BookOrder, FilledNote, UnixSecs};
 
 use super::config::PPM_DENOMINATOR;
 use super::math::{checked_mul, mul_div_ceil, mul_div_floor, ppm_floor, to_asset_amount};
 use super::types::{BatchPrice, ClearingError, InvalidOrderReason, OrderExecution};
+use crate::matching::types::RateKey;
+use crate::types::TokenId;
+
+/// Orders sort by exact rate first, then by their original FIFO sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OrderKey {
+    pub(crate) rate: RateKey,
+    priority: u64,
+}
+
+/// A direct lifecycle view for callers; the book index controls matchability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookStatus {
+    Active,
+    Inactive,
+}
 
 #[derive(Clone, Debug)]
 pub struct Order {
-    note_id: NoteId,
-    note: PswapNote,
+    pswap: PswapNote,
+    note: Arc<Note>,
     priority: NonZeroU64,
+    status: BookStatus,
+    arrival_unix: UnixSecs,
 }
 
 impl Order {
     pub fn from_note(note: &Note, priority_sequence: u64) -> Result<Self, ClearingError> {
+        Self::new(Arc::new(note.clone()), priority_sequence, now_unix())
+    }
+
+    fn new(
+        note: Arc<Note>,
+        priority_sequence: u64,
+        arrival_unix: UnixSecs,
+    ) -> Result<Self, ClearingError> {
         let priority = NonZeroU64::new(priority_sequence).ok_or(ClearingError::InvalidOrder {
             note_id: note.id(),
             reason: InvalidOrderReason::MissingPriority,
         })?;
-        let parsed = PswapNote::try_from(note).map_err(|source| ClearingError::InvalidPswap {
-            note_id: note.id(),
-            source,
-        })?;
+        let pswap =
+            PswapNote::try_from(note.as_ref()).map_err(|source| ClearingError::InvalidPswap {
+                note_id: note.id(),
+                source,
+            })?;
         Ok(Self {
-            note_id: note.id(),
-            note: parsed,
+            pswap,
+            note,
             priority,
+            status: BookStatus::Active,
+            arrival_unix,
         })
     }
 
-    /// Parse the authoritative note bytes and verify every persisted cache field.
-    pub fn from_ingest_order(order: &IngestOrder) -> Result<Self, ClearingError> {
-        let note = Note::read_from(&mut SliceReader::new(&order.raw_note_data)).map_err(|_| {
-            ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::MalformedRawNote,
-            }
-        })?;
-        if note.id() != order.note_id {
-            return Err(ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::InconsistentIngestOrder,
-            });
-        }
-
-        let admitted = Self::from_note(&note, order.priority_seq)?;
-        admitted.verify_ingest_fields(order)?;
-        Ok(admitted)
-    }
-
-    fn verify_ingest_fields(&self, order: &IngestOrder) -> Result<(), ClearingError> {
-        let offered = self.offered_asset();
-        let requested = self.requested_asset();
-        if offered.faucet_id() != order.offered_token
-            || offered.amount().as_u64() != order.offered_amount
-            || requested.faucet_id() != order.requested_token
-            || requested.amount().as_u64() != order.requested_amount
-            || self.note.storage().min_fill_step().as_u64() != order.min_fill_step
-        {
-            return Err(ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::InconsistentIngestOrder,
-            });
-        }
-        Ok(())
+    /// Parse the shared original note once, preserving its attachments.
+    pub fn from_book_order(order: &BookOrder) -> Result<Self, ClearingError> {
+        Self::new(order.note.clone(), order.priority_seq, order.arrival_unix)
     }
 
     pub fn id(&self) -> NoteId {
-        self.note_id
+        self.note.id()
+    }
+
+    pub(crate) fn note(&self) -> &miden_protocol::note::Note {
+        &self.note
     }
 
     pub fn priority_sequence(&self) -> u64 {
         self.priority.get()
     }
 
+    pub fn is_active(&self) -> bool {
+        self.status == BookStatus::Active
+    }
+
+    pub(crate) fn activate(&mut self) {
+        self.status = BookStatus::Active;
+    }
+
+    pub(crate) fn deactivate(&mut self) {
+        self.status = BookStatus::Inactive;
+    }
+
+    pub(crate) fn index_key(&self) -> ((TokenId, TokenId), OrderKey) {
+        let offered = self.offered_asset();
+        let requested = self.requested_asset();
+        (
+            (offered.faucet_id(), requested.faucet_id()),
+            OrderKey {
+                rate: RateKey::new(requested.amount().as_u64(), offered.amount().as_u64()),
+                priority: self.priority_sequence(),
+            },
+        )
+    }
+
     pub fn pswap_note(&self) -> &PswapNote {
-        &self.note
+        &self.pswap
     }
 
     pub fn offered_asset(&self) -> FungibleAsset {
-        *self.note.offered_asset()
+        *self.pswap.offered_asset()
     }
 
     pub fn requested_asset(&self) -> FungibleAsset {
-        *self.note.storage().min_requested_asset()
+        *self.pswap.storage().min_requested_asset()
     }
 
     pub(crate) fn prepare_if_eligible(
@@ -127,7 +152,7 @@ impl Order {
         }
 
         let fill_scale = FillScale::new(comparison_units, payment_units);
-        let minimum_payment = self.note.storage().min_fill_step().min(requested.amount());
+        let minimum_payment = self.pswap.storage().min_fill_step().min(requested.amount());
         let minimum = fill_scale.to_comparison_floor(minimum_payment)?;
         let maximum = fill_scale.to_comparison_floor(requested.amount())?;
 
@@ -139,21 +164,14 @@ impl Order {
         }))
     }
 
-    /// Carry the verified fill and original note bytes to the executor.
-    pub(crate) fn to_filled_note(
-        &self,
-        execution: &OrderExecution,
-        arrival_unix: u64,
-    ) -> FilledNote {
-        let note: Note = self.note.clone().into();
-        let mut raw_note_data = Vec::new();
-        note.write_into(&mut raw_note_data);
+    /// Carry the verified fill and shared original note to the executor.
+    pub(crate) fn to_filled_note(&self, execution: &OrderExecution) -> FilledNote {
         FilledNote {
-            note_id: self.note_id,
+            note_id: self.id(),
             priority_seq: self.priority_sequence(),
             requested_filled: execution.payment.amount().as_u64(),
-            raw_note_data,
-            arrival_unix,
+            note: self.note.clone(),
+            arrival_unix: self.arrival_unix,
         }
     }
 }
@@ -256,7 +274,7 @@ impl MatchOrder<'_> {
             };
         let release_amount = self
             .order
-            .note
+            .pswap
             .calculate_offered_for_requested(payment_amount.as_u64())
             .map_err(|_| ClearingError::InternalInvariant("protocol payout calculation failed"))?;
         let payment = FungibleAsset::new(requested.faucet_id(), payment_amount.as_u64())?;

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::{Note, NoteId};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -15,10 +14,10 @@ use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::{self, PreciseSnapshot, PriceClient, PriceSnapshot, SharedTokenMap};
+use crate::price::{self, PreciseSnapshot, PriceClient, SharedTokenMap};
+use crate::router::{QuotesSnapshot, RouteBatch};
 use crate::swap_eta::SettlementStats;
-use crate::router::{RouteBatch, QuotesSnapshot};
-use crate::types::{ExecutionBatch, IngestOrder, TokenId};
+use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
 /// batches, consumed-note notifications), used by `create_channels`.
@@ -41,10 +40,6 @@ pub struct PipelineConfig {
     pub initial_tokens: Vec<(TokenId, Option<String>)>,
     pub admin_port: u16,
     pub admin_token: Option<String>,
-    /// Enable the 3-edge cycle (triangular) matching phase. Defaults to `true`
-    /// in [`EngineConfig`]; disable to skip the O(T³) enumeration when only
-    /// direct matching is desired (e.g. with a large registered token set).
-    pub triangular_enabled: bool,
     /// Shared in-memory faucet-id → external-symbol cache. Hydrated from DB
     /// at boot and mutated by admin handlers. Pass the same Arc as the one
     /// used to construct the `HttpPriceClient` so both see the latest mapping.
@@ -84,7 +79,6 @@ impl PipelineConfig {
             initial_tokens,
             admin_port: engine.admin_port,
             admin_token,
-            triangular_enabled: engine.triangular_enabled,
             token_map,
             cancel,
             last_sync_unix_seconds,
@@ -120,11 +114,7 @@ pub async fn subscribe_all_pairs(
 /// best-effort: on any RPC/DB error it logs and leaves the row NULL, so the next
 /// registration touching this token (or a restart) retries. Must run on the
 /// ingest thread — the only place the `!Send` Miden client lives.
-async fn ensure_token_metadata(
-    client: &mut dyn MidenClient,
-    pool: &db::DbPool,
-    token: TokenId,
-) {
+async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, token: TokenId) {
     let key = token.to_bytes();
 
     // Already cached? Check first so we never re-hit the RPC for a known token
@@ -133,7 +123,7 @@ async fn ensure_token_metadata(
         Ok(mut conn) => match db::get_registered_token(&mut conn, &key) {
             Ok(Some(row)) if row.decimals.is_some() => return, // already have it
             Ok(Some(_)) => {}                                  // registered, still missing → fetch
-            Ok(None) => return,                                // not registered → nothing to annotate
+            Ok(None) => return, // not registered → nothing to annotate
             Err(e) => {
                 tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
                 return;
@@ -159,7 +149,9 @@ async fn ensure_token_metadata(
                     tracing::info!(%token, decimals, ticker = %ticker, "fetched on-chain token metadata");
                 }
             }
-            Err(e) => tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed"),
+            Err(e) => {
+                tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed")
+            }
         },
         Ok(None) => {
             tracing::debug!(%token, "no on-chain metadata (private/non-faucet); will retry on next registration")
@@ -182,13 +174,13 @@ async fn ensure_token_metadata(
 /// Cross-thread channel endpoints, created once on the main thread and split
 /// between the main coordination thread and the client threads.
 pub struct PipelineChannels {
-    pub order_tx: mpsc::Sender<IngestOrder>,
-    pub order_rx: mpsc::Receiver<IngestOrder>,
-    pub consumed_tx: mpsc::Sender<NoteId>,
-    pub consumed_rx: mpsc::Receiver<NoteId>,
-    pub price_tx: watch::Sender<PriceSnapshot>,
-    pub price_rx: watch::Receiver<PriceSnapshot>,
-    /// Exact references for opt-in clearing and f64 values for the price API.
+    pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
+    pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
+    pub route_tx: mpsc::Sender<RouteBatch>,
+    pub route_rx: mpsc::Receiver<RouteBatch>,
+    pub book_tx: mpsc::Sender<BookUpdate>,
+    pub book_rx: mpsc::Receiver<BookUpdate>,
+    /// Exact references for clearing and f64 values for the price API.
     pub precise_tx: watch::Sender<PreciseSnapshot>,
     pub precise_rx: watch::Receiver<PreciseSnapshot>,
     /// Top-of-book snapshot (matcher → swap-eta API), latest-wins.
@@ -201,18 +193,10 @@ pub struct PipelineChannels {
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
-    /// Standing DEX quotes: router → matcher (latest-wins).
-    pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
-    pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
-    /// Selected notes: matcher → router (delivered to DEXes over websocket).
-    pub route_tx: mpsc::Sender<RouteBatch>,
-    pub route_rx: mpsc::Receiver<RouteBatch>,
 }
 
 pub fn create_channels() -> PipelineChannels {
-    let (order_tx, order_rx) = mpsc::channel::<IngestOrder>(PIPELINE_CHANNEL_BUF);
-    let (consumed_tx, consumed_rx) = mpsc::channel::<NoteId>(PIPELINE_CHANNEL_BUF);
-    let (price_tx, price_rx) = watch::channel::<PriceSnapshot>(HashMap::new());
+    let (book_tx, book_rx) = mpsc::channel::<BookUpdate>(PIPELINE_CHANNEL_BUF);
     let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
     // Two separate swap-eta feeds, NOT one combined channel: they have two
     // independent producers on two threads — the matcher publishes the live
@@ -224,18 +208,19 @@ pub fn create_channels() -> PipelineChannels {
     // swap-eta handler in price_api.rs.
     let (swap_snapshot_tx, swap_snapshot_rx) =
         watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
-    let (stats_tx, stats_rx) = watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
+    let (stats_tx, stats_rx) =
+        watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
-    let (quotes_tx, quotes_rx) = watch::channel::<Arc<QuotesSnapshot>>(Arc::new(std::collections::HashMap::new()));
-    let (route_tx, route_rx) = mpsc::channel::<RouteBatch>(PIPELINE_CHANNEL_BUF);
+    let (quotes_tx, quotes_rx) = watch::channel(Arc::new(QuotesSnapshot::new()));
+    let (route_tx, route_rx) = mpsc::channel(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
-        order_tx,
-        order_rx,
-        consumed_tx,
-        consumed_rx,
-        price_tx,
-        price_rx,
+        quotes_tx,
+        quotes_rx,
+        route_tx,
+        route_rx,
+        book_tx,
+        book_rx,
         precise_tx,
         precise_rx,
         swap_snapshot_tx,
@@ -246,26 +231,12 @@ pub fn create_channels() -> PipelineChannels {
         exec_rx,
         subscribe_tx,
         subscribe_rx,
-        quotes_tx,
-        quotes_rx,
-        route_tx,
-        route_rx,
     }
 }
 
-/// Boot recovery + token seed + symbol-map hydrate. Touches only the DB (no
-/// miden client), so it runs on the main thread before any client thread.
+/// Token seed + symbol-map hydrate. Outstanding settlements stay reserved
+/// until the executor reconciles them; resetting them could rematch a consumed parent.
 pub fn prepare_db(config: &PipelineConfig) -> Result<()> {
-    {
-        let mut conn = config.db_pool.write_conn()?;
-        let n = db::reset_all_settling_to_active(&mut conn)?;
-        if n > 0 {
-            tracing::info!(
-                count = n,
-                "boot recovery: reset Settling orders to Active for re-matching"
-            );
-        }
-    }
     db::seed_tokens_from_config(&config.db_pool, &config.initial_tokens)?;
     {
         let loaded = db::load_token_symbols(&config.db_pool)?;
@@ -289,49 +260,42 @@ pub struct CoreHandles {
 pub fn spawn_core_services<P: PriceClient + 'static>(
     config: &PipelineConfig,
     price_client: P,
-    order_rx: mpsc::Receiver<IngestOrder>,
-    consumed_rx: mpsc::Receiver<NoteId>,
-    price_tx: watch::Sender<PriceSnapshot>,
-    price_rx: watch::Receiver<PriceSnapshot>,
+    book_rx: mpsc::Receiver<BookUpdate>,
     precise_tx: watch::Sender<PreciseSnapshot>,
     last_price_update: Arc<AtomicI64>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
-    router_hooks: Option<matcher::RouterHooks>,
-    clearing: Option<matcher::ClearingRuntime>,
+    clearing: matcher::ClearingRuntime,
 ) -> CoreHandles {
-    // Price feed — broadcasts cents (matcher) + precise (price API) snapshots.
+    // Price feed — publishes exact snapshots for clearing and the price API.
     let price_token_map = config.token_map.clone();
     let price_interval = config.price_interval;
     let price_cancel = config.cancel.clone();
     let price_handle = tokio::task::spawn_local(async move {
         tokio::select! {
-            _ = price::run_price_feed(price_client, price_token_map, price_tx, precise_tx, last_price_update, price_interval) => {}
+            _ = price::run_price_feed(price_client, price_token_map, precise_tx, last_price_update, price_interval) => {}
             _ = price_cancel.cancelled() => {}
         }
     });
 
     // Matcher.
     let match_interval = config.match_interval;
-    let matcher_pool = config.db_pool.clone();
     let matcher_cancel = config.cancel.clone();
-    let triangular_enabled = config.triangular_enabled;
     let matcher_handle = tokio::task::spawn_local(async move {
-        matcher::run_matcher(
-            matcher_pool,
-            order_rx,
-            consumed_rx,
-            price_rx,
+        if let Err(error) = matcher::run_matcher(
+            book_rx,
             exec_tx,
             match_interval,
-            triangular_enabled,
             swap_snapshot_tx,
-            router_hooks,
             clearing,
-            matcher_cancel,
+            matcher_cancel.clone(),
         )
-        .await;
+        .await
+        {
+            tracing::error!(%error, "matcher failed; requiring recovery");
+            matcher_cancel.cancel();
+        }
     });
 
     // Admin HTTP server.
@@ -344,19 +308,19 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     let admin_port = config.admin_port;
     let admin_cancel = config.cancel.clone();
     let admin_handle = tokio::task::spawn_local(async move {
-        let listener =
-            match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        port = admin_port,
-                        error = %e,
-                        "failed to bind admin port; triggering graceful shutdown"
-                    );
-                    admin_cancel.cancel();
-                    return;
-                }
-            };
+        let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{admin_port}")).await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    port = admin_port,
+                    error = %e,
+                    "failed to bind admin port; triggering graceful shutdown"
+                );
+                admin_cancel.cancel();
+                return;
+            }
+        };
         let shutdown_cancel = admin_cancel.clone();
         if let Err(e) = axum::serve(listener, admin_router)
             .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
@@ -388,22 +352,22 @@ pub struct IngestHandles {
 pub async fn spawn_ingest_tasks(
     adapter: Arc<Mutex<dyn MidenClient>>,
     db_pool: db::DbPool,
-    order_tx: mpsc::Sender<IngestOrder>,
-    consumed_tx: mpsc::Sender<NoteId>,
+    book_tx: mpsc::Sender<BookUpdate>,
     mut subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicI64>,
     solver_id: miden_protocol::account::AccountId,
-    clearing_bootstrap: Option<oneshot::Sender<matcher::ClearingBootstrap>>,
+    clearing_bootstrap: oneshot::Sender<matcher::ClearingBootstrap>,
 ) -> Result<IngestHandles> {
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
 
-    if let Some(sender) = clearing_bootstrap {
-        let bootstrap = reconcile_clearing_book(&db_pool, &mut *adapter.lock().await).await?;
-        sender.send(bootstrap).map_err(|_| anyhow::anyhow!("clearing matcher stopped before startup reconciliation"))?;
-    }
+    ingest::SyncResult::recover(&mut *adapter.lock().await, &db_pool, solver_id).await?;
+    let bootstrap = reconcile_clearing_book(&db_pool, &mut *adapter.lock().await).await?;
+    clearing_bootstrap
+        .send(bootstrap)
+        .map_err(|_| anyhow::anyhow!("clearing matcher stopped before startup reconciliation"))?;
 
     // Subscribe-relay task: admin (on the main thread) sends (offered,
     // requested) tuples across the channel; this task applies them via the
@@ -437,8 +401,7 @@ pub async fn spawn_ingest_tasks(
         ingest::run_ingest(
             adapter,
             db_pool,
-            order_tx,
-            consumed_tx,
+            book_tx,
             ingest_interval,
             cancel,
             last_sync_unix_seconds,
@@ -474,13 +437,12 @@ async fn reconcile_clearing_book(
         (orders, decimals)
     };
     let mut consumed = std::collections::HashSet::new();
-    // Bound each RPC request and its temporary deserialized notes.
+    // Bound each RPC request; notes were decoded once at the DB boundary.
     for chunk in orders.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
         let notes = chunk
             .iter()
-            .map(|order| Note::read_from_bytes(&order.raw_note_data))
-            .collect::<Result<Vec<_>, _>>()
-            .context("deserialize persisted clearing notes")?;
+            .map(|order| order.note.as_ref().clone())
+            .collect::<Vec<_>>();
         consumed.extend(
             client
                 .check_consumed_notes(&notes)
@@ -492,7 +454,7 @@ async fn reconcile_clearing_book(
         let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
         let mut conn = pool.write_conn()?;
         db::mark_orders_onchain_nullified(&mut conn, &ids)?;
-        orders.retain(|order| !consumed.contains(&order.note_id));
+        orders.retain(|order| !consumed.contains(&order.id()));
     }
     Ok(matcher::ClearingBootstrap { orders, decimals })
 }
@@ -500,6 +462,8 @@ async fn reconcile_clearing_book(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::note::Note;
+    use miden_protocol::note::NoteId;
     use std::collections::HashMap;
 
     use miden_protocol::account::AccountId;
@@ -513,7 +477,7 @@ mod tests {
     use crate::ingest::tests::MockMidenClient;
     use crate::ingest::MidenClient;
     use crate::matching::price_feed::PriceFeed;
-    use crate::price::{MockPriceClient, PriceClient, WatchPriceFeed};
+    use crate::price::{MockPriceClient, PriceClient, PriceSnapshot, WatchPriceFeed};
     use std::sync::Arc;
 
     fn test_token_a() -> TokenId {
@@ -603,7 +567,7 @@ mod tests {
         client.mark_consumed_silent(vec![ids[0]]);
         let bootstrap = reconcile_clearing_book(&pool, &mut client).await.unwrap();
         assert_eq!(bootstrap.orders.len(), 1);
-        assert_eq!(bootstrap.orders[0].note_id, ids[1]);
+        assert_eq!(bootstrap.orders[0].id(), ids[1]);
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(
@@ -853,7 +817,9 @@ mod tests {
         let key_a = token_a.to_bytes();
         {
             let mut conn = pool.read_conn().unwrap();
-            let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+            let row = db::get_registered_token(&mut conn, &key_a)
+                .unwrap()
+                .unwrap();
             assert!(row.decimals.is_none() && row.ticker.is_none());
         }
 
@@ -863,7 +829,9 @@ mod tests {
         subscribe_all_pairs(&pool, &mut mock_client).await.unwrap();
 
         let mut conn = pool.read_conn().unwrap();
-        let row = db::get_registered_token(&mut conn, &key_a).unwrap().unwrap();
+        let row = db::get_registered_token(&mut conn, &key_a)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.decimals, Some(8));
         assert_eq!(row.ticker.as_deref(), Some("MTA"));
     }

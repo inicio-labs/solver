@@ -11,7 +11,7 @@ mod types;
 pub use config::{ClearingConfig, PPM_DENOMINATOR};
 pub use matching::{PairBatch, PairMatcher};
 pub use order::Order;
-pub(crate) use order::{MatchOrder, OrderSide};
+pub(crate) use order::{MatchOrder, OrderKey, OrderSide};
 pub use types::{
     BatchPrice, CandidatePlan, ClearingError, ClearingOutcome, InvalidOrderReason, OrderExecution,
     PairAmounts, ReferencePrice, SettlementPlan, SkipReason, SolverAccruals,

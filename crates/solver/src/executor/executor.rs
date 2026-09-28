@@ -28,7 +28,7 @@ use crate::db::models::{SettlementAttemptRow, SettlementInputRow};
 use crate::db::{self, DbPool};
 use crate::ingest::{MidenClient, MidenClientAdapter};
 use crate::swap_eta::SettlementStats;
-use crate::types::{BookUpdate, ExecutionBatch, FilledNote, IngestOrder, TokenId};
+use crate::types::{BookUpdate, ExecutionBatch, IngestOrder, TokenId};
 
 // ── Backoff knobs ──────────────────────────────────────────────────────────
 
@@ -103,7 +103,7 @@ enum BatchSubmission {
 
 /// Keep each input and its predicted outputs together, in batch order.
 struct PreparedInput {
-    note: Note,
+    note: Arc<Note>,
     args: NoteArgs,
     payback_id: NoteId,
     remainder: Option<Note>,
@@ -129,10 +129,9 @@ impl BatchComponents {
         let mut flow: HashMap<TokenId, i128> = HashMap::new();
 
         for filled in &batch.filled_notes {
-            let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))
-                .context("failed to deserialize note from raw data")?;
+            let note = Arc::clone(&filled.note);
 
-            let pswap = PswapNote::try_from(&note)
+            let pswap = PswapNote::try_from(note.as_ref())
                 .map_err(|e| anyhow!("failed to parse PswapNote: {}", e))?;
 
             let offered_asset = pswap.offered_asset();
@@ -217,7 +216,7 @@ impl BatchComponents {
         // to its attachments, so the batch would fail with `InputNoteNotInBlock`.
         let inputs = self.inputs.iter().map(|input| {
             (
-                InputNote::unauthenticated(input.note.clone()),
+                InputNote::unauthenticated(input.note.as_ref().clone()),
                 Some(input.args),
             )
         });
@@ -275,15 +274,9 @@ impl BatchComponents {
 
     /// Only failure paths need a separate note slice for the client API.
     fn notes(&self) -> Vec<Note> {
-        self.inputs.iter().map(|input| input.note.clone()).collect()
-    }
-
-    fn source_orders(&self, batch: &ExecutionBatch) -> Result<Vec<IngestOrder>> {
-        batch
-            .filled_notes
+        self.inputs
             .iter()
-            .zip(&self.inputs)
-            .map(|(filled, input)| rebuild_ingest_order(filled, &input.note))
+            .map(|input| input.note.as_ref().clone())
             .collect()
     }
 }
@@ -399,23 +392,6 @@ async fn submit_with_rpc_backoff(
     unreachable!("loop exits via return inside the matched arms")
 }
 
-/// Rebuild the `IngestOrder` for one filled note so the matcher can re-add
-/// it to its book. Shared by failure re-feed paths.
-fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder> {
-    let parsed =
-        crate::types::Order::from_note(note).context("failed to re-parse Note for re-feed")?;
-    Ok(IngestOrder {
-        note_id: filled.note_id,
-        priority_seq: filled.priority_seq,
-        offered_token: parsed.offered_faucet_id,
-        requested_token: parsed.requested_faucet_id,
-        offered_amount: parsed.offered_amount,
-        requested_amount: parsed.requested_amount,
-        min_fill_step: parsed.min_fill_step,
-        raw_note_data: filled.raw_note_data.clone(),
-    })
-}
-
 /// Shutdown-aware re-feed into the matcher via the same channel ingest uses.
 /// Stops early if the matcher channel is closed (it's tearing down).
 async fn refeed_orders(
@@ -441,9 +417,9 @@ async fn classify_input_notes(
 
     let mut active_orders: Vec<IngestOrder> = Vec::new();
 
-    for (filled, note) in batch.filled_notes.iter().zip(input_notes.iter()) {
+    for filled in &batch.filled_notes {
         if !consumed_ids.contains(&filled.note_id) {
-            active_orders.push(rebuild_ingest_order(filled, note)?);
+            active_orders.push(filled.to_ingest_order());
         }
     }
 
@@ -633,11 +609,7 @@ pub async fn run_executor(
             Ok(transactions) => transactions,
             Err(error) => {
                 tracing::error!(%error, "cannot split execution batch safely; returning orders");
-                if let Err(error) = refeed_unprepared(&pool, &batch, &book_tx, &cancel) {
-                    tracing::error!(%error, "cannot recover unprepared orders");
-                    cancel.cancel();
-                    return;
-                }
+                refeed_unprepared(&pool, &batch, &book_tx, &cancel);
                 continue;
             }
         };
@@ -772,8 +744,8 @@ async fn release_rejected_settlement(
     let parents = db::settlement_parents(&mut *pool.read_conn()?, tx_id)?;
     let notes = parents
         .iter()
-        .map(|parent| Note::read_from_bytes(&parent.raw_note_data))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|parent| parent.note.as_ref().clone())
+        .collect::<Vec<_>>();
     let consumed = adapter.lock().await.check_consumed_notes(&notes).await?;
     pool.update_book(book_tx, |conn| {
         db::finish_discarded_settlement(conn, tx_id, &consumed)
@@ -896,23 +868,20 @@ fn refeed_unprepared(
     batch: &ExecutionBatch,
     book_tx: &mpsc::Sender<BookUpdate>,
     cancel: &CancellationToken,
-) -> Result<()> {
-    let orders = batch
-        .filled_notes
-        .iter()
-        .map(|filled| {
-            let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))?;
-            rebuild_ingest_order(filled, &note)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    refeed_later(pool, book_tx, cancel, orders, HELD_REFEED_DELAY);
-    Ok(())
+) {
+    refeed_later(
+        pool,
+        book_tx,
+        cancel,
+        batch.source_orders(),
+        HELD_REFEED_DELAY,
+    );
 }
 
 /// After mempool acceptance, record each note's enqueue-to-submit duration
 /// (now − arrival) into the in-memory swap-eta window and republish it.
 /// Everything is in-memory: `arrival_unix` was stamped by the matcher and rides
-/// on the batch; the pair is parsed from the note's own bytes. No DB.
+/// on the batch; the pair is read from the shared original note. No DB.
 fn record_settlement(
     batch: &ExecutionBatch,
     stats: &mut SettlementStats,
@@ -924,13 +893,13 @@ fn record_settlement(
     for filled in &batch.filled_notes {
         // Pair from the note's own terms (offered, requested) — the direction a
         // wallet queries. Skip anything unparseable.
-        let Ok(note) = Note::read_from(&mut SliceReader::new(&filled.raw_note_data)) else {
+        let Ok(pswap) = PswapNote::try_from(filled.note.as_ref()) else {
             continue;
         };
-        let Ok(parsed) = crate::types::Order::from_note(&note) else {
-            continue;
-        };
-        let pair = (parsed.offered_faucet_id, parsed.requested_faucet_id);
+        let pair = (
+            pswap.offered_asset().faucet_id(),
+            pswap.storage().requested_faucet_id(),
+        );
         let duration = now.saturating_sub(filled.arrival_unix);
         stats.record(pair, now, duration);
         changed = true;
@@ -958,7 +927,7 @@ async fn execute_batch(
         Ok(parts) => parts,
         Err(e) => {
             // Nothing is marked Settling yet and the matcher dropped these orders on
-            // emit, so hand back every order whose note still parses — otherwise
+            // emit, so hand back the original orders — otherwise
             // they're stranded until the next restart. Delayed, so a batch that
             // fails deterministically isn't rebuilt every tick.
             tracing::error!(
@@ -966,7 +935,7 @@ async fn execute_batch(
                 notes = batch.filled_notes.len(),
                 "batch preparation failed; re-feeding its orders after a pause"
             );
-            refeed_unprepared(pool, batch, book_tx, cancel)?;
+            refeed_unprepared(pool, batch, book_tx, cancel);
             return Ok(BatchSubmission::Returned);
         }
     };
@@ -976,7 +945,7 @@ async fn execute_batch(
     // shortfall hand the orders back after a pause.
     if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
         tracing::warn!(error = %e, "deferring fee-starved batch");
-        let orders = components.source_orders(batch)?;
+        let orders = batch.source_orders();
         refeed_later(pool, book_tx, cancel, orders, HELD_REFEED_DELAY);
         return Ok(BatchSubmission::Returned);
     }
@@ -996,7 +965,7 @@ async fn execute_batch(
             // orders remain Active (submit never landed). Re-feed so
             // the matcher can reconsider (and possibly compose a different
             // batch) without waiting for a process restart.
-            let orders = components.source_orders(batch)?;
+            let orders = batch.source_orders();
             refeed_orders(pool, book_tx, orders).await?;
             tracing::error!(error = %msg, "tx build failed; re-fed active orders");
             Ok(BatchSubmission::Returned)
@@ -1393,6 +1362,7 @@ pub(crate) fn spawn_executor_thread(
 #[cfg(test)]
 mod claim_tests {
     use super::*;
+    use crate::types::FilledNote;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::{NoteId, NoteType};
@@ -1479,7 +1449,7 @@ mod claim_tests {
                     note_id: note.id(),
                     priority_seq: index as u64 + 1,
                     requested_filled,
-                    raw_note_data: note.to_bytes().into(),
+                    note: Arc::new(note),
                     arrival_unix: 1,
                 })
                 .collect(),
@@ -1490,11 +1460,11 @@ mod claim_tests {
             assert_eq!(input.note.id(), filled.note_id);
             assert!(input.remainder.is_none());
         }
-        let sources = components.source_orders(&batch).unwrap();
+        let sources = batch.source_orders();
         for (source, filled) in sources.iter().zip(&batch.filled_notes) {
-            assert_eq!(source.note_id, filled.note_id);
+            assert_eq!(source.id(), filled.note_id);
             assert_eq!(source.priority_seq, filled.priority_seq);
-            assert!(Arc::ptr_eq(&source.raw_note_data, &filled.raw_note_data));
+            assert!(Arc::ptr_eq(&source.note, &filled.note));
         }
         let residual: HashMap<_, _> = components
             .surplus_assets
@@ -1543,7 +1513,7 @@ mod claim_tests {
                     note_id: note.id(),
                     priority_seq: combined.filled_notes.len() as u64 + 1,
                     requested_filled: payment,
-                    raw_note_data: note.to_bytes().into(),
+                    note: Arc::new(note),
                     arrival_unix: 1,
                 });
             }
@@ -1564,14 +1534,16 @@ mod claim_tests {
     fn sized_batch(group_sizes: &[usize]) -> ExecutionBatch {
         let mut group_ends = Vec::new();
         let mut filled_notes = Vec::new();
+        let mut rng = RandomCoin::new(Word::default());
         for &size in group_sizes {
             for _ in 0..size {
                 let index = filled_notes.len() as u64 + 1;
+                let note = Arc::new(p2id(fee_faucet(), 1, &mut rng));
                 filled_notes.push(FilledNote {
-                    note_id: NoteId::try_from_hex(&format!("0x{index:064x}")).unwrap(),
+                    note_id: note.id(),
                     priority_seq: index,
                     requested_filled: 1,
-                    raw_note_data: Vec::new().into(),
+                    note,
                     arrival_unix: 1,
                 });
             }

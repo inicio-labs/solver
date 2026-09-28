@@ -199,6 +199,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     swap_block_time_ms: 6000,
                     swap_offmarket_tolerance_bps: 50,
                     router_enabled: false,
+                    router_bind: "127.0.0.1".to_string(),
+                    router_port: 0,
+                    router_max_connections: 64,
+                    router_max_msg_bytes: 16384,
+                    router_quote_ttl_ms: 20_000,
+                    router_inflight_ttl_ms: 30_000,
                 },
             };
 

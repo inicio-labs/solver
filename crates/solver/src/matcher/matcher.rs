@@ -1,10 +1,11 @@
+use anyhow::{ensure, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::clearing_book::{run_clearer, ClearingBook, ClearingBootstrap};
+use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use crate::clearing::{
     self, ClearingConfig, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
 };
@@ -12,8 +13,8 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
 use crate::types::*;
 
-/// Exact-price, two-sided PSWAP clearing. Missing, stale, or inexact prices
-/// leave orders untouched until a fresh snapshot arrives.
+/// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
+/// oracle prices pause clearing, but do not disable fixed-limit RFQ selection.
 pub struct ClearingRuntime {
     pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
     pub prices: watch::Receiver<PreciseSnapshot>,
@@ -22,6 +23,32 @@ pub struct ClearingRuntime {
     pub max_price_age_ms: u64,
     pub max_source_age_ms: u64,
     pub max_source_skew_ms: u64,
+    pub routing: Option<crate::router::Routing>,
+}
+
+impl ClearingRuntime {
+    /// An order belongs to one unordered pair. Reject duplicate markets once,
+    /// so clearing needs no per-tick set to prevent double selection.
+    fn validate(&self) -> Result<()> {
+        self.config.validate()?;
+        let mut pairs = HashSet::with_capacity(self.pairs.len());
+        for &(base, quote) in &self.pairs {
+            ensure!(
+                base != quote,
+                "a clearing pair must contain different assets"
+            );
+            let pair = if base < quote {
+                (base, quote)
+            } else {
+                (quote, base)
+            };
+            ensure!(
+                pairs.insert(pair),
+                "duplicate clearing pair: {base}/{quote}"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Apply lifecycle updates immediately; match the active book on timer ticks.
@@ -33,19 +60,52 @@ pub async fn run_matcher(
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     runtime: ClearingRuntime,
     cancel: CancellationToken,
-) {
-    if let Err(error) = run_clearer(
-        book_rx,
-        exec_tx,
-        match_interval,
-        swap_snapshot_tx,
-        runtime,
-        cancel.clone(),
-    )
-    .await
-    {
-        tracing::error!(%error, "clearing book failed; requiring recovery");
-        cancel.cancel();
+) -> Result<()> {
+    // One cancellation boundary covers bootstrap, matching, and a blocked send.
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        result = run_worker(book_rx, exec_tx, match_interval, swap_snapshot_tx, runtime) => result,
+    }
+}
+
+pub(super) async fn run_worker(
+    mut book_rx: mpsc::Receiver<BookUpdate>,
+    exec_tx: mpsc::Sender<ExecutionBatch>,
+    match_interval: Duration,
+    snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    mut runtime: ClearingRuntime,
+) -> Result<()> {
+    // Configuration is frozen for this worker; validate before admitting orders.
+    runtime.validate()?;
+    let bootstrap = (&mut runtime.bootstrap).await?;
+    let mut book = ClearingBook::default();
+    for order in bootstrap.orders {
+        book.insert(&order)?;
+    }
+    let mut interval = tokio::time::interval(match_interval);
+    loop {
+        // Update the book immediately; run matching only on the batch timer.
+        tokio::select! {
+            update = book_rx.recv() => {
+                let update = update.context("ingestion stopped: book update channel closed")?;
+                book.apply(update)?;
+            }
+            _ = interval.tick() => {
+                book.apply_pending(&mut book_rx)?;
+                let now = now_millis();
+                if let Some(routing) = runtime.routing.as_mut() {
+                    routing.release_expired(&mut book, now)?;
+                }
+                internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now).await?;
+                if let Some(routing) = runtime.routing.as_mut() {
+                    // Executor backpressure may have delayed this tick. Check RFQ
+                    // expiry against the handover time, not the old tick timestamp.
+                    routing.dispatch(&mut book, now_millis())?;
+                }
+                // Latest order-book levels for the price API's swap-ETA estimates.
+                snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
+            }
+        }
     }
 }
 
@@ -89,7 +149,7 @@ pub(super) async fn internal_clear(
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
     now_ms: u64,
-) -> bool {
+) -> Result<()> {
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor
@@ -98,7 +158,6 @@ pub(super) async fn internal_clear(
         filled_notes: Vec::new(),
         group_ends: Vec::new(),
     };
-    let mut selected = HashSet::new();
     let mut included_pairs = 0usize;
     for &(base, quote) in &runtime.pairs {
         let Some((base_price, quote_price)) = fresh_reference_prices(
@@ -123,7 +182,7 @@ pub(super) async fn internal_clear(
             base_decimals,
             quote_decimals,
         )
-        .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config, &selected));
+        .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config));
         let batch = match batch {
             Ok(batch) => batch,
             Err(error) => {
@@ -171,36 +230,31 @@ pub(super) async fn internal_clear(
             surplus_quote = %plan.accruals.rounding_surplus.quote,
             "clearing pair included in combined batch"
         );
-        for filled in &execution.filled_notes {
-            selected.insert(filled.note_id);
-        }
         combined.filled_notes.extend(execution.filled_notes);
         combined.group_ends.push(combined.filled_notes.len());
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
-        return false;
+        return Ok(());
     }
-    let filled_ids: Vec<_> = combined
-        .filled_notes
-        .iter()
-        .map(|note| note.note_id)
-        .collect();
-    tracing::info!(
-        pairs = included_pairs,
-        orders = filled_ids.len(),
-        "combined clearing batch sent to executor"
-    );
-    if exec_tx.send(combined).await.is_err() {
-        tracing::error!("executor channel closed during clearing");
-        return true;
-    }
+    // Reserve before changing the book. Once reserved, deactivation and send
+    // are synchronous: cancellation cannot leave half of the handoff applied.
+    let permit = exec_tx
+        .reserve()
+        .await
+        .context("executor stopped: execution batch receiver closed")?;
     // Keep the parents in memory but off the matchable index. A definite
     // failure reactivates them; confirmation removes them permanently.
-    for note_id in filled_ids {
-        book.deactivate(note_id);
+    for filled in &combined.filled_notes {
+        book.deactivate(filled.note_id);
     }
-    false
+    tracing::info!(
+        pairs = included_pairs,
+        orders = combined.filled_notes.len(),
+        "combined clearing batch sent to executor"
+    );
+    permit.send(combined);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -384,30 +438,39 @@ mod tests {
             max_price_age_ms: 1_000,
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
+            routing: None,
         };
+        runtime.validate().unwrap();
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
-        assert!(internal_clear(&mut book, &decimals, &runtime, &closed_tx, 1_500).await);
+        let error = internal_clear(&mut book, &decimals, &runtime, &closed_tx, 1_500)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("executor stopped"));
         assert_eq!(
-            book.snapshot().len(),
+            book.best_levels_snapshot().len(),
             4,
             "failed dispatch must leave orders live"
         );
-        assert!(!internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500,).await);
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
+            .await
+            .unwrap();
         let execution = exec_rx.try_recv().unwrap();
         assert_eq!(execution.filled_notes.len(), 4);
         assert_eq!(execution.group_ends, vec![2, 4]);
         for filled in &execution.filled_notes {
             let source = persisted
                 .iter()
-                .find(|order| order.note_id == filled.note_id)
+                .find(|order| order.id() == filled.note_id)
                 .unwrap();
-            assert!(Arc::ptr_eq(&filled.raw_note_data, &source.raw_note_data));
+            assert!(Arc::ptr_eq(&filled.note, &source.note));
         }
         assert!(exec_rx.try_recv().is_err());
-        assert!(book.snapshot().is_empty());
-        assert!(!internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).await);
+        assert!(book.best_levels_snapshot().is_empty());
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
+            .await
+            .unwrap();
         assert!(
             exec_rx.try_recv().is_err(),
             "pending orders must not be dispatched twice"
@@ -415,12 +478,14 @@ mod tests {
         for order in &persisted {
             book.insert(order).unwrap();
         }
-        assert!(!internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).await);
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
+            .await
+            .unwrap();
         let retried = exec_rx.try_recv().unwrap();
         for (first, next) in execution.filled_notes.iter().zip(&retried.filled_notes) {
             assert_eq!(first.note_id, next.note_id);
             assert_eq!(first.arrival_unix, next.arrival_unix);
-            assert!(Arc::ptr_eq(&first.raw_note_data, &next.raw_note_data));
+            assert!(Arc::ptr_eq(&first.note, &next.note));
         }
     }
 }

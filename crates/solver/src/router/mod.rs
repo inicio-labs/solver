@@ -3,15 +3,17 @@
 //!
 //! - [`select`] — the pure, decimal-correct note-selection math (`select_notes`).
 //! - shared channel payloads ([`QuotesSnapshot`], [`RouteBatch`]) below.
-//! - (server thread + matcher pass are wired in `router::server` / `matcher`).
+//! - [`routing`] — dispatch and RFQ reservations over the worker's shared book.
 //!
 //! The websocket wire protocol lives in the standalone `pswap-lp-sdk` crate
 //! (`pswap_lp_sdk::protocol`) — the same definition external LPs import, so the
 //! contract can't drift between the two sides.
 
+mod routing;
 pub mod select;
 pub mod server;
 
+pub use routing::Routing;
 pub use select::{select_notes, Pair, Pick, Quote, Rate};
 pub use server::{spawn_router_thread, RouterConfig};
 
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 pub type QuotesSnapshot = HashMap<Pair, Vec<Quote>>;
 
 /// A batch of notes the matcher sends the router to deliver to DEXes, over the
-/// `route` mpsc channel with `try_send` (never blocks the tick).
+/// `route` mpsc channel using a nonblocking reservation (never blocks the tick).
 #[derive(Clone, Debug)]
 pub struct RouteBatch {
     pub items: Vec<RoutedNote>,

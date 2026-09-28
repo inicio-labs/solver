@@ -2,7 +2,7 @@
 //! quotes (→ `quotes_tx`, read by the matcher), and receive note handovers
 //! (← `route_rx`, produced by the matcher). Runs on its own OS thread with a
 //! multi-thread runtime, mirroring `spawn_price_api_thread`. Thin transport:
-//! every order decision is made in the matcher, not here.
+//! selection runs against the shared book in `router::routing`, not here.
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -315,10 +315,13 @@ pub fn spawn_router_thread(
                 };
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "router RFQ websocket listening");
-                let shutdown = async move { cancel.cancelled().await };
+                let shutdown_cancel = cancel.clone();
+                let shutdown = async move { shutdown_cancel.cancelled().await };
                 if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
                     tracing::error!(error = %e, "router server error");
                 }
+                // An unexpected RFQ transport exit requires coordinated recovery.
+                cancel.cancel();
             });
         })
         .context("spawn router thread")?;

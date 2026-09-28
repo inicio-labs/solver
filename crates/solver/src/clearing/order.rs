@@ -3,7 +3,6 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
-use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use ruint::aliases::U256;
@@ -31,81 +30,55 @@ enum BookStatus {
 
 #[derive(Clone, Debug)]
 pub struct Order {
-    note_id: NoteId,
-    note: PswapNote,
+    pswap: PswapNote,
+    note: Arc<Note>,
     priority: NonZeroU64,
     status: BookStatus,
     arrival_unix: UnixSecs,
-    raw_note_data: Arc<[u8]>,
 }
 
 impl Order {
     pub fn from_note(note: &Note, priority_sequence: u64) -> Result<Self, ClearingError> {
-        Self::new(note, priority_sequence, note.to_bytes().into())
+        Self::new(Arc::new(note.clone()), priority_sequence)
     }
 
-    fn new(
-        note: &Note,
-        priority_sequence: u64,
-        raw_note_data: Arc<[u8]>,
-    ) -> Result<Self, ClearingError> {
+    fn new(note: Arc<Note>, priority_sequence: u64) -> Result<Self, ClearingError> {
         let priority = NonZeroU64::new(priority_sequence).ok_or(ClearingError::InvalidOrder {
             note_id: note.id(),
             reason: InvalidOrderReason::MissingPriority,
         })?;
-        let parsed = PswapNote::try_from(note).map_err(|source| ClearingError::InvalidPswap {
-            note_id: note.id(),
-            source,
-        })?;
+        let pswap =
+            PswapNote::try_from(note.as_ref()).map_err(|source| ClearingError::InvalidPswap {
+                note_id: note.id(),
+                source,
+            })?;
         Ok(Self {
-            note_id: note.id(),
-            note: parsed,
+            pswap,
+            note,
             priority,
             status: BookStatus::Active,
             arrival_unix: now_unix(),
-            raw_note_data,
         })
     }
 
-    /// Parse the authoritative note bytes and verify every persisted cache field.
+    /// Parse the shared original note once, preserving its attachments.
     pub fn from_ingest_order(order: &IngestOrder) -> Result<Self, ClearingError> {
-        let note = Note::read_from(&mut SliceReader::new(&order.raw_note_data)).map_err(|_| {
-            ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::MalformedRawNote,
-            }
-        })?;
-        if note.id() != order.note_id {
-            return Err(ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::InconsistentIngestOrder,
-            });
-        }
-
-        let admitted = Self::new(&note, order.priority_seq, Arc::clone(&order.raw_note_data))?;
-        admitted.verify_ingest_fields(order)?;
-        Ok(admitted)
-    }
-
-    fn verify_ingest_fields(&self, order: &IngestOrder) -> Result<(), ClearingError> {
-        let offered = self.offered_asset();
-        let requested = self.requested_asset();
-        if offered.faucet_id() != order.offered_token
-            || offered.amount().as_u64() != order.offered_amount
-            || requested.faucet_id() != order.requested_token
-            || requested.amount().as_u64() != order.requested_amount
-            || self.note.storage().min_fill_step().as_u64() != order.min_fill_step
-        {
-            return Err(ClearingError::InvalidOrder {
-                note_id: order.note_id,
-                reason: InvalidOrderReason::InconsistentIngestOrder,
-            });
-        }
-        Ok(())
+        Self::new(Arc::clone(&order.note), order.priority_seq)
     }
 
     pub fn id(&self) -> NoteId {
-        self.note_id
+        self.note.id()
+    }
+
+    pub(crate) fn note(&self) -> &miden_protocol::note::Note {
+        &self.note
+    }
+
+    pub(crate) fn to_ingest_order(&self) -> IngestOrder {
+        IngestOrder {
+            priority_seq: self.priority_sequence(),
+            note: Arc::clone(&self.note),
+        }
     }
 
     pub fn priority_sequence(&self) -> u64 {
@@ -137,15 +110,15 @@ impl Order {
     }
 
     pub fn pswap_note(&self) -> &PswapNote {
-        &self.note
+        &self.pswap
     }
 
     pub fn offered_asset(&self) -> FungibleAsset {
-        *self.note.offered_asset()
+        *self.pswap.offered_asset()
     }
 
     pub fn requested_asset(&self) -> FungibleAsset {
-        *self.note.storage().min_requested_asset()
+        *self.pswap.storage().min_requested_asset()
     }
 
     pub(crate) fn prepare_if_eligible(
@@ -181,7 +154,7 @@ impl Order {
         }
 
         let fill_scale = FillScale::new(comparison_units, payment_units);
-        let minimum_payment = self.note.storage().min_fill_step().min(requested.amount());
+        let minimum_payment = self.pswap.storage().min_fill_step().min(requested.amount());
         let minimum = fill_scale.to_comparison_floor(minimum_payment)?;
         let maximum = fill_scale.to_comparison_floor(requested.amount())?;
 
@@ -193,13 +166,13 @@ impl Order {
         }))
     }
 
-    /// Carry the verified fill and original note bytes to the executor.
+    /// Carry the verified fill and shared original note to the executor.
     pub(crate) fn to_filled_note(&self, execution: &OrderExecution) -> FilledNote {
         FilledNote {
-            note_id: self.note_id,
+            note_id: self.id(),
             priority_seq: self.priority_sequence(),
             requested_filled: execution.payment.amount().as_u64(),
-            raw_note_data: Arc::clone(&self.raw_note_data),
+            note: Arc::clone(&self.note),
             arrival_unix: self.arrival_unix,
         }
     }
@@ -303,7 +276,7 @@ impl MatchOrder<'_> {
             };
         let release_amount = self
             .order
-            .note
+            .pswap
             .calculate_offered_for_requested(payment_amount.as_u64())
             .map_err(|_| ClearingError::InternalInvariant("protocol payout calculation failed"))?;
         let payment = FungibleAsset::new(requested.faucet_id(), payment_amount.as_u64())?;

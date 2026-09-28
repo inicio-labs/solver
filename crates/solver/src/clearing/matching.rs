@@ -174,10 +174,7 @@ mod tests {
     use super::*;
     use miden_protocol::account::AccountId;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
-    use miden_protocol::crypto::{
-        rand::{FeltRng, RandomCoin},
-        utils::Serializable,
-    };
+    use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::{Note, NoteType};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -186,6 +183,7 @@ mod tests {
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
     use ruint::aliases::U256;
+    use std::sync::Arc;
 
     use crate::clearing::{PairAmounts, ReferencePrice};
     use crate::matching::types::RateKey;
@@ -310,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn ingested_note_adapter_checks_identity_amounts_and_fifo() {
+    fn ingested_note_adapter_preserves_native_note_and_fifo() {
         let (base, quote) = assets();
         let mut rng = RandomCoin::new(Word::default());
         let original = order(
@@ -322,14 +320,8 @@ mod tests {
         );
         let note: Note = original.pswap_note().clone().into();
         let mut ingested = IngestOrder {
-            note_id: original.id(),
             priority_seq: 7,
-            offered_token: base,
-            requested_token: quote,
-            offered_amount: 10,
-            requested_amount: 20,
-            min_fill_step: 5,
-            raw_note_data: note.to_bytes().into(),
+            note: Arc::new(note),
         };
         assert_eq!(
             Order::from_ingest_order(&ingested)
@@ -348,15 +340,7 @@ mod tests {
         let input = batch(price, &orders);
         assert_eq!(input.orders().count(), 1);
         assert_eq!(input.clearing_price.quote_units, U256::from(2u8));
-        ingested.requested_amount = 21;
-        assert!(matches!(
-            Order::from_ingest_order(&ingested),
-            Err(ClearingError::InvalidOrder {
-                reason: super::super::types::InvalidOrderReason::InconsistentIngestOrder,
-                ..
-            })
-        ));
-        ingested.requested_amount = 20;
+        assert_eq!(orders[0].id(), ingested.id());
         ingested.priority_seq = 0;
         assert!(matches!(
             Order::from_ingest_order(&ingested),
@@ -770,17 +754,9 @@ mod tests {
             .iter()
             .map(|order| {
                 let note: Note = order.pswap_note().clone().into();
-                let offered = order.offered_asset();
-                let requested = order.requested_asset();
                 IngestOrder {
-                    note_id: order.id(),
                     priority_seq: order.priority_sequence(),
-                    offered_token: offered.faucet_id(),
-                    requested_token: requested.faucet_id(),
-                    offered_amount: offered.amount().as_u64(),
-                    requested_amount: requested.amount().as_u64(),
-                    min_fill_step: order.pswap_note().storage().min_fill_step().as_u64(),
-                    raw_note_data: note.to_bytes().into(),
+                    note: Arc::new(note),
                 }
             })
             .collect();

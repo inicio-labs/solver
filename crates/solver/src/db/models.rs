@@ -1,8 +1,8 @@
 use crate::db::schema::*;
-use crate::types::{IngestOrder, OrderId, OrderStatus, TokenId};
-use anyhow::{anyhow, Result};
+use crate::types::{IngestOrder, OrderId, OrderStatus};
+use anyhow::{anyhow, ensure, Result};
 use diesel::prelude::*;
-use miden_protocol::crypto::utils::{Deserializable, SliceReader};
+use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
 #[derive(Queryable, Selectable, Insertable, Debug)]
@@ -51,15 +51,17 @@ impl OrderRow {
         if note.id() != note_id {
             return Err(anyhow!("stored order and note IDs differ"));
         }
+        // Validate persisted metadata at the DB boundary, not on every book insert.
+        ensure!(
+            parsed.offered_faucet_id.to_bytes() == self.offered_asset
+                && parsed.requested_faucet_id.to_bytes() == self.requested_asset
+                && parsed.offered_amount == u64::try_from(self.offered_amount)?
+                && parsed.requested_amount == u64::try_from(self.requested_amount)?,
+            "stored order terms differ from note"
+        );
         Ok(IngestOrder {
-            note_id,
             priority_seq: u64::try_from(self.priority_seq)?,
-            offered_token: TokenId::read_from(&mut SliceReader::new(&self.offered_asset))?,
-            requested_token: TokenId::read_from(&mut SliceReader::new(&self.requested_asset))?,
-            offered_amount: u64::try_from(self.offered_amount)?,
-            requested_amount: u64::try_from(self.requested_amount)?,
-            min_fill_step: parsed.min_fill_step,
-            raw_note_data: raw_note_data.into(),
+            note: std::sync::Arc::new(note),
         })
     }
 }

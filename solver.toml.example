@@ -56,7 +56,6 @@ price_interval_ms = 5000
 # token decimals. Missing/stale prices leave the pair's orders in the live book.
 # Protocol fee and minimum price edge in ppm; zero disables fees.
 clearing_fee_ppm = 0
-# External RFQ routing is unsupported by this clearing path.
 # clearing_max_source_age_secs = 60  # provider timestamp age, not HTTP fetch age
 # clearing_max_source_skew_secs = 30 # difference between the two asset timestamps
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
@@ -96,6 +95,12 @@ admin_port = 3001
 # price_vs_currency = "usd"          # CoinGecko vs_currency (usd/eur/...; NOT "usdt")
 # price_staleness_secs = 30          # older than this → 503 (use ?allow_stale=true to override)
 
-# External RFQ routing is not supported by the pair-clearing runtime.
-# Keep disabled if present in an existing config.
+# External RFQ routing hands unmatched whole notes to allow-listed DEXes.
+# Set SOLVER_ROUTER_TOKENS to comma-separated bearer tokens when enabling it.
 # router_enabled = false
+# router_bind = "127.0.0.1"
+# router_port = 8090
+# router_max_connections = 64
+# router_max_msg_bytes = 16384
+# router_quote_ttl_ms = 20000
+# router_inflight_ttl_ms = 30000 # must exceed expected external settlement latency

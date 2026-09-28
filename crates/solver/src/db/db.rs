@@ -8,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = include_str!("../../schema.sql");
 
-use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
@@ -315,7 +314,7 @@ pub fn finish_discarded_settlement(
         let parents = settlement_parents(conn, tx_id)?;
         let mut update = BookUpdate::default();
         for parent in parents {
-            let parent_id = parent.note_id;
+            let parent_id = parent.id();
             let current: String = orders::table
                 .find(parent_id.to_bytes().as_slice())
                 .select(orders::status)
@@ -350,7 +349,7 @@ pub fn active_book_update(
 ) -> Result<BookUpdate> {
     let ids: Vec<_> = candidates
         .iter()
-        .map(|order| order.note_id.to_bytes().to_vec())
+        .map(|order| order.id().to_bytes().to_vec())
         .collect();
     let active: HashSet<Vec<u8>> = orders::table
         .filter(orders::note_id.eq_any(ids))
@@ -363,13 +362,13 @@ pub fn active_book_update(
         removed: Vec::new(),
         active: candidates
             .into_iter()
-            .filter(|order| active.contains(order.note_id.to_bytes().as_slice()))
+            .filter(|order| active.contains(order.id().to_bytes().as_slice()))
             .collect(),
     })
 }
 
 impl SettlementInputRow {
-    fn child_order(&self, priority_seq: u64) -> Result<Option<(IngestOrder, AccountId)>> {
+    fn child_order(&self, priority_seq: u64) -> Result<Option<(IngestOrder, crate::types::Order)>> {
         let (Some(child_id), Some(raw_note_data)) = (&self.child_note_id, &self.child_note_data)
         else {
             return Ok(None);
@@ -382,16 +381,10 @@ impl SettlementInputRow {
         let parsed = crate::types::Order::from_note(&note)?;
         Ok(Some((
             IngestOrder {
-                note_id: note.id(),
                 priority_seq,
-                offered_token: parsed.offered_faucet_id,
-                requested_token: parsed.requested_faucet_id,
-                offered_amount: parsed.offered_amount,
-                requested_amount: parsed.requested_amount,
-                min_fill_step: parsed.min_fill_step,
-                raw_note_data: raw_note_data.clone().into(),
+                note: std::sync::Arc::new(note),
             },
-            parsed.creator_id,
+            parsed,
         )))
     }
 }
@@ -427,31 +420,29 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
                 .first(conn)?;
             let parent_id = OrderId::read_from(&mut SliceReader::new(&input.parent_note_id))?;
             activation.removed.push(parent_id);
-            if let Some((child, creator)) =
-                input.child_order(u64::try_from(parent.priority_seq)?)?
-            {
+            if let Some((child, terms)) = input.child_order(u64::try_from(parent.priority_seq)?)? {
                 diesel::insert_or_ignore_into(notes::table)
                     .values(NoteRow {
-                        note_id: child.note_id.to_bytes().to_vec(),
-                        account_id: creator.to_bytes().to_vec(),
-                        raw_data: child.raw_note_data.to_vec(),
+                        note_id: child.id().to_bytes().to_vec(),
+                        account_id: terms.creator_id.to_bytes().to_vec(),
+                        raw_data: child.note.to_bytes(),
                     })
                     .execute(conn)?;
                 diesel::insert_or_ignore_into(orders::table)
                     .values(OrderRow {
-                        note_id: child.note_id.to_bytes().to_vec(),
-                        account_id: creator.to_bytes().to_vec(),
-                        requested_asset: child.requested_token.to_bytes().to_vec(),
-                        requested_amount: i64::try_from(child.requested_amount)?,
-                        offered_asset: child.offered_token.to_bytes().to_vec(),
-                        offered_amount: i64::try_from(child.offered_amount)?,
+                        note_id: child.id().to_bytes().to_vec(),
+                        account_id: terms.creator_id.to_bytes().to_vec(),
+                        requested_asset: terms.requested_faucet_id.to_bytes().to_vec(),
+                        requested_amount: i64::try_from(terms.requested_amount)?,
+                        offered_asset: terms.offered_faucet_id.to_bytes().to_vec(),
+                        offered_amount: i64::try_from(terms.offered_amount)?,
                         timestamp: parent.timestamp,
                         status: OrderStatus::Active.as_str().to_string(),
                         priority_seq: parent.priority_seq,
                     })
                     .execute(conn)?;
                 let status: String = orders::table
-                    .find(child.note_id.to_bytes().as_slice())
+                    .find(child.id().to_bytes().as_slice())
                     .select(orders::status)
                     .first(conn)?;
                 if status == OrderStatus::Active.as_str() {
@@ -851,15 +842,37 @@ mod tests {
     }
 
     #[test]
+    fn stored_order_metadata_is_checked_at_hydration_boundary() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        let (parent, _, _, priority) = prepared_fixture(&mut conn);
+        let row: OrderRow = orders::table
+            .find(parent.id().to_bytes().as_slice())
+            .select(OrderRow::as_select())
+            .first(&mut conn)
+            .unwrap();
+        let ingested = row.clone().into_ingest(parent.to_bytes()).unwrap();
+        assert_eq!(ingested.id(), parent.id());
+        assert_eq!(ingested.priority_seq, priority as u64);
+        assert_eq!(ingested.note.as_ref(), &parent);
+        let mut wrong_amount = row.clone();
+        wrong_amount.requested_amount += 1;
+        assert!(wrong_amount.into_ingest(parent.to_bytes()).is_err());
+        let mut wrong_asset = row;
+        wrong_asset.requested_asset = wrong_asset.offered_asset.clone();
+        assert!(wrong_asset.into_ingest(parent.to_bytes()).is_err());
+    }
+
+    #[test]
     fn settlement_parent_load_preserves_data_and_rejects_missing_note() {
         let pool = test_pool();
         let mut conn = pool.write_conn().unwrap();
         let (parent, _, tx_id, priority) = prepared_fixture(&mut conn);
         let parents = settlement_parents(&mut conn, &tx_id).unwrap();
         assert_eq!(parents.len(), 1);
-        assert_eq!(parents[0].note_id, parent.id());
+        assert_eq!(parents[0].id(), parent.id());
         assert_eq!(parents[0].priority_seq, priority as u64);
-        assert_eq!(parents[0].raw_note_data.as_ref(), parent.to_bytes());
+        assert_eq!(parents[0].note.as_ref(), &parent);
 
         diesel::delete(notes::table.find(parent.id().to_bytes().as_slice()))
             .execute(&mut conn)
@@ -885,13 +898,13 @@ mod tests {
             "rejected"
         );
         assert_eq!(
-            settlement_parents(&mut conn, &tx_id).unwrap()[0].note_id,
+            settlement_parents(&mut conn, &tx_id).unwrap()[0].id(),
             parent.id()
         );
 
         conn.batch_execute("DROP TRIGGER reject_cleanup;").unwrap();
         let update = finish_discarded_settlement(&mut conn, &tx_id, &HashSet::new()).unwrap();
-        assert_eq!(update.active[0].note_id, parent.id());
+        assert_eq!(update.active[0].id(), parent.id());
         assert!(unresolved_settlements(&mut conn).unwrap().is_empty());
         assert!(settlement_parents(&mut conn, &tx_id).unwrap().is_empty());
         assert_eq!(get_active_orders(&mut conn).unwrap().len(), 1);
@@ -938,7 +951,7 @@ mod tests {
         publish.await.unwrap();
         let outcome = receiver.recv().await.unwrap();
         assert_eq!(outcome.removed, vec![parent.id()]);
-        assert_eq!(outcome.active[0].note_id, child.id());
+        assert_eq!(outcome.active[0].id(), child.id());
         assert_eq!(outcome.active[0].priority_seq, priority as u64);
     }
 

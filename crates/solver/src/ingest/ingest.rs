@@ -226,7 +226,7 @@ impl SyncResult {
             db_notes.push(NoteRow {
                 note_id: note_id_bytes.clone(),
                 account_id: order.creator_id.to_bytes().to_vec(),
-                raw_data: raw_data.clone(),
+                raw_data,
             });
 
             db_orders.push(OrderRow {
@@ -245,14 +245,8 @@ impl SyncResult {
             });
 
             ingest_orders.push(IngestOrder {
-                note_id: note.id(),
                 priority_seq: 0, // replaced with the persisted sequence after insert
-                offered_token: order.offered_faucet_id,
-                requested_token: order.requested_faucet_id,
-                offered_amount: order.offered_amount,
-                requested_amount: order.requested_amount,
-                min_fill_step: order.min_fill_step,
-                raw_note_data: raw_data.into(),
+                note: Arc::new(note.clone()),
             });
         }
 
@@ -266,7 +260,7 @@ impl SyncResult {
 
         // Only newly inserted ordinary orders need an activation event.
         for mut order in ingest_orders {
-            if let Some(&priority_seq) = inserted.get(order.note_id.to_bytes().as_slice()) {
+            if let Some(&priority_seq) = inserted.get(order.id().to_bytes().as_slice()) {
                 order.priority_seq = priority_seq;
                 update.active.push(order);
             }
@@ -276,7 +270,7 @@ impl SyncResult {
         db::mark_orders_onchain_nullified(conn, &consumed_bytes)?;
         update
             .active
-            .retain(|order| !consumed.contains(&order.note_id));
+            .retain(|order| !consumed.contains(&order.id()));
         update.removed.extend(consumed);
         Ok(update)
     }

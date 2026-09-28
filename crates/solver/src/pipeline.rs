@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::Note;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -16,6 +15,7 @@ use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, SharedTokenMap};
+use crate::router::{QuotesSnapshot, RouteBatch};
 use crate::swap_eta::SettlementStats;
 use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
@@ -174,6 +174,10 @@ async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, 
 /// Cross-thread channel endpoints, created once on the main thread and split
 /// between the main coordination thread and the client threads.
 pub struct PipelineChannels {
+    pub quotes_tx: watch::Sender<Arc<QuotesSnapshot>>,
+    pub quotes_rx: watch::Receiver<Arc<QuotesSnapshot>>,
+    pub route_tx: mpsc::Sender<RouteBatch>,
+    pub route_rx: mpsc::Receiver<RouteBatch>,
     pub book_tx: mpsc::Sender<BookUpdate>,
     pub book_rx: mpsc::Receiver<BookUpdate>,
     /// Exact references for clearing and f64 values for the price API.
@@ -208,7 +212,13 @@ pub fn create_channels() -> PipelineChannels {
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
+    let (quotes_tx, quotes_rx) = watch::channel(Arc::new(QuotesSnapshot::new()));
+    let (route_tx, route_rx) = mpsc::channel(PIPELINE_CHANNEL_BUF);
     PipelineChannels {
+        quotes_tx,
+        quotes_rx,
+        route_tx,
+        route_rx,
         book_tx,
         book_rx,
         precise_tx,
@@ -273,15 +283,19 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     let match_interval = config.match_interval;
     let matcher_cancel = config.cancel.clone();
     let matcher_handle = tokio::task::spawn_local(async move {
-        matcher::run_matcher(
+        if let Err(error) = matcher::run_matcher(
             book_rx,
             exec_tx,
             match_interval,
             swap_snapshot_tx,
             clearing,
-            matcher_cancel,
+            matcher_cancel.clone(),
         )
-        .await;
+        .await
+        {
+            tracing::error!(%error, "matcher failed; requiring recovery");
+            matcher_cancel.cancel();
+        }
     });
 
     // Admin HTTP server.
@@ -423,13 +437,12 @@ async fn reconcile_clearing_book(
         (orders, decimals)
     };
     let mut consumed = std::collections::HashSet::new();
-    // Bound each RPC request and its temporary deserialized notes.
+    // Bound each RPC request; notes were decoded once at the DB boundary.
     for chunk in orders.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
         let notes = chunk
             .iter()
-            .map(|order| Note::read_from_bytes(&order.raw_note_data))
-            .collect::<Result<Vec<_>, _>>()
-            .context("deserialize persisted clearing notes")?;
+            .map(|order| order.note.as_ref().clone())
+            .collect::<Vec<_>>();
         consumed.extend(
             client
                 .check_consumed_notes(&notes)
@@ -441,7 +454,7 @@ async fn reconcile_clearing_book(
         let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
         let mut conn = pool.write_conn()?;
         db::mark_orders_onchain_nullified(&mut conn, &ids)?;
-        orders.retain(|order| !consumed.contains(&order.note_id));
+        orders.retain(|order| !consumed.contains(&order.id()));
     }
     Ok(matcher::ClearingBootstrap { orders, decimals })
 }
@@ -449,6 +462,7 @@ async fn reconcile_clearing_book(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::note::Note;
     use miden_protocol::note::NoteId;
     use std::collections::HashMap;
 
@@ -553,7 +567,7 @@ mod tests {
         client.mark_consumed_silent(vec![ids[0]]);
         let bootstrap = reconcile_clearing_book(&pool, &mut client).await.unwrap();
         assert_eq!(bootstrap.orders.len(), 1);
-        assert_eq!(bootstrap.orders[0].note_id, ids[1]);
+        assert_eq!(bootstrap.orders[0].id(), ids[1]);
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(

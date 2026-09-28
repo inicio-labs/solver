@@ -123,19 +123,18 @@ impl Order {
     }
 }
 
-/// An order with its raw note data, flowing from ingest → matcher.
+/// A shared note and its durable FIFO priority, flowing into the matcher.
 #[derive(Debug, Clone)]
 pub struct IngestOrder {
-    pub note_id: OrderId,
     /// Durable ingestion FIFO sequence, independent of restart order.
     pub priority_seq: u64,
-    pub offered_token: TokenId,
-    pub requested_token: TokenId,
-    pub offered_amount: Amount,
-    pub requested_amount: Amount,
-    /// The note's `min_fill_step` (see [`Order::min_fill_step`]).
-    pub min_fill_step: Amount,
-    pub raw_note_data: Arc<[u8]>,
+    pub note: Arc<Note>,
+}
+
+impl IngestOrder {
+    pub fn id(&self) -> OrderId {
+        self.note.id()
+    }
 }
 
 /// One committed change to the book. Apply removals and activations without
@@ -167,11 +166,21 @@ pub struct FilledNote {
     pub note_id: OrderId,
     pub priority_seq: u64,
     pub requested_filled: Amount,
-    pub raw_note_data: Arc<[u8]>,
+    pub note: Arc<Note>,
     /// When the matcher first observed this order (stamped in-memory, not from
     /// the DB). Carried to the executor so it can record the settlement duration
     /// (`settled − arrival`) for the in-memory swap-eta window.
     pub arrival_unix: UnixSecs,
+}
+
+impl FilledNote {
+    /// Re-activate the original note without re-parsing its terms.
+    pub fn to_ingest_order(&self) -> IngestOrder {
+        IngestOrder {
+            priority_seq: self.priority_seq,
+            note: Arc::clone(&self.note),
+        }
+    }
 }
 
 /// A batch of matched orders to be executed together.
@@ -182,4 +191,13 @@ pub struct ExecutionBatch {
     /// only between these boundaries, never between counterparties in a group.
     /// Empty means the whole batch is indivisible (legacy matching).
     pub group_ends: Vec<usize>,
+}
+
+impl ExecutionBatch {
+    pub fn source_orders(&self) -> Vec<IngestOrder> {
+        self.filled_notes
+            .iter()
+            .map(FilledNote::to_ingest_order)
+            .collect()
+    }
 }

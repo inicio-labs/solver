@@ -76,10 +76,6 @@ pub async fn start(
     config: SolverConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !config.engine.router_enabled,
-        "engine.router_enabled is unsupported by pair clearing"
-    );
     // Internal worker failure must not look like an operator-requested stop.
     // Cancelling this child stops the pipeline without cancelling its parent.
     let shutdown_requested = cancel;
@@ -111,11 +107,13 @@ pub async fn start(
 
     // 5. Flatten configured pairs → token list with optional symbols.
     let mut initial_tokens: Vec<(TokenId, Option<String>)> = Vec::new();
+    let mut pairs = Vec::with_capacity(config.pairs.len());
     for pair in &config.pairs {
         let x = AccountId::from_hex(&pair.asset_x_faucet_id)
             .with_context(|| format!("invalid asset_x_faucet_id for pair {}", pair.name))?;
         let y = AccountId::from_hex(&pair.asset_y_faucet_id)
             .with_context(|| format!("invalid asset_y_faucet_id for pair {}", pair.name))?;
+        pairs.push((x, y));
         initial_tokens.push((x, pair.asset_x_external_symbol.clone()));
         initial_tokens.push((y, pair.asset_y_external_symbol.clone()));
     }
@@ -151,19 +149,17 @@ pub async fn start(
     // stale until the first real fetch (no fabricated-fresh empty snapshot).
     let last_price_update = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
-    let pairs = config
-        .pairs
-        .iter()
-        .map(|pair| {
-            Ok((
-                AccountId::from_hex(&pair.asset_x_faucet_id)?,
-                AccountId::from_hex(&pair.asset_y_faucet_id)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let (clearing_bootstrap, bootstrap_rx) = tokio::sync::oneshot::channel();
+    let routing = config.engine.router_enabled.then(|| {
+        crate::router::Routing::new(
+            channels.quotes_rx.clone(),
+            channels.route_tx.clone(),
+            config.engine.router_inflight_ttl_ms,
+        )
+    });
     let clearing = ClearingRuntime {
         bootstrap: bootstrap_rx,
+        routing,
         prices: channels.precise_rx.clone(),
         pairs,
         config: crate::clearing::ClearingConfig {
@@ -285,6 +281,55 @@ pub async fn start(
         cancel.clone(),
     )?;
 
+    // 13c. ROUTER THREAD (external liquidity RFQ websocket): its own OS thread +
+    //      multi-thread runtime (like the price-API) so DEX traffic can't stall
+    //      settlement. Only spawned when enabled; allow-list tokens come from the
+    //      `SOLVER_ROUTER_TOKENS` env var (comma-separated).
+    let (router_thread, router_ready_rx) = if config.engine.router_enabled {
+        let auth_tokens: Vec<String> = std::env::var("SOLVER_ROUTER_TOKENS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if auth_tokens.is_empty() {
+            tracing::warn!(
+                "router_enabled but SOLVER_ROUTER_TOKENS is empty — all DEX connections rejected"
+            );
+        }
+        let router_cfg = crate::router::RouterConfig {
+            bind: config.engine.router_bind.clone(),
+            port: config.engine.router_port,
+            max_connections: config.engine.router_max_connections,
+            max_msg_bytes: config.engine.router_max_msg_bytes,
+            quote_ttl_ms: config.engine.router_quote_ttl_ms,
+            auth_tokens,
+        };
+        match crate::router::spawn_router_thread(
+            router_cfg,
+            channels.quotes_tx,
+            channels.route_rx,
+            cancel.clone(),
+        ) {
+            Ok((t, r)) => (Some(t), Some(r)),
+            Err(e) => {
+                // Router failed to start — tear down the already-spawned services
+                // (same cancel + join path as a startup-gate failure) so nothing is
+                // left running after `start` returns.
+                cancel.cancel();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = ingest_thread.join();
+                    let _ = executor_thread.join();
+                    let _ = price_api_thread.join();
+                })
+                .await;
+                return Err(e).context("router startup failed");
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // 14. Startup gate: both client threads must report ready (client built +
     //     tasks spawned) before startup is considered successful. Any build /
     //     subscribe failure -> cancel everything, join, return the error.
@@ -307,6 +352,13 @@ pub async fn start(
                 ))
             }
         }
+        if let Some(rx) = router_ready_rx {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(anyhow!("router thread exited before signalling readiness")),
+            }
+        }
         Ok(())
     }
     .await;
@@ -317,6 +369,9 @@ pub async fn start(
             let _ = ingest_thread.join();
             let _ = executor_thread.join();
             let _ = price_api_thread.join();
+            if let Some(t) = router_thread {
+                let _ = t.join();
+            }
         })
         .await;
         return Err(e).context("startup failed");
@@ -355,6 +410,11 @@ pub async fn start(
         }
         if let Err(e) = price_api_thread.join() {
             tracing::error!(?e, "price-api thread panicked");
+        }
+        if let Some(t) = router_thread {
+            if let Err(e) = t.join() {
+                tracing::error!(?e, "router thread panicked");
+            }
         }
     })
     .await;

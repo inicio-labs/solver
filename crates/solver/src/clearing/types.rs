@@ -38,8 +38,6 @@ pub enum SkipReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidOrderReason {
     MissingPriority,
-    MalformedRawNote,
-    InconsistentIngestOrder,
 }
 
 #[derive(Debug, Error)]

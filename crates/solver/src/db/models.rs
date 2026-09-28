@@ -59,7 +59,7 @@ impl OrderRow {
             offered_amount: u64::try_from(self.offered_amount)?,
             requested_amount: u64::try_from(self.requested_amount)?,
             min_fill_step: parsed.min_fill_step,
-            raw_note_data,
+            raw_note_data: raw_note_data.into(),
         })
     }
 }

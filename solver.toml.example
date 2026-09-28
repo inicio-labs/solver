@@ -52,17 +52,11 @@ fetch_interval_ms = 3000
 # price snapshot until the budget resets. For sustained production, either
 # bump this interval, switch providers, or upgrade to a paid CoinGecko tier.
 price_interval_ms = 5000
-# Whether the triangular (3-cycle) matching phase runs. On Miden 0.16 builds it
-# is forced off at load, with a warning: the triangular path doesn't enforce the
-# PSWAP `min_fill_step` floor yet, and one sub-floor fill would fail the whole
-# settlement transaction. Direct (pairwise) matching always runs.
-triangular_enabled = false
-# Set this to opt into exact-price PSWAP pair clearing instead of the legacy
-# internal matcher. Omit it until the pair's provider prices and on-chain token
-# decimals are available; stale/missing prices cause the pair to wait.
-# External RFQ routing must remain disabled in this mode; market makers can
-# provide liquidity with ordinary PSWAP notes in the batch.
-# clearing_fee_ppm = 1000
+# Exact-price PSWAP pair clearing requires fresh provider prices and on-chain
+# token decimals. Missing/stale prices leave the pair's orders in the live book.
+# Protocol fee and minimum price edge in ppm; zero disables fees.
+clearing_fee_ppm = 0
+# External RFQ routing is unsupported by this clearing path.
 # clearing_max_source_age_secs = 60  # provider timestamp age, not HTTP fetch age
 # clearing_max_source_skew_secs = 30 # difference between the two asset timestamps
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
@@ -102,15 +96,6 @@ admin_port = 3001
 # price_vs_currency = "usd"          # CoinGecko vs_currency (usd/eur/...; NOT "usdt")
 # price_staleness_secs = 30          # older than this → 503 (use ?allow_stale=true to override)
 
-# ── External liquidity routing (RFQ websocket to other DEXes) ────────────────
-# Off by default. When enabled, runs a websocket RFQ server on its own thread:
-# allow-listed DEXes connect to GET /v1/rfq, post standing {price, quantity}
-# quotes per registered pair, and receive note handovers to self-consume on-chain.
-# Allow-list tokens come from the SOLVER_ROUTER_TOKENS env var (comma-separated).
+# External RFQ routing is not supported by the pair-clearing runtime.
+# Keep disabled if present in an existing config.
 # router_enabled = false
-# router_bind = "127.0.0.1"               # "0.0.0.0" to expose (front w/ a proxy)
-# router_port = 8090
-# router_max_connections = 64
-# router_max_msg_bytes = 16384
-# router_quote_ttl_ms = 20000             # how long a posted quote stays selectable
-# router_inflight_ttl_ms = 30000          # handed-over note reactivates after this if not consumed

@@ -1,4 +1,4 @@
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = include_str!("../../schema.sql");
 
+use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
@@ -281,20 +282,21 @@ pub fn settlement_payback_id(conn: &mut SqliteConnection, tx_id: &[u8]) -> Resul
 }
 
 pub fn settlement_parents(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<Vec<IngestOrder>> {
-    let parent_ids: Vec<Vec<u8>> = settlement_inputs::table
+    // A missing persisted parent must fail recovery, not silently disappear.
+    let parents: Vec<(Option<OrderRow>, Option<Vec<u8>>)> = settlement_inputs::table
+        .left_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
+        .left_join(notes::table.on(orders::note_id.eq(notes::note_id)))
         .filter(settlement_inputs::tx_id.eq(tx_id))
-        .select(settlement_inputs::parent_note_id)
+        .select((Option::<OrderRow>::as_select(), notes::raw_data.nullable()))
         .load(conn)?;
-    let mut parents = Vec::with_capacity(parent_ids.len());
-    for id in parent_ids {
-        let (row, raw): (OrderRow, Vec<u8>) = orders::table
-            .inner_join(notes::table.on(orders::note_id.eq(notes::note_id)))
-            .filter(orders::note_id.eq(&id))
-            .select((OrderRow::as_select(), notes::raw_data))
-            .first(conn)?;
-        parents.push(row.into_ingest(raw)?);
-    }
-    Ok(parents)
+    parents
+        .into_iter()
+        .map(|(row, raw)| {
+            let row = row.ok_or_else(|| anyhow!("settlement parent order missing"))?;
+            let raw = raw.ok_or_else(|| anyhow!("settlement parent note missing"))?;
+            row.into_ingest(raw)
+        })
+        .collect()
 }
 
 pub fn finish_discarded_settlement(
@@ -313,22 +315,23 @@ pub fn finish_discarded_settlement(
         let parents = settlement_parents(conn, tx_id)?;
         let mut update = BookUpdate::default();
         for parent in parents {
+            let parent_id = parent.note_id;
             let current: String = orders::table
-                .find(parent.note_id.to_bytes().as_slice())
+                .find(parent_id.to_bytes().as_slice())
                 .select(orders::status)
                 .first(conn)?;
             // Never undo a terminal state observed after the RPC snapshot.
             if current != OrderStatus::Settling.as_str() {
                 continue;
             }
-            let status = if consumed.contains(&parent.note_id) {
-                update.removed.push(parent.note_id);
+            let status = if consumed.contains(&parent_id) {
+                update.removed.push(parent_id);
                 OrderStatus::OnchainNullified
             } else {
-                update.active.push(parent.clone());
+                update.active.push(parent);
                 OrderStatus::Active
             };
-            diesel::update(orders::table.find(parent.note_id.to_bytes().as_slice()))
+            diesel::update(orders::table.find(parent_id.to_bytes().as_slice()))
                 .set(orders::status.eq(status.as_str()))
                 .execute(conn)?;
         }
@@ -366,7 +369,7 @@ pub fn active_book_update(
 }
 
 impl SettlementInputRow {
-    fn child_order(&self, priority_seq: u64) -> Result<Option<IngestOrder>> {
+    fn child_order(&self, priority_seq: u64) -> Result<Option<(IngestOrder, AccountId)>> {
         let (Some(child_id), Some(raw_note_data)) = (&self.child_note_id, &self.child_note_data)
         else {
             return Ok(None);
@@ -377,16 +380,19 @@ impl SettlementInputRow {
             "settlement child ID mismatch"
         );
         let parsed = crate::types::Order::from_note(&note)?;
-        Ok(Some(IngestOrder {
-            note_id: note.id(),
-            priority_seq,
-            offered_token: parsed.offered_faucet_id,
-            requested_token: parsed.requested_faucet_id,
-            offered_amount: parsed.offered_amount,
-            requested_amount: parsed.requested_amount,
-            min_fill_step: parsed.min_fill_step,
-            raw_note_data: raw_note_data.clone(),
-        }))
+        Ok(Some((
+            IngestOrder {
+                note_id: note.id(),
+                priority_seq,
+                offered_token: parsed.offered_faucet_id,
+                requested_token: parsed.requested_faucet_id,
+                offered_amount: parsed.offered_amount,
+                requested_amount: parsed.requested_amount,
+                min_fill_step: parsed.min_fill_step,
+                raw_note_data: raw_note_data.clone().into(),
+            },
+            parsed.creator_id,
+        )))
     }
 }
 
@@ -399,10 +405,7 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
             .select(settlement_attempts::status)
             .first(conn)?;
         if status == "confirmed" {
-            return Ok(BookUpdate {
-                removed: Vec::new(),
-                active: Vec::new(),
-            });
+            return Ok(BookUpdate::default());
         }
         ensure!(
             matches!(
@@ -416,10 +419,7 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
             .filter(settlement_inputs::tx_id.eq(tx_id))
             .select(SettlementInputRow::as_select())
             .load(conn)?;
-        let mut activation = BookUpdate {
-            removed: Vec::new(),
-            active: Vec::new(),
-        };
+        let mut activation = BookUpdate::default();
         for input in inputs {
             let parent: OrderRow = orders::table
                 .find(&input.parent_note_id)
@@ -427,20 +427,20 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
                 .first(conn)?;
             let parent_id = OrderId::read_from(&mut SliceReader::new(&input.parent_note_id))?;
             activation.removed.push(parent_id);
-            if let Some(child) = input.child_order(u64::try_from(parent.priority_seq)?)? {
-                let note = Note::read_from(&mut SliceReader::new(&child.raw_note_data))?;
-                let parsed = crate::types::Order::from_note(&note)?;
+            if let Some((child, creator)) =
+                input.child_order(u64::try_from(parent.priority_seq)?)?
+            {
                 diesel::insert_or_ignore_into(notes::table)
                     .values(NoteRow {
                         note_id: child.note_id.to_bytes().to_vec(),
-                        account_id: parsed.creator_id.to_bytes().to_vec(),
-                        raw_data: child.raw_note_data.clone(),
+                        account_id: creator.to_bytes().to_vec(),
+                        raw_data: child.raw_note_data.to_vec(),
                     })
                     .execute(conn)?;
                 diesel::insert_or_ignore_into(orders::table)
                     .values(OrderRow {
                         note_id: child.note_id.to_bytes().to_vec(),
-                        account_id: parsed.creator_id.to_bytes().to_vec(),
+                        account_id: creator.to_bytes().to_vec(),
                         requested_asset: child.requested_token.to_bytes().to_vec(),
                         requested_amount: i64::try_from(child.requested_amount)?,
                         offered_asset: child.offered_token.to_bytes().to_vec(),
@@ -848,6 +848,23 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].note_id, child.id().to_bytes());
         assert_eq!(live[0].priority_seq, priority);
+    }
+
+    #[test]
+    fn settlement_parent_load_preserves_data_and_rejects_missing_note() {
+        let pool = test_pool();
+        let mut conn = pool.write_conn().unwrap();
+        let (parent, _, tx_id, priority) = prepared_fixture(&mut conn);
+        let parents = settlement_parents(&mut conn, &tx_id).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].note_id, parent.id());
+        assert_eq!(parents[0].priority_seq, priority as u64);
+        assert_eq!(parents[0].raw_note_data.as_ref(), parent.to_bytes());
+
+        diesel::delete(notes::table.find(parent.id().to_bytes().as_slice()))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(settlement_parents(&mut conn, &tx_id).is_err());
     }
 
     #[test]

@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::matching::price_feed::{PriceFeed, UsdCents};
 use crate::clearing::ReferencePrice;
+use crate::matching::price_feed::{PriceFeed, UsdCents};
 use crate::price::{read_token_map, SharedTokenMap};
 use crate::types::TokenId;
 
-/// Legacy-matcher snapshot: token (faucet) ID → USD price in whole cents.
+/// Token (faucet) ID → USD price in whole cents, used by test fixtures.
 pub type PriceSnapshot = HashMap<TokenId, UsdCents>;
 
 /// One token's wallet-API price and independently parsed exact clearing price.
@@ -34,8 +34,7 @@ pub struct PriceData {
 /// Token → price data, published once for the wallet API and clearing.
 pub type PreciseSnapshot = HashMap<TokenId, PriceData>;
 
-/// Trait abstracting the price service. The legacy matcher's cents snapshot is
-/// derived in [`run_price_feed`]; exact clearing uses `exact_reference` only.
+/// Price service snapshot. Clearing uses only the exact reference.
 #[async_trait]
 pub trait PriceClient: Send {
     async fn fetch_prices(&self, tokens: &[TokenId]) -> Result<PreciseSnapshot>;
@@ -70,7 +69,13 @@ impl MockPriceClient {
 #[async_trait]
 impl PriceClient for MockPriceClient {
     async fn fetch_prices(&self, _tokens: &[TokenId]) -> Result<PreciseSnapshot> {
-        Ok(self.prices.clone())
+        let mut prices = self.prices.clone();
+        // This synthetic provider publishes fresh static prices on each fetch.
+        let updated_at = crate::types::now_millis();
+        for price in prices.values_mut() {
+            price.source_updated_at_unix_ms = Some(updated_at);
+        }
+        Ok(prices)
     }
 }
 
@@ -89,27 +94,15 @@ impl PriceClient for Box<dyn PriceClient + Send + Sync> {
     }
 }
 
-/// Derive the matcher's cents snapshot from full-precision USD. Identical
-/// rounding to the previous fetch-edge behaviour (`round(usd*100)`), so the
-/// matcher sees the same integer prices it always has.
-fn to_cents(precise: &PreciseSnapshot) -> PriceSnapshot {
-    precise
-        .iter()
-        .map(|(t, d)| (*t, (d.usd * 100.0).round() as UsdCents))
-        .collect()
-}
-
 /// Run the price fetching loop. The token set comes from the in-memory
 /// `token_map` (hydrated at boot, kept current by admin write-through), so the
 /// loop never reads the DB. Each successful poll publishes the current prices
-/// twice — a whole-cents map for the legacy matcher and one snapshot retaining
-/// exact references for clearing plus f64 prices for the wallet API — and bumps
+/// with exact references for clearing plus f64 prices for the wallet API, and bumps
 /// `last_price_update`. A failed poll keeps the last good prices and does NOT
 /// advance the timestamp, so the API can detect staleness.
 pub async fn run_price_feed(
     client: impl PriceClient,
     token_map: SharedTokenMap,
-    price_tx: watch::Sender<PriceSnapshot>,
     precise_tx: watch::Sender<PreciseSnapshot>,
     last_price_update: Arc<AtomicI64>,
     interval: Duration,
@@ -123,7 +116,6 @@ pub async fn run_price_feed(
                 for data in precise.values_mut() {
                     data.observed_at_unix_ms = observed_at_unix_ms;
                 }
-                let _ = price_tx.send(to_cents(&precise));
                 let _ = precise_tx.send(precise);
                 last_price_update.store((observed_at_unix_ms / 1_000) as i64, Ordering::Relaxed);
             }
@@ -146,11 +138,15 @@ pub struct WatchPriceFeed {
 
 impl WatchPriceFeed {
     pub fn new() -> Self {
-        Self { prices: HashMap::new() }
+        Self {
+            prices: HashMap::new(),
+        }
     }
 
     pub fn from_watch(rx: &watch::Receiver<PriceSnapshot>) -> Self {
-        Self { prices: rx.borrow().clone() }
+        Self {
+            prices: rx.borrow().clone(),
+        }
     }
 }
 

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Result};
-use miden_protocol::account::AccountId;
 use miden_protocol::asset::AssetId;
 use miden_protocol::note::NoteId;
 use tokio::sync::{mpsc, watch};
@@ -11,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::matcher::{internal_clear, ClearingRuntime};
 use crate::clearing::{
-    BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderSide, PairBatch,
+    BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
-use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
-use crate::types::{now_millis, now_unix, BookUpdate, ExecutionBatch, IngestOrder, TokenId};
+use crate::matching::types::{BestLevel, SwapBookSnapshot};
+use crate::types::{now_millis, BookUpdate, ExecutionBatch, IngestOrder, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
@@ -28,88 +27,77 @@ pub struct ClearingBootstrap {
 #[derive(Default)]
 pub(super) struct ClearingBook {
     orders: HashMap<NoteId, Order>,
-    inactive: HashSet<NoteId>,
-    pairs: HashMap<(TokenId, TokenId), BTreeMap<(RateKey, u64), NoteId>>,
-    pub arrivals: HashMap<NoteId, u64>,
+    pairs: HashMap<(TokenId, TokenId), BTreeMap<OrderKey, NoteId>>,
 }
 
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
-    fn apply(&mut self, update: BookUpdate, solver_id: AccountId) -> Result<()> {
+    fn apply(&mut self, update: BookUpdate) -> Result<()> {
         for id in update.removed {
             self.remove(id);
         }
         for order in update.active {
-            self.insert(&order, solver_id)?;
+            self.insert(&order)?;
         }
         Ok(())
     }
 
-    fn index_key(order: &Order) -> ((TokenId, TokenId), (RateKey, u64)) {
-        let offered = order.offered_asset();
-        let requested = order.requested_asset();
-        (
-            (offered.faucet_id(), requested.faucet_id()),
-            (
-                RateKey::new(requested.amount().as_u64(), offered.amount().as_u64()),
-                order.priority_sequence(),
-            ),
-        )
+    /// Apply the updates queued at the start of the tick. New arrivals wait for
+    /// the next receive, so a busy producer cannot postpone matching forever.
+    fn apply_pending(&mut self, updates: &mut mpsc::Receiver<BookUpdate>) -> Result<()> {
+        for _ in 0..updates.len() {
+            let Ok(update) = updates.try_recv() else {
+                break;
+            };
+            self.apply(update)?;
+        }
+        Ok(())
     }
 
-    fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: (RateKey, u64)) {
+    fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey) {
         if let Some(index) = self.pairs.get_mut(&pair) {
             index.remove(&key);
-            if index.is_empty() {
-                self.pairs.remove(&pair);
-            }
         }
     }
 
-    pub fn insert(&mut self, order: &IngestOrder, solver_id: AccountId) -> Result<()> {
-        if let Some(existing) = self.orders.get(&order.note_id) {
-            if self.inactive.contains(&order.note_id) {
-                let (pair, key) = Self::index_key(existing);
+    pub fn insert(&mut self, order: &IngestOrder) -> Result<()> {
+        if let Some(existing) = self.orders.get_mut(&order.note_id) {
+            if !existing.is_active() {
+                let (pair, key) = existing.index_key();
                 let index = self.pairs.entry(pair).or_default();
                 ensure!(!index.contains_key(&key), "duplicate price/FIFO priority");
                 index.insert(key, order.note_id);
-                self.inactive.remove(&order.note_id);
+                existing.activate();
             }
             return Ok(());
         }
         let parsed = Order::from_ingest_order(order)?;
-        ensure!(
-            parsed.pswap_note().storage().creator_account_id() != solver_id,
-            "solver-created order"
-        );
-        let (pair, key) = Self::index_key(&parsed);
+        let (pair, key) = parsed.index_key();
         let index = self.pairs.entry(pair).or_default();
         ensure!(!index.contains_key(&key), "duplicate price/FIFO priority");
         index.insert(key, order.note_id);
         self.orders.insert(order.note_id, parsed);
-        self.arrivals.insert(order.note_id, now_unix());
         Ok(())
     }
 
     pub fn deactivate(&mut self, id: NoteId) {
-        if self.inactive.contains(&id) {
-            return;
-        }
-        if let Some(order) = self.orders.get(&id) {
-            let (pair, key) = Self::index_key(order);
+        if let Some(order) = self.orders.get_mut(&id) {
+            if !order.is_active() {
+                return;
+            }
+            let (pair, key) = order.index_key();
+            order.deactivate();
             self.remove_from_index(pair, key);
-            self.inactive.insert(id);
         }
     }
 
     pub fn remove(&mut self, id: NoteId) {
         if let Some(order) = self.orders.remove(&id) {
-            if !self.inactive.remove(&id) {
-                let (pair, key) = Self::index_key(&order);
+            if order.is_active() {
+                let (pair, key) = order.index_key();
                 self.remove_from_index(pair, key);
             }
-            self.arrivals.remove(&id);
         }
     }
 
@@ -148,7 +136,6 @@ impl ClearingBook {
         config: &ClearingConfig,
         selected: &HashSet<NoteId>,
     ) -> Result<PairBatch<'a>, ClearingError> {
-        config.validate()?;
         let base_asset = AssetId::new_fungible(base);
         let quote_asset = AssetId::new_fungible(quote);
         let mut sell_orders = self.admit(
@@ -170,14 +157,14 @@ impl ClearingBook {
         PairBatch::new(base_asset, quote_asset, price, sell_orders, buy_orders)
     }
 
-    fn snapshot(&self) -> SwapBookSnapshot {
+    pub(super) fn snapshot(&self) -> SwapBookSnapshot {
         self.pairs
             .iter()
             .filter_map(|(&pair, index)| {
-                let (&(rate, _), _) = index.first_key_value()?;
+                let rate = index.first_key_value()?.0.rate;
                 let volume = index
                     .iter()
-                    .take_while(|((other, _), _)| *other == rate)
+                    .take_while(|(key, _)| key.rate == rate)
                     .filter_map(|(_, id)| self.orders.get(id))
                     .fold(0u64, |sum, order| {
                         sum.saturating_add(order.offered_asset().amount().as_u64())
@@ -188,7 +175,6 @@ impl ClearingBook {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_clearer(
     mut book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
@@ -196,66 +182,40 @@ pub(super) async fn run_clearer(
     snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     mut runtime: ClearingRuntime,
     cancel: CancellationToken,
-) {
+) -> Result<()> {
+    // Configuration is frozen for this worker; validate before admitting orders.
+    runtime.config.validate()?;
     let bootstrap = tokio::select! {
-        _ = cancel.cancelled() => return,
-        result = &mut runtime.bootstrap => match result {
-            Ok(bootstrap) => bootstrap,
-            Err(error) => {
-                tracing::error!(%error, "clearing startup reconciliation failed");
-                cancel.cancel();
-                return;
-            }
-        }
+        _ = cancel.cancelled() => return Ok(()),
+        result = &mut runtime.bootstrap => result?,
     };
     let mut book = ClearingBook::default();
     for order in bootstrap.orders {
-        if let Err(error) = book.insert(&order, runtime.solver_id) {
+        if let Err(error) = book.insert(&order) {
             tracing::warn!(note = %order.note_id, %error, "persisted order rejected");
         }
     }
     let mut interval = tokio::time::interval(match_interval);
     loop {
-        // Apply outcome messages as soon as they arrive. Only batch matching
-        // waits for the timer; parents must leave the book before their
-        // inherited-priority remainder is inserted.
-        let update = tokio::select! {
-            _ = cancel.cancelled() => return,
-            result = book_rx.recv() => match result {
-                Some(update) => Some(update),
-                None => return,
-            },
-            _ = interval.tick() => None,
-        };
-        let match_now = update.is_none();
-        if let Some(update) = update {
-            if let Err(error) = book.apply(update, runtime.solver_id) {
-                tracing::error!(%error, "book update failed; requiring recovery");
-                cancel.cancel();
-                return;
+        // Update the book immediately; run matching only on the batch timer.
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            update = book_rx.recv() => {
+                let Some(update) = update else { return Ok(()) };
+                book.apply(update)?;
             }
-        }
-        // Drain only the already-queued updates: continuous ingestion must not
-        // keep this loop running forever and starve matching or shutdown.
-        for _ in 0..book_rx.len() {
-            let Ok(update) = book_rx.try_recv() else {
-                break;
-            };
-            if let Err(error) = book.apply(update, runtime.solver_id) {
-                tracing::error!(%error, "book update failed; requiring recovery");
-                cancel.cancel();
-                return;
+            _ = interval.tick() => {
+                book.apply_pending(&mut book_rx)?;
+                let stopped = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    stopped = internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now_millis()) => stopped,
+                };
+                if stopped {
+                    return Ok(());
+                }
+                // Latest order-book levels for the price API's swap-ETA estimates.
+                snapshot_tx.send_replace(Arc::new(book.snapshot()));
             }
-        }
-        if match_now {
-            let stopped = tokio::select! {
-                _ = cancel.cancelled() => return,
-                stopped = internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now_millis()) => stopped,
-            };
-            if stopped {
-                return;
-            }
-            snapshot_tx.send_replace(Arc::new(book.snapshot()));
         }
     }
 }
@@ -272,7 +232,6 @@ mod tests {
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2,
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
@@ -313,14 +272,8 @@ mod tests {
             offered_amount: offered,
             requested_amount: requested,
             min_fill_step: 1,
-            raw_note_data: note.to_bytes(),
+            raw_note_data: note.to_bytes().into(),
         }
-    }
-
-    fn solver() -> AccountId {
-        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE_2
-            .try_into()
-            .unwrap()
     }
 
     fn admit<'a>(book: &'a ClearingBook, buy: bool, limit: usize) -> Vec<MatchOrder<'a>> {
@@ -354,8 +307,7 @@ mod tests {
                     (true, true) => (22, 10),
                     (true, false) => (19, 10),
                 };
-                book.insert(&fixture(buy, o, r, seq, &mut rng), solver())
-                    .unwrap();
+                book.insert(&fixture(buy, o, r, seq, &mut rng)).unwrap();
             }
             let admitted = admit(&book, buy, 100);
             assert_eq!(
@@ -379,7 +331,7 @@ mod tests {
         let buyer = fixture(true, 22, 10, 4, &mut rng);
         let ineligible_buyer = fixture(true, 19, 10, 3, &mut rng);
         for order in [&buyer, &ineligible_seller, &seller, &ineligible_buyer] {
-            book.insert(order, solver()).unwrap();
+            book.insert(order).unwrap();
         }
         let (base, quote) = (
             ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(),
@@ -411,7 +363,7 @@ mod tests {
         let better = fixture(false, 10, 18, 3, &mut rng);
         let earlier = fixture(false, 20, 36, 2, &mut rng);
         for order in [&worse, &better, &earlier] {
-            book.insert(order, solver()).unwrap();
+            book.insert(order).unwrap();
         }
         let expected = vec![earlier.note_id, better.note_id, worse.note_id];
         assert_eq!(
@@ -422,14 +374,14 @@ mod tests {
             expected
         );
         book.deactivate(earlier.note_id);
-        assert!(book.inactive.contains(&earlier.note_id));
+        assert!(!book.orders[&earlier.note_id].is_active());
         assert_eq!(book.orders.len(), 3);
         assert!(!admit(&book, false, 100)
             .iter()
             .any(|order| order.order().id() == earlier.note_id));
-        book.insert(&earlier, solver()).unwrap();
-        book.insert(&earlier, solver()).unwrap();
-        assert!(!book.inactive.contains(&earlier.note_id));
+        book.insert(&earlier).unwrap();
+        book.insert(&earlier).unwrap();
+        assert!(book.orders[&earlier.note_id].is_active());
         assert_eq!(book.orders.len(), 3);
         assert_eq!(
             admit(&book, false, 100)
@@ -446,33 +398,70 @@ mod tests {
         let mut book = ClearingBook::default();
         let parent = fixture(false, 20, 36, 2, &mut rng);
         let child = fixture(false, 10, 18, 2, &mut rng);
-        book.insert(&parent, solver()).unwrap();
+        book.insert(&parent).unwrap();
         book.deactivate(parent.note_id);
-        book.apply(
-            BookUpdate {
-                removed: vec![parent.note_id],
-                active: vec![child.clone()],
-            },
-            solver(),
-        )
+        book.apply(BookUpdate {
+            removed: vec![parent.note_id],
+            active: vec![child.clone()],
+        })
         .unwrap();
         assert_eq!(admit(&book, false, 100)[0].order().id(), child.note_id);
     }
 
     #[test]
-    fn removing_last_order_clears_index_and_solver_creator_is_rejected() {
+    fn removing_last_order_keeps_empty_pair_index_for_reuse() {
         let mut rng = RandomCoin::new(Word::default());
         let order = fixture(false, 10, 18, 1, &mut rng);
         let mut book = ClearingBook::default();
-        let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
-            .try_into()
-            .unwrap();
-        assert!(book.insert(&order, creator).is_err());
-        book.insert(&order, solver()).unwrap();
+        book.insert(&order).unwrap();
         assert_eq!(book.snapshot().len(), 1);
         book.remove(order.note_id);
         book.remove(order.note_id);
-        assert!(book.orders.is_empty() && book.pairs.is_empty() && book.arrivals.is_empty());
+        assert!(book.orders.is_empty());
+        let pair = (order.offered_token, order.requested_token);
+        assert!(book.pairs[&pair].is_empty());
+        assert!(book.snapshot().is_empty());
+        book.insert(&order).unwrap();
+        assert_eq!(book.pairs.len(), 1);
+        assert_eq!(admit(&book, false, 100)[0].order().id(), order.note_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearer_rejects_invalid_config_before_waiting_for_bootstrap() {
+        let (_bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        let (_price_tx, prices) = watch::channel(crate::price::PreciseSnapshot::new());
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices,
+            pairs: Vec::new(),
+            config: ClearingConfig {
+                protocol_fee_ppm: crate::clearing::PPM_DENOMINATOR,
+                ..ClearingConfig::default()
+            },
+            max_price_age_ms: 10_000,
+            max_source_age_ms: 10_000,
+            max_source_skew_ms: 100,
+        };
+        let (_book_tx, book_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_clearer(
+                book_rx,
+                exec_tx,
+                Duration::from_secs(1),
+                snapshot_tx,
+                runtime,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("invalid config must not wait for bootstrap");
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<ClearingError>(),
+            Some(ClearingError::InvalidConfig)
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -510,7 +499,6 @@ mod tests {
             max_price_age_ms: 10_000,
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
-            solver_id: solver(),
         };
         let (book_tx, book_rx) = mpsc::channel(4);
         let (exec_tx, mut exec_rx) = mpsc::channel(4);
@@ -570,6 +558,6 @@ mod tests {
             .iter()
             .all(|note| note.priority_seq >= 3));
         cancel.cancel();
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
+use std::sync::Arc;
 
 /// Faucet ID identifying a token.
 pub type TokenId = AccountId;
@@ -134,7 +135,7 @@ pub struct IngestOrder {
     pub requested_amount: Amount,
     /// The note's `min_fill_step` (see [`Order::min_fill_step`]).
     pub min_fill_step: Amount,
-    pub raw_note_data: Vec<u8>,
+    pub raw_note_data: Arc<[u8]>,
 }
 
 /// One committed change to the book. Apply removals and activations without
@@ -166,7 +167,7 @@ pub struct FilledNote {
     pub note_id: OrderId,
     pub priority_seq: u64,
     pub requested_filled: Amount,
-    pub raw_note_data: Vec<u8>,
+    pub raw_note_data: Arc<[u8]>,
     /// When the matcher first observed this order (stamped in-memory, not from
     /// the DB). Carried to the executor so it can record the settlement duration
     /// (`settled − arrival`) for the in-memory swap-eta window.

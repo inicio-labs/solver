@@ -1,5 +1,6 @@
 use std::num::NonZeroU64;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
@@ -7,21 +8,47 @@ use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use ruint::aliases::U256;
 
-use crate::types::{FilledNote, IngestOrder};
+use crate::types::{now_unix, FilledNote, IngestOrder, UnixSecs};
 
 use super::config::PPM_DENOMINATOR;
 use super::math::{checked_mul, mul_div_ceil, mul_div_floor, ppm_floor, to_asset_amount};
 use super::types::{BatchPrice, ClearingError, InvalidOrderReason, OrderExecution};
+use crate::matching::types::RateKey;
+use crate::types::TokenId;
+
+/// Orders sort by exact rate first, then by their original FIFO sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OrderKey {
+    pub(crate) rate: RateKey,
+    priority: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookStatus {
+    Active,
+    Inactive,
+}
 
 #[derive(Clone, Debug)]
 pub struct Order {
     note_id: NoteId,
     note: PswapNote,
     priority: NonZeroU64,
+    status: BookStatus,
+    arrival_unix: UnixSecs,
+    raw_note_data: Arc<[u8]>,
 }
 
 impl Order {
     pub fn from_note(note: &Note, priority_sequence: u64) -> Result<Self, ClearingError> {
+        Self::new(note, priority_sequence, note.to_bytes().into())
+    }
+
+    fn new(
+        note: &Note,
+        priority_sequence: u64,
+        raw_note_data: Arc<[u8]>,
+    ) -> Result<Self, ClearingError> {
         let priority = NonZeroU64::new(priority_sequence).ok_or(ClearingError::InvalidOrder {
             note_id: note.id(),
             reason: InvalidOrderReason::MissingPriority,
@@ -34,6 +61,9 @@ impl Order {
             note_id: note.id(),
             note: parsed,
             priority,
+            status: BookStatus::Active,
+            arrival_unix: now_unix(),
+            raw_note_data,
         })
     }
 
@@ -52,7 +82,7 @@ impl Order {
             });
         }
 
-        let admitted = Self::from_note(&note, order.priority_seq)?;
+        let admitted = Self::new(&note, order.priority_seq, Arc::clone(&order.raw_note_data))?;
         admitted.verify_ingest_fields(order)?;
         Ok(admitted)
     }
@@ -80,6 +110,30 @@ impl Order {
 
     pub fn priority_sequence(&self) -> u64 {
         self.priority.get()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.status == BookStatus::Active
+    }
+
+    pub(crate) fn activate(&mut self) {
+        self.status = BookStatus::Active;
+    }
+
+    pub(crate) fn deactivate(&mut self) {
+        self.status = BookStatus::Inactive;
+    }
+
+    pub(crate) fn index_key(&self) -> ((TokenId, TokenId), OrderKey) {
+        let offered = self.offered_asset();
+        let requested = self.requested_asset();
+        (
+            (offered.faucet_id(), requested.faucet_id()),
+            OrderKey {
+                rate: RateKey::new(requested.amount().as_u64(), offered.amount().as_u64()),
+                priority: self.priority_sequence(),
+            },
+        )
     }
 
     pub fn pswap_note(&self) -> &PswapNote {
@@ -140,20 +194,13 @@ impl Order {
     }
 
     /// Carry the verified fill and original note bytes to the executor.
-    pub(crate) fn to_filled_note(
-        &self,
-        execution: &OrderExecution,
-        arrival_unix: u64,
-    ) -> FilledNote {
-        let note: Note = self.note.clone().into();
-        let mut raw_note_data = Vec::new();
-        note.write_into(&mut raw_note_data);
+    pub(crate) fn to_filled_note(&self, execution: &OrderExecution) -> FilledNote {
         FilledNote {
             note_id: self.note_id,
             priority_seq: self.priority_sequence(),
             requested_filled: execution.payment.amount().as_u64(),
-            raw_note_data,
-            arrival_unix,
+            raw_note_data: Arc::clone(&self.raw_note_data),
+            arrival_unix: self.arrival_unix,
         }
     }
 }

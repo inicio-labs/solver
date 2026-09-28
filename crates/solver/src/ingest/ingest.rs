@@ -252,7 +252,7 @@ impl SyncResult {
                 offered_amount: order.offered_amount,
                 requested_amount: order.requested_amount,
                 min_fill_step: order.min_fill_step,
-                raw_note_data: raw_data,
+                raw_note_data: raw_data.into(),
             });
         }
 
@@ -505,7 +505,7 @@ pub(crate) fn spawn_ingest_thread(
     ingest_interval: Duration,
     last_sync: Arc<AtomicI64>,
     solver_id: AccountId,
-    clearing_bootstrap: Option<oneshot::Sender<crate::matcher::ClearingBootstrap>>,
+    clearing_bootstrap: oneshot::Sender<crate::matcher::ClearingBootstrap>,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<Result<()>>();
     let ingest_factory = factory;

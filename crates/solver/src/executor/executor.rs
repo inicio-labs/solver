@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use miden_protocol::{
     account::AccountId,
     asset::{Asset, FungibleAsset},
     crypto::utils::{Deserializable, Serializable, SliceReader},
-    note::{Note, NoteRecipient},
+    note::{Note, NoteId, NoteRecipient},
     transaction::{InputNote, TransactionId},
 };
 use miden_standards::note::{NoteConsumptionStatus, P2idNote, P2ideNote, PswapNote};
@@ -101,27 +101,126 @@ enum BatchSubmission {
     Returned,
 }
 
+/// Keep each input and its predicted outputs together, in batch order.
+struct PreparedInput {
+    note: Note,
+    args: NoteArgs,
+    payback_id: NoteId,
+    remainder: Option<Note>,
+}
+
 /// Inputs pre-computed once for a batch. Retries reuse the *same proven
 /// transaction*, so its ID and predicted children cannot change.
 struct BatchComponents {
-    input_notes: Vec<(Note, Option<NoteArgs>)>,
+    inputs: Vec<PreparedInput>,
     expected_output_recipients: Vec<NoteRecipient>,
     surplus_assets: Vec<Asset>,
-    expected_remainders: HashMap<miden_protocol::note::NoteId, Note>,
-    expected_paybacks: HashMap<miden_protocol::note::NoteId, miden_protocol::note::NoteId>,
 }
 
 impl BatchComponents {
+    /// Parse each input once and predict its outputs. Exact per-token balances
+    /// must be solvent before the transaction can be built.
+    fn prepare(batch: &ExecutionBatch, solver_id: AccountId) -> Result<Self> {
+        let mut inputs = Vec::with_capacity(batch.filled_notes.len());
+        let mut expected_output_recipients = Vec::new();
+
+        // Net flow per token: positive = surplus staying with solver, negative = insolvent.
+        // i128 is lossless for any u64 sum encountered here — no wrap risk on `as i128`.
+        let mut flow: HashMap<TokenId, i128> = HashMap::new();
+
+        for filled in &batch.filled_notes {
+            let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))
+                .context("failed to deserialize note from raw data")?;
+
+            let pswap = PswapNote::try_from(&note)
+                .map_err(|e| anyhow!("failed to parse PswapNote: {}", e))?;
+
+            let offered_asset = pswap.offered_asset();
+            let offered_token = offered_asset.faucet_id();
+            let requested_token = pswap.storage().requested_faucet_id();
+
+            *flow.entry(offered_token).or_default() += u64::from(offered_asset.amount()) as i128;
+
+            let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
+                .map_err(|e| anyhow!("failed to create fill asset: {}", e))?;
+
+            // Both-zero args make the script fall back to a vault-funded full fill.
+            if filled.requested_filled == 0 {
+                bail!("zero fill for note {}", filled.note_id);
+            }
+            let note_args = PswapNote::create_args(0, filled.requested_filled)
+                .map_err(|e| anyhow!("failed to create note args: {}", e))?;
+
+            let (p2id, remainder) = pswap
+                .execute(solver_id, None, Some(fill_asset))
+                .map_err(|e| anyhow!("pswap execute failed: {}", e))?;
+            let payback_id = Note::from(p2id.clone()).id();
+
+            *flow.entry(requested_token).or_default() -= note_asset_amount(&p2id) as i128;
+            // Payback + remainder settle to the order CREATOR, not the solver. Declare them
+            // as expected OUTPUT RECIPIENTS only — NEVER as expected future notes. This mirrors
+            // `miden-client::build_pswap_consume`, which deliberately does the same and warns
+            // that registering them as future notes "would leave stale, un-consumable notes in
+            // the consumer's store": the future-note record is built from `NoteDetails` (which
+            // carries NO attachments), and a PSWAP note's id commits to its attachments — so it
+            // would land attachment-stripped, and the kernel later rejects the re-consume with
+            // `InputNoteNotInBlock`.
+            expected_output_recipients.push(p2id.recipient().clone());
+
+            let remainder = remainder.map(Note::from);
+            if let Some(rem_note) = &remainder {
+                *flow.entry(offered_token).or_default() -= note_asset_amount(&rem_note) as i128;
+                expected_output_recipients.push(rem_note.recipient().clone());
+            }
+            inputs.push(PreparedInput {
+                note,
+                args: note_args,
+                payback_id,
+                remainder,
+            });
+        }
+
+        // Negative flow means we owe more than we have — batch is insolvent.
+        let mut surplus_assets: Vec<Asset> = Vec::new();
+        for (token, net) in &flow {
+            if *net < 0 {
+                bail!(
+                    "insolvent batch: token {:?} has deficit of {}",
+                    token,
+                    net.abs()
+                );
+            }
+            if *net > 0 {
+                let amount = u64::try_from(*net).map_err(|_| {
+                    anyhow!("surplus exceeds u64 range for token {:?}: {}", token, net)
+                })?;
+                surplus_assets.push(
+                    FungibleAsset::new(*token, amount)
+                        .map_err(|e| anyhow!("surplus asset: {}", e))?
+                        .into(),
+                );
+            }
+        }
+
+        Ok(Self {
+            inputs,
+            expected_output_recipients,
+            surplus_assets,
+        })
+    }
+
     fn request(&self) -> Result<TransactionRequest> {
         // Every batch note is consumed unauthenticated, from the solver's own copy.
         // `input_notes` would substitute the executor store's copy whenever it holds an
         // inclusion proof, and that copy can have its attachments stripped (see
         // crates/solver/pswap-attachment-corruption-report.md); a PSWAP note id commits
         // to its attachments, so the batch would fail with `InputNoteNotInBlock`.
-        let inputs = self
-            .input_notes
-            .iter()
-            .map(|(note, args)| (InputNote::unauthenticated(note.clone()), *args));
+        let inputs = self.inputs.iter().map(|input| {
+            (
+                InputNote::unauthenticated(input.note.clone()),
+                Some(input.args),
+            )
+        });
         let mut builder = TransactionRequestBuilder::new()
             .explicit_input_notes(inputs)
             .expected_output_recipients(self.expected_output_recipients.clone());
@@ -139,27 +238,20 @@ impl BatchComponents {
             .context("failed to build transaction request")
     }
 
-    fn settlement_inputs(
-        &self,
-        batch: &ExecutionBatch,
-        result: &TransactionResult,
-    ) -> Result<Vec<SettlementInputRow>> {
-        let output_ids: std::collections::HashSet<_> = result
+    fn settlement_inputs(&self, result: &TransactionResult) -> Result<Vec<SettlementInputRow>> {
+        let tx_id = result.id().to_bytes();
+        let output_ids: HashSet<_> = result
             .created_notes()
             .iter()
             .map(|note| note.id())
             .collect();
-        batch
-            .filled_notes
+        self.inputs
             .iter()
-            .map(|filled| {
-                let remainder = self.expected_remainders.get(&filled.note_id);
-                let payback_id = self
-                    .expected_paybacks
-                    .get(&filled.note_id)
-                    .ok_or_else(|| anyhow!("missing expected payback for {}", filled.note_id))?;
+            .map(|input| {
+                let remainder = input.remainder.as_ref();
+                let payback_id = input.payback_id;
                 anyhow::ensure!(
-                    output_ids.contains(payback_id),
+                    output_ids.contains(&payback_id),
                     "expected payback {} absent from executed outputs",
                     payback_id
                 );
@@ -171,13 +263,27 @@ impl BatchComponents {
                     );
                 }
                 Ok(SettlementInputRow {
-                    tx_id: result.id().to_bytes().to_vec(),
-                    parent_note_id: filled.note_id.to_bytes().to_vec(),
+                    tx_id: tx_id.clone(),
+                    parent_note_id: input.note.id().to_bytes().to_vec(),
                     payback_note_id: payback_id.to_bytes().to_vec(),
                     child_note_id: remainder.map(|note| note.id().to_bytes().to_vec()),
                     child_note_data: remainder.map(Serializable::to_bytes),
                 })
             })
+            .collect()
+    }
+
+    /// Only failure paths need a separate note slice for the client API.
+    fn notes(&self) -> Vec<Note> {
+        self.inputs.iter().map(|input| input.note.clone()).collect()
+    }
+
+    fn source_orders(&self, batch: &ExecutionBatch) -> Result<Vec<IngestOrder>> {
+        batch
+            .filled_notes
+            .iter()
+            .zip(&self.inputs)
+            .map(|(filled, input)| rebuild_ingest_order(filled, &input.note))
             .collect()
     }
 }
@@ -188,7 +294,6 @@ async fn submit_with_rpc_backoff(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
     solver_id: AccountId,
     components: &BatchComponents,
-    batch: &ExecutionBatch,
     pool: &DbPool,
     cancel: &CancellationToken,
 ) -> SubmitOutcome {
@@ -205,7 +310,7 @@ async fn submit_with_rpc_backoff(
         Ok(result) => result,
         Err(error) => return SubmitOutcome::TxError(error, None),
     };
-    let inputs = match components.settlement_inputs(batch, &result) {
+    let inputs = match components.settlement_inputs(&result) {
         Ok(inputs) => inputs,
         Err(error) => return SubmitOutcome::BuildFailed(error.to_string()),
     };
@@ -294,108 +399,6 @@ async fn submit_with_rpc_backoff(
     unreachable!("loop exits via return inside the matched arms")
 }
 
-/// Parse PSWAP notes from the batch, compute the per-token flow, derive the
-/// fill arguments and surplus assets, and assemble all the components needed
-/// to construct a `TransactionRequest`. Returns the prepared components plus
-/// the deserialized notes (separately, so the executor can pass them to
-/// `check_consumed_notes` on the classify path).
-fn prepare_batch_components(
-    batch: &ExecutionBatch,
-    solver_id: AccountId,
-) -> Result<(BatchComponents, Vec<Note>)> {
-    let mut input_notes = Vec::new();
-    let mut expected_output_recipients = Vec::new();
-    let mut input_notes_only: Vec<Note> = Vec::new();
-    let mut expected_remainders = HashMap::new();
-    let mut expected_paybacks = HashMap::new();
-
-    // Net flow per token: positive = surplus staying with solver, negative = insolvent.
-    // i128 is lossless for any u64 sum encountered here — no wrap risk on `as i128`.
-    let mut flow: HashMap<TokenId, i128> = HashMap::new();
-
-    for filled in &batch.filled_notes {
-        let note = Note::read_from(&mut SliceReader::new(&filled.raw_note_data))
-            .context("failed to deserialize note from raw data")?;
-
-        let pswap =
-            PswapNote::try_from(&note).map_err(|e| anyhow!("failed to parse PswapNote: {}", e))?;
-
-        let offered_asset = pswap.offered_asset();
-        let offered_token = offered_asset.faucet_id();
-        let requested_token = pswap.storage().requested_faucet_id();
-
-        *flow.entry(offered_token).or_default() += u64::from(offered_asset.amount()) as i128;
-
-        let fill_asset = FungibleAsset::new(requested_token, filled.requested_filled)
-            .map_err(|e| anyhow!("failed to create fill asset: {}", e))?;
-
-        // Both-zero args make the script fall back to a vault-funded full fill.
-        if filled.requested_filled == 0 {
-            bail!("zero fill for note {}", filled.note_id);
-        }
-        let note_args = PswapNote::create_args(0, filled.requested_filled)
-            .map_err(|e| anyhow!("failed to create note args: {}", e))?;
-
-        input_notes.push((note.clone(), Some(note_args)));
-        input_notes_only.push(note.clone());
-
-        let (p2id, remainder) = pswap
-            .execute(solver_id, None, Some(fill_asset))
-            .map_err(|e| anyhow!("pswap execute failed: {}", e))?;
-        expected_paybacks.insert(filled.note_id, Note::from(p2id.clone()).id());
-
-        *flow.entry(requested_token).or_default() -= note_asset_amount(&p2id) as i128;
-        // Payback + remainder settle to the order CREATOR, not the solver. Declare them
-        // as expected OUTPUT RECIPIENTS only — NEVER as expected future notes. This mirrors
-        // `miden-client::build_pswap_consume`, which deliberately does the same and warns
-        // that registering them as future notes "would leave stale, un-consumable notes in
-        // the consumer's store": the future-note record is built from `NoteDetails` (which
-        // carries NO attachments), and a PSWAP note's id commits to its attachments — so it
-        // would land attachment-stripped, and the kernel later rejects the re-consume with
-        // `InputNoteNotInBlock`.
-        expected_output_recipients.push(p2id.recipient().clone());
-
-        if let Some(rem_pswap) = remainder {
-            let rem_note = Note::from(rem_pswap);
-            *flow.entry(offered_token).or_default() -= note_asset_amount(&rem_note) as i128;
-            expected_output_recipients.push(rem_note.recipient().clone());
-            expected_remainders.insert(filled.note_id, rem_note);
-        }
-    }
-
-    // Negative flow means we owe more than we have — batch is insolvent.
-    let mut surplus_assets: Vec<Asset> = Vec::new();
-    for (token, net) in &flow {
-        if *net < 0 {
-            bail!(
-                "insolvent batch: token {:?} has deficit of {}",
-                token,
-                net.abs()
-            );
-        }
-        if *net > 0 {
-            let amount = u64::try_from(*net)
-                .map_err(|_| anyhow!("surplus exceeds u64 range for token {:?}: {}", token, net))?;
-            surplus_assets.push(
-                FungibleAsset::new(*token, amount)
-                    .map_err(|e| anyhow!("surplus asset: {}", e))?
-                    .into(),
-            );
-        }
-    }
-
-    Ok((
-        BatchComponents {
-            input_notes,
-            expected_output_recipients,
-            surplus_assets,
-            expected_remainders,
-            expected_paybacks,
-        },
-        input_notes_only,
-    ))
-}
-
 /// Rebuild the `IngestOrder` for one filled note so the matcher can re-add
 /// it to its book. Shared by failure re-feed paths.
 fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder> {
@@ -413,18 +416,6 @@ fn rebuild_ingest_order(filled: &FilledNote, note: &Note) -> Result<IngestOrder>
     })
 }
 
-/// Rebuild *every* order in the batch (no nullifier filtering). Used by the
-/// pre-submission failure paths: the submit never landed, so all orders remain
-/// valid and must return to the live matcher.
-fn rebuild_all_orders(batch: &ExecutionBatch, input_notes: &[Note]) -> Result<Vec<IngestOrder>> {
-    batch
-        .filled_notes
-        .iter()
-        .zip(input_notes.iter())
-        .map(|(filled, note)| rebuild_ingest_order(filled, note))
-        .collect()
-}
-
 /// Shutdown-aware re-feed into the matcher via the same channel ingest uses.
 /// Stops early if the matcher channel is closed (it's tearing down).
 async fn refeed_orders(
@@ -437,33 +428,26 @@ async fn refeed_orders(
 }
 
 /// On the TxError classification path, fetch which input notes are consumed
-/// on-chain. Returns the partitioned source-id byte-vecs (consumed vs active)
-/// plus the active orders re-built as `IngestOrder` for re-feed.
+/// on-chain. Keep IDs typed until the database boundary.
 async fn classify_input_notes(
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     batch: &ExecutionBatch,
     input_notes: &[Note],
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<IngestOrder>)> {
+) -> Result<(HashSet<NoteId>, Vec<IngestOrder>)> {
     let consumed_ids = {
         let mut adapter = miden_adapter.lock().await;
         adapter.check_consumed_notes(input_notes).await?
     };
 
-    let mut consumed_bytes: Vec<Vec<u8>> = Vec::new();
-    let mut active_bytes: Vec<Vec<u8>> = Vec::new();
     let mut active_orders: Vec<IngestOrder> = Vec::new();
 
     for (filled, note) in batch.filled_notes.iter().zip(input_notes.iter()) {
-        let id_bytes = filled.note_id.to_bytes().to_vec();
-        if consumed_ids.contains(&filled.note_id) {
-            consumed_bytes.push(id_bytes);
-        } else {
+        if !consumed_ids.contains(&filled.note_id) {
             active_orders.push(rebuild_ingest_order(filled, note)?);
-            active_bytes.push(id_bytes);
         }
     }
 
-    Ok((consumed_bytes, active_bytes, active_orders))
+    Ok((consumed_ids, active_orders))
 }
 
 /// DIAGNOSTIC (temporary): on a tx failure, dump EVERYTHING about the batch consume.
@@ -970,7 +954,7 @@ async fn execute_batch(
     book_tx: &mpsc::Sender<BookUpdate>,
     cancel: &CancellationToken,
 ) -> Result<BatchSubmission> {
-    let (components, input_notes_only) = match prepare_batch_components(batch, solver_id) {
+    let components = match BatchComponents::prepare(batch, solver_id) {
         Ok(parts) => parts,
         Err(e) => {
             // Nothing is marked Settling yet and the matcher dropped these orders on
@@ -992,12 +976,12 @@ async fn execute_batch(
     // shortfall hand the orders back after a pause.
     if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
         tracing::warn!(error = %e, "deferring fee-starved batch");
-        let orders = rebuild_all_orders(batch, &input_notes_only)?;
+        let orders = components.source_orders(batch)?;
         refeed_later(pool, book_tx, cancel, orders, HELD_REFEED_DELAY);
         return Ok(BatchSubmission::Returned);
     }
 
-    match submit_with_rpc_backoff(client, solver_id, &components, batch, pool, cancel).await {
+    match submit_with_rpc_backoff(client, solver_id, &components, pool, cancel).await {
         SubmitOutcome::Success => {
             // Mempool acceptance is not chain confirmation. The sync poll or
             // ingestion of an expected remainder performs the DB handoff.
@@ -1012,7 +996,7 @@ async fn execute_batch(
             // orders remain Active (submit never landed). Re-feed so
             // the matcher can reconsider (and possibly compose a different
             // batch) without waiting for a process restart.
-            let orders = rebuild_all_orders(batch, &input_notes_only)?;
+            let orders = components.source_orders(batch)?;
             refeed_orders(pool, book_tx, orders).await?;
             tracing::error!(error = %msg, "tx build failed; re-fed active orders");
             Ok(BatchSubmission::Returned)
@@ -1030,24 +1014,24 @@ async fn execute_batch(
             // DIAGNOSTIC: full per-note dump (id/serial/nullifier/attachments/offered+
             // requested), on-chain nullifier check, store-existence + store-vs-consumed
             // MATCH, and the COMPLETE VM/tx error — nothing truncated.
-            log_batch_consume_diagnostics(client, miden_adapter, &input_notes_only, &e).await;
+            let input_notes = components.notes();
+            log_batch_consume_diagnostics(client, miden_adapter, &input_notes, &e).await;
 
             // Non-RPC error: classify per-note via the nullifier check.
-            let (consumed_bytes, active_bytes, active_orders) =
-                classify_input_notes(miden_adapter, batch, &input_notes_only).await?;
+            let (consumed, active_orders) =
+                classify_input_notes(miden_adapter, batch, &input_notes).await?;
+            let consumed_count = consumed.len();
+            let active_count = active_orders.len();
 
             // DB updates first, then re-feed the actives. Idempotent against
             // a concurrent ingest update (status guard in mark_orders_onchain_nullified).
-            let consumed: std::collections::HashSet<_> = consumed_bytes
-                .iter()
-                .map(|bytes| miden_protocol::note::NoteId::read_from_bytes(bytes))
-                .collect::<std::result::Result<_, _>>()?;
             pool.update_book(book_tx, |conn| {
                 if let Some(tx_id) = tx_id {
                     // Release parents and delete the attempt in one transaction.
                     db::finish_discarded_settlement(conn, &tx_id, &consumed)
                 } else {
                     // Execution/proving failed before durable reservation.
+                    let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
                     db::mark_orders_onchain_nullified(conn, &consumed_bytes)?;
                     let mut update = db::active_book_update(conn, active_orders)?;
                     update.removed.extend(consumed);
@@ -1058,8 +1042,8 @@ async fn execute_batch(
 
             tracing::error!(
                 error = ?e,
-                consumed_count = consumed_bytes.len(),
-                refed_count = active_bytes.len(),
+                consumed_count,
+                refed_count = active_count,
                 "non-RPC submit failure classified"
             );
             Ok(BatchSubmission::Returned)
@@ -1495,13 +1479,23 @@ mod claim_tests {
                     note_id: note.id(),
                     priority_seq: index as u64 + 1,
                     requested_filled,
-                    raw_note_data: note.to_bytes(),
+                    raw_note_data: note.to_bytes().into(),
                     arrival_unix: 1,
                 })
                 .collect(),
         };
-        let (components, notes) = prepare_batch_components(&batch, solver_id).unwrap();
-        assert_eq!(notes.len(), 2);
+        let components = BatchComponents::prepare(&batch, solver_id).unwrap();
+        assert_eq!(components.inputs.len(), 2);
+        for (input, filled) in components.inputs.iter().zip(&batch.filled_notes) {
+            assert_eq!(input.note.id(), filled.note_id);
+            assert!(input.remainder.is_none());
+        }
+        let sources = components.source_orders(&batch).unwrap();
+        for (source, filled) in sources.iter().zip(&batch.filled_notes) {
+            assert_eq!(source.note_id, filled.note_id);
+            assert_eq!(source.priority_seq, filled.priority_seq);
+            assert!(Arc::ptr_eq(&source.raw_note_data, &filled.raw_note_data));
+        }
         let residual: HashMap<_, _> = components
             .surplus_assets
             .into_iter()
@@ -1513,6 +1507,21 @@ mod claim_tests {
             .collect();
         assert_eq!(residual.get(&base), Some(&1));
         assert_eq!(residual.get(&quote), Some(&2));
+
+        let mut partial = batch.clone();
+        partial.filled_notes[0].requested_filled = 9;
+        partial.filled_notes[1].requested_filled = 5;
+        let components = BatchComponents::prepare(&partial, solver_id).unwrap();
+        assert_eq!(components.expected_output_recipients.len(), 4);
+        for input in &components.inputs {
+            let remainder = input.remainder.as_ref().unwrap();
+            assert_ne!(remainder.id(), input.note.id());
+            assert_ne!(input.payback_id, remainder.id());
+        }
+
+        let mut insolvent = batch.clone();
+        insolvent.filled_notes[0].requested_filled = 23;
+        assert!(BatchComponents::prepare(&insolvent, solver_id).is_err());
 
         // Cross the transaction bound with independently solvent groups of
         // real, distinct PSWAP notes, not just synthetic note-count metadata.
@@ -1534,7 +1543,7 @@ mod claim_tests {
                     note_id: note.id(),
                     priority_seq: combined.filled_notes.len() as u64 + 1,
                     requested_filled: payment,
-                    raw_note_data: note.to_bytes(),
+                    raw_note_data: note.to_bytes().into(),
                     arrival_unix: 1,
                 });
             }
@@ -1543,8 +1552,8 @@ mod claim_tests {
         let transactions = split_batch(&mut combined).unwrap();
         assert_eq!(transactions.len(), 2);
         for tx in transactions {
-            let (components, _) = prepare_batch_components(&tx, solver_id).unwrap();
-            assert!(components.input_notes.len() <= miden_protocol::MAX_INPUT_NOTES_PER_TX);
+            let components = BatchComponents::prepare(&tx, solver_id).unwrap();
+            assert!(components.inputs.len() <= miden_protocol::MAX_INPUT_NOTES_PER_TX);
             assert!(
                 components.expected_output_recipients.len() + 1
                     <= miden_protocol::MAX_OUTPUT_NOTES_PER_TX
@@ -1562,7 +1571,7 @@ mod claim_tests {
                     note_id: NoteId::try_from_hex(&format!("0x{index:064x}")).unwrap(),
                     priority_seq: index,
                     requested_filled: 1,
-                    raw_note_data: Vec::new(),
+                    raw_note_data: Vec::new().into(),
                     arrival_unix: 1,
                 });
             }

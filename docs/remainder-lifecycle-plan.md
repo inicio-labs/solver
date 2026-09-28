@@ -2,7 +2,7 @@
 
 ## Scope and ownership
 
-This change covers the direct-clearing executor, ingestion, the SQLite order store, and both matcher modes. It does not add a market-maker API or change the clearing-price algorithm. A single submitted transaction can consume several parent notes and produce zero or one PSWAP remainder for each. The executor owns the transaction outcome; ingestion is a second confirmation observer; SQLite owns the authoritative order state; the matcher keeps a rebuildable in-memory view.
+This change covers the direct-clearing executor, ingestion, the SQLite order store, and the clearing matcher. It does not add a market-maker API or change the clearing-price algorithm. A single submitted transaction can consume several parent notes and produce zero or one PSWAP remainder for each. The executor owns the transaction outcome; ingestion is a second confirmation observer; SQLite owns the authoritative order state; the matcher keeps a rebuildable in-memory view.
 
 ## Invariants
 

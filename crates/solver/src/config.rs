@@ -76,16 +76,9 @@ pub struct EngineConfig {
     /// so this only affects how stale the prices can get, not the matcher's
     /// tick rate.
     pub price_interval_ms: u64,
-    /// Whether the 3-edge cycle (triangular) matching phase runs each tick.
-    /// Direct (pairwise) matching always runs. Defaults to `true` when
-    /// omitted from `solver.toml` so existing configs continue to behave
-    /// the same. Disable to skip the O(T³) enumeration on large token sets.
-    #[serde(default = "default_true")]
-    pub triangular_enabled: bool,
-    /// Opt into exact-price, two-sided PSWAP clearing. When omitted the legacy
-    /// matcher remains active. The value is also the eligibility edge in ppm.
+    /// Protocol fee and minimum eligibility edge in ppm. Zero disables fees.
     #[serde(default)]
-    pub clearing_fee_ppm: Option<u32>,
+    pub clearing_fee_ppm: u32,
     /// Maximum age of each provider's own price timestamp when clearing.
     #[serde(default = "default_clearing_source_age_secs")]
     pub clearing_max_source_age_secs: u64,
@@ -165,30 +158,10 @@ pub struct EngineConfig {
     #[serde(default = "default_swap_offmarket_tolerance_bps")]
     pub swap_offmarket_tolerance_bps: u64,
     // ── External liquidity routing (RFQ websocket to other DEXes) ─────────────
-    /// Enable the external-liquidity router (websocket RFQ server + matcher
-    /// external pass). Default `false` (opt-in). Allow-list tokens are sourced
-    /// from the `SOLVER_ROUTER_TOKENS` env var (comma-separated), not config.
+    /// Retained for config compatibility. Pair clearing requires this to be false;
+    /// the standalone RFQ router is not wired into this solver runtime.
     #[serde(default)]
     pub router_enabled: bool,
-    /// Router websocket bind address. Default `"127.0.0.1"`; `"0.0.0.0"` exposes it.
-    #[serde(default = "default_router_bind")]
-    pub router_bind: String,
-    /// Router websocket port. Default 8090.
-    #[serde(default = "default_router_port")]
-    pub router_port: u16,
-    /// Max concurrent DEX websocket connections. Default 64.
-    #[serde(default = "default_router_max_connections")]
-    pub router_max_connections: usize,
-    /// Max inbound websocket message size (bytes). Default 16384.
-    #[serde(default = "default_router_max_msg_bytes")]
-    pub router_max_msg_bytes: usize,
-    /// How long a DEX's standing quote stays selectable (ms). Default 20000.
-    #[serde(default = "default_router_quote_ttl_ms")]
-    pub router_quote_ttl_ms: u64,
-    /// How long a handed-over note waits for the DEX's on-chain consume before it
-    /// reactivates (ms). Set above realistic consume latency. Default 30000.
-    #[serde(default = "default_router_inflight_ttl_ms")]
-    pub router_inflight_ttl_ms: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -207,10 +180,6 @@ impl PricePrecision {
         }
         s.parse::<u8>().ok().filter(|n| *n <= 18).map(Self::Fixed)
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_clearing_source_age_secs() -> u64 {
@@ -266,33 +235,14 @@ fn default_swap_block_time_ms() -> u64 {
 fn default_swap_offmarket_tolerance_bps() -> u64 {
     50
 }
-fn default_router_bind() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_router_port() -> u16 {
-    8090
-}
-fn default_router_max_connections() -> usize {
-    64
-}
-fn default_router_max_msg_bytes() -> usize {
-    16384
-}
-fn default_router_quote_ttl_ms() -> u64 {
-    20_000
-}
-fn default_router_inflight_ttl_ms() -> u64 {
-    30_000
-}
-
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path))?;
-        let mut config: SolverConfig =
+        let config: SolverConfig =
             toml::from_str(&content).context("Failed to parse config file")?;
         config.validate()?;
-        config.apply_miden_016_overrides();
+        config.warn_ignored_settings();
         Ok(config)
     }
 
@@ -307,28 +257,16 @@ impl SolverConfig {
             !self.engine.price_vs_currency.trim().is_empty(),
             "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
         );
-        if let Some(fee) = self.engine.clearing_fee_ppm {
-            anyhow::ensure!(
-                fee < crate::clearing::PPM_DENOMINATOR,
-                "engine.clearing_fee_ppm must be below {}",
-                crate::clearing::PPM_DENOMINATOR
-            );
-        }
+        anyhow::ensure!(
+            self.engine.clearing_fee_ppm < crate::clearing::PPM_DENOMINATOR,
+            "engine.clearing_fee_ppm must be below {}",
+            crate::clearing::PPM_DENOMINATOR
+        );
         Ok(())
     }
 
-    /// Settings this build can't honour on Miden 0.16, forced off with a warning.
-    /// - `triangular_enabled`: the 3-cycle path fills via `Order::fill` directly and
-    ///   doesn't enforce PSWAP `min_fill_step`, so one sub-floor fill would fail the
-    ///   whole batch transaction.
-    /// - `debug_mode`: miden-client 0.16 removed client debug mode.
-    fn apply_miden_016_overrides(&mut self) {
-        if self.engine.triangular_enabled {
-            tracing::warn!(
-                "engine.triangular_enabled forced to false: triangular matching does not enforce PSWAP min_fill_step yet"
-            );
-            self.engine.triangular_enabled = false;
-        }
+    /// The Miden client no longer exposes debug mode.
+    fn warn_ignored_settings(&self) {
         if self.engine.debug_mode {
             tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
         }

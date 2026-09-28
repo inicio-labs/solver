@@ -253,8 +253,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     pulse_interval_ms: 200,
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
-                    triangular_enabled: true,
-                    clearing_fee_ppm: None,
+                    clearing_fee_ppm: 0,
                     clearing_max_source_age_secs: 60,
                     clearing_max_source_skew_secs: 30,
                     admin_port: 0,
@@ -274,12 +273,6 @@ async fn three_user_direct_matching() -> Result<()> {
                     swap_block_time_ms: 6000,
                     swap_offmarket_tolerance_bps: 50,
                     router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
                 },
             };
 
@@ -288,11 +281,10 @@ async fn three_user_direct_matching() -> Result<()> {
             //    on their own OS threads.
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            // Inject prices (CoinGecko is unreachable in tests). Direct
-            // matching is rate-based and doesn't gate on USD price, but the
-            // solver still needs a working price client.
+            // Clear at 100 USDC/ETH: Alice and Bob execute, leaving 20 USDC.
+            // Both faucets have the same decimals, so the reference ratio is 100.
             let price_map: std::collections::HashMap<_, u64> =
-                [(usdc.id(), 100), (eth.id(), 100)].into_iter().collect();
+                [(usdc.id(), 100), (eth.id(), 10_000)].into_iter().collect();
             let mut solver_handle = tokio::task::spawn_local(async move {
                 solver::start(
                     factory,

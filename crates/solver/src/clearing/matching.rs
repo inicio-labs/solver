@@ -329,7 +329,7 @@ mod tests {
             offered_amount: 10,
             requested_amount: 20,
             min_fill_step: 5,
-            raw_note_data: note.to_bytes(),
+            raw_note_data: note.to_bytes().into(),
         };
         assert_eq!(
             Order::from_ingest_order(&ingested)
@@ -402,11 +402,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.base, 1);
         assert_eq!(plan.accruals.realized_protocol_fee.quote, 2);
         assert_eq!(plan.accruals.rounding_surplus, PairAmounts::default());
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let execution_batch = plan.to_execution_batch(&input).unwrap();
         assert_eq!(execution_batch.filled_notes.len(), 2);
         assert_eq!(execution_batch.filled_notes[0].requested_filled, 20);
         assert_eq!(execution_batch.filled_notes[1].requested_filled, 10);
@@ -508,11 +504,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.base, 8);
         assert_eq!(plan.accruals.rounding_surplus.quote, 40);
 
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        plan.to_execution_batch(&input, &arrivals).unwrap();
+        plan.to_execution_batch(&input).unwrap();
     }
 
     #[test]
@@ -548,11 +540,7 @@ mod tests {
         };
         assert_eq!(plan.candidate.executions[0].order_id, early_id);
         assert_eq!(plan.candidate.executions.len(), 2);
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let settled = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let settled = plan.to_execution_batch(&input).unwrap();
         assert_eq!(settled.filled_notes[0].note_id, early_id);
         assert_eq!(settled.filled_notes.len(), 2);
     }
@@ -792,7 +780,7 @@ mod tests {
                     offered_amount: offered.amount().as_u64(),
                     requested_amount: requested.amount().as_u64(),
                     min_fill_step: order.pswap_note().storage().min_fill_step().as_u64(),
-                    raw_note_data: note.to_bytes(),
+                    raw_note_data: note.to_bytes().into(),
                 }
             })
             .collect();
@@ -825,11 +813,7 @@ mod tests {
         assert_eq!(plan.accruals.realized_protocol_fee.quote, 1_200);
         assert_eq!(plan.accruals.rounding_surplus, PairAmounts::default());
 
-        let arrivals = input
-            .orders()
-            .map(|order| (order.order().id(), 100))
-            .collect();
-        let execution_batch = plan.to_execution_batch(&input, &arrivals).unwrap();
+        let execution_batch = plan.to_execution_batch(&input).unwrap();
         assert_eq!(execution_batch.filled_notes.len(), 200);
     }
 }

@@ -81,8 +81,7 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     pulse_interval_ms: 200,
                     fetch_interval_ms: 100,
                     price_interval_ms: 60_000,
-                    triangular_enabled: false,
-                    clearing_fee_ppm: None,
+                    clearing_fee_ppm: 0,
                     clearing_max_source_age_secs: 60,
                     clearing_max_source_skew_secs: 30,
                     admin_port: 0,
@@ -102,12 +101,6 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     swap_block_time_ms: 6000,
                     swap_offmarket_tolerance_bps: 50,
                     router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
                 },
             };
 

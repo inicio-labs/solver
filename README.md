@@ -3,7 +3,7 @@
 An off-chain **matching engine + settlement bot** for Miden
 [PSWAP](https://0xmiden.github.io) (partially-fillable swap) notes. It watches
 the chain for resting swap orders, matches compatible ones **off-chain**
-(pairwise *direct* matching and 3-cycle *triangular* matching), and **settles
+with exact-price pairwise batch clearing, and **settles
 the matches on-chain** by consuming the notes from its own account — keeping the
 price spread as surplus.
 
@@ -26,7 +26,7 @@ flowchart TB
 
     subgraph proc["solver-bin process"]
         subgraph main["main thread — current_thread runtime + LocalSet (Send services)"]
-            MATCH["Matcher<br/>direct + triangular"]
+            MATCH["Matcher<br/>pairwise batch clearing"]
             PRICE["Price feed task"]
             ADMIN["Admin HTTP<br/>127.0.0.1:3001"]
             OBS["Obs HTTP<br/>127.0.0.1:9090"]
@@ -134,15 +134,14 @@ env var (default: `./solver.toml`).
 | `pulse_interval_ms` | ✅ | — | Matcher tick interval. |
 | `fetch_interval_ms` | ✅ | — | Chain sync interval (ingest + executor). |
 | `price_interval_ms` | ✅ | — | How often the price task polls CoinGecko. |
-| `triangular_enabled` | — | `true` | Run 3-cycle matching. Set `false` to skip the O(T³) enumeration on large token sets. |
+| `clearing_fee_ppm` | — | `0` | Protocol fee and minimum eligibility edge in ppm. Clearing always uses fresh exact reference prices. |
 | `admin_port` | — | `3001` | Admin HTTP port (binds `127.0.0.1` only). |
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
 | `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
-| `router_enabled` + `router_*` | — | off | External liquidity routing (RFQ websocket to other DEXes). Off by default; 6 `router_*` knobs + the `SOLVER_ROUTER_TOKENS` env allow-list. See [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). |
+| `router_enabled` | — | `false` | Must remain disabled: the clearing matcher does not route notes externally. |
 
-> **External liquidity routing** lets allow-listed DEXes fill orders the matcher can't
-> cross internally, over a websocket RFQ. Architecture + config + operator runbook:
+> The RFQ router library is retained for separate integration; the running solver uses only pair clearing. Historical design:
 > [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). DEX-side
 > integration + the `pswap-lp-sdk`: [docs/filler-integration.md](docs/filler-integration.md).
 

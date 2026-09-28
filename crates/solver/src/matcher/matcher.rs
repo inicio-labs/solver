@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use crate::clearing::{
-    self, ClearingConfig, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
+    self, ClearingConfig, ClearingError, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
 };
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
@@ -29,23 +29,21 @@ pub struct ClearingRuntime {
 impl ClearingRuntime {
     /// An order belongs to one unordered pair. Reject duplicate markets once,
     /// so clearing needs no per-tick set to prevent double selection.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<(), ClearingError> {
         self.config.validate()?;
         let mut pairs = HashSet::with_capacity(self.pairs.len());
         for &(base, quote) in &self.pairs {
-            ensure!(
-                base != quote,
-                "a clearing pair must contain different assets"
-            );
+            if base == quote {
+                return Err(ClearingError::IdenticalPairAssets);
+            }
             let pair = if base < quote {
                 (base, quote)
             } else {
                 (quote, base)
             };
-            ensure!(
-                pairs.insert(pair),
-                "duplicate clearing pair: {base}/{quote}"
-            );
+            if !pairs.insert(pair) {
+                return Err(ClearingError::DuplicatePair);
+            }
         }
         Ok(())
     }
@@ -60,7 +58,7 @@ pub async fn run_matcher(
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     runtime: ClearingRuntime,
     cancel: CancellationToken,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // One cancellation boundary covers bootstrap, matching, and a blocked send.
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
@@ -74,7 +72,7 @@ pub(super) async fn run_worker(
     match_interval: Duration,
     snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     mut runtime: ClearingRuntime,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // Configuration is frozen for this worker; validate before admitting orders.
     runtime.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
@@ -149,7 +147,7 @@ pub(super) async fn internal_clear(
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
     now_ms: u64,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor

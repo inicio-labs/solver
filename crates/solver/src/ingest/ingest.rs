@@ -23,7 +23,7 @@ use crate::client_factory::ClientFactory;
 use crate::db::models::{NoteRow, OrderRow};
 use crate::db::{self, DbPool};
 use crate::types::Order as PipelineOrder;
-use crate::types::{BookUpdate, IngestOrder, OrderStatus, TokenId};
+use crate::types::{BookOrder, BookUpdate, OrderStatus, TokenId};
 
 /// Result of a sync_state call — newly received notes plus IDs of notes
 /// whose nullifier was just observed on-chain. The matcher uses the
@@ -244,7 +244,7 @@ impl SyncResult {
                 priority_seq: 0, // assigned by the DB trigger on first insert
             });
 
-            ingest_orders.push(IngestOrder {
+            ingest_orders.push(BookOrder {
                 priority_seq: 0, // replaced with the persisted sequence after insert
                 note: Arc::new(note.clone()),
             });

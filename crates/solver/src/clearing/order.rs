@@ -7,7 +7,7 @@ use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use ruint::aliases::U256;
 
-use crate::types::{now_unix, FilledNote, IngestOrder, UnixSecs};
+use crate::types::{now_unix, BookOrder, FilledNote, UnixSecs};
 
 use super::config::PPM_DENOMINATOR;
 use super::math::{checked_mul, mul_div_ceil, mul_div_floor, ppm_floor, to_asset_amount};
@@ -22,6 +22,7 @@ pub(crate) struct OrderKey {
     priority: u64,
 }
 
+/// A direct lifecycle view for callers; the book index controls matchability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BookStatus {
     Active,
@@ -62,8 +63,8 @@ impl Order {
     }
 
     /// Parse the shared original note once, preserving its attachments.
-    pub fn from_ingest_order(order: &IngestOrder) -> Result<Self, ClearingError> {
-        Self::new(Arc::clone(&order.note), order.priority_seq)
+    pub fn from_book_order(order: &BookOrder) -> Result<Self, ClearingError> {
+        Self::new(order.note.clone(), order.priority_seq)
     }
 
     pub fn id(&self) -> NoteId {
@@ -74,18 +75,11 @@ impl Order {
         &self.note
     }
 
-    pub(crate) fn to_ingest_order(&self) -> IngestOrder {
-        IngestOrder {
-            priority_seq: self.priority_sequence(),
-            note: Arc::clone(&self.note),
-        }
-    }
-
     pub fn priority_sequence(&self) -> u64 {
         self.priority.get()
     }
 
-    pub(crate) fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.status == BookStatus::Active
     }
 
@@ -172,7 +166,7 @@ impl Order {
             note_id: self.id(),
             priority_seq: self.priority_sequence(),
             requested_filled: execution.payment.amount().as_u64(),
-            note: Arc::clone(&self.note),
+            note: self.note.clone(),
             arrival_unix: self.arrival_unix,
         }
     }

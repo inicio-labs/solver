@@ -1,9 +1,18 @@
 use crate::db::schema::*;
-use crate::types::{IngestOrder, OrderId, OrderStatus};
-use anyhow::{anyhow, ensure, Result};
+use crate::types::{BookOrder, OrderId, OrderStatus};
+use anyhow::Result;
 use diesel::prelude::*;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum StoredOrderError {
+    #[error("stored order and note IDs differ")]
+    NoteIdMismatch,
+    #[error("stored order terms differ from note")]
+    TermsMismatch,
+}
 
 #[derive(Queryable, Selectable, Insertable, Debug)]
 #[diesel(table_name = sync_state)]
@@ -36,7 +45,7 @@ pub struct OrderRow {
 
 impl OrderRow {
     pub fn order_status(&self) -> Option<OrderStatus> {
-        OrderStatus::from_str(&self.status)
+        OrderStatus::parse(&self.status)
     }
 
     pub fn with_status(mut self, status: OrderStatus) -> Self {
@@ -44,22 +53,22 @@ impl OrderRow {
         self
     }
 
-    pub fn into_ingest(self, raw_note_data: Vec<u8>) -> Result<IngestOrder> {
+    pub fn into_book_order(self, raw_note_data: Vec<u8>) -> Result<BookOrder> {
         let note = Note::read_from(&mut SliceReader::new(&raw_note_data))?;
         let parsed = crate::types::Order::from_note(&note)?;
         let note_id = OrderId::read_from(&mut SliceReader::new(&self.note_id))?;
         if note.id() != note_id {
-            return Err(anyhow!("stored order and note IDs differ"));
+            return Err(StoredOrderError::NoteIdMismatch.into());
         }
         // Validate persisted metadata at the DB boundary, not on every book insert.
-        ensure!(
-            parsed.offered_faucet_id.to_bytes() == self.offered_asset
-                && parsed.requested_faucet_id.to_bytes() == self.requested_asset
-                && parsed.offered_amount == u64::try_from(self.offered_amount)?
-                && parsed.requested_amount == u64::try_from(self.requested_amount)?,
-            "stored order terms differ from note"
-        );
-        Ok(IngestOrder {
+        let terms_match = parsed.offered_faucet_id.to_bytes() == self.offered_asset
+            && parsed.requested_faucet_id.to_bytes() == self.requested_asset
+            && parsed.offered_amount == u64::try_from(self.offered_amount)?
+            && parsed.requested_amount == u64::try_from(self.requested_amount)?;
+        if !terms_match {
+            return Err(StoredOrderError::TermsMismatch.into());
+        }
+        Ok(BookOrder {
             priority_seq: u64::try_from(self.priority_seq)?,
             note: std::sync::Arc::new(note),
         })

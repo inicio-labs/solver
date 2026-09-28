@@ -28,7 +28,7 @@ use crate::db::models::{SettlementAttemptRow, SettlementInputRow};
 use crate::db::{self, DbPool};
 use crate::ingest::{MidenClient, MidenClientAdapter};
 use crate::swap_eta::SettlementStats;
-use crate::types::{BookUpdate, ExecutionBatch, IngestOrder, TokenId};
+use crate::types::{BookOrder, BookUpdate, ExecutionBatch, SettlementError, TokenId};
 
 // ── Backoff knobs ──────────────────────────────────────────────────────────
 
@@ -249,17 +249,13 @@ impl BatchComponents {
             .map(|input| {
                 let remainder = input.remainder.as_ref();
                 let payback_id = input.payback_id;
-                anyhow::ensure!(
-                    output_ids.contains(&payback_id),
-                    "expected payback {} absent from executed outputs",
-                    payback_id
-                );
+                if !output_ids.contains(&payback_id) {
+                    return Err(SettlementError::MissingPayback(payback_id).into());
+                }
                 if let Some(note) = remainder {
-                    anyhow::ensure!(
-                        output_ids.contains(&note.id()),
-                        "expected remainder {} absent from executed outputs",
-                        note.id()
-                    );
+                    if !output_ids.contains(&note.id()) {
+                        return Err(SettlementError::MissingRemainder(note.id()).into());
+                    }
                 }
                 Ok(SettlementInputRow {
                     tx_id: tx_id.clone(),
@@ -397,7 +393,7 @@ async fn submit_with_rpc_backoff(
 async fn refeed_orders(
     pool: &DbPool,
     book_tx: &mpsc::Sender<BookUpdate>,
-    orders: Vec<IngestOrder>,
+    orders: Vec<BookOrder>,
 ) -> Result<()> {
     pool.update_book(book_tx, |conn| db::active_book_update(conn, orders))
         .await
@@ -409,17 +405,17 @@ async fn classify_input_notes(
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     batch: &ExecutionBatch,
     input_notes: &[Note],
-) -> Result<(HashSet<NoteId>, Vec<IngestOrder>)> {
+) -> Result<(HashSet<NoteId>, Vec<BookOrder>)> {
     let consumed_ids = {
         let mut adapter = miden_adapter.lock().await;
         adapter.check_consumed_notes(input_notes).await?
     };
 
-    let mut active_orders: Vec<IngestOrder> = Vec::new();
+    let mut active_orders: Vec<BookOrder> = Vec::new();
 
     for filled in &batch.filled_notes {
         if !consumed_ids.contains(&filled.note_id) {
-            active_orders.push(filled.to_ingest_order());
+            active_orders.push(filled.to_book_order());
         }
     }
 
@@ -788,10 +784,9 @@ async fn retry_recorded_transaction(
     attempt: &SettlementAttemptRow,
 ) -> Result<()> {
     let result = TransactionResult::read_from(&mut SliceReader::new(&attempt.tx_result))?;
-    anyhow::ensure!(
-        result.id().to_bytes().as_slice() == attempt.tx_id,
-        "recorded transaction ID mismatch"
-    );
+    if result.id().to_bytes().as_slice() != attempt.tx_id {
+        return Err(SettlementError::RecordedTransactionIdMismatch.into());
+    }
     let proven = client.lock().await.prove_transaction(&result).await?;
     let submission = client
         .lock()
@@ -833,15 +828,22 @@ fn split_batch(batch: &mut ExecutionBatch) -> Result<Vec<ExecutionBatch>> {
     let mut packed = 0;
     let mut sizes = Vec::new();
     for &end in ends {
-        anyhow::ensure!(
-            end > previous && end <= total,
-            "invalid execution group boundary"
-        );
+        if end <= previous || end > total {
+            return Err(SettlementError::InvalidExecutionGroupBoundary {
+                previous,
+                end,
+                total,
+            }
+            .into());
+        }
         let size = end - previous;
-        anyhow::ensure!(
-            size <= MAX_SETTLEMENT_INPUTS,
-            "indivisible match group exceeds transaction note limit"
-        );
+        if size > MAX_SETTLEMENT_INPUTS {
+            return Err(SettlementError::ExecutionGroupTooLarge {
+                size,
+                maximum: MAX_SETTLEMENT_INPUTS,
+            }
+            .into());
+        }
         if packed + size > MAX_SETTLEMENT_INPUTS {
             sizes.push(packed);
             packed = 0;
@@ -849,7 +851,13 @@ fn split_batch(batch: &mut ExecutionBatch) -> Result<Vec<ExecutionBatch>> {
         packed += size;
         previous = end;
     }
-    anyhow::ensure!(previous == total, "execution groups do not cover all notes");
+    if previous != total {
+        return Err(SettlementError::IncompleteExecutionGroups {
+            covered: previous,
+            total,
+        }
+        .into());
+    }
     if packed > 0 {
         sizes.push(packed);
     }
@@ -873,7 +881,7 @@ fn refeed_unprepared(
         pool,
         book_tx,
         cancel,
-        batch.source_orders(),
+        batch.book_orders(),
         HELD_REFEED_DELAY,
     );
 }
@@ -945,7 +953,7 @@ async fn execute_batch(
     // shortfall hand the orders back after a pause.
     if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
         tracing::warn!(error = %e, "deferring fee-starved batch");
-        let orders = batch.source_orders();
+        let orders = batch.book_orders();
         refeed_later(pool, book_tx, cancel, orders, HELD_REFEED_DELAY);
         return Ok(BatchSubmission::Returned);
     }
@@ -965,7 +973,7 @@ async fn execute_batch(
             // orders remain Active (submit never landed). Re-feed so
             // the matcher can reconsider (and possibly compose a different
             // batch) without waiting for a process restart.
-            let orders = batch.source_orders();
+            let orders = batch.book_orders();
             refeed_orders(pool, book_tx, orders).await?;
             tracing::error!(error = %msg, "tx build failed; re-fed active orders");
             Ok(BatchSubmission::Returned)
@@ -1176,7 +1184,7 @@ fn refeed_later(
     pool: &DbPool,
     book_tx: &mpsc::Sender<BookUpdate>,
     cancel: &CancellationToken,
-    orders: Vec<IngestOrder>,
+    orders: Vec<BookOrder>,
     delay: Duration,
 ) {
     let pool = pool.clone();
@@ -1460,7 +1468,7 @@ mod claim_tests {
             assert_eq!(input.note.id(), filled.note_id);
             assert!(input.remainder.is_none());
         }
-        let sources = batch.source_orders();
+        let sources = batch.book_orders();
         for (source, filled) in sources.iter().zip(&batch.filled_notes) {
             assert_eq!(source.id(), filled.note_id);
             assert_eq!(source.priority_seq, filled.priority_seq);

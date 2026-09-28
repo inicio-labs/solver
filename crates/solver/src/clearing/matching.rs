@@ -1,4 +1,4 @@
-use miden_protocol::asset::{AssetAmount, AssetId};
+use miden_protocol::asset::AssetAmount;
 
 use super::config::ClearingConfig;
 use super::envelope::ReachableFillMap;
@@ -19,20 +19,15 @@ impl<'a> PairBatch<'a> {
     /// The live book supplies both sides already price-eligible and sorted by
     /// price, then durable FIFO. The matcher does not revalidate that work.
     pub(crate) fn new(
-        base: AssetId,
-        quote: AssetId,
         clearing_price: BatchPrice,
         sell_orders: Vec<MatchOrder<'a>>,
         buy_orders: Vec<MatchOrder<'a>>,
-    ) -> Result<Self, ClearingError> {
-        if base == quote {
-            return Err(ClearingError::InvalidConfig);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             clearing_price,
             sell_orders,
             buy_orders,
-        })
+        }
     }
 
     pub(crate) fn orders(&self) -> impl Iterator<Item = &MatchOrder<'a>> {
@@ -187,7 +182,7 @@ mod tests {
 
     use crate::clearing::{PairAmounts, ReferencePrice};
     use crate::matching::types::RateKey;
-    use crate::types::IngestOrder;
+    use crate::types::BookOrder;
 
     fn assets() -> (AccountId, AccountId) {
         (
@@ -224,7 +219,7 @@ mod tests {
     }
 
     fn batch<'a>(price: BatchPrice, orders: &'a [Order]) -> PairBatch<'a> {
-        let (base, quote) = assets();
+        let (base, _quote) = assets();
         let (mut sell_orders, mut buy_orders): (Vec<_>, Vec<_>) = orders
             .iter()
             .partition(|order| order.offered_asset().faucet_id() == base);
@@ -257,14 +252,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        PairBatch::new(
-            AssetId::new_fungible(base),
-            AssetId::new_fungible(quote),
-            price,
-            sell_orders,
-            buy_orders,
-        )
-        .unwrap()
+        PairBatch::new(price, sell_orders, buy_orders)
     }
 
     fn clear(batch: &PairBatch<'_>, config: &ClearingConfig) -> ClearingOutcome {
@@ -319,12 +307,12 @@ mod tests {
             &mut rng,
         );
         let note: Note = original.pswap_note().clone().into();
-        let mut ingested = IngestOrder {
+        let mut ingested = BookOrder {
             priority_seq: 7,
             note: Arc::new(note),
         };
         assert_eq!(
-            Order::from_ingest_order(&ingested)
+            Order::from_book_order(&ingested)
                 .unwrap()
                 .priority_sequence(),
             7
@@ -336,14 +324,14 @@ mod tests {
             0,
         )
         .unwrap();
-        let orders = vec![Order::from_ingest_order(&ingested).unwrap()];
+        let orders = vec![Order::from_book_order(&ingested).unwrap()];
         let input = batch(price, &orders);
         assert_eq!(input.orders().count(), 1);
         assert_eq!(input.clearing_price.quote_units, U256::from(2u8));
         assert_eq!(orders[0].id(), ingested.id());
         ingested.priority_seq = 0;
         assert!(matches!(
-            Order::from_ingest_order(&ingested),
+            Order::from_book_order(&ingested),
             Err(ClearingError::InvalidOrder {
                 reason: super::super::types::InvalidOrderReason::MissingPriority,
                 ..
@@ -754,7 +742,7 @@ mod tests {
             .iter()
             .map(|order| {
                 let note: Note = order.pswap_note().clone().into();
-                IngestOrder {
+                BookOrder {
                     priority_seq: order.priority_sequence(),
                     note: Arc::new(note),
                 }
@@ -769,7 +757,7 @@ mod tests {
         .unwrap();
         let parsed = ingested
             .iter()
-            .map(Order::from_ingest_order)
+            .map(Order::from_book_order)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let input = batch(price, &parsed);

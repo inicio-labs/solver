@@ -1,7 +1,5 @@
-use std::collections::{btree_map, hash_map, BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap};
 
-use anyhow::{ensure, Result};
-use miden_protocol::asset::AssetId;
 use miden_protocol::note::NoteId;
 use tokio::sync::mpsc;
 
@@ -9,11 +7,11 @@ use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
 use crate::matching::types::{BestLevel, SwapBookSnapshot};
-use crate::types::{BookUpdate, IngestOrder, TokenId};
+use crate::types::{BookOrder, BookUpdate, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
-    pub orders: Vec<IngestOrder>,
+    pub orders: Vec<BookOrder>,
     pub decimals: HashMap<TokenId, u8>,
 }
 
@@ -29,7 +27,7 @@ pub(crate) struct ClearingBook {
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
-    pub(super) fn apply(&mut self, update: BookUpdate) -> Result<()> {
+    pub(super) fn apply(&mut self, update: BookUpdate) -> Result<(), ClearingError> {
         for id in update.removed {
             self.remove(id);
         }
@@ -41,7 +39,10 @@ impl ClearingBook {
 
     /// Apply the updates queued at the start of the tick. New arrivals wait for
     /// the next receive, so a busy producer cannot postpone matching forever.
-    pub(super) fn apply_pending(&mut self, updates: &mut mpsc::Receiver<BookUpdate>) -> Result<()> {
+    pub(super) fn apply_pending(
+        &mut self,
+        updates: &mut mpsc::Receiver<BookUpdate>,
+    ) -> Result<(), ClearingError> {
         for _ in 0..updates.len() {
             let Ok(update) = updates.try_recv() else {
                 break;
@@ -63,39 +64,50 @@ impl ClearingBook {
         }
     }
 
-    pub fn insert(&mut self, order: &IngestOrder) -> Result<()> {
+    pub fn insert(&mut self, order: &BookOrder) -> Result<(), ClearingError> {
         let id = order.id();
-        let existing = match self.orders.entry(id) {
-            hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hash_map::Entry::Vacant(entry) => entry.insert(Order::from_ingest_order(order)?),
-        };
-        let (pair, key) = existing.index_key();
+        self.orders.insert(id, Order::from_book_order(order)?);
+        self.add_to_index(id)
+    }
+
+    fn add_to_index(&mut self, id: NoteId) -> Result<(), ClearingError> {
+        let (pair, key) = self
+            .orders
+            .get(&id)
+            .ok_or(ClearingError::InternalInvariant("missing order to index"))?
+            .index_key();
         let index = self.pairs.entry(pair).or_default();
         match index.entry(key) {
             btree_map::Entry::Vacant(entry) => {
                 entry.insert(id);
             }
             btree_map::Entry::Occupied(entry) => {
-                ensure!(*entry.get() == id, "duplicate price/FIFO priority");
+                if *entry.get() != id {
+                    return Err(ClearingError::DuplicateBookPriority);
+                }
             }
         }
-        existing.activate();
+        self.orders
+            .get_mut(&id)
+            .ok_or(ClearingError::InternalInvariant("missing indexed order"))?
+            .activate();
         Ok(())
     }
 
     pub fn deactivate(&mut self, id: NoteId) {
         if let Some(order) = self.orders.get_mut(&id) {
             let (pair, key) = order.index_key();
+            // The order record remains for recovery, but the active index must
+            // no longer expose it to matching or RFQ.
             order.deactivate();
             self.remove_from_index(pair, key, id);
         }
     }
 
     /// A routed note may have been removed by ingestion before its lease expires.
-    pub(crate) fn reactivate(&mut self, id: NoteId) -> Result<()> {
-        if let Some(order) = self.orders.get(&id) {
-            let restored = order.to_ingest_order();
-            self.insert(&restored)?;
+    pub(crate) fn reactivate(&mut self, id: NoteId) -> Result<(), ClearingError> {
+        if self.orders.contains_key(&id) {
+            self.add_to_index(id)?;
         }
         Ok(())
     }
@@ -136,10 +148,8 @@ impl ClearingBook {
 
     pub fn remove(&mut self, id: NoteId) {
         if let Some(order) = self.orders.remove(&id) {
-            if order.is_active() {
-                let (pair, key) = order.index_key();
-                self.remove_from_index(pair, key, id);
-            }
+            let (pair, key) = order.index_key();
+            self.remove_from_index(pair, key, id);
         }
     }
 
@@ -177,8 +187,6 @@ impl ClearingBook {
         price: BatchPrice,
         config: &ClearingConfig,
     ) -> Result<PairBatch<'a>, ClearingError> {
-        let base_asset = AssetId::new_fungible(base);
-        let quote_asset = AssetId::new_fungible(quote);
         let sell_orders = self.admit(
             (base, quote),
             OrderSide::SellBase,
@@ -193,7 +201,7 @@ impl ClearingBook {
             config.protocol_fee_ppm,
             config.max_orders_per_side,
         )?;
-        PairBatch::new(base_asset, quote_asset, price, sell_orders, buy_orders)
+        Ok(PairBatch::new(price, sell_orders, buy_orders))
     }
 
     pub(super) fn best_levels_snapshot(&self) -> SwapBookSnapshot {
@@ -240,7 +248,7 @@ mod tests {
         requested: u64,
         seq: u64,
         rng: &mut RandomCoin,
-    ) -> IngestOrder {
+    ) -> BookOrder {
         let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
         let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
@@ -262,7 +270,7 @@ mod tests {
             .build()
             .unwrap()
             .into();
-        IngestOrder {
+        BookOrder {
             priority_seq: seq,
             note: Arc::new(note),
         }
@@ -286,12 +294,12 @@ mod tests {
     }
 
     fn routing_fixture(
-        order: &IngestOrder,
+        order: &BookOrder,
     ) -> (
         crate::router::Routing,
         mpsc::Receiver<crate::router::RouteBatch>,
     ) {
-        let pair = Order::from_ingest_order(order).unwrap().index_key().0;
+        let pair = Order::from_book_order(order).unwrap().index_key().0;
         let quotes = [(
             pair,
             vec![crate::router::Quote {
@@ -336,10 +344,7 @@ mod tests {
         assert!(book.best_levels_snapshot().is_empty());
         routing.release_expired(&mut book, 110).unwrap();
         assert_eq!(admit(&book, false, 100)[0].order().priority_sequence(), 1);
-        assert!(Arc::ptr_eq(
-            &book.orders[&order.id()].to_ingest_order().note,
-            &order.note
-        ));
+        assert_eq!(book.orders[&order.id()].note().id(), order.id());
     }
 
     #[test]
@@ -371,7 +376,7 @@ mod tests {
             let order = fixture(false, 10, 18, 1, &mut rng);
             let mut book = ClearingBook::default();
             book.insert(&order).unwrap();
-            let pair = Order::from_ingest_order(&order).unwrap().index_key().0;
+            let pair = Order::from_book_order(&order).unwrap().index_key().0;
             let quotes = [(
                 pair,
                 vec![crate::router::Quote {
@@ -396,7 +401,6 @@ mod tests {
             let result = routing.dispatch(&mut book, 100);
             assert_eq!(result.is_err(), closed);
             assert_eq!(admit(&book, false, 100).len(), 1);
-            assert!(book.orders[&order.id()].is_active());
         }
     }
 
@@ -404,7 +408,7 @@ mod tests {
     async fn worker_routes_an_unmatched_note_without_legacy_matcher() {
         let mut rng = RandomCoin::new(Word::default());
         let order = fixture(false, 10, 18, 1, &mut rng);
-        let pair = Order::from_ingest_order(&order).unwrap().index_key().0;
+        let pair = Order::from_book_order(&order).unwrap().index_key().0;
         let (routing, mut route_rx) = routing_fixture(&order);
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
         assert!(bootstrap_tx
@@ -563,14 +567,12 @@ mod tests {
             expected
         );
         book.deactivate(earlier.id());
-        assert!(!book.orders[&earlier.id()].is_active());
         assert_eq!(book.orders.len(), 3);
         assert!(!admit(&book, false, 100)
             .iter()
             .any(|order| order.order().id() == earlier.id()));
         book.insert(&earlier).unwrap();
         book.insert(&earlier).unwrap();
-        assert!(book.orders[&earlier.id()].is_active());
         assert_eq!(book.orders.len(), 3);
         assert_eq!(
             admit(&book, false, 100)
@@ -649,7 +651,7 @@ mod tests {
         book.remove(order.id());
         book.remove(order.id());
         assert!(book.orders.is_empty());
-        let pair = Order::from_ingest_order(&order).unwrap().index_key().0;
+        let pair = Order::from_book_order(&order).unwrap().index_key().0;
         assert!(book.pairs[&pair].is_empty());
         assert!(book.best_levels_snapshot().is_empty());
         book.insert(&order).unwrap();
@@ -702,7 +704,7 @@ mod tests {
         let mut rng = RandomCoin::new(Word::default());
         let seller = fixture(false, 11, 18, 1, &mut rng);
         let buyer = fixture(true, 22, 10, 2, &mut rng);
-        let (base, quote) = Order::from_ingest_order(&seller).unwrap().index_key().0;
+        let (base, quote) = Order::from_book_order(&seller).unwrap().index_key().0;
         let mut prices = PreciseSnapshot::new();
         for (token, value) in [(base, "2"), (quote, "1")] {
             prices.insert(

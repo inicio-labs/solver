@@ -44,6 +44,10 @@ pub enum InvalidOrderReason {
 pub enum ClearingError {
     #[error("invalid clearing configuration")]
     InvalidConfig,
+    #[error("a clearing pair must contain different assets")]
+    IdenticalPairAssets,
+    #[error("duplicate clearing pair")]
+    DuplicatePair,
     #[error("invalid clearing price")]
     InvalidPrice,
     #[error("invalid oracle price or token decimals")]
@@ -61,6 +65,8 @@ pub enum ClearingError {
     },
     #[error("envelope interval limit exceeded")]
     ResourceLimit,
+    #[error("duplicate price/FIFO priority in the active book")]
+    DuplicateBookPriority,
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error("arithmetic overflow")]

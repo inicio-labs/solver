@@ -5,6 +5,17 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum ConfigError {
+    #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
+    InvalidPricePrecision(String),
+    #[error("engine.price_vs_currency must be non-empty")]
+    EmptyPriceCurrency,
+    #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
+    InvalidClearingFee { fee: u32, maximum: u32 },
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SolverConfig {
@@ -286,21 +297,21 @@ impl SolverConfig {
     }
 
     /// Validate fields that have constrained domains (fail fast at boot).
-    fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            PricePrecision::parse(&self.engine.price_precision).is_some(),
-            "engine.price_precision must be \"full\" or an integer 0..=18, got {:?}",
-            self.engine.price_precision
-        );
-        anyhow::ensure!(
-            !self.engine.price_vs_currency.trim().is_empty(),
-            "engine.price_vs_currency must be non-empty (a CoinGecko vs_currency like \"usd\")"
-        );
-        anyhow::ensure!(
-            self.engine.clearing_fee_ppm < crate::clearing::PPM_DENOMINATOR,
-            "engine.clearing_fee_ppm must be below {}",
-            crate::clearing::PPM_DENOMINATOR
-        );
+    fn validate(&self) -> std::result::Result<(), ConfigError> {
+        if PricePrecision::parse(&self.engine.price_precision).is_none() {
+            return Err(ConfigError::InvalidPricePrecision(
+                self.engine.price_precision.clone(),
+            ));
+        }
+        if self.engine.price_vs_currency.trim().is_empty() {
+            return Err(ConfigError::EmptyPriceCurrency);
+        }
+        if self.engine.clearing_fee_ppm >= crate::clearing::PPM_DENOMINATOR {
+            return Err(ConfigError::InvalidClearingFee {
+                fee: self.engine.clearing_fee_ppm,
+                maximum: crate::clearing::PPM_DENOMINATOR,
+            });
+        }
         Ok(())
     }
 

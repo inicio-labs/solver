@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use miden_protocol::account::AccountId;
+use thiserror::Error;
 use tokio::task::LocalSet;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,10 @@ use crate::matcher::ClearingRuntime;
 use crate::pipeline::{self, PipelineConfig};
 use crate::price::{PriceClient, SharedTokenMap};
 use crate::types::TokenId;
+
+#[derive(Debug, Error)]
+#[error("critical solver worker stopped unexpectedly")]
+struct CriticalWorkerStopped;
 
 /// Build a `current_thread` tokio runtime + `LocalSet` and run `fut` to
 /// completion on it. Used as the body of each client OS thread so the `!Send`
@@ -418,9 +423,8 @@ pub async fn start(
         }
     })
     .await;
-    anyhow::ensure!(
-        shutdown_requested.is_cancelled(),
-        "critical solver worker stopped unexpectedly"
-    );
+    if !shutdown_requested.is_cancelled() {
+        return Err(CriticalWorkerStopped.into());
+    }
     Ok(())
 }

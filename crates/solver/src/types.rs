@@ -3,6 +3,7 @@ use miden_protocol::account::AccountId;
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// Faucet ID identifying a token.
 pub type TokenId = AccountId;
@@ -12,6 +13,35 @@ pub type OrderId = NoteId;
 
 /// Token amount (u64 to match Miden's native asset amounts).
 pub type Amount = u64;
+
+/// Invalid state detected while preparing, storing, or recovering a settlement.
+#[derive(Debug, Error)]
+pub enum SettlementError {
+    #[error("settlement input belongs to a different transaction")]
+    InputTransactionMismatch,
+    #[error("settlement input order is not active")]
+    InputOrderNotActive,
+    #[error("settlement child ID does not match its note")]
+    ChildIdMismatch,
+    #[error("settlement cannot be confirmed from status {0}")]
+    InvalidConfirmationStatus(String),
+    #[error("expected payback {0} is absent from the executed outputs")]
+    MissingPayback(NoteId),
+    #[error("expected remainder {0} is absent from the executed outputs")]
+    MissingRemainder(NoteId),
+    #[error("recorded transaction ID does not match its transaction result")]
+    RecordedTransactionIdMismatch,
+    #[error("invalid execution group boundary {end} after {previous} for {total} notes")]
+    InvalidExecutionGroupBoundary {
+        previous: usize,
+        end: usize,
+        total: usize,
+    },
+    #[error("execution group has {size} inputs; maximum is {maximum}")]
+    ExecutionGroupTooLarge { size: usize, maximum: usize },
+    #[error("execution groups cover {covered} of {total} notes")]
+    IncompleteExecutionGroups { covered: usize, total: usize },
+}
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it). std has no
 /// single call for this — `SystemTime` + `duration_since(UNIX_EPOCH)` is idiomatic.
@@ -64,7 +94,7 @@ impl OrderStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "active" => Some(OrderStatus::Active),
             "settling" => Some(OrderStatus::Settling),
@@ -125,13 +155,13 @@ impl Order {
 
 /// A shared note and its durable FIFO priority, flowing into the matcher.
 #[derive(Debug, Clone)]
-pub struct IngestOrder {
+pub struct BookOrder {
     /// Durable ingestion FIFO sequence, independent of restart order.
     pub priority_seq: u64,
     pub note: Arc<Note>,
 }
 
-impl IngestOrder {
+impl BookOrder {
     pub fn id(&self) -> OrderId {
         self.note.id()
     }
@@ -142,17 +172,18 @@ impl IngestOrder {
 #[derive(Debug, Default)]
 pub struct BookUpdate {
     pub removed: Vec<OrderId>,
-    pub active: Vec<IngestOrder>,
+    pub active: Vec<BookOrder>,
 }
 
 impl BookUpdate {
+    /// Avoid waking the matcher for a transaction that changed no book entries.
     pub fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.active.is_empty()
     }
 }
 
-impl From<IngestOrder> for BookUpdate {
-    fn from(order: IngestOrder) -> Self {
+impl From<BookOrder> for BookUpdate {
+    fn from(order: BookOrder) -> Self {
         Self {
             removed: Vec::new(),
             active: vec![order],
@@ -175,10 +206,10 @@ pub struct FilledNote {
 
 impl FilledNote {
     /// Re-activate the original note without re-parsing its terms.
-    pub fn to_ingest_order(&self) -> IngestOrder {
-        IngestOrder {
+    pub fn to_book_order(&self) -> BookOrder {
+        BookOrder {
             priority_seq: self.priority_seq,
-            note: Arc::clone(&self.note),
+            note: self.note.clone(),
         }
     }
 }
@@ -194,10 +225,10 @@ pub struct ExecutionBatch {
 }
 
 impl ExecutionBatch {
-    pub fn source_orders(&self) -> Vec<IngestOrder> {
+    pub fn book_orders(&self) -> Vec<BookOrder> {
         self.filled_notes
             .iter()
-            .map(FilledNote::to_ingest_order)
+            .map(FilledNote::to_book_order)
             .collect()
     }
 }

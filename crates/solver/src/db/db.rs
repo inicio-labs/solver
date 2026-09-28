@@ -1,4 +1,4 @@
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, Result};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
@@ -13,7 +13,7 @@ use miden_protocol::note::Note;
 
 use crate::db::models::*;
 use crate::db::schema::*;
-use crate::types::{BookUpdate, IngestOrder, OrderId, OrderStatus, TokenId};
+use crate::types::{BookOrder, BookUpdate, OrderId, OrderStatus, SettlementError, TokenId};
 
 pub type DbConn = r2d2::PooledConnection<ConnectionManager<SqliteConnection>>;
 
@@ -208,10 +208,9 @@ pub fn prepare_settlement(
             .values(attempt)
             .execute(conn)?;
         for input in inputs {
-            ensure!(
-                input.tx_id == attempt.tx_id,
-                "settlement input has wrong transaction ID"
-            );
+            if input.tx_id != attempt.tx_id {
+                return Err(SettlementError::InputTransactionMismatch.into());
+            }
             let changed = diesel::update(
                 orders::table
                     .find(&input.parent_note_id)
@@ -219,7 +218,9 @@ pub fn prepare_settlement(
             )
             .set(orders::status.eq(OrderStatus::Settling.as_str()))
             .execute(conn)?;
-            ensure!(changed == 1, "settlement input is not active");
+            if changed != 1 {
+                return Err(SettlementError::InputOrderNotActive.into());
+            }
         }
         diesel::insert_into(settlement_inputs::table)
             .values(inputs)
@@ -280,7 +281,7 @@ pub fn settlement_payback_id(conn: &mut SqliteConnection, tx_id: &[u8]) -> Resul
     Ok(OrderId::read_from(&mut SliceReader::new(&bytes))?)
 }
 
-pub fn settlement_parents(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<Vec<IngestOrder>> {
+pub fn settlement_parents(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<Vec<BookOrder>> {
     // A missing persisted parent must fail recovery, not silently disappear.
     let parents: Vec<(Option<OrderRow>, Option<Vec<u8>>)> = settlement_inputs::table
         .left_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
@@ -293,7 +294,7 @@ pub fn settlement_parents(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<V
         .map(|(row, raw)| {
             let row = row.ok_or_else(|| anyhow!("settlement parent order missing"))?;
             let raw = raw.ok_or_else(|| anyhow!("settlement parent note missing"))?;
-            row.into_ingest(raw)
+            row.into_book_order(raw)
         })
         .collect()
 }
@@ -345,7 +346,7 @@ pub fn finish_discarded_settlement(
 /// consumed, or a different attempt reserved, while the re-feed was waiting.
 pub fn active_book_update(
     conn: &mut SqliteConnection,
-    candidates: Vec<IngestOrder>,
+    candidates: Vec<BookOrder>,
 ) -> Result<BookUpdate> {
     let ids: Vec<_> = candidates
         .iter()
@@ -368,19 +369,18 @@ pub fn active_book_update(
 }
 
 impl SettlementInputRow {
-    fn child_order(&self, priority_seq: u64) -> Result<Option<(IngestOrder, crate::types::Order)>> {
+    fn child_order(&self, priority_seq: u64) -> Result<Option<(BookOrder, crate::types::Order)>> {
         let (Some(child_id), Some(raw_note_data)) = (&self.child_note_id, &self.child_note_data)
         else {
             return Ok(None);
         };
         let note = Note::read_from(&mut SliceReader::new(raw_note_data))?;
-        ensure!(
-            note.id().to_bytes().as_slice() == child_id,
-            "settlement child ID mismatch"
-        );
+        if note.id().to_bytes().as_slice() != child_id {
+            return Err(SettlementError::ChildIdMismatch.into());
+        }
         let parsed = crate::types::Order::from_note(&note)?;
         Ok(Some((
-            IngestOrder {
+            BookOrder {
                 priority_seq,
                 note: std::sync::Arc::new(note),
             },
@@ -400,13 +400,12 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
         if status == "confirmed" {
             return Ok(BookUpdate::default());
         }
-        ensure!(
-            matches!(
-                status.as_str(),
-                "prepared" | "submitted" | "uncertain" | "rejected"
-            ),
-            "invalid settlement status for confirmation"
-        );
+        if !matches!(
+            status.as_str(),
+            "prepared" | "submitted" | "uncertain" | "rejected"
+        ) {
+            return Err(SettlementError::InvalidConfirmationStatus(status).into());
+        }
 
         let inputs: Vec<SettlementInputRow> = settlement_inputs::table
             .filter(settlement_inputs::tx_id.eq(tx_id))
@@ -524,7 +523,7 @@ pub fn mark_orders_onchain_nullified(
 /// hydrate an in-memory `OrderBook`. The matcher calls this on startup so that
 /// orders ingest persisted but never delivered (channel send failed, process
 /// crashed) are still picked up — DB is the source of truth.
-pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<IngestOrder>> {
+pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<BookOrder>> {
     let rows: Vec<(OrderRow, Vec<u8>)> = orders::table
         .inner_join(notes::table.on(orders::note_id.eq(notes::note_id)))
         .filter(orders::status.eq(OrderStatus::Active.as_str()))
@@ -534,7 +533,7 @@ pub fn load_active_orders_with_notes(conn: &mut SqliteConnection) -> Result<Vec<
 
     let mut out = Vec::with_capacity(rows.len());
     for (order_row, raw_data) in rows {
-        match order_row.into_ingest(raw_data) {
+        match order_row.into_book_order(raw_data) {
             Ok(order) if order.priority_seq > 0 => out.push(order),
             Ok(_) => anyhow::bail!("active order lacks persisted FIFO sequence"),
             Err(e) => {
@@ -851,16 +850,16 @@ mod tests {
             .select(OrderRow::as_select())
             .first(&mut conn)
             .unwrap();
-        let ingested = row.clone().into_ingest(parent.to_bytes()).unwrap();
+        let ingested = row.clone().into_book_order(parent.to_bytes()).unwrap();
         assert_eq!(ingested.id(), parent.id());
         assert_eq!(ingested.priority_seq, priority as u64);
         assert_eq!(ingested.note.as_ref(), &parent);
         let mut wrong_amount = row.clone();
         wrong_amount.requested_amount += 1;
-        assert!(wrong_amount.into_ingest(parent.to_bytes()).is_err());
+        assert!(wrong_amount.into_book_order(parent.to_bytes()).is_err());
         let mut wrong_asset = row;
         wrong_asset.requested_asset = wrong_asset.offered_asset.clone();
-        assert!(wrong_asset.into_ingest(parent.to_bytes()).is_err());
+        assert!(wrong_asset.into_book_order(parent.to_bytes()).is_err());
     }
 
     #[test]

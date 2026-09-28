@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS settlement_inputs (
     CHECK ((child_note_id IS NULL) = (child_note_data IS NULL))
 );
 CREATE INDEX IF NOT EXISTS settlement_inputs_child_idx ON settlement_inputs(child_note_id);
+CREATE INDEX IF NOT EXISTS settlement_inputs_parent_idx ON settlement_inputs(parent_note_id);
 
 CREATE TABLE IF NOT EXISTS generated_notes (
     note_id BLOB PRIMARY KEY,

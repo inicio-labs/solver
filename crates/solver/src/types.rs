@@ -158,6 +158,8 @@ impl Order {
 pub struct BookOrder {
     /// Durable ingestion FIFO sequence, independent of restart order.
     pub priority_seq: u64,
+    /// First durable observation time. Re-feeds and remainders preserve it.
+    pub arrival_unix: UnixSecs,
     pub note: Arc<Note>,
 }
 
@@ -198,9 +200,8 @@ pub struct FilledNote {
     pub priority_seq: u64,
     pub requested_filled: Amount,
     pub note: Arc<Note>,
-    /// When the matcher first observed this order (stamped in-memory, not from
-    /// the DB). Carried to the executor so it can record the settlement duration
-    /// (`settled − arrival`) for the in-memory swap-eta window.
+    /// First durable observation time, carried through re-feeds and remainders
+    /// so the executor can record `settled - arrival` consistently.
     pub arrival_unix: UnixSecs,
 }
 
@@ -209,6 +210,7 @@ impl FilledNote {
     pub fn to_book_order(&self) -> BookOrder {
         BookOrder {
             priority_seq: self.priority_seq,
+            arrival_unix: self.arrival_unix,
             note: self.note.clone(),
         }
     }

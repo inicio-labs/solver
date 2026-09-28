@@ -73,6 +73,9 @@ impl r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for WalCus
         diesel::sql_query("PRAGMA synchronous=NORMAL")
             .execute(conn)
             .map_err(diesel::r2d2::Error::QueryError)?;
+        diesel::sql_query("PRAGMA foreign_keys=ON")
+            .execute(conn)
+            .map_err(diesel::r2d2::Error::QueryError)?;
         Ok(())
     }
 }
@@ -369,7 +372,11 @@ pub fn active_book_update(
 }
 
 impl SettlementInputRow {
-    fn child_order(&self, priority_seq: u64) -> Result<Option<(BookOrder, crate::types::Order)>> {
+    fn child_order(
+        &self,
+        priority_seq: u64,
+        arrival_unix: u64,
+    ) -> Result<Option<(BookOrder, crate::types::Order)>> {
         let (Some(child_id), Some(raw_note_data)) = (&self.child_note_id, &self.child_note_data)
         else {
             return Ok(None);
@@ -382,6 +389,7 @@ impl SettlementInputRow {
         Ok(Some((
             BookOrder {
                 priority_seq,
+                arrival_unix,
                 note: std::sync::Arc::new(note),
             },
             parsed,
@@ -419,7 +427,10 @@ pub fn confirm_settlement(conn: &mut SqliteConnection, tx_id: &[u8]) -> Result<B
                 .first(conn)?;
             let parent_id = OrderId::read_from(&mut SliceReader::new(&input.parent_note_id))?;
             activation.removed.push(parent_id);
-            if let Some((child, terms)) = input.child_order(u64::try_from(parent.priority_seq)?)? {
+            if let Some((child, terms)) = input.child_order(
+                u64::try_from(parent.priority_seq)?,
+                u64::try_from(parent.timestamp)?,
+            )? {
                 diesel::insert_or_ignore_into(notes::table)
                     .values(NoteRow {
                         note_id: child.id().to_bytes().to_vec(),

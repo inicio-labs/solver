@@ -70,6 +70,7 @@ impl OrderRow {
         }
         Ok(BookOrder {
             priority_seq: u64::try_from(self.priority_seq)?,
+            arrival_unix: u64::try_from(self.timestamp)?,
             note: std::sync::Arc::new(note),
         })
     }

@@ -309,6 +309,7 @@ mod tests {
         let note: Note = original.pswap_note().clone().into();
         let mut ingested = BookOrder {
             priority_seq: 7,
+            arrival_unix: 1,
             note: Arc::new(note),
         };
         assert_eq!(
@@ -744,6 +745,7 @@ mod tests {
                 let note: Note = order.pswap_note().clone().into();
                 BookOrder {
                     priority_seq: order.priority_sequence(),
+                    arrival_unix: 1,
                     note: Arc::new(note),
                 }
             })

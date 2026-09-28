@@ -40,10 +40,14 @@ pub struct Order {
 
 impl Order {
     pub fn from_note(note: &Note, priority_sequence: u64) -> Result<Self, ClearingError> {
-        Self::new(Arc::new(note.clone()), priority_sequence)
+        Self::new(Arc::new(note.clone()), priority_sequence, now_unix())
     }
 
-    fn new(note: Arc<Note>, priority_sequence: u64) -> Result<Self, ClearingError> {
+    fn new(
+        note: Arc<Note>,
+        priority_sequence: u64,
+        arrival_unix: UnixSecs,
+    ) -> Result<Self, ClearingError> {
         let priority = NonZeroU64::new(priority_sequence).ok_or(ClearingError::InvalidOrder {
             note_id: note.id(),
             reason: InvalidOrderReason::MissingPriority,
@@ -58,13 +62,13 @@ impl Order {
             note,
             priority,
             status: BookStatus::Active,
-            arrival_unix: now_unix(),
+            arrival_unix,
         })
     }
 
     /// Parse the shared original note once, preserving its attachments.
     pub fn from_book_order(order: &BookOrder) -> Result<Self, ClearingError> {
-        Self::new(order.note.clone(), order.priority_seq)
+        Self::new(order.note.clone(), order.priority_seq, order.arrival_unix)
     }
 
     pub fn id(&self) -> NoteId {

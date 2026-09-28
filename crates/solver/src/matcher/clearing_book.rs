@@ -272,6 +272,7 @@ mod tests {
             .into();
         BookOrder {
             priority_seq: seq,
+            arrival_unix: 1,
             note: Arc::new(note),
         }
     }

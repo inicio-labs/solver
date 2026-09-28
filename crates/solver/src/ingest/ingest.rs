@@ -4,7 +4,7 @@ use diesel::{Connection, SqliteConnection};
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
 use miden_client::rpc::{NodeRpcClient, RpcError};
-use miden_client::Client;
+use miden_client::{Client, ClientError};
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
@@ -94,21 +94,37 @@ pub async fn run_ingest(
     solver_id: AccountId,
 ) {
     loop {
-        // An error after client sync may have advanced its durable cursor. Stop
-        // rather than silently losing that sync's events; boot replays stored notes.
-        match ingest_once(&client, &pool, &book_tx, solver_id).await {
-            Ok(()) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                last_sync_unix_seconds.store(now, Ordering::Relaxed);
+        let sync = match client.lock().await.sync_state().await {
+            Ok(sync) => Some(sync),
+            Err(error) if is_rpc_error(&error) => {
+                tracing::warn!(%error, "ingest RPC failed; retrying next tick");
+                None
             }
-            Err(e) => {
-                tracing::error!(error = %e, "ingest failed; restarting for reconciliation");
+            Err(error) => {
+                tracing::error!(%error, "ingest client failed; stopping pipeline");
                 cancel.cancel();
                 return;
             }
+        };
+
+        if let Some(sync) = sync {
+            // Sync may already have advanced the client's durable cursor. A DB
+            // or matcher-channel failure now needs coordinated restart so boot
+            // can replay the client's stored discoveries without losing them.
+            if let Err(error) = pool
+                .update_book(&book_tx, |conn| sync.persist(conn, solver_id))
+                .await
+            {
+                tracing::error!(%error, "persisting ingest update failed; stopping pipeline");
+                cancel.cancel();
+                return;
+            }
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            last_sync_unix_seconds.store(now, Ordering::Relaxed);
         }
         // The idle wait stays cancellable (and stays at the end so the first
         // tick fires immediately, not after `interval`). This is where a
@@ -122,17 +138,11 @@ pub async fn run_ingest(
     tracing::info!("ingest cancelled, shutting down");
 }
 
-/// Single iteration of the ingest loop.
-#[tracing::instrument(skip_all)]
-async fn ingest_once(
-    client: &Arc<Mutex<dyn MidenClient>>,
-    pool: &DbPool,
-    book_tx: &mpsc::Sender<BookUpdate>,
-    solver_id: AccountId,
-) -> Result<()> {
-    let sync = client.lock().await.sync_state().await?;
-    pool.update_book(book_tx, |conn| sync.persist(conn, solver_id))
-        .await
+fn is_rpc_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ClientError>()
+        .is_some_and(|error| matches!(error, ClientError::RpcError(_)))
+        || error.downcast_ref::<RpcError>().is_some()
 }
 
 impl SyncResult {
@@ -229,6 +239,10 @@ impl SyncResult {
                 raw_data,
             });
 
+            let arrival_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             db_orders.push(OrderRow {
                 note_id: note_id_bytes,
                 account_id: order.creator_id.to_bytes().to_vec(),
@@ -236,16 +250,14 @@ impl SyncResult {
                 requested_amount: order.requested_amount as i64,
                 offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
                 offered_amount: order.offered_amount as i64,
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
+                timestamp: arrival_unix as i64,
                 status: OrderStatus::Active.as_str().to_string(),
                 priority_seq: 0, // assigned by the DB trigger on first insert
             });
 
             ingest_orders.push(BookOrder {
                 priority_seq: 0, // replaced with the persisted sequence after insert
+                arrival_unix,
                 note: Arc::new(note.clone()),
             });
         }
@@ -373,10 +385,7 @@ impl MidenClient for MidenClientAdapter {
     #[tracing::instrument(skip(self), fields(block_num, new_pub, new_priv))]
     async fn sync_state(&mut self) -> Result<SyncResult> {
         let mut client = self.client.lock().await;
-        let summary = client
-            .sync_state()
-            .await
-            .map_err(|e| anyhow!("sync_state failed: {e}"))?;
+        let summary = client.sync_state().await.context("sync_state failed")?;
 
         // Populate span fields so structured logs carry sync stats.
         let span = tracing::Span::current();
@@ -438,7 +447,7 @@ impl MidenClient for MidenClientAdapter {
             .rpc
             .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
             .await
-            .map_err(|e| anyhow!("get_nullifier_commit_heights failed: {e}"))?;
+            .context("get_nullifier_commit_heights failed")?;
 
         let mut consumed = HashSet::new();
         for (nullifier, maybe_height) in heights {
@@ -770,6 +779,7 @@ pub mod tests {
         /// Set of note IDs that should be reported as consumed by
         /// `check_consumed_notes`. Persistent — represents on-chain state.
         consumed_set: HashSet<NoteId>,
+        sync_rpc_failures: usize,
         pub fail_consumed_check: bool,
         /// Canned on-chain metadata returned by `fetch_token_metadata`
         /// (`None` = the faucet has no public metadata).
@@ -784,6 +794,7 @@ pub mod tests {
                 block: 0,
                 pending_consumed: Vec::new(),
                 consumed_set: HashSet::new(),
+                sync_rpc_failures: 0,
                 fail_consumed_check: false,
                 token_metadata: None,
             }
@@ -792,6 +803,10 @@ pub mod tests {
         /// Stage the `(decimals, ticker)` that `fetch_token_metadata` returns.
         pub fn set_token_metadata(&mut self, decimals: u8, ticker: &str) {
             self.token_metadata = Some((decimals, ticker.to_string()));
+        }
+
+        pub fn fail_next_syncs(&mut self, count: usize) {
+            self.sync_rpc_failures = count;
         }
 
         pub fn add_notes(&mut self, notes: Vec<Note>, block: u64) {
@@ -834,6 +849,13 @@ pub mod tests {
         }
 
         async fn sync_state(&mut self) -> Result<SyncResult> {
+            if self.sync_rpc_failures > 0 {
+                self.sync_rpc_failures -= 1;
+                return Err(ClientError::RpcError(RpcError::InvalidNodeEndpoint(
+                    "mock transient failure".to_string(),
+                ))
+                .into());
+            }
             let consumed = std::mem::take(&mut self.pending_consumed);
             Ok(SyncResult {
                 block_num: self.block,
@@ -857,5 +879,47 @@ pub mod tests {
         ) -> Result<Option<(u8, String)>> {
             Ok(self.token_metadata.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn transient_ingest_rpc_failure_retries_without_cancelling_pipeline() {
+        let pool = db::init_db(":memory:", 1).unwrap();
+        let (_, _, solver) = fixture();
+        let mut mock = MockMidenClient::new();
+        mock.add_notes(Vec::new(), 7);
+        mock.fail_next_syncs(1);
+        let client: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(mock));
+        let (book_tx, _book_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let last_sync = Arc::new(AtomicI64::new(0));
+
+        let ingest = run_ingest(
+            client,
+            pool.clone(),
+            book_tx,
+            Duration::from_millis(1),
+            cancel.clone(),
+            last_sync.clone(),
+            solver,
+        );
+        tokio::pin!(ingest);
+
+        let observed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if db::get_last_fetched_block(&mut pool.write_conn().unwrap()).unwrap() == 7 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        tokio::select! {
+            _ = &mut ingest => panic!("ingest stopped after a transient RPC failure"),
+            result = observed => result.unwrap(),
+        }
+
+        assert!(!cancel.is_cancelled());
+        assert!(last_sync.load(Ordering::Relaxed) > 0);
+        cancel.cancel();
+        ingest.await;
     }
 }

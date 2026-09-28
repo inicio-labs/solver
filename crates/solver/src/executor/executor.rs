@@ -794,6 +794,9 @@ async fn reconcile_settlement(
         // The executor may have crashed after network acceptance but before
         // its own client store recorded the transaction. A known output
         // proves the whole atomic settlement committed, even for full fills.
+        // Read height first so an older negative payback lookup can never be
+        // combined with a newer, post-expiry chain height.
+        let expired = settlement_has_expired(client, &settlement.attempt).await?;
         let Some(payback_is_included) =
             expected_payback_is_included(miden_adapter, settlement.payback_id).await?
         else {
@@ -803,7 +806,7 @@ async fn reconcile_settlement(
             activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
             return Ok(true);
         }
-        if settlement_has_expired(client, &settlement.attempt).await? {
+        if expired {
             return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
         }
         if settlement.attempt.status != "uncertain"
@@ -825,6 +828,18 @@ async fn reconcile_settlement(
             // A client-side discard can race with a previously accepted copy.
             // Its payback proves commitment even if the local transaction
             // record never moved to Committed.
+            let waits_for_expiry = matches!(
+                reason,
+                DiscardCause::Stale | DiscardCause::DiscardedInitialState
+            );
+            // For ambiguous discards, capture expiry before checking payback.
+            // If expiry has passed, this makes the subsequent negative lookup
+            // authoritative for that already-expired transaction.
+            let expired = if waits_for_expiry {
+                settlement_has_expired(client, &settlement.attempt).await?
+            } else {
+                false
+            };
             let Some(payback_is_included) =
                 expected_payback_is_included(miden_adapter, settlement.payback_id).await?
             else {
@@ -835,14 +850,11 @@ async fn reconcile_settlement(
                 return Ok(true);
             }
 
-            if matches!(
-                reason,
-                DiscardCause::Stale | DiscardCause::DiscardedInitialState
-            ) {
+            if waits_for_expiry {
                 // A local discard is not enough to release inputs. Wait for
                 // the transaction's on-chain expiration, then classify each
                 // parent by nullifier before reactivating anything.
-                if settlement_has_expired(client, &settlement.attempt).await? {
+                if expired {
                     let released =
                         release_rejected_settlement(miden_adapter, pool, settlement, book_tx)
                             .await?;

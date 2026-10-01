@@ -73,14 +73,16 @@ async fn wait_for_confirmed_attempt(db_url: &str) -> Result<()> {
     loop {
         let url = db_url.to_owned();
         let confirmed = tokio::task::spawn_blocking(move || -> Result<bool> {
-            use solver::db::postgres_schema::settlement_attempts;
+            use solver::db::postgres_schema::{orders, settlement_attempts};
 
+            // Confirmation retires the parents and deletes the attempt.
             let mut conn = solver::db::postgres_migrations::connect(&url)?;
-            let count: i64 = settlement_attempts::table
-                .filter(settlement_attempts::status.eq("confirmed"))
+            let unresolved: i64 = settlement_attempts::table.count().get_result(&mut conn)?;
+            let executed: i64 = orders::table
+                .filter(orders::status.eq("executed"))
                 .count()
                 .get_result(&mut conn)?;
-            Ok(count == 1)
+            Ok(unresolved == 0 && executed > 0)
         })
         .await??;
         if confirmed {

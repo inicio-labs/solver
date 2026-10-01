@@ -27,12 +27,21 @@ pub(crate) struct ClearingBook {
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
+    ///
+    /// One order that cannot be indexed — malformed, or a stale parent whose
+    /// remainder already holds its FIFO slot — is left out of the live book
+    /// rather than stopping matching for every other order. It stays Active
+    /// in the database and is rehydrated on the next boot.
     pub(super) fn apply(&mut self, update: BookUpdate) -> Result<(), ClearingError> {
         for id in update.removed {
             self.remove(id);
         }
         for order in update.active {
-            self.insert(&order)?;
+            if let Err(error) = self.insert(&order) {
+                let id = order.id();
+                self.remove(id);
+                tracing::warn!(note_id = %id, %error, "skipping order the live book cannot index");
+            }
         }
         Ok(())
     }
@@ -914,5 +923,29 @@ mod tests {
             .expect("matcher must stop even when the executor queue is full")
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn apply_skips_an_order_whose_fifo_slot_is_taken_and_keeps_matching() {
+        let mut rng = RandomCoin::new(Word::default());
+        // Same pair, price and priority: a remainder holds the slot a stale
+        // parent activation would also claim.
+        let holder = fixture(false, 11, 18, 5, &mut rng);
+        let stale = fixture(false, 11, 18, 5, &mut rng);
+        let other = fixture(true, 22, 10, 6, &mut rng);
+        assert_ne!(holder.id(), stale.id());
+
+        let mut book = ClearingBook::default();
+        book.apply(BookUpdate {
+            removed: Vec::new(),
+            active: vec![holder.clone(), stale.clone(), other.clone()],
+        })
+        .expect("one unindexable order must not stop the matcher");
+
+        assert!(book.orders.contains_key(&holder.id()));
+        assert!(book.orders.contains_key(&other.id()));
+        assert!(!book.orders.contains_key(&stale.id()));
+        let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
+        assert_eq!(indexed, 2, "the slot still belongs to the holder");
     }
 }

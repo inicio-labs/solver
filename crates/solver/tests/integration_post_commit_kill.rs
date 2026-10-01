@@ -85,8 +85,8 @@ async fn process_kill_after_commit_restores_book() -> Result<()> {
     let survivor = order_note(rng.draw_word())?;
     let parent_id = parent.id().to_bytes();
     let survivor_id = survivor.id();
-    let (parent_note, parent_order) = NewOrderRow::ingested(&parent, 10)?;
-    let (survivor_note, survivor_order) = NewOrderRow::ingested(&survivor, 11)?;
+    let parent_order = NewOrderRow::ingested(&parent, 10)?;
+    let survivor_order = NewOrderRow::ingested(&survivor, 11)?;
     let pool = DbPool::open(
         pg.url.clone(),
         pg.url.clone(),
@@ -95,12 +95,7 @@ async fn process_kill_after_commit_restores_book() -> Result<()> {
     )
     .await?;
     pool.write(move |conn| {
-        postgres_db::insert_notes_batch_tx(
-            conn,
-            &[parent_note, survivor_note],
-            &[parent_order, survivor_order],
-            1,
-        )?;
+        postgres_db::insert_orders_batch_tx(conn, &[parent_order, survivor_order], 1)?;
         Ok(())
     })
     .await?;
@@ -160,9 +155,7 @@ async fn process_kill_after_commit_restores_book() -> Result<()> {
     .await
     .context("new solver could not reacquire PostgreSQL ownership")?;
     restarted.readiness_check().await?;
-    let restored = restarted
-        .read(postgres_db::load_active_orders_with_notes_tx)
-        .await?;
+    let restored = restarted.read(postgres_db::load_active_orders_tx).await?;
     assert_eq!(restored.len(), 1, "startup hydration used stale book state");
     assert_eq!(restored[0].id(), survivor_id);
     assert_ne!(restored[0].id().to_bytes(), parent_id);

@@ -142,7 +142,9 @@ SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integrat
 
 The separate `integration_unpriced_direct` test is intentionally red for the
 pre-existing unpriced-token audit finding C2 and is not part of this migration
-gate.
+gate; running `cargo test -p solver -- --ignored` without `--lib` includes it.
+Deploy and rollback order for later schema changes is in
+[docs/postgres-runbook.md](docs/postgres-runbook.md#schema-migrations).
 
 ### `[rpc]`
 | Field | Req | Description |
@@ -158,6 +160,7 @@ gate.
 | `executor_store_path` | ✅ | miden-client store for the **executor** (signing) client. The solver account state lives here. |
 | `ingest_store_path` | ✅ | miden-client store for the **keyless ingest** client. **Must be a distinct file** from the executor store. |
 | `read_pool_size` | — | Concurrent PostgreSQL read connections. Default `4`. |
+| `app_db_path` | removed | Former SQLite application database path. Ignored if still present; the application database is PostgreSQL (`SOLVER_DATABASE_URL`). |
 
 ### `[[pairs]]` (one block per trading pair)
 | Field | Req | Description |
@@ -360,7 +363,7 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
 
 ```bash
 cargo test -p solver               # unit + integration + adversarial proptest
-SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --lib -- --ignored --test-threads=2
 cargo test -p consume-script       # MASM script compiles + behaves
 ```
 - **Adversarial fuzzing:** `crates/solver/src/matching/tests/test_proptest_adversarial.rs`

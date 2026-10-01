@@ -33,30 +33,32 @@ async fn remainder_state(
     let url = db_url.to_owned();
     let parent_note_id = parent_note_id.to_vec();
     tokio::task::spawn_blocking(move || -> Result<_> {
-        use solver::db::postgres_schema::{orders, settlement_inputs};
+        use solver::db::postgres_schema::orders;
 
         let mut conn = solver::db::postgres_migrations::connect(&url)?;
-        let child_note_id: Option<Vec<u8>> = settlement_inputs::table
-            .filter(settlement_inputs::parent_note_id.eq(&parent_note_id))
-            .select(settlement_inputs::child_note_id)
-            .first::<Option<Vec<u8>>>(&mut conn)
-            .optional()?
-            .flatten();
-        let Some(child_note_id) = child_note_id else {
-            return Ok(None);
-        };
-        let (parent_status, parent_priority): (String, i64) = orders::table
+        let Some((parent_status, parent_priority)) = orders::table
             .find(&parent_note_id)
             .select((orders::status, orders::priority_seq))
-            .first(&mut conn)?;
-        let Some((child_status, child_priority, child_offered_amount)) = orders::table
-            .find(&child_note_id)
-            .select((orders::status, orders::priority_seq, orders::offered_amount))
-            .first::<(String, i64, i64)>(&mut conn)
+            .first::<(String, i64)>(&mut conn)
             .optional()?
         else {
             return Ok(None);
         };
+        // A confirmed settlement deletes its attempt and input rows, so the
+        // remainder is found by the FIFO slot it inherits from its parent.
+        let Some((child_status, child_priority, child_raw)) = orders::table
+            .filter(orders::priority_seq.eq(parent_priority))
+            .filter(orders::note_id.ne(&parent_note_id))
+            .select((orders::status, orders::priority_seq, orders::raw_data))
+            .first::<(String, i64, Vec<u8>)>(&mut conn)
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        // An order's terms live only in its serialized note.
+        let child_note = <miden_protocol::note::Note as miden_protocol::crypto::utils::Deserializable>::read_from_bytes(&child_raw)?;
+        let child_offered_amount =
+            i64::try_from(solver::types::Order::from_note(&child_note)?.offered_amount)?;
         Ok(Some((
             parent_status,
             parent_priority,
@@ -268,11 +270,17 @@ async fn partial_fill_repro() -> Result<()> {
                 if committed < initial + 2 {
                     bail!("partial settlement produced fewer than two payback notes: committed={committed}, before={initial}");
                 }
+                // Ingest stores the remainder as soon as it appears on chain,
+                // before the executor confirms our transaction ID; wait for the
+                // parent to be retired, keeping the last state seen for the error.
                 let mut persisted = None;
-                for _ in 0..100 {
+                for _ in 0..600 {
                     if let Some(state) = remainder_state(&pg.url, &maker_note_id).await? {
+                        let confirmed = state.0 == "executed";
                         persisted = Some(state);
-                        break;
+                        if confirmed {
+                            break;
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }

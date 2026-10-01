@@ -22,6 +22,10 @@ use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
 /// batches, consumed-note notifications), used by `create_channels`.
 const PIPELINE_CHANNEL_BUF: usize = 5000;
+/// At most one batch waits for the executor. When it stops receiving
+/// (verification mode) the matcher's `try_reserve` fails on the next tick,
+/// so orders stay live in its book instead of queueing at stale prices.
+const EXEC_CHANNEL_BUF: usize = 1;
 /// Admin → subscribe-relay buffer. Low-traffic (infrequent operator actions).
 const SUBSCRIBE_CHANNEL_BUF: usize = 100;
 
@@ -216,7 +220,7 @@ pub fn create_channels() -> PipelineChannels {
         watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
-    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(PIPELINE_CHANNEL_BUF);
+    let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(EXEC_CHANNEL_BUF);
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let (quotes_tx, quotes_rx) = watch::channel(Arc::new(QuotesSnapshot::new()));
     let (route_tx, route_rx) = mpsc::channel(PIPELINE_CHANNEL_BUF);
@@ -437,7 +441,7 @@ async fn reconcile_clearing_book(
 ) -> Result<matcher::ClearingBootstrap> {
     let (mut orders, decimals) = pool
         .read(|conn| {
-            let orders = db::postgres_db::load_active_orders_with_notes_tx(conn)?;
+            let orders = db::postgres_db::load_active_orders_tx(conn)?;
             let mut decimals = HashMap::new();
             for token in db::postgres_db::get_registered_tokens_tx(conn)? {
                 if let Some(value) = token.decimals {
@@ -518,7 +522,6 @@ mod tests {
             .unwrap();
         let mut rng = RandomCoin::new(Word::default());
         let mut ids = Vec::new();
-        let mut note_rows = Vec::new();
         let mut order_rows = Vec::new();
         for _ in 0..2 {
             let note: Note = PswapNote::builder()
@@ -536,8 +539,7 @@ mod tests {
                 .build()
                 .unwrap()
                 .into();
-            let (note_row, order_row) = NewOrderRow::ingested(&note, 1).unwrap();
-            note_rows.push(note_row);
+            let order_row = NewOrderRow::ingested(&note, 1).unwrap();
             order_rows.push(order_row);
             ids.push(note.id());
         }
@@ -546,7 +548,7 @@ mod tests {
                 db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
                 db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(6), None)?;
             }
-            db::postgres_db::insert_notes_batch_tx(conn, &note_rows, &order_rows, 1)?;
+            db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
             Ok(())
         })
         .await
@@ -561,7 +563,7 @@ mod tests {
         let pool = &test_db.pool;
         let ids = persist_clearing_notes(pool).await;
         let before = pool
-            .read(db::postgres_db::load_active_orders_with_notes_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         let mut client = MockMidenClient::new();
@@ -572,7 +574,7 @@ mod tests {
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_with_notes_tx)
+            pool.read(db::postgres_db::load_active_orders_tx)
                 .await
                 .unwrap()
                 .len(),
@@ -590,7 +592,7 @@ mod tests {
         client.fail_consumed_check = true;
         assert!(reconcile_clearing_book(&pool, &mut client).await.is_err());
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_with_notes_tx)
+            pool.read(db::postgres_db::load_active_orders_tx)
                 .await
                 .unwrap()
                 .len(),

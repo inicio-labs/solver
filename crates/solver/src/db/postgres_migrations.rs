@@ -93,7 +93,7 @@ pub fn verify(conn: &mut PgConnection) -> Result<()> {
     let tables: BaselineTables = diesel::sql_query(
         "SELECT count(*)::bigint AS present
          FROM unnest(ARRAY[
-             '__diesel_schema_migrations', 'sync_state', 'notes', 'orders',
+             '__diesel_schema_migrations', 'sync_state', 'orders',
              'settlement_attempts', 'settlement_inputs', 'registered_tokens'
          ]) AS expected(table_name)
          JOIN pg_class AS c ON c.oid = to_regclass(expected.table_name)
@@ -103,7 +103,7 @@ pub fn verify(conn: &mut PgConnection) -> Result<()> {
     )
     .get_result(conn)
     .context("verify PostgreSQL baseline tables")?;
-    if tables.present != 7 {
+    if tables.present != 6 {
         bail!("PostgreSQL baseline tables are missing or resolve to different schemas");
     }
     Ok(())
@@ -221,28 +221,18 @@ mod tests {
         let conn = &mut fixture.conn;
         migrate(conn)?;
         conn.batch_execute("BEGIN")?;
-        conn.batch_execute(
-            "INSERT INTO notes (note_id, account_id, raw_data) VALUES
-             (decode('01', 'hex'), decode('aa', 'hex'), decode('11', 'hex')),
-             (decode('02', 'hex'), decode('aa', 'hex'), decode('22', 'hex')),
-             (decode('03', 'hex'), decode('aa', 'hex'), decode('33', 'hex'))",
-        )?;
 
         let first: PriorityRow = diesel::sql_query(
-            "INSERT INTO orders (note_id, account_id, requested_asset, requested_amount,
-              offered_asset, offered_amount, arrival_unix)
-             VALUES (decode('01', 'hex'), decode('aa', 'hex'), decode('10', 'hex'), 1,
-                     decode('20', 'hex'), 2, 42)
+            "INSERT INTO orders (note_id, raw_data, arrival_unix)
+             VALUES (decode('01', 'hex'), decode('11', 'hex'), 42)
              RETURNING priority_seq",
         )
         .get_result(conn)?;
         assert!(first.priority_seq > 0);
 
         let child: PriorityRow = diesel::sql_query(
-            "INSERT INTO orders (note_id, account_id, requested_asset, requested_amount,
-              offered_asset, offered_amount, arrival_unix, priority_seq)
-             VALUES (decode('02', 'hex'), decode('aa', 'hex'), decode('10', 'hex'), 1,
-                     decode('20', 'hex'), 2, 42, $1)
+            "INSERT INTO orders (note_id, raw_data, arrival_unix, priority_seq)
+             VALUES (decode('02', 'hex'), decode('22', 'hex'), 42, $1)
              RETURNING priority_seq",
         )
         .bind::<BigInt, _>(first.priority_seq)
@@ -250,10 +240,8 @@ mod tests {
         assert_eq!(child.priority_seq, first.priority_seq);
 
         let next: PriorityRow = diesel::sql_query(
-            "INSERT INTO orders (note_id, account_id, requested_asset, requested_amount,
-              offered_asset, offered_amount, arrival_unix)
-             VALUES (decode('03', 'hex'), decode('aa', 'hex'), decode('10', 'hex'), 1,
-                     decode('20', 'hex'), 2, 43)
+            "INSERT INTO orders (note_id, raw_data, arrival_unix)
+             VALUES (decode('03', 'hex'), decode('33', 'hex'), 43)
              RETURNING priority_seq",
         )
         .get_result(conn)?;
@@ -265,44 +253,58 @@ mod tests {
         )?;
         rejects(
             conn,
-            "UPDATE sync_state SET last_fetched_block = -1 WHERE id = 1",
+            "UPDATE orders SET arrival_unix = -1 WHERE note_id = decode('01', 'hex')",
         )?;
         rejects(
             conn,
-            "INSERT INTO orders (note_id, account_id, requested_asset, requested_amount,
-              offered_asset, offered_amount, arrival_unix)
-             VALUES (decode('99', 'hex'), decode('aa', 'hex'), decode('10', 'hex'), 1,
-                     decode('20', 'hex'), 2, 42)",
+            "UPDATE sync_state SET last_fetched_block = -1 WHERE id = 1",
         )?;
 
         conn.batch_execute(
-            "INSERT INTO settlement_attempts (tx_id, tx_result, status, created_at_unix)
-             VALUES (decode('fe', 'hex'), decode('ab', 'hex'), 'prepared', 42)",
+            "INSERT INTO settlement_attempts (tx_id, tx_result, status)
+             VALUES (decode('fe', 'hex'), decode('ab', 'hex'), 'prepared')",
         )?;
-        rejects(conn, "UPDATE settlement_attempts SET status = 'invalid'")?;
+        // Resolved attempts are deleted, never stored as confirmed/submitted.
+        for status in ["invalid", "confirmed", "submitted"] {
+            rejects(
+                conn,
+                &format!("UPDATE settlement_attempts SET status = '{status}'"),
+            )?;
+        }
         conn.batch_execute(
-            "INSERT INTO settlement_inputs (tx_id, parent_note_id, payback_note_id)
-             VALUES (decode('fe', 'hex'), decode('01', 'hex'), decode('b1', 'hex'))",
+            "INSERT INTO settlement_inputs (tx_id, parent_note_id)
+             VALUES (decode('fe', 'hex'), decode('01', 'hex'))",
         )?;
         rejects(
             conn,
-            "INSERT INTO settlement_inputs
-              (tx_id, parent_note_id, payback_note_id, child_note_id)
-             VALUES (decode('fe', 'hex'), decode('02', 'hex'), decode('b2', 'hex'), decode('c1', 'hex'))",
-        )?;
-        conn.batch_execute(
-            "INSERT INTO settlement_inputs
-              (tx_id, parent_note_id, payback_note_id, child_note_id, child_note_data)
-             VALUES (decode('fe', 'hex'), decode('02', 'hex'), decode('b2', 'hex'),
-                     decode('c1', 'hex'), decode('d1', 'hex'))",
+            "INSERT INTO settlement_inputs (tx_id, parent_note_id)
+             VALUES (decode('fe', 'hex'), decode('99', 'hex'))",
         )?;
         rejects(
             conn,
-            "INSERT INTO settlement_inputs
-              (tx_id, parent_note_id, payback_note_id, child_note_id, child_note_data)
-             VALUES (decode('fe', 'hex'), decode('03', 'hex'), decode('b3', 'hex'),
-                     decode('c1', 'hex'), decode('d2', 'hex'))",
+            "INSERT INTO settlement_inputs (tx_id, parent_note_id, child_note_id)
+             VALUES (decode('fe', 'hex'), decode('02', 'hex'), decode('c1', 'hex'))",
         )?;
+        conn.batch_execute(
+            "INSERT INTO settlement_inputs (tx_id, parent_note_id, child_note_id, child_note_data)
+             VALUES (decode('fe', 'hex'), decode('02', 'hex'), decode('c1', 'hex'), decode('d1', 'hex'))",
+        )?;
+        rejects(
+            conn,
+            "INSERT INTO settlement_inputs (tx_id, parent_note_id, child_note_id, child_note_data)
+             VALUES (decode('fe', 'hex'), decode('03', 'hex'), decode('c1', 'hex'), decode('d2', 'hex'))",
+        )?;
+        // Deleting a resolved attempt removes its inputs with it.
+        conn.batch_execute("DELETE FROM settlement_attempts WHERE tx_id = decode('fe', 'hex')")?;
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            count: i64,
+        }
+        let inputs: Count =
+            diesel::sql_query("SELECT count(*)::bigint AS count FROM settlement_inputs")
+                .get_result(conn)?;
+        assert_eq!(inputs.count, 0);
         conn.batch_execute("ROLLBACK")?;
         Ok(())
     }

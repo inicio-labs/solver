@@ -1,6 +1,6 @@
 # PostgreSQL application database runbook
 
-This applies only to the solver's orders, notes, settlement attempts, sync
+This applies only to the solver's orders, unresolved settlement attempts, sync
 cursor, and token registry. The keyless-ingest and signing-executor Miden client
 stores remain separate SQLite files. Deploy one solver process per application
 schema. There is no SQLite-to-PostgreSQL data copy, dual write, outbox, or
@@ -22,9 +22,10 @@ active-active mode in V1.
    writer, and reader resolve the same tables. Configure default grants for
    future migrations as well.
 3. Set `SOLVER_MIGRATION_DATABASE_URL` to the migration-role URL and run
-   `solver-bin migrate-db` once. Set `SOLVER_DATABASE_URL` and
-   `SOLVER_READ_DATABASE_URL` to the writer and reader URLs, respectively, and
-   run `solver-bin check-db`. Use `sslmode=verify-full`, a trusted root CA,
+   `solver-bin migrate-db` once. Set `SOLVER_DATABASE_URL` to the writer URL
+   and run `solver-bin check-db` (it checks the writer connection only). Set
+   `SOLVER_READ_DATABASE_URL` to the reader URL for the runtime; startup
+   verifies that both URLs resolve the same database and schema. Use `sslmode=verify-full`, a trusted root CA,
    `connect_timeout=5`, and supported libpq TCP keepalive settings in remote
    URLs. Store credentials in a secret manager or protected environment file;
    never put them in `solver.toml` or a command log.
@@ -36,14 +37,67 @@ active-active mode in V1.
    enabling normal traffic. A partial remainder must inherit its parent's FIFO
    priority.
 
-Normal startup never runs DDL. A missing or unexpected migration fails before
-workers start. Apply future migrations with the operator command while the
-solver is stopped, then deploy a compatible binary.
+The former SQLite setting `app_db_path` is no longer read; remove it from
+`solver.toml`. A config that still sets it is accepted without a warning.
+
+## Cutover from a SQLite deployment
+
+There is no data copy. Before switching, stop accepting new orders and let the
+old solver run until it has no unresolved settlement (every attempt confirmed
+or released, every order `executed`, `onchain_nullified`, or still `active`).
+Then stop it, prepare the PostgreSQL database as above, and start the new
+solver. Startup replays the ingest client's stored notes into PostgreSQL, so
+still-active orders return; a settlement that was in flight at the switch is
+not known to the new database and its parents would be re-matched.
+
+## Schema migrations
+
+Normal startup never runs DDL. Each solver binary embeds the migrations it was
+built with, and startup requires the database's applied set to equal that set
+exactly: a missing migration stops with "run migrate-db", an extra one with
+"use a compatible solver binary". Because only one solver may run per schema,
+every schema change is a stop-then-start deploy:
+
+1. Stop the solver.
+2. With the **new** binary: `solver-bin migrate-db` (migration role).
+3. Start the new binary.
+
+To roll back after step 2, revert the migration with the new binary before
+starting the old one, for example `diesel migration revert` against the
+migration-role URL from the solver crate directory; the old binary refuses to
+start while the newer migration is applied. Every migration after the baseline
+must ship a `down.sql` that undoes it without data loss. The baseline's own
+`down.sql` drops every application table and is only appropriate before the
+first production order.
 
 ## Failure and restart
 
 The solver holds one PostgreSQL advisory lock on its original writer session.
-If that connection or lock is lost, restart the whole solver; restarting only a
+Only losing that session stops the solver: a dropped writer connection, a lost
+advisory lock, a crashed database worker, or a write that passed the 30-second
+client deadline with an uncertain commit. Every other database error is
+returned to the caller and handled in place:
+
+- A failed read (including the public price API and `/readyz`) returns an
+  error to that caller; the read pool reconnects on the next checkout.
+- A lock or statement timeout rolls back that one transaction on a healthy
+  session; the caller re-feeds or retries.
+- Ingest keeps a sync result whose write failed and retries it on the next
+  tick, up to five times, before stopping the pipeline.
+- A settlement whose lifecycle write failed is retried on the next
+  reconciliation tick.
+
+When the executor cannot settle — no fee headroom, the node RPC or the
+database writer unavailable — it enters **verification mode**: it stops
+reading the matcher queue, holds the batch it was working on, and every five
+seconds checks that the node answers, the fee balance covers one settlement,
+and the writer commits. Once all three pass it runs the held batch and resumes.
+The matcher keeps one candidate batch queued and leaves every other order live
+in its book, so nothing is re-matched at a stale price. Watch for
+`executor entering verification mode` in the logs; a long stay means the
+node, the fee balance, or PostgreSQL needs attention, not the solver.
+
+If the writer session is lost, restart the whole solver; restarting only a
 Rust task does not rebuild the matcher. A lost PostgreSQL response does not
 prove that a write failed. The restart reconciles durable notes and unresolved
 settlements and rehydrates the matcher from what committed.
@@ -60,8 +114,9 @@ Configure libpq/TCP failure detection and alert if the supervisor has to
 force-stop the process. Diagnose a database-server failure before restarting
 PostgreSQL; a single solver network failure does not justify restarting it.
 
-Check `GET /health` for process liveness and `GET /readyz` for PostgreSQL
-schema, original writer ownership, and recent ingest sync. Alert on any
+Check `GET /health` for process liveness and `GET /readyz` for read-pool
+reachability, original writer ownership, and recent ingest sync (the schema is
+verified once at startup; a probe never waits behind application writes). Alert on any
 database deadlock, repeated lock timeout, writer ownership loss, migration
 mismatch, repeated critical restart, stale sync, and an unresolved settlement
 older than its chain expiry plus reconciliation allowance. Track pool wait,

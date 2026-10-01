@@ -95,8 +95,13 @@ fn load_buckets(buckets: &[AtomicU64; 9]) -> [u64; 9] {
     std::array::from_fn(|index| buckets[index].load(Ordering::Relaxed))
 }
 
+// `diesel::r2d2::Error` is Diesel's own enum; a failed pool checkout surfaces
+// as the r2d2 crate's `PoolError`. Both mean the connection is unusable.
+// Message matching below relies on `lc_messages = 'C'` from `configure_session`.
 fn database_error_class(error: &anyhow::Error) -> &'static str {
-    if error.downcast_ref::<r2d2::Error>().is_some() {
+    if error.downcast_ref::<r2d2::Error>().is_some()
+        || error.downcast_ref::<r2d2::PoolError>().is_some()
+    {
         return "connection";
     }
     match error.downcast_ref::<DieselError>() {
@@ -216,6 +221,7 @@ fn writer_health(conn: &mut PgConnection, lock_key: i64) -> diesel::QueryResult<
 fn configure_session(conn: &mut PgConnection, application_name: &str) -> diesel::QueryResult<()> {
     conn.batch_execute(
         "SET default_transaction_isolation = 'read committed';
+         SET lc_messages = 'C';
          SET statement_timeout = '10s';
          SET lock_timeout = '2s';
          SET idle_in_transaction_session_timeout = '10s'",
@@ -251,6 +257,7 @@ pub struct PgPool {
     fatal_db: CancellationToken,
     operation_deadline: Duration,
     admin_order: Arc<Mutex<()>>,
+    publish_order: Arc<Mutex<()>>,
     readers: r2d2::Pool<ConnectionManager<PgConnection>>,
     read_slots: Arc<Semaphore>,
     telemetry: Arc<PoolTelemetry>,
@@ -322,6 +329,7 @@ impl PgPool {
             fatal_db: CancellationToken::new(),
             operation_deadline: DEFAULT_OPERATION_DEADLINE,
             admin_order: Arc::new(Mutex::new(())),
+            publish_order: Arc::new(Mutex::new(())),
             readers,
             read_slots: Arc::new(Semaphore::new(read_pool_size as usize)),
             telemetry: Arc::new(PoolTelemetry::default()),
@@ -360,6 +368,9 @@ impl PgPool {
         self.fatal_db.clone()
     }
 
+    /// Reads never request a solver shutdown. The read pool holds no
+    /// ownership state, so a failed read is reported to its caller and the
+    /// pool reconnects on the next checkout. Only the writer can be fatal.
     pub async fn read<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
@@ -371,37 +382,27 @@ impl PgPool {
         let operation_name = std::any::type_name::<F>();
         self.telemetry.read_total.fetch_add(1, Ordering::Relaxed);
         let waiting_since = Instant::now();
-        let permit = match tokio::time::timeout(
+        let permit = tokio::time::timeout(
             Duration::from_secs(5),
             self.read_slots.clone().acquire_owned(),
         )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(error)) => {
-                let wait_us = elapsed_us(waiting_since);
-                self.telemetry
-                    .read_wait_us
-                    .fetch_add(wait_us, Ordering::Relaxed);
-                record_latency(&self.telemetry.read_wait_buckets, wait_us);
-                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(error).context("PostgreSQL read pool closed");
-            }
-            Err(_) => {
-                let wait_us = elapsed_us(waiting_since);
-                self.telemetry
-                    .read_wait_us
-                    .fetch_add(wait_us, Ordering::Relaxed);
-                record_latency(&self.telemetry.read_wait_buckets, wait_us);
-                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                bail!("PostgreSQL read pool wait exceeded five seconds");
-            }
-        };
+        .await;
         let wait_us = elapsed_us(waiting_since);
         self.telemetry
             .read_wait_us
             .fetch_add(wait_us, Ordering::Relaxed);
         record_latency(&self.telemetry.read_wait_buckets, wait_us);
+        let permit = match permit {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(error).context("PostgreSQL read pool closed");
+            }
+            Err(_) => {
+                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
+                bail!("PostgreSQL read pool wait exceeded five seconds");
+            }
+        };
         let readers = self.readers.clone();
         let started = Instant::now();
         let result = match tokio::time::timeout(
@@ -417,17 +418,13 @@ impl PgPool {
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => {
-                self.fatal_db.cancel();
-                Err(error).context("PostgreSQL read worker stopped")
-            }
-            Err(_) => {
-                self.fatal_db.cancel();
-                Err(anyhow::anyhow!(
-                    "PostgreSQL read exceeded {:?}; restart the whole solver",
-                    self.operation_deadline
-                ))
-            }
+            Ok(Err(error)) => Err(error).context("PostgreSQL read worker stopped"),
+            // The blocking worker keeps its permit until libpq returns, so a
+            // lost reply costs one read slot until then, not the solver.
+            Err(_) => Err(anyhow::anyhow!(
+                "PostgreSQL read exceeded {:?}",
+                self.operation_deadline
+            )),
         };
         let duration_us = elapsed_us(started);
         self.telemetry
@@ -438,12 +435,6 @@ impl PgPool {
             self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
             let class = database_error_class(error);
             self.telemetry.record_error(class);
-            if matches!(
-                class,
-                "connection" | "lock_timeout" | "statement_timeout" | "deadlock"
-            ) {
-                self.fatal_db.cancel();
-            }
             tracing::warn!(%error, class, operation = operation_name, duration_us, "PostgreSQL read failed");
         } else if duration_us > 100_000 {
             tracing::warn!(
@@ -457,6 +448,11 @@ impl PgPool {
 
     /// Own exactly one application write transaction. The operation permit
     /// stays with the blocking worker even if its async caller is cancelled.
+    ///
+    /// Only losing the writer session is fatal: a dropped connection, a lost
+    /// advisory lock, a worker panic, or a deadline with an uncertain commit.
+    /// Lock and statement timeouts roll back one transaction on a healthy
+    /// session; they are returned to the caller, who re-feeds or retries.
     pub async fn write<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
@@ -547,10 +543,8 @@ impl PgPool {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
             let class = database_error_class(error);
             self.telemetry.record_error(class);
-            if matches!(
-                class,
-                "connection" | "lock_timeout" | "statement_timeout" | "deadlock"
-            ) {
+            if class == "connection" {
+                self.ownership_lost.store(true, Ordering::Release);
                 self.fatal_db.cancel();
             }
             tracing::error!(%error, class, operation = operation_name, duration_us, "PostgreSQL write failed");
@@ -564,12 +558,19 @@ impl PgPool {
         result
     }
 
-    /// Commit and release the writer before awaiting matcher capacity. This
-    /// does not impose post-commit publication ordering across callers.
+    /// Commit a book-changing transaction and publish its update to the
+    /// matcher in commit order. The matcher applies updates as deltas and
+    /// recreates any order named `active`, so a stale activation delivered
+    /// after a later removal would put a consumed order back in its book.
+    ///
+    /// The publish guard spans commit and send. Plain `write` calls do not
+    /// take it, so a full matcher channel delays only other publishers, and
+    /// the matcher never takes it, so waiting for capacity cannot deadlock.
     pub async fn write_book<F>(&self, sender: &mpsc::Sender<BookUpdate>, operation: F) -> Result<()>
     where
         F: FnOnce(&mut PgConnection) -> Result<BookUpdate> + Send + 'static,
     {
+        let _publish = self.publish_order.lock().await;
         let update = self.write(operation).await?;
         if !update.is_empty() {
             sender
@@ -602,25 +603,42 @@ impl PgPool {
         .context("PostgreSQL admin mutation worker stopped")?
     }
 
-    /// Readiness checks the exact schema on a read connection and verifies
-    /// that the original writer backend still holds an advisory lock. A live
-    /// read pool alone cannot prove this solver still owns the database.
+    /// Readiness proves the read pool answers and the original writer backend
+    /// still holds its advisory lock. The schema was verified at `open` and
+    /// cannot change under a running binary, so it is not re-checked here.
+    ///
+    /// A probe must never queue behind application writes or stop the
+    /// solver: a busy writer is reported healthy (every failed write already
+    /// re-verifies ownership), and a failed probe only returns an error.
     pub async fn readiness_check(&self) -> Result<()> {
-        if self.fatal_db.is_cancelled() {
-            bail!("PostgreSQL operation failed critically; restart the whole solver");
+        if self.ownership_lost.load(Ordering::Acquire) || self.fatal_db.is_cancelled() {
+            bail!("PostgreSQL writer is no longer safe; restart the whole solver");
         }
-        self.read(postgres_migrations::verify).await?;
-        let expected_pid = self.writer_backend_pid;
-        let lock_key = self.lock_key;
-        self.write(move |conn| {
-            let health =
-                writer_health(conn, lock_key).context("query PostgreSQL writer ownership")?;
-            if health.backend_pid != expected_pid || !health.owns_advisory_lock {
-                bail!("PostgreSQL writer lost its original ownership session or advisory lock");
-            }
+        self.read(|conn| {
+            diesel::sql_query("SELECT 1").execute(conn)?;
             Ok(())
         })
         .await
+        .context("PostgreSQL read pool is unavailable")?;
+        let Ok(mut writer) = self.writer.clone().try_lock_owned() else {
+            return Ok(());
+        };
+        let expected_pid = self.writer_backend_pid;
+        let lock_key = self.lock_key;
+        let health = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || writer_health(&mut writer, lock_key)),
+        )
+        .await
+        .context("PostgreSQL writer ownership probe timed out")?
+        .context("PostgreSQL writer ownership probe stopped")?
+        .context("query PostgreSQL writer ownership")?;
+        if health.backend_pid != expected_pid || !health.owns_advisory_lock {
+            self.ownership_lost.store(true, Ordering::Release);
+            self.fatal_db.cancel();
+            bail!("PostgreSQL writer lost its original ownership session or advisory lock");
+        }
+        Ok(())
     }
 }
 
@@ -819,6 +837,75 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn book_updates_arrive_in_commit_order() -> Result<()> {
+        let fixture = PoolFixture::new()?;
+        let url = fixture.url.clone();
+        let pool = PgPool::open(url.clone(), url, 1, "solver/publish-order".into()).await?;
+        let first_id = crate::types::OrderId::read_from(&mut SliceReader::new(&[1_u8; 32]))?;
+        let second_id = crate::types::OrderId::read_from(&mut SliceReader::new(&[2_u8; 32]))?;
+
+        // A full channel parks the first publisher after its commit.
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(BookUpdate::default()).await?;
+        let first_pool = pool.clone();
+        let first_sender = sender.clone();
+        let first = tokio::spawn(async move {
+            first_pool
+                .write_book(&first_sender, move |conn| {
+                    diesel::update(sync_state::table.find(1_i16))
+                        .set(sync_state::last_fetched_block.eq(1_i64))
+                        .execute(conn)?;
+                    Ok(BookUpdate {
+                        removed: vec![first_id],
+                        active: Vec::new(),
+                    })
+                })
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.telemetry_snapshot().write_total == 0 {
+            if Instant::now() >= deadline {
+                bail!("first publisher never committed");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The second publisher cannot commit and overtake the first send.
+        let second_pool = pool.clone();
+        let second_sender = sender.clone();
+        let second = tokio::spawn(async move {
+            second_pool
+                .write_book(&second_sender, move |conn| {
+                    diesel::update(sync_state::table.find(1_i16))
+                        .set(sync_state::last_fetched_block.eq(2_i64))
+                        .execute(conn)?;
+                    Ok(BookUpdate {
+                        removed: vec![second_id],
+                        active: Vec::new(),
+                    })
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            pool.telemetry_snapshot().write_total,
+            1,
+            "second publisher must wait for the first to publish"
+        );
+
+        receiver.recv().await.context("missing filler update")?;
+        let delivered = receiver.recv().await.context("missing first update")?;
+        assert_eq!(delivered.removed, vec![first_id]);
+        let delivered = receiver.recv().await.context("missing second update")?;
+        assert_eq!(delivered.removed, vec![second_id]);
+        first.await??;
+        second.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn closed_matcher_after_commit_leaves_state_for_restart() -> Result<()> {
         let fixture = PoolFixture::new()?;
         let url = fixture.url.clone();
@@ -978,12 +1065,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
-    async fn lost_read_reply_marks_solver_unhealthy() -> Result<()> {
+    async fn lost_read_reply_is_not_fatal() -> Result<()> {
         let fixture = PoolFixture::new()?;
         let mut pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
-            1,
+            2,
             "solver/lost-read-reply".into(),
         )
         .await?;
@@ -996,15 +1083,45 @@ mod tests {
             .await
             .expect_err("the client must stop waiting for the read reply");
         assert!(error.to_string().contains("read exceeded"));
-        assert!(pool.fatal_token().is_cancelled());
-        assert!(pool.readiness_check().await.is_err());
+        assert!(!pool.fatal_token().is_cancelled());
+        pool.readiness_check().await?;
+        pool.write(|_| Ok(())).await?;
         tokio::time::sleep(Duration::from_millis(350)).await;
         Ok(())
     }
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
-    async fn row_lock_timeout_triggers_fail_stop() -> Result<()> {
+    async fn readiness_does_not_wait_for_a_busy_writer() -> Result<()> {
+        let fixture = PoolFixture::new()?;
+        let pool = PgPool::open(
+            fixture.url.clone(),
+            fixture.url.clone(),
+            1,
+            "solver/busy-writer".into(),
+        )
+        .await?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let busy_pool = pool.clone();
+        let busy = tokio::spawn(async move {
+            busy_pool
+                .write(move |_| {
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await?;
+        tokio::time::timeout(Duration::from_millis(200), pool.readiness_check()).await??;
+        busy.await??;
+        assert!(!pool.fatal_token().is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn row_lock_timeout_is_not_fatal() -> Result<()> {
         let mut fixture = PoolFixture::new()?;
         let pool = PgPool::open(
             fixture.url.clone(),
@@ -1029,14 +1146,23 @@ mod tests {
         let error = blocked.expect_err("the writer must not wait indefinitely on a row lock");
         assert!(error.to_string().contains("lock timeout"));
         assert_eq!(pool.telemetry_snapshot().lock_timeouts, 1);
-        assert!(pool.fatal_token().is_cancelled());
-        assert!(pool.readiness_check().await.is_err());
+        // One rolled-back transaction on a healthy session is the caller's
+        // problem, not the solver's.
+        assert!(!pool.fatal_token().is_cancelled());
+        pool.readiness_check().await?;
+        pool.write(|conn| {
+            diesel::update(sync_state::table.find(1_i16))
+                .set(sync_state::last_fetched_block.eq(8_i64))
+                .execute(conn)?;
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
-    async fn statement_timeout_triggers_fail_stop() -> Result<()> {
+    async fn statement_timeout_is_not_fatal() -> Result<()> {
         let fixture = PoolFixture::new()?;
         let pool = PgPool::open(
             fixture.url.clone(),
@@ -1054,8 +1180,8 @@ mod tests {
             .expect_err("a timed-out statement must fail the transaction");
         assert!(error.to_string().contains("statement timeout"));
         assert_eq!(pool.telemetry_snapshot().statement_timeouts, 1);
-        assert!(pool.fatal_token().is_cancelled());
-        assert!(pool.write(|_| Ok(())).await.is_err());
+        assert!(!pool.fatal_token().is_cancelled());
+        pool.write(|_| Ok(())).await?;
         Ok(())
     }
 

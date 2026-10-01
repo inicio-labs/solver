@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use miden_client::{keystore::FilesystemKeyStore, Client};
 use miden_protocol::{
     account::AccountId,
     asset::{Asset, FungibleAsset},
+    block::BlockNumber,
     crypto::utils::{Deserializable, Serializable, SliceReader},
     note::{Note, NoteId, NoteRecipient},
     transaction::{InputNote, TransactionId},
@@ -48,10 +49,10 @@ const MAX_SUBMISSION_BACKOFF: Duration = Duration::from_secs(30);
 /// and the auth procedure may reserve up to 2×.
 const FEE_HEADROOM_MULTIPLIER: u64 = 64;
 
-/// How long a batch the executor hands back unsettled (no fee headroom, or
-/// failed preparation) waits before its orders return to the matcher, so a
-/// persistent condition isn't rebuilt and rejected every tick.
-const HELD_REFEED_DELAY: Duration = Duration::from_secs(30);
+/// While verifying, how often the executor re-checks whether it can settle.
+/// The matcher holds clearing for this long at minimum, so a persistent
+/// condition is not rebuilt and rejected on every matcher tick.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Most incoming notes claimed into the solver's vault in one transaction.
 const MAX_CLAIM_NOTES: usize = 16;
@@ -108,6 +109,15 @@ enum BatchSubmission {
     Accepted(PendingSettlement),
     Uncertain(PendingSettlement),
     Returned,
+    /// The executor cannot settle right now (no fee headroom, RPC or database
+    /// unavailable). Nothing was reserved; the orders are still Active. The
+    /// executor stops accepting batches and enters verification mode.
+    Paused {
+        reason: String,
+        /// `None`: retry this transaction once verification passes.
+        /// `Some`: these orders go back to the matcher instead.
+        give_back: Option<Vec<BookOrder>>,
+    },
 }
 
 /// Keep each input and its predicted outputs together, in batch order.
@@ -132,24 +142,24 @@ struct BatchComponents {
 struct PendingSettlement {
     tx_id: TransactionId,
     attempt: SettlementAttemptRow,
-    payback_id: NoteId,
     parent_notes: Vec<Note>,
+    /// Remainders this transaction creates when it commits.
+    child_notes: Vec<Note>,
     retry_at: Option<tokio::time::Instant>,
 }
 
 impl PendingSettlement {
     fn prepared(attempt: SettlementAttemptRow, components: &BatchComponents) -> Result<Self> {
         let tx_id = TransactionId::read_from(&mut SliceReader::new(&attempt.tx_id))?;
-        let payback_id = components
-            .inputs
-            .first()
-            .ok_or_else(|| anyhow!("settlement has no inputs"))?
-            .payback_id;
         Ok(Self {
             tx_id,
             attempt,
-            payback_id,
             parent_notes: components.notes(),
+            child_notes: components
+                .inputs
+                .iter()
+                .filter_map(|input| input.remainder.clone())
+                .collect(),
             retry_at: None,
         })
     }
@@ -168,7 +178,7 @@ impl PendingSettlement {
             if result.id() != tx_id {
                 return Err(SettlementError::RecordedTransactionIdMismatch.into());
             }
-            let payback_id = recovered.payback_id;
+            let child_notes = recovered.children;
             let parent_notes = recovered
                 .parents
                 .into_iter()
@@ -179,8 +189,8 @@ impl PendingSettlement {
                 Self {
                     tx_id,
                     attempt,
-                    payback_id,
                     parent_notes,
+                    child_notes,
                     retry_at: None,
                 },
             );
@@ -351,7 +361,6 @@ impl BatchComponents {
                 Ok(SettlementInputRow {
                     tx_id: tx_id.clone(),
                     parent_note_id: input.note.id().to_bytes().to_vec(),
-                    payback_note_id: payback_id.to_bytes().to_vec(),
                     child_note_id: remainder.map(|note| note.id().to_bytes().to_vec()),
                     child_note_data: remainder.map(Serializable::to_bytes),
                 })
@@ -398,11 +407,7 @@ async fn submit_with_rpc_backoff(
         Ok(proven) => proven,
         Err(error) => return SubmitOutcome::TxError(error, None),
     };
-    let tx_id = result.id().to_bytes().to_vec();
-    let attempt = match SettlementAttemptRow::prepared(&result, crate::types::now_unix()) {
-        Ok(attempt) => attempt,
-        Err(error) => return SubmitOutcome::BuildFailed(error.to_string()),
-    };
+    let attempt = SettlementAttemptRow::prepared(&result);
     let pending = match PendingSettlement::prepared(attempt, components) {
         Ok(pending) => pending,
         Err(error) => return SubmitOutcome::BuildFailed(error.to_string()),
@@ -412,7 +417,17 @@ async fn submit_with_rpc_backoff(
         .write(move |conn| db::postgres_db::prepare_settlement_tx(conn, &durable_attempt, &inputs))
         .await;
     if let Err(error) = persisted {
-        return SubmitOutcome::Critical(format!("persist settlement before submission: {error}"));
+        if pool.fatal_token().is_cancelled() {
+            return SubmitOutcome::Critical(format!(
+                "persist settlement before submission: {error}"
+            ));
+        }
+        // The transaction rolled back, so nothing is reserved and nothing was
+        // submitted. A parent consumed or reclaimed during proving is the
+        // common cause; the matcher simply reconsiders whatever is still Active.
+        return SubmitOutcome::BuildFailed(format!(
+            "persist settlement before submission: {error}"
+        ));
     }
 
     let mut backoff = INITIAL_SUBMISSION_BACKOFF;
@@ -423,18 +438,9 @@ async fn submit_with_rpc_backoff(
             c.submit_proven_transaction(proven.clone(), &result).await
         };
         match submit_res {
+            // Acceptance is not recorded: reconciliation reads the outcome
+            // from our transaction ID, and resubmitting it is harmless.
             Ok(height) => {
-                let accepted_tx_id = tx_id.clone();
-                if let Err(error) = pool
-                    .write(move |conn| {
-                        db::postgres_db::mark_settlement_submitted_tx(conn, &accepted_tx_id)
-                    })
-                    .await
-                {
-                    return SubmitOutcome::Critical(format!(
-                        "accepted settlement status write failed: {error}"
-                    ));
-                }
                 return match client.lock().await.apply_transaction(&result, height).await {
                     Ok(()) => SubmitOutcome::Success(pending),
                     Err(error) => SubmitOutcome::Pending(
@@ -488,6 +494,134 @@ async fn refeed_orders(
         db::postgres_db::active_book_update_tx(conn, orders)
     })
     .await
+}
+
+/// Hand orders that were never reserved straight back to the matcher. If the
+/// write does not commit, the executor pauses until they can be returned.
+async fn give_back(
+    pool: &DbPool,
+    book_tx: &mpsc::Sender<BookUpdate>,
+    orders: Vec<BookOrder>,
+    reason: &str,
+) -> Result<BatchSubmission> {
+    match refeed_orders(pool, book_tx, orders.clone()).await {
+        Ok(()) => Ok(BatchSubmission::Returned),
+        Err(error) if pool.fatal_token().is_cancelled() => Err(error),
+        Err(error) => Ok(BatchSubmission::Paused {
+            reason: format!("{reason}: {error}"),
+            give_back: Some(orders),
+        }),
+    }
+}
+
+/// Verification-mode bookkeeping, kept apart from the I/O so it is testable.
+/// While `active`, the executor stops reading its queue; held transactions
+/// run, in their original order, once verification passes.
+#[derive(Default)]
+struct Verification {
+    active: bool,
+    /// Transactions to run again once verification passes.
+    retry: VecDeque<ExecutionBatch>,
+    /// Orders owed back to the matcher whose return did not commit yet.
+    returning: Vec<BookOrder>,
+}
+
+impl Verification {
+    /// Pause on `current`. It is retried after verification unless its
+    /// orders are owed back instead; the rest of the tick queues behind it.
+    fn pause(
+        &mut self,
+        current: ExecutionBatch,
+        give_back: Option<Vec<BookOrder>>,
+        rest: impl Iterator<Item = ExecutionBatch>,
+    ) {
+        match give_back {
+            Some(orders) => self.returning.extend(orders),
+            None => self.retry.push_back(current),
+        }
+        self.retry.extend(rest);
+        self.active = true;
+    }
+
+    fn resume(&mut self) {
+        self.active = false;
+    }
+
+    /// Held transactions to run before reading new batches; none while paused.
+    fn take_retries(&mut self) -> Vec<ExecutionBatch> {
+        if self.active {
+            Vec::new()
+        } else {
+            self.retry.drain(..).collect()
+        }
+    }
+}
+
+/// Return orders to the matcher, minus any whose note is already consumed on
+/// chain (those are marked OnchainNullified instead). Leaves `held` intact on
+/// error, so verification retries the return once RPC and DB are back.
+async fn release_held(
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    pool: &DbPool,
+    book_tx: &mpsc::Sender<BookUpdate>,
+    held: &mut Vec<BookOrder>,
+) -> Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    let notes: Vec<Note> = held
+        .iter()
+        .map(|order| order.note.as_ref().clone())
+        .collect();
+    let mut consumed = HashSet::new();
+    for chunk in notes.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
+        consumed.extend(
+            miden_adapter
+                .lock()
+                .await
+                .check_consumed_notes(chunk)
+                .await?,
+        );
+    }
+    let orders: Vec<_> = held
+        .iter()
+        .filter(|order| !consumed.contains(&order.id()))
+        .cloned()
+        .collect();
+    let returned = orders.len();
+    let dropped = consumed.len();
+    pool.write_book(book_tx, move |conn| {
+        let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
+        db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
+        let mut update = db::postgres_db::active_book_update_tx(conn, orders)?;
+        update.removed.extend(consumed);
+        Ok(update)
+    })
+    .await?;
+    tracing::info!(returned, dropped, "held orders returned to the matcher");
+    held.clear();
+    Ok(())
+}
+
+/// Verification mode's readiness probe. Every check must pass before the
+/// executor accepts batches again: node RPC answers, fee headroom covers one
+/// settlement, the database writer commits, and any orders still owed to the
+/// matcher are returned.
+async fn verify_ready(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+    pool: &DbPool,
+    book_tx: &mpsc::Sender<BookUpdate>,
+    held: &mut Vec<BookOrder>,
+) -> Result<()> {
+    check_fee_headroom(client, miden_adapter, solver_id, FeePreflight::Strict).await?;
+    pool.write(|_| Ok(()))
+        .await
+        .context("database writer is not committing")?;
+    release_held(miden_adapter, pool, book_tx, held)
+        .await
+        .context("held orders could not be returned")
 }
 
 /// On the TxError classification path, fetch which input notes are consumed
@@ -545,42 +679,85 @@ pub async fn run_executor(
     };
     let mut reconcile_tick = tokio::time::interval(SETTLEMENT_RECONCILE_INTERVAL);
     reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut verify_tick = tokio::time::interval(VERIFY_INTERVAL);
+    verify_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Verification mode. The executor stops reading `exec_rx`; once its one
+    // queue slot is full the matcher skips ticks and keeps orders live.
+    let mut verification = Verification::default();
     loop {
-        // Cancellation is only checked BETWEEN batches. Once execute_batch
-        // starts, only the backoff sleep is cancel-aware — the on-chain submit
-        // runs to completion before a result is observed.
-        let mut batch = tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = reconcile_tick.tick() => {
-                if let Err(error) = reconcile_settlements(&client, &miden_adapter, &pool, &book_tx, &mut pending).await {
-                    // RPC failures are handled per settlement inside reconciliation.
-                    // Reaching here means local durable state or the matcher channel
-                    // is unavailable, so continuing would leave the book inconsistent.
-                    tracing::error!(%error, "settlement reconciliation failed; stopping pipeline");
-                    cancel.cancel();
-                    return;
+        let held = verification.take_retries();
+        let transactions = if !held.is_empty() {
+            held
+        } else {
+            // Cancellation is only checked BETWEEN batches. Once execute_batch
+            // starts, only the backoff sleep is cancel-aware — the on-chain
+            // submit runs to completion before a result is observed.
+            let mut batch = tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = reconcile_tick.tick() => {
+                    if let Err(error) = reconcile_settlements(&client, &miden_adapter, solver_id, &pool, &book_tx, &mut pending).await {
+                        // RPC failures are handled per settlement inside reconciliation.
+                        // Reaching here means local durable state or the matcher channel
+                        // is unavailable, so continuing would leave the book inconsistent.
+                        tracing::error!(%error, "settlement reconciliation failed; stopping pipeline");
+                        cancel.cancel();
+                        return;
+                    }
+                    continue;
                 }
+                _ = verify_tick.tick(), if verification.active => {
+                    match verify_ready(&client, &miden_adapter, solver_id, &pool, &book_tx, &mut verification.returning).await {
+                        Ok(()) => {
+                            verification.resume();
+                            tracing::info!(retrying = verification.retry.len(), "executor verified ready; accepting batches");
+                        }
+                        Err(error) if pool.fatal_token().is_cancelled() => {
+                            tracing::error!(%error, "executor verification hit a fatal database failure; stopping pipeline");
+                            cancel.cancel();
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "executor not ready; still verifying");
+                        }
+                    }
+                    continue;
+                }
+                opt = exec_rx.recv(), if !verification.active => match opt {
+                    Some(b) => b,
+                    None => break,  // channel closed → upstream is gone
+                },
+            };
+
+            if batch.filled_notes.is_empty() {
                 continue;
             }
-            opt = exec_rx.recv() => match opt {
-                Some(b) => b,
-                None => break,  // channel closed → upstream is gone
-            },
-        };
-
-        if batch.filled_notes.is_empty() {
-            continue;
-        }
-
-        let transactions = match split_batch(&mut batch) {
-            Ok(transactions) => transactions,
-            Err(error) => {
-                tracing::error!(%error, "cannot split execution batch safely; returning orders");
-                refeed_unprepared(&pool, &batch, &book_tx, &cancel);
-                continue;
+            match split_batch(&mut batch) {
+                Ok(transactions) => transactions,
+                Err(error) => {
+                    // A malformed batch fails the same way on every retry, so
+                    // its orders go straight back; the executor itself is fine.
+                    tracing::error!(%error, "cannot split execution batch safely; returning orders");
+                    let orders = batch.book_orders();
+                    match give_back(&pool, &book_tx, orders, "returning unsplittable batch").await {
+                        Ok(BatchSubmission::Paused { reason, give_back }) => {
+                            verification.pause(batch, give_back, std::iter::empty());
+                            verify_tick.reset();
+                            tracing::warn!(%reason, "executor entering verification mode");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "returning orders hit a fatal database failure; stopping pipeline");
+                            cancel.cancel();
+                            return;
+                        }
+                    }
+                    continue;
+                }
             }
         };
-        for batch in transactions {
+
+        let mut transactions = transactions.into_iter();
+        while let Some(batch) = transactions.next() {
             if cancel.is_cancelled() {
                 // Unsubmitted groups remain Active in the DB for boot recovery.
                 break;
@@ -613,6 +790,17 @@ pub async fn run_executor(
                     pending.insert(settlement.id(), settlement);
                 }
                 Ok(BatchSubmission::Returned) => {}
+                Ok(BatchSubmission::Paused { reason, give_back }) => {
+                    verification.pause(batch, give_back, transactions.by_ref());
+                    verify_tick.reset();
+                    tracing::warn!(
+                        %reason,
+                        retrying = verification.retry.len(),
+                        returning = verification.returning.len(),
+                        "executor entering verification mode"
+                    );
+                    break;
+                }
                 Err(e) => {
                     tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch recovery failed; stopping pipeline");
                     cancel.cancel();
@@ -630,6 +818,7 @@ pub async fn run_executor(
 async fn reconcile_settlements(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
     pool: &DbPool,
     book_tx: &mpsc::Sender<BookUpdate>,
     pending: &mut HashMap<TransactionId, PendingSettlement>,
@@ -639,8 +828,25 @@ async fn reconcile_settlements(
         let Some(mut settlement) = pending.remove(&key) else {
             continue;
         };
-        let resolved =
-            reconcile_settlement(client, miden_adapter, pool, book_tx, &mut settlement).await?;
+        let resolved = match reconcile_settlement(
+            client,
+            miden_adapter,
+            solver_id,
+            pool,
+            book_tx,
+            &mut settlement,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) if pool.fatal_token().is_cancelled() => return Err(error),
+            // One failed lifecycle write leaves this settlement exactly as
+            // durable state describes it; try again on the next tick.
+            Err(error) => {
+                tracing::warn!(tx_id = %key, %error, "settlement reconciliation failed; retrying next tick");
+                false
+            }
+        };
         if !resolved {
             pending.insert(key, settlement);
         }
@@ -648,54 +854,111 @@ async fn reconcile_settlements(
     Ok(())
 }
 
+/// What the chain says about our settlement transaction. Decided only from
+/// our transaction ID — never from payback or remainder note IDs, which
+/// another filler of the same parent and amount reproduces exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecoveryObservation {
-    MissingRecord,
-    AmbiguousDiscard,
-    DefiniteDiscard,
+enum TxOutcome {
+    /// The node committed our transaction.
+    Committed,
+    /// It can never commit: rejected by the node, or its whole validity
+    /// window has passed without it appearing.
+    NeverCommits,
+    /// Not decidable yet (still valid, not seen, or an RPC failed).
+    /// `resubmittable`: the executor client has no record of submitting it,
+    /// so the executor may have stopped before the node received it.
+    Unknown { resubmittable: bool },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RecoveryDecision {
-    Wait,
-    Confirm,
-    ReleaseAfterNullifierCheck,
-    RetryRecordedTransaction,
-    MarkUncertain,
-}
-
-/// Decide only after the chain height (when needed) and payback inclusion have
-/// been observed in that order. A failed payback lookup never releases inputs.
-fn recovery_decision(
-    status: SettlementStatus,
-    observation: RecoveryObservation,
-    payback_included: Option<bool>,
-    expired: bool,
-    retry_due: bool,
-) -> RecoveryDecision {
-    match payback_included {
-        None => return RecoveryDecision::Wait,
-        Some(true) => return RecoveryDecision::Confirm,
-        Some(false) => {}
+/// Look up our transaction: the executor client's record first, then the node
+/// for the solver account's transactions over the attempt's validity window.
+async fn transaction_outcome(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+    settlement: &PendingSettlement,
+) -> Result<TxOutcome> {
+    let tx_id = settlement.id();
+    if settlement.attempt.settlement_status()? == SettlementStatus::Rejected {
+        // Rejected by the node at submission: it never entered the chain.
+        return Ok(TxOutcome::NeverCommits);
     }
-    match observation {
-        RecoveryObservation::MissingRecord if expired => {
-            RecoveryDecision::ReleaseAfterNullifierCheck
+    let record = match client
+        .lock()
+        .await
+        .get_transactions(TransactionFilter::Ids(vec![tx_id]))
+        .await
+    {
+        Ok(records) => records.into_iter().next(),
+        Err(ClientError::RpcError(error)) => {
+            tracing::warn!(%tx_id, %error, "transaction lookup failed; retrying next tick");
+            return Ok(TxOutcome::Unknown {
+                resubmittable: false,
+            });
         }
-        RecoveryObservation::MissingRecord
-            if status != SettlementStatus::Uncertain && retry_due =>
+        Err(error) => return Err(error.into()),
+    };
+    let resubmittable = record.is_none();
+    match record.map(|record| record.status) {
+        Some(TransactionStatus::Committed { .. }) => return Ok(TxOutcome::Committed),
+        // A definite discard means the node never accepted this transaction.
+        Some(TransactionStatus::Discarded(reason))
+            if !matches!(
+                reason,
+                DiscardCause::Stale | DiscardCause::DiscardedInitialState
+            ) =>
         {
-            RecoveryDecision::RetryRecordedTransaction
+            tracing::warn!(%tx_id, %reason, "settlement transaction discarded");
+            return Ok(TxOutcome::NeverCommits);
         }
-        RecoveryObservation::MissingRecord => RecoveryDecision::Wait,
-        RecoveryObservation::AmbiguousDiscard if expired => {
-            RecoveryDecision::ReleaseAfterNullifierCheck
+        // Pending, an ambiguous discard, or no local record (the executor may
+        // have stopped between submission and recording): ask the node.
+        _ => {}
+    }
+
+    let result =
+        TransactionResult::read_from(&mut SliceReader::new(&settlement.attempt.tx_result))?;
+    let executed = result.executed_transaction();
+    let reference = executed.block_header().block_num();
+    let expiration = executed.expiration_block_num();
+    // Read the synced height before the lookup, so a negative answer covers
+    // every block up to it.
+    let synced = client.lock().await.get_sync_height().await?;
+    let to = if synced < expiration {
+        synced
+    } else {
+        expiration
+    };
+    let committed = match miden_adapter
+        .lock()
+        .await
+        .transaction_committed(solver_id, tx_id, reference, to)
+        .await
+    {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::warn!(%tx_id, %error, "node transaction lookup failed; retrying next tick");
+            return Ok(TxOutcome::Unknown { resubmittable });
         }
-        RecoveryObservation::AmbiguousDiscard if status != SettlementStatus::Uncertain => {
-            RecoveryDecision::MarkUncertain
-        }
-        RecoveryObservation::AmbiguousDiscard => RecoveryDecision::Wait,
-        RecoveryObservation::DefiniteDiscard => RecoveryDecision::ReleaseAfterNullifierCheck,
+    };
+    Ok(node_outcome(committed, synced, expiration, resubmittable))
+}
+
+/// The node's answer for our transaction, searched up to `synced`. A
+/// transaction is valid in its expiration block; once the chain is past it
+/// and the node never committed it, it never will.
+fn node_outcome(
+    committed: bool,
+    synced: BlockNumber,
+    expiration: BlockNumber,
+    resubmittable: bool,
+) -> TxOutcome {
+    if committed {
+        TxOutcome::Committed
+    } else if synced > expiration {
+        TxOutcome::NeverCommits
+    } else {
+        TxOutcome::Unknown { resubmittable }
     }
 }
 
@@ -703,125 +966,34 @@ fn recovery_decision(
 async fn reconcile_settlement(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
     pool: &DbPool,
     book_tx: &mpsc::Sender<BookUpdate>,
     settlement: &mut PendingSettlement,
 ) -> Result<bool> {
-    let status = settlement.attempt.settlement_status()?;
-    if status == SettlementStatus::Rejected {
-        return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
-    }
-    let tx_id = settlement.id();
-    let records = match client
-        .lock()
-        .await
-        .get_transactions(TransactionFilter::Ids(vec![tx_id]))
-        .await
-    {
-        Ok(records) => records,
-        Err(ClientError::RpcError(error)) => {
-            tracing::warn!(%tx_id, %error, "transaction lookup RPC failed; retrying next tick");
-            return Ok(false);
+    match transaction_outcome(client, miden_adapter, solver_id, settlement).await? {
+        TxOutcome::Committed => {
+            activate_confirmed_settlement(miden_adapter, pool, settlement, book_tx).await
         }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(record) = records.into_iter().next() else {
-        // The executor may have crashed after network acceptance but before
-        // its own client store recorded the transaction. A known output
-        // proves the whole atomic settlement committed, even for full fills.
-        // Read height first so an older negative payback lookup can never be
-        // combined with a newer, post-expiry chain height.
-        let expired = settlement_has_expired(client, &settlement.attempt).await?;
-        let payback = expected_payback_is_included(miden_adapter, settlement.payback_id).await?;
-        let retry_due = settlement
-            .retry_at
-            .is_none_or(|at| tokio::time::Instant::now() >= at);
-        match recovery_decision(
-            status,
-            RecoveryObservation::MissingRecord,
-            payback,
-            expired,
-            retry_due,
-        ) {
-            RecoveryDecision::Confirm => {
-                activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
-                return Ok(true);
-            }
-            RecoveryDecision::ReleaseAfterNullifierCheck => {
-                return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
-            }
-            RecoveryDecision::RetryRecordedTransaction => {
+        // Inputs return by nullifier: a parent someone else consumed is
+        // retired, every other parent goes back to the matcher.
+        TxOutcome::NeverCommits => {
+            release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await
+        }
+        TxOutcome::Unknown { resubmittable } => {
+            // The executor may have stopped after preparing but before the
+            // node received the transaction. Resubmitting the same proven
+            // transaction keeps its ID; the outcome is still read from it.
+            let status = settlement.attempt.settlement_status()?;
+            let retry_due = settlement
+                .retry_at
+                .is_none_or(|at| tokio::time::Instant::now() >= at);
+            if resubmittable && status != SettlementStatus::Uncertain && retry_due {
                 settlement.retry_at = Some(tokio::time::Instant::now() + RECOVERY_RETRY_DELAY);
                 retry_recorded_transaction(client, pool, settlement).await?;
             }
-            RecoveryDecision::Wait => {}
-            RecoveryDecision::MarkUncertain => unreachable!("missing record cannot mark uncertain"),
+            Ok(false)
         }
-        return Ok(false);
-    };
-    match record.status {
-        TransactionStatus::Committed { .. } => {
-            activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
-            Ok(true)
-        }
-        TransactionStatus::Discarded(reason) => {
-            // A client-side discard can race with a previously accepted copy.
-            // Its payback proves commitment even if the local transaction
-            // record never moved to Committed.
-            let waits_for_expiry = matches!(
-                reason,
-                DiscardCause::Stale | DiscardCause::DiscardedInitialState
-            );
-            // For ambiguous discards, capture expiry before checking payback.
-            // If expiry has passed, this makes the subsequent negative lookup
-            // authoritative for that already-expired transaction.
-            let expired = if waits_for_expiry {
-                settlement_has_expired(client, &settlement.attempt).await?
-            } else {
-                false
-            };
-            let payback =
-                expected_payback_is_included(miden_adapter, settlement.payback_id).await?;
-            let observation = if waits_for_expiry {
-                RecoveryObservation::AmbiguousDiscard
-            } else {
-                RecoveryObservation::DefiniteDiscard
-            };
-            match recovery_decision(status, observation, payback, expired, false) {
-                RecoveryDecision::Confirm => {
-                    activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
-                    Ok(true)
-                }
-                RecoveryDecision::ReleaseAfterNullifierCheck => {
-                    let released =
-                        release_rejected_settlement(miden_adapter, pool, settlement, book_tx)
-                            .await?;
-                    if waits_for_expiry && released {
-                        tracing::warn!(%tx_id, "expired settlement released after nullifier check");
-                    } else if !waits_for_expiry {
-                        tracing::warn!(%tx_id, %reason, "discarded settlement classified by input nullifiers");
-                    }
-                    Ok(released)
-                }
-                RecoveryDecision::MarkUncertain => {
-                    // A local ambiguous discard cannot release inputs before
-                    // expiry and a negative payback observation.
-                    let attempt_id = settlement.id_bytes().to_vec();
-                    pool.write(move |conn| {
-                        db::postgres_db::mark_settlement_uncertain_tx(conn, &attempt_id)
-                    })
-                    .await?;
-                    settlement.mark_uncertain();
-                    tracing::warn!(%tx_id, "discarded settlement remains reserved until expiry");
-                    Ok(false)
-                }
-                RecoveryDecision::Wait => Ok(false),
-                RecoveryDecision::RetryRecordedTransaction => {
-                    unreachable!("discarded record cannot retry here")
-                }
-            }
-        }
-        TransactionStatus::Pending => Ok(false),
     }
 }
 
@@ -851,47 +1023,38 @@ async fn release_rejected_settlement(
     Ok(true)
 }
 
-async fn expected_payback_is_included(
-    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
-    payback_id: NoteId,
-) -> Result<Option<bool>> {
-    match miden_adapter
-        .lock()
-        .await
-        .note_is_included(payback_id)
-        .await
-    {
-        Ok(included) => Ok(Some(included)),
-        Err(error) => {
-            tracing::warn!(%error, "payback lookup RPC failed; retrying next tick");
-            Ok(None)
-        }
-    }
-}
-
-async fn settlement_has_expired(
-    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
-    attempt: &SettlementAttemptRow,
-) -> Result<bool> {
-    let result = TransactionResult::read_from(&mut SliceReader::new(&attempt.tx_result))?;
-    let expiration = result.executed_transaction().expiration_block_num();
-    let sync_height = client.lock().await.get_sync_height().await?;
-
-    // A transaction is still valid in its expiration block. Release only
-    // after the synchronized chain has moved strictly beyond that block.
-    Ok(sync_height > expiration)
-}
-
+/// Our transaction committed: retire its parents and activate its remainders.
+/// A remainder may already be consumed by the time we confirm, so its
+/// nullifier is checked first; a consumed one keeps its FIFO slot but is
+/// never activated. Returns `false` (retry next tick) if that lookup fails.
 async fn activate_confirmed_settlement(
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     pool: &DbPool,
-    tx_id: &[u8],
+    settlement: &PendingSettlement,
     book_tx: &mpsc::Sender<BookUpdate>,
-) -> Result<()> {
-    let attempt_id = tx_id.to_vec();
+) -> Result<bool> {
+    let consumed_children = if settlement.child_notes.is_empty() {
+        HashSet::new()
+    } else {
+        match miden_adapter
+            .lock()
+            .await
+            .check_consumed_notes(&settlement.child_notes)
+            .await
+        {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                tracing::warn!(%error, "remainder nullifier lookup failed; confirming next tick");
+                return Ok(false);
+            }
+        }
+    };
+    let attempt_id = settlement.id_bytes().to_vec();
     pool.write_book(book_tx, move |conn| {
-        db::postgres_db::confirm_settlement_tx(conn, &attempt_id)
+        db::postgres_db::confirm_settlement_tx(conn, &attempt_id, &consumed_children)
     })
-    .await
+    .await?;
+    Ok(true)
 }
 
 /// A crash may occur after the PostgreSQL prepare write but before the client
@@ -922,12 +1085,6 @@ async fn retry_recorded_transaction(
         .await;
     match submission {
         Ok(height) => {
-            let attempt_id = attempt.tx_id.clone();
-            pool.write(move |conn| {
-                db::postgres_db::mark_settlement_submitted_tx(conn, &attempt_id)
-            })
-            .await?;
-            settlement.attempt.status = "submitted".to_string();
             if let Err(error) = client.lock().await.apply_transaction(&result, height).await {
                 tracing::warn!(tx_id = %result.id(), %error, "recovered submission accepted but local store update failed");
             }
@@ -1012,21 +1169,6 @@ fn split_batch(batch: &mut ExecutionBatch) -> Result<Vec<ExecutionBatch>> {
         .collect())
 }
 
-fn refeed_unprepared(
-    pool: &DbPool,
-    batch: &ExecutionBatch,
-    book_tx: &mpsc::Sender<BookUpdate>,
-    cancel: &CancellationToken,
-) {
-    refeed_later(
-        pool,
-        book_tx,
-        cancel,
-        batch.book_orders(),
-        HELD_REFEED_DELAY,
-    );
-}
-
 /// After mempool acceptance, record each note's enqueue-to-submit duration
 /// (now − arrival) into the in-memory swap-eta window and republish it.
 /// `arrival_unix` follows the order from durable ingestion through the batch;
@@ -1072,31 +1214,33 @@ async fn execute_batch(
     book_tx: &mpsc::Sender<BookUpdate>,
     cancel: &CancellationToken,
 ) -> Result<BatchSubmission> {
+    // Nothing is reserved before `prepare_settlement_tx`, and the matcher took
+    // these orders off its book on emit, so every early exit hands them back.
     let components = match BatchComponents::prepare(batch, solver_id) {
         Ok(parts) => parts,
         Err(e) => {
-            // Nothing is marked Settling yet and the matcher dropped these orders on
-            // emit, so hand back the original orders — otherwise
-            // they're stranded until the next restart. Delayed, so a batch that
-            // fails deterministically isn't rebuilt every tick.
-            tracing::error!(
-                error = %e,
-                notes = batch.filled_notes.len(),
-                "batch preparation failed; re-feeding its orders after a pause"
-            );
-            refeed_unprepared(pool, batch, book_tx, cancel);
-            return Ok(BatchSubmission::Returned);
+            // A batch that cannot be prepared fails the same way on retry,
+            // so its orders go straight back to the matcher.
+            tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch preparation failed; returning its orders");
+            return give_back(
+                pool,
+                book_tx,
+                batch.book_orders(),
+                "returning unprepared batch",
+            )
+            .await;
         }
     };
 
     // Fee pre-flight (Miden 0.16): each settlement's fee is paid in the native
-    // asset from the solver's own vault. Nothing is marked Settling yet, so on a
-    // shortfall hand the orders back after a pause.
-    if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
-        tracing::warn!(error = %e, "deferring fee-starved batch");
-        let orders = batch.book_orders();
-        refeed_later(pool, book_tx, cancel, orders, HELD_REFEED_DELAY);
-        return Ok(BatchSubmission::Returned);
+    // asset from the solver's own vault.
+    if let Err(e) =
+        check_fee_headroom(client, miden_adapter, solver_id, FeePreflight::Lenient).await
+    {
+        return Ok(BatchSubmission::Paused {
+            reason: format!("insufficient fee headroom: {e}"),
+            give_back: None,
+        });
     }
 
     match submit_with_rpc_backoff(client, solver_id, &components, pool, cancel).await {
@@ -1110,14 +1254,17 @@ async fn execute_batch(
             Ok(BatchSubmission::Uncertain(settlement))
         }
         SubmitOutcome::BuildFailed(msg) => {
-            // Deterministic failure for THIS batch composition; the individual
-            // orders remain Active (submit never landed). Re-feed so
-            // the matcher can reconsider (and possibly compose a different
-            // batch) without waiting for a process restart.
-            let orders = batch.book_orders();
-            refeed_orders(pool, book_tx, orders).await?;
-            tracing::error!(error = %msg, "tx build failed; re-fed active orders");
-            Ok(BatchSubmission::Returned)
+            // Failure for THIS batch composition; nothing was reserved or
+            // submitted. Re-feed immediately: the DB filter returns only the
+            // parents still Active, so one consumed during proving drops out.
+            tracing::error!(error = %msg, "tx build failed; re-feeding active orders");
+            give_back(
+                pool,
+                book_tx,
+                batch.book_orders(),
+                "re-feed after build failure",
+            )
+            .await
         }
         SubmitOutcome::Critical(message) => {
             Err(anyhow!("critical settlement database failure: {message}"))
@@ -1131,10 +1278,19 @@ async fn execute_batch(
         SubmitOutcome::TxError(e, mut settlement) => {
             if let Some(settlement) = settlement.as_mut() {
                 let attempt_id = settlement.id_bytes().to_vec();
-                pool.write(move |conn| {
-                    db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_id)
-                })
-                .await?;
+                if let Err(error) = pool
+                    .write(move |conn| {
+                        db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_id)
+                    })
+                    .await
+                {
+                    if pool.fatal_token().is_cancelled() {
+                        return Err(error);
+                    }
+                    // The durable row keeps its pre-rejection status; the
+                    // discard transaction below accepts any unconfirmed status.
+                    tracing::warn!(%error, "rejected settlement status write failed; continuing");
+                }
                 settlement.mark_rejected();
             }
             let input_notes = components.notes();
@@ -1158,41 +1314,57 @@ async fn execute_batch(
                         return Ok(BatchSubmission::Uncertain(settlement));
                     }
 
-                    // Nothing was submitted or reserved. Keep the valid
-                    // orders live and let ingest remove any externally
-                    // consumed note when the RPC becomes available again.
-                    tracing::warn!(%error, "pre-submission classification RPC failed; re-feeding batch later");
-                    refeed_later(
-                        pool,
-                        book_tx,
-                        cancel,
-                        batch.book_orders(),
-                        HELD_REFEED_DELAY,
-                    );
-                    return Ok(BatchSubmission::Returned);
+                    // Nothing was submitted or reserved, but which input is
+                    // consumed is unknown until the RPC answers again.
+                    return Ok(BatchSubmission::Paused {
+                        reason: format!("input classification RPC failed: {error}"),
+                        give_back: None,
+                    });
                 }
             };
             let consumed_count = consumed.len();
             let active_count = active_orders.len();
-            let rejected_tx_id = settlement.map(|settlement| settlement.attempt.tx_id);
+            let rejected_tx_id = settlement
+                .as_ref()
+                .map(|settlement| settlement.attempt.tx_id.clone());
 
             // DB updates first, then re-feed the actives. Idempotent against
             // a concurrent ingest update (status guard in mark_orders_onchain_nullified).
-            pool.write_book(book_tx, move |conn| {
-                if let Some(tx_id) = rejected_tx_id {
-                    // Release parents and delete the attempt in one transaction.
-                    db::postgres_db::finish_discarded_settlement_tx(conn, &tx_id, &consumed)
-                } else {
-                    // Execution/proving failed before durable reservation.
-                    let consumed_bytes: Vec<_> =
-                        consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
-                    db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
-                    let mut update = db::postgres_db::active_book_update_tx(conn, active_orders)?;
-                    update.removed.extend(consumed);
-                    Ok(update)
+            let released = pool
+                .write_book(book_tx, move |conn| {
+                    if let Some(tx_id) = rejected_tx_id {
+                        // Release parents and delete the attempt in one transaction.
+                        db::postgres_db::finish_discarded_settlement_tx(conn, &tx_id, &consumed)
+                    } else {
+                        // Execution/proving failed before durable reservation.
+                        let consumed_bytes: Vec<_> =
+                            consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
+                        db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
+                        let mut update =
+                            db::postgres_db::active_book_update_tx(conn, active_orders)?;
+                        update.removed.extend(consumed);
+                        Ok(update)
+                    }
+                })
+                .await;
+            if let Err(error) = released {
+                if pool.fatal_token().is_cancelled() {
+                    return Err(error);
                 }
-            })
-            .await?;
+                return Ok(match settlement {
+                    // Parents stay reserved; reconciliation retries the release.
+                    Some(settlement) => {
+                        tracing::warn!(%error, "discard write failed; settlement left for reconciliation");
+                        BatchSubmission::Uncertain(settlement)
+                    }
+                    // Nothing was reserved, so the orders are still Active.
+                    // The nullifier check is repeated when they are returned.
+                    None => BatchSubmission::Paused {
+                        reason: format!("post-failure book update did not commit: {error}"),
+                        give_back: Some(batch.book_orders()),
+                    },
+                });
+            }
 
             tracing::error!(
                 error = ?e,
@@ -1205,19 +1377,32 @@ async fn execute_batch(
     }
 }
 
+/// How a failed fee or balance lookup is treated by `check_fee_headroom`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeePreflight {
+    /// Before a settlement: a failed lookup is logged and lets the batch
+    /// through — the submit itself is the real check.
+    Lenient,
+    /// While verifying readiness: the lookups must succeed.
+    Strict,
+}
+
 /// `Err` when the chain charges a fee and the solver's fee-asset balance is below
 /// one settlement's worst case. The balance comes from the local store, so it lags
-/// the chain by up to one sync interval. A failed lookup is logged and lets the
-/// batch through — the submit itself is the real check.
+/// the chain by up to one sync interval.
 async fn check_fee_headroom(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     solver_id: AccountId,
+    mode: FeePreflight,
 ) -> Result<()> {
     let fees = miden_adapter.lock().await.fee_parameters().await;
     let (fee_faucet, base_fee) = match fees {
         Ok(Some(params)) => params,
         Ok(None) => return Ok(()),
+        Err(e) if mode == FeePreflight::Strict => {
+            return Err(e.context("node RPC is not answering"));
+        }
         Err(e) => {
             tracing::warn!(error = %e, "fee parameters unavailable; skipping fee pre-flight");
             return Ok(());
@@ -1240,6 +1425,9 @@ async fn check_fee_headroom(
             have.as_u64()
         ),
         Ok(_) => Ok(()),
+        Err(e) if mode == FeePreflight::Strict => {
+            Err(anyhow::Error::from(e).context("solver fee-asset balance unavailable"))
+        }
         Err(e) => {
             tracing::warn!(error = %e, "solver fee-asset balance unavailable; skipping fee pre-flight");
             Ok(())
@@ -1351,32 +1539,6 @@ async fn claim_or_back_off(
             Some(tokio::time::Instant::now() + CLAIM_RETRY_DELAY)
         }
     }
-}
-
-/// Hand orders back to the matcher after `delay`, without blocking the executor.
-/// Used when the executor holds a batch it can't settle yet. On shutdown the
-/// orders stay `Active` in the DB (they were never marked Settling) and the next
-/// boot rehydrates them.
-fn refeed_later(
-    pool: &DbPool,
-    book_tx: &mpsc::Sender<BookUpdate>,
-    cancel: &CancellationToken,
-    orders: Vec<BookOrder>,
-    delay: Duration,
-) {
-    let pool = pool.clone();
-    let (book_tx, cancel) = (book_tx.clone(), cancel.clone());
-    tokio::task::spawn_local(async move {
-        tokio::select! {
-            _ = cancel.cancelled() => {}
-            _ = tokio::time::sleep(delay) => {
-                if let Err(error) = refeed_orders(&pool, &book_tx, orders).await {
-                    tracing::error!(%error, "deferred re-feed failed; stopping pipeline");
-                    cancel.cancel();
-                }
-            },
-        }
-    });
 }
 
 fn note_asset_amount(note: &Note) -> u64 {
@@ -1566,140 +1728,6 @@ mod claim_tests {
             "mock rejection".to_string(),
         ));
         assert!(!submission_outcome_is_unknown(&error));
-    }
-
-    #[test]
-    fn recovery_keeps_ambiguous_settlements_reserved_until_chain_evidence_is_safe() {
-        use RecoveryDecision as Decision;
-        use RecoveryObservation as Observation;
-        use SettlementStatus as Status;
-
-        let cases = [
-            (
-                "missing included payback",
-                Status::Submitted,
-                Observation::MissingRecord,
-                Some(true),
-                false,
-                true,
-                Decision::Confirm,
-            ),
-            (
-                "missing payback lookup failed",
-                Status::Submitted,
-                Observation::MissingRecord,
-                None,
-                true,
-                true,
-                Decision::Wait,
-            ),
-            (
-                "missing expired and absent",
-                Status::Submitted,
-                Observation::MissingRecord,
-                Some(false),
-                true,
-                true,
-                Decision::ReleaseAfterNullifierCheck,
-            ),
-            (
-                "missing prepared retry",
-                Status::Prepared,
-                Observation::MissingRecord,
-                Some(false),
-                false,
-                true,
-                Decision::RetryRecordedTransaction,
-            ),
-            (
-                "missing submitted retry not due",
-                Status::Submitted,
-                Observation::MissingRecord,
-                Some(false),
-                false,
-                false,
-                Decision::Wait,
-            ),
-            (
-                "missing uncertain never retries",
-                Status::Uncertain,
-                Observation::MissingRecord,
-                Some(false),
-                false,
-                true,
-                Decision::Wait,
-            ),
-            (
-                "stale included payback",
-                Status::Submitted,
-                Observation::AmbiguousDiscard,
-                Some(true),
-                false,
-                false,
-                Decision::Confirm,
-            ),
-            (
-                "stale payback lookup failed",
-                Status::Submitted,
-                Observation::AmbiguousDiscard,
-                None,
-                true,
-                false,
-                Decision::Wait,
-            ),
-            (
-                "stale unexpired",
-                Status::Submitted,
-                Observation::AmbiguousDiscard,
-                Some(false),
-                false,
-                false,
-                Decision::MarkUncertain,
-            ),
-            (
-                "stale already uncertain",
-                Status::Uncertain,
-                Observation::AmbiguousDiscard,
-                Some(false),
-                false,
-                false,
-                Decision::Wait,
-            ),
-            (
-                "stale expired and absent",
-                Status::Uncertain,
-                Observation::AmbiguousDiscard,
-                Some(false),
-                true,
-                false,
-                Decision::ReleaseAfterNullifierCheck,
-            ),
-            (
-                "definite discard included",
-                Status::Submitted,
-                Observation::DefiniteDiscard,
-                Some(true),
-                false,
-                false,
-                Decision::Confirm,
-            ),
-            (
-                "definite discard absent",
-                Status::Submitted,
-                Observation::DefiniteDiscard,
-                Some(false),
-                false,
-                false,
-                Decision::ReleaseAfterNullifierCheck,
-            ),
-        ];
-        for (name, status, observation, payback, expired, retry_due, expected) in cases {
-            assert_eq!(
-                recovery_decision(status, observation, payback, expired, retry_due),
-                expected,
-                "{name}"
-            );
-        }
     }
 
     fn fee_faucet() -> AccountId {
@@ -2004,6 +2032,7 @@ mod recovery_tests {
     use crate::db::postgres_schema::{orders, settlement_attempts};
     use crate::db::postgres_test::TestDb;
     use crate::ingest::SyncResult;
+    use crate::types::OrderStatus;
     use diesel::prelude::*;
     use miden_protocol::asset::AssetAmount;
     use miden_protocol::note::NoteType;
@@ -2045,7 +2074,13 @@ mod recovery_tests {
             })
         }
 
-        async fn note_is_included(&mut self, _: NoteId) -> Result<bool> {
+        async fn transaction_committed(
+            &mut self,
+            _: AccountId,
+            _: TransactionId,
+            _: BlockNumber,
+            _: BlockNumber,
+        ) -> Result<bool> {
             Ok(false)
         }
 
@@ -2055,6 +2090,10 @@ mod recovery_tests {
     }
 
     fn parent_note() -> Result<Note> {
+        parent_note_with(Word::default())
+    }
+
+    fn parent_note_with(serial: Word) -> Result<Note> {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE.try_into()?;
         let sender = ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE.try_into()?;
         let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into()?;
@@ -2067,7 +2106,7 @@ mod recovery_tests {
         Ok(PswapNote::builder()
             .sender(sender)
             .storage(storage)
-            .serial_number(Word::default())
+            .serial_number(serial)
             .note_type(NoteType::Public)
             .offered_asset(FungibleAsset::new(offered, 11)?)
             .build()?
@@ -2097,19 +2136,17 @@ mod recovery_tests {
                 tx_id: tx_id.to_bytes().to_vec(),
                 tx_result: vec![1],
                 status: SettlementStatus::Prepared.as_str().into(),
-                created_at_unix: 1,
             };
             let attempt_for_write = attempt.clone();
-            let (note_row, order_row) = NewOrderRow::ingested(&parent, 1)?;
+            let order_row = NewOrderRow::ingested(&parent, 1)?;
             let input = SettlementInputRow {
                 tx_id: attempt.tx_id.clone(),
                 parent_note_id: parent_id.to_bytes().to_vec(),
-                payback_note_id: parent_id.to_bytes().to_vec(),
                 child_note_id: None,
                 child_note_data: None,
             };
             pool.write(move |conn| {
-                db::postgres_db::insert_notes_batch_tx(conn, &[note_row], &[order_row], 1)?;
+                db::postgres_db::insert_orders_batch_tx(conn, &[order_row], 1)?;
                 db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input])?;
                 db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_for_write.tx_id)
             })
@@ -2120,8 +2157,8 @@ mod recovery_tests {
             let settlement = PendingSettlement {
                 tx_id,
                 attempt: rejected_attempt,
-                payback_id: parent_id,
                 parent_notes: vec![parent],
+                child_notes: Vec::new(),
                 retry_at: None,
             };
             let adapter: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(RecoveryAdapter {
@@ -2153,6 +2190,149 @@ mod recovery_tests {
                 assert_eq!(update.active.len(), usize::from(!consumed));
                 assert_eq!(update.removed.len(), usize::from(consumed));
             }
+        }
+        Ok(())
+    }
+
+    fn tagged(tag: usize) -> ExecutionBatch {
+        ExecutionBatch {
+            filled_notes: Vec::new(),
+            group_ends: vec![tag],
+        }
+    }
+
+    fn tags(batches: &[ExecutionBatch]) -> Vec<usize> {
+        batches.iter().map(|batch| batch.group_ends[0]).collect()
+    }
+
+    #[test]
+    fn verification_holds_the_failed_tick_and_retries_it_in_order() {
+        let mut verification = Verification::default();
+        assert!(verification.take_retries().is_empty());
+
+        // Pausing on transaction 1 holds it and the rest of its tick.
+        verification.pause(tagged(1), None, [tagged(2), tagged(3)].into_iter());
+        assert!(verification.active);
+        assert!(
+            verification.take_retries().is_empty(),
+            "nothing runs while verifying"
+        );
+
+        verification.resume();
+        assert_eq!(tags(&verification.take_retries()), vec![1, 2, 3]);
+        assert!(
+            verification.take_retries().is_empty(),
+            "retried exactly once"
+        );
+    }
+
+    #[test]
+    fn verification_gives_orders_back_instead_of_retrying_when_asked() -> Result<()> {
+        let order = BookOrder {
+            priority_seq: 1,
+            arrival_unix: 1,
+            note: Arc::new(parent_note()?),
+        };
+        let mut verification = Verification::default();
+        verification.pause(tagged(1), Some(vec![order]), [tagged(2)].into_iter());
+        assert_eq!(verification.returning.len(), 1);
+        verification.resume();
+        assert_eq!(
+            tags(&verification.take_retries()),
+            vec![2],
+            "a given-back transaction is not retried"
+        );
+
+        verification.pause(tagged(3), Some(Vec::new()), std::iter::empty());
+        assert!(
+            verification.active,
+            "an unreturned batch pauses the executor"
+        );
+        verification.resume();
+        assert!(
+            verification.take_retries().is_empty(),
+            "a given-back batch is never retried"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn node_outcome_waits_until_the_validity_window_has_passed() {
+        let expiration = BlockNumber::from(100_u32);
+        assert_eq!(
+            node_outcome(true, BlockNumber::from(50_u32), expiration, true),
+            TxOutcome::Committed
+        );
+        assert_eq!(
+            node_outcome(false, BlockNumber::from(100_u32), expiration, true),
+            TxOutcome::Unknown {
+                resubmittable: true
+            },
+            "still valid in its expiration block"
+        );
+        assert_eq!(
+            node_outcome(false, BlockNumber::from(101_u32), expiration, false),
+            TxOutcome::NeverCommits
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn release_held_returns_live_orders_and_retires_consumed_ones() -> Result<()> {
+        for (consumed, fail_lookup) in [(false, false), (true, false), (false, true)] {
+            let test_db = TestDb::new().await?;
+            let pool = test_db.pool.clone();
+            let notes = [
+                parent_note_with(Word::from([1_u32, 0, 0, 0]))?,
+                parent_note_with(Word::from([2_u32, 0, 0, 0]))?,
+            ];
+            let rows: Vec<_> = notes
+                .iter()
+                .map(|note| NewOrderRow::ingested(note, 1))
+                .collect::<Result<_>>()?;
+            pool.write(move |conn| {
+                db::postgres_db::insert_orders_batch_tx(conn, &rows, 1)?;
+                Ok(())
+            })
+            .await?;
+            let mut held: Vec<_> = notes
+                .iter()
+                .map(|note| BookOrder {
+                    priority_seq: 1,
+                    arrival_unix: 1,
+                    note: Arc::new(note.clone()),
+                })
+                .collect();
+            let adapter: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(RecoveryAdapter {
+                consumed,
+                fail_nullifier_lookup: fail_lookup,
+            }));
+            let (book_tx, mut book_rx) = mpsc::channel(1);
+
+            let released = release_held(&adapter, &pool, &book_tx, &mut held).await;
+            if fail_lookup {
+                assert!(released.is_err());
+                assert_eq!(held.len(), 2, "kept for the next verification tick");
+                assert!(book_rx.try_recv().is_err());
+                continue;
+            }
+            released?;
+            assert!(held.is_empty());
+            let update = book_rx.try_recv()?;
+            let expected_status = if consumed {
+                assert_eq!(update.removed.len(), 2);
+                assert!(update.active.is_empty());
+                OrderStatus::OnchainNullified
+            } else {
+                assert_eq!(update.active.len(), 2);
+                OrderStatus::Active
+            };
+            let statuses = pool
+                .read(|conn| Ok(orders::table.select(orders::status).load::<String>(conn)?))
+                .await?;
+            assert!(statuses
+                .iter()
+                .all(|status| status == expected_status.as_str()));
         }
         Ok(())
     }

@@ -23,8 +23,6 @@ pub enum SettlementError {
     InputOrderNotActive,
     #[error("settlement child ID does not match its note")]
     ChildIdMismatch,
-    #[error("settlement cannot be confirmed from status {0}")]
-    InvalidConfirmationStatus(String),
     #[error("expected payback {0} is absent from the executed outputs")]
     MissingPayback(NoteId),
     #[error("expected remainder {0} is absent from the executed outputs")]

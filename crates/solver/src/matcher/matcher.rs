@@ -407,17 +407,17 @@ mod tests {
                 db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
                 db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(0), None)?;
             }
-            let (note_rows, order_rows): (Vec<_>, Vec<_>) = notes
+            let order_rows: Vec<_> = notes
                 .iter()
                 .map(|note| NewOrderRow::ingested(note, 1).unwrap())
-                .unzip();
-            db::postgres_db::insert_notes_batch_tx(conn, &note_rows, &order_rows, 1)?;
+                .collect();
+            db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
             Ok(())
         })
         .await
         .unwrap();
         let persisted = pool
-            .read(db::postgres_db::load_active_orders_with_notes_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         let mut book = ClearingBook::default();

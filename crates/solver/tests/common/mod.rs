@@ -268,10 +268,10 @@ where
             use solver::db::postgres_schema::settlement_attempts;
 
             let mut conn = solver::db::postgres_migrations::connect(&url)?;
-            let count: i64 = settlement_attempts::table
-                .filter(settlement_attempts::status.eq("submitted"))
-                .count()
-                .get_result(&mut conn)?;
+            // A prepared attempt is written only after proving, immediately
+            // before submission; it cannot be confirmed (and deleted) until
+            // the test advances the mock chain.
+            let count: i64 = settlement_attempts::table.count().get_result(&mut conn)?;
             Ok(count > 0)
         })
         .await??;

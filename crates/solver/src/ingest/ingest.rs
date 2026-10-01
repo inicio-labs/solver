@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use diesel::{Connection, SqliteConnection};
+use diesel::pg::PgConnection;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
 use miden_client::rpc::{NodeRpcClient, RpcError};
@@ -20,10 +20,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::client_factory::ClientFactory;
-use crate::db::models::{NoteRow, OrderRow};
+use crate::db::postgres_models::NewOrderRow;
 use crate::db::{self, DbPool};
 use crate::types::Order as PipelineOrder;
-use crate::types::{BookOrder, BookUpdate, OrderStatus, TokenId};
+use crate::types::{BookOrder, BookUpdate, TokenId};
 
 /// Result of a sync_state call — newly received notes plus IDs of notes
 /// whose nullifier was just observed on-chain. The matcher uses the
@@ -112,7 +112,9 @@ pub async fn run_ingest(
             // or matcher-channel failure now needs coordinated restart so boot
             // can replay the client's stored discoveries without losing them.
             if let Err(error) = pool
-                .update_book(&book_tx, |conn| sync.persist(conn, solver_id))
+                .write_book(&book_tx, move |conn| {
+                    sync.persist_postgres_tx(conn, solver_id)
+                })
                 .await
             {
                 tracing::error!(%error, "persisting ingest update failed; stopping pipeline");
@@ -146,35 +148,33 @@ fn is_rpc_error(error: &anyhow::Error) -> bool {
 }
 
 impl SyncResult {
-    /// Replay the client's durable discoveries, not only the next sync's delta.
-    /// RPC checks are bounded and happen before the SQLite transaction.
-    pub async fn recover(
+    /// Replays the keyless client's durable note discoveries into PostgreSQL
+    /// before matcher hydration. The Miden client itself never crosses the
+    /// blocking-worker boundary; only the owned sync result does.
+    pub async fn recover_postgres(
         client: &mut dyn MidenClient,
         pool: &DbPool,
         solver_id: AccountId,
     ) -> Result<()> {
         let mut sync = client.sync_state().await?;
         sync.new_notes = client.stored_notes().await?;
-        for notes in sync
+        for note_chunk in sync
             .new_notes
             .chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX)
         {
             sync.consumed_notes
-                .extend(client.check_consumed_notes(notes).await?);
+                .extend(client.check_consumed_notes(note_chunk).await?);
         }
-        sync.persist(&mut *pool.write_conn()?, solver_id)?;
+        pool.write(move |conn| sync.persist_postgres_tx(conn, solver_id))
+            .await?;
         Ok(())
     }
 
-    /// Persist one observed chain update as one transaction. Removals win over
-    /// additions when a sync both discovers and consumes the same remainder.
-    fn persist(self, conn: &mut SqliteConnection, solver_id: AccountId) -> Result<BookUpdate> {
-        conn.transaction(|conn| self.persist_notes(conn, solver_id))
-    }
-
-    fn persist_notes(
+    /// PostgreSQL version of the ingest transition. `PgPool::write_book` owns
+    /// the single transaction; this helper performs no nested transaction.
+    pub(crate) fn persist_postgres_tx(
         self,
-        conn: &mut SqliteConnection,
+        conn: &mut PgConnection,
         solver_id: AccountId,
     ) -> Result<BookUpdate> {
         let SyncResult {
@@ -182,96 +182,47 @@ impl SyncResult {
             new_notes,
             consumed_notes,
         } = self;
+        let observed_ids: Vec<_> = new_notes
+            .iter()
+            .map(|note| note.id().to_bytes().to_vec())
+            .collect();
+        let (expected_children, mut update) =
+            db::postgres_db::confirm_expected_remainders_tx(conn, &observed_ids)?;
 
-        // An included expected remainder confirms its whole settlement. Do this
-        // before processing nullifiers so our own parent becomes Executed rather
-        // than being mistaken for an externally consumed order.
-        let mut expected_children = HashSet::new();
-        let mut update = BookUpdate::default();
+        let mut note_rows = Vec::new();
+        let mut order_rows = Vec::new();
+        let mut book_orders = Vec::new();
         for note in &new_notes {
-            if let Some(outcome) =
-                db::confirm_expected_remainder(conn, note.id().to_bytes().as_slice())?
+            if expected_children.contains(note.id().to_bytes().as_slice())
+                || note.recipient().script().root() != PswapNote::script_root()
             {
-                expected_children.insert(note.id());
-                update.removed.extend(outcome.removed);
-                update.active.extend(outcome.active);
-            }
-        }
-
-        // Parse ordinary PSWAP notes after recognizing linked remainders.
-        let mut db_notes = Vec::new();
-        let mut db_orders = Vec::new();
-        let mut ingest_orders = Vec::new();
-
-        for note in &new_notes {
-            if expected_children.contains(&note.id()) {
                 continue;
             }
-            if note.recipient().script().root() != PswapNote::script_root() {
-                continue;
-            }
-
             let order = match PipelineOrder::from_note(note) {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(note_id = %note.id(), error = %e, "skipping unparseable PSWAP note");
+                Ok(order) => order,
+                Err(error) => {
+                    tracing::warn!(note_id = %note.id(), %error, "skipping unparseable PSWAP note");
                     continue;
                 }
             };
-
-            // A note naming the solver as its creator takes PSWAP's reclaim branch when
-            // the solver consumes it: the offered asset lands in the solver's vault and
-            // no payback note is created, so the batch's expected outputs never appear
-            // and the whole batch fails — every tick, at a fee each time.
             if order.creator_id == solver_id {
                 tracing::warn!(note_id = %note.id(), "skipping PSWAP note whose creator is the solver account");
                 continue;
             }
-
-            let note_id_bytes = note.id().to_bytes().to_vec();
-
-            let mut raw_data = Vec::new();
-            note.write_into(&mut raw_data);
-
-            db_notes.push(NoteRow {
-                note_id: note_id_bytes.clone(),
-                account_id: order.creator_id.to_bytes().to_vec(),
-                raw_data,
-            });
-
-            let arrival_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            db_orders.push(OrderRow {
-                note_id: note_id_bytes,
-                account_id: order.creator_id.to_bytes().to_vec(),
-                requested_asset: order.requested_faucet_id.to_bytes().to_vec(),
-                requested_amount: order.requested_amount as i64,
-                offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
-                offered_amount: order.offered_amount as i64,
-                timestamp: arrival_unix as i64,
-                status: OrderStatus::Active.as_str().to_string(),
-                priority_seq: 0, // assigned by the DB trigger on first insert
-            });
-
-            ingest_orders.push(BookOrder {
-                priority_seq: 0, // replaced with the persisted sequence after insert
+            let arrival_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let (note_row, order_row) = NewOrderRow::ingested(note, arrival_unix)?;
+            note_rows.push(note_row);
+            order_rows.push(order_row);
+            book_orders.push(BookOrder {
+                priority_seq: 0,
                 arrival_unix,
                 note: Arc::new(note.clone()),
             });
         }
 
-        // Insert notes, orders and the cursor together. The returned set contains
-        //    is the orders that were *actually* inserted this call — i.e. seen
-        //    for the first time. Duplicates (already-known note_ids) are excluded
-        //    by the `orders` primary key. This is the durable, bounded dedup that
-        //    replaces the old in-memory `seen_notes` HashSet: a note enters the
-        //    matcher channel exactly once, at first commit, even across restarts.
-        let inserted = db::insert_notes_batch(conn, &db_notes, &db_orders, block_num)?;
-
-        // Only newly inserted ordinary orders need an activation event.
-        for mut order in ingest_orders {
+        let inserted =
+            db::postgres_db::insert_notes_batch_tx(conn, &note_rows, &order_rows, block_num)?;
+        for mut order in book_orders {
             if let Some(&priority_seq) = inserted.get(order.id().to_bytes().as_slice()) {
                 order.priority_seq = priority_seq;
                 update.active.push(order);
@@ -279,7 +230,7 @@ impl SyncResult {
         }
         let consumed: HashSet<_> = consumed_notes.into_iter().collect();
         let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
-        db::mark_orders_onchain_nullified(conn, &consumed_bytes)?;
+        db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
         update
             .active
             .retain(|order| !consumed.contains(&order.id()));
@@ -606,7 +557,10 @@ pub(crate) fn spawn_ingest_thread(
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::db::postgres_test::TestDb;
+    use crate::types::OrderStatus;
     use diesel::connection::SimpleConnection;
+    use diesel::prelude::*;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
@@ -614,6 +568,116 @@ pub mod tests {
     };
     use miden_protocol::{asset::AssetAmount, Word};
     use miden_standards::note::PswapNoteStorage;
+
+    struct PostgresFixture {
+        conn: PgConnection,
+        name: String,
+    }
+
+    impl PostgresFixture {
+        fn new() -> Result<Self> {
+            let url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
+            let mut conn = db::postgres_migrations::connect(&url)?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let name = format!("solver_ingest_{}_{}", std::process::id(), nonce);
+            conn.batch_execute(&format!("CREATE SCHEMA {name}; SET search_path TO {name}"))?;
+            db::postgres_migrations::migrate(&mut conn)?;
+            Ok(Self { conn, name })
+        }
+    }
+
+    impl Drop for PostgresFixture {
+        fn drop(&mut self) {
+            let _ = self.conn.batch_execute("ROLLBACK");
+            let _ = self.conn.batch_execute(&format!(
+                "SET search_path TO public; DROP SCHEMA {} CASCADE",
+                self.name
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn postgres_ingest_confirms_and_suppresses_consumed_remainder() -> Result<()> {
+        use db::postgres_schema::{notes, orders};
+
+        let mut pg_fixture = PostgresFixture::new()?;
+        let conn = &mut pg_fixture.conn;
+        let (parent, child, solver) = fixture();
+        let first = conn.transaction::<_, anyhow::Error, _>(|conn| {
+            SyncResult {
+                block_num: 1,
+                new_notes: vec![parent.clone()],
+                consumed_notes: Vec::new(),
+            }
+            .persist_postgres_tx(conn, solver)
+        })?;
+        assert_eq!(first.active.len(), 1);
+        assert_eq!(first.active[0].id(), parent.id());
+        let creator = PipelineOrder::from_note(&parent)?.creator_id;
+        let stored_creator: Vec<u8> = notes::table
+            .find(parent.id().to_bytes().to_vec())
+            .select(notes::account_id)
+            .first(conn)?;
+        assert_eq!(stored_creator, creator.to_bytes());
+
+        let duplicate = conn.transaction::<_, anyhow::Error, _>(|conn| {
+            SyncResult {
+                block_num: 2,
+                new_notes: vec![parent.clone()],
+                consumed_notes: Vec::new(),
+            }
+            .persist_postgres_tx(conn, solver)
+        })?;
+        assert!(duplicate.is_empty());
+
+        let priority: i64 = orders::table
+            .find(parent.id().to_bytes().to_vec())
+            .select(orders::priority_seq)
+            .first(conn)?;
+        let tx_id = vec![7; 32];
+        conn.transaction::<_, anyhow::Error, _>(|conn| {
+            db::postgres_db::prepare_settlement_tx(
+                conn,
+                &db::postgres_models::SettlementAttemptRow {
+                    tx_id: tx_id.clone(),
+                    tx_result: vec![1],
+                    status: "prepared".into(),
+                    created_at_unix: 3,
+                },
+                &[db::postgres_models::SettlementInputRow {
+                    tx_id: tx_id.clone(),
+                    parent_note_id: parent.id().to_bytes().to_vec(),
+                    payback_note_id: vec![8; 32],
+                    child_note_id: Some(child.id().to_bytes().to_vec()),
+                    child_note_data: Some(child.to_bytes()),
+                }],
+            )
+        })?;
+        let unresolved = db::postgres_db::load_unresolved_attempts_tx(conn)?;
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].parents.len(), 1);
+        assert_eq!(unresolved[0].parents[0].id(), parent.id());
+        let update = conn.transaction::<_, anyhow::Error, _>(|conn| {
+            SyncResult {
+                block_num: 3,
+                new_notes: vec![child.clone()],
+                consumed_notes: vec![child.id(), parent.id()],
+            }
+            .persist_postgres_tx(conn, solver)
+        })?;
+        assert!(update.active.is_empty());
+        assert!(update.removed.contains(&parent.id()));
+        assert!(update.removed.contains(&child.id()));
+        let child_row: (String, i64) = orders::table
+            .find(child.id().to_bytes().to_vec())
+            .select((orders::status, orders::priority_seq))
+            .first(conn)?;
+        assert_eq!(child_row.0, OrderStatus::OnchainNullified.as_str());
+        assert_eq!(child_row.1, priority);
+        assert!(db::postgres_db::load_unresolved_attempts_tx(conn)?.is_empty());
+        Ok(())
+    }
 
     fn fixture() -> (Note, Note, AccountId) {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
@@ -652,120 +716,161 @@ pub mod tests {
         (parent, child.unwrap().into(), solver)
     }
 
-    fn prepare(pool: &DbPool, parent: &Note, child: &Note, solver: AccountId) -> Vec<u8> {
-        let mut conn = pool.write_conn().unwrap();
-        SyncResult {
-            block_num: 1,
-            new_notes: vec![parent.clone()],
-            consumed_notes: vec![],
-        }
-        .persist(&mut conn, solver)
+    async fn prepare(pool: &DbPool, parent: &Note, child: &Note, solver: AccountId) -> Vec<u8> {
+        let first_parent = parent.clone();
+        let parent = parent.clone();
+        let child = child.clone();
+        pool.write(move |conn| {
+            SyncResult {
+                block_num: 1,
+                new_notes: vec![first_parent],
+                consumed_notes: vec![],
+            }
+            .persist_postgres_tx(conn, solver)
+        })
+        .await
         .unwrap();
         let tx_id = vec![7; 32];
-        db::prepare_settlement(
-            &mut conn,
-            &db::models::SettlementAttemptRow {
-                tx_id: tx_id.clone(),
-                tx_result: vec![1],
-                status: "prepared".into(),
-            },
-            &[db::models::SettlementInputRow {
-                tx_id: tx_id.clone(),
-                parent_note_id: parent.id().to_bytes().to_vec(),
-                payback_note_id: vec![8; 32],
-                child_note_id: Some(child.id().to_bytes().to_vec()),
-                child_note_data: Some(child.to_bytes()),
-            }],
-        )
+        let durable_tx_id = tx_id.clone();
+        pool.write(move |conn| {
+            db::postgres_db::prepare_settlement_tx(
+                conn,
+                &db::postgres_models::SettlementAttemptRow {
+                    tx_id: durable_tx_id.clone(),
+                    tx_result: vec![1],
+                    status: "prepared".into(),
+                    created_at_unix: 1,
+                },
+                &[db::postgres_models::SettlementInputRow {
+                    tx_id: durable_tx_id,
+                    parent_note_id: parent.id().to_bytes().to_vec(),
+                    payback_note_id: vec![8; 32],
+                    child_note_id: Some(child.id().to_bytes().to_vec()),
+                    child_note_data: Some(child.to_bytes()),
+                }],
+            )
+        })
+        .await
         .unwrap();
         tx_id
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn startup_recovers_client_notes_missing_from_solver_database() {
-        let pool = db::init_db(":memory:", 1).unwrap();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let (parent, _, solver) = fixture();
         let mut client = MockMidenClient::new();
         client.add_notes(vec![parent.clone()], 10);
         // Client sync committed, then the process died before solver persistence.
         client.sync_state().await.unwrap();
         assert!(client.sync_state().await.unwrap().new_notes.is_empty());
-        SyncResult::recover(&mut client, &pool, solver)
+        SyncResult::recover_postgres(&mut client, pool, solver)
             .await
             .unwrap();
-        let first = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        let first = pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
+            .unwrap();
         assert_eq!(first.len(), 1);
-        SyncResult::recover(&mut client, &pool, solver)
+        SyncResult::recover_postgres(&mut client, pool, solver)
             .await
             .unwrap();
-        let second = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        let second = pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
+            .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].priority_seq, first[0].priority_seq);
         client.mark_consumed_silent(vec![parent.id()]);
-        SyncResult::recover(&mut client, &pool, solver)
+        SyncResult::recover_postgres(&mut client, pool, solver)
             .await
             .unwrap();
-        assert!(db::get_active_orders(&mut pool.write_conn().unwrap())
+        assert!(pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
             .unwrap()
             .is_empty());
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn startup_remainder_keeps_parent_priority() {
-        let pool = db::init_db(":memory:", 1).unwrap();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let (parent, child, solver) = fixture();
-        prepare(&pool, &parent, &child, solver);
+        prepare(pool, &parent, &child, solver).await;
         let mut client = MockMidenClient::new();
         client.add_notes(vec![child.clone()], 10);
         client.sync_state().await.unwrap();
-        SyncResult::recover(&mut client, &pool, solver)
+        SyncResult::recover_postgres(&mut client, pool, solver)
             .await
             .unwrap();
-        let live = db::get_active_orders(&mut pool.write_conn().unwrap()).unwrap();
+        let live = pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
+            .unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].note_id, child.id().to_bytes());
         assert_eq!(live[0].priority_seq, 1);
     }
 
-    #[test]
-    fn consumed_remainder_is_not_activated_in_same_sync() {
-        let pool = db::init_db(":memory:", 1).unwrap();
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn consumed_remainder_is_not_activated_in_same_sync() {
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let (parent, child, solver) = fixture();
-        prepare(&pool, &parent, &child, solver);
+        prepare(pool, &parent, &child, solver).await;
+        let child_id = child.id();
         let update = SyncResult {
             block_num: 10,
             new_notes: vec![child.clone()],
             consumed_notes: vec![parent.id(), child.id()],
-        }
-        .persist(&mut pool.write_conn().unwrap(), solver)
-        .unwrap();
+        };
+        let update = pool
+            .write(move |conn| update.persist_postgres_tx(conn, solver))
+            .await
+            .unwrap();
         assert!(update.active.is_empty());
-        assert!(update.removed.contains(&child.id()));
-        assert!(db::get_active_orders(&mut pool.write_conn().unwrap())
+        assert!(update.removed.contains(&child_id));
+        assert!(pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
             .unwrap()
             .is_empty());
     }
 
-    #[test]
-    fn sync_error_rolls_back_remainder_confirmation() {
-        let pool = db::init_db(":memory:", 1).unwrap();
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn sync_error_rolls_back_remainder_confirmation() {
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let (parent, child, solver) = fixture();
-        prepare(&pool, &parent, &child, solver);
-        let mut conn = pool.write_conn().unwrap();
-        conn.batch_execute(
-            "CREATE TRIGGER reject_cursor BEFORE UPDATE ON sync_state
-            BEGIN SELECT RAISE(ABORT, 'injected cursor error'); END;",
-        )
-        .unwrap();
-        assert!(SyncResult {
+        prepare(pool, &parent, &child, solver).await;
+        pool.write(|conn| { conn.batch_execute("ALTER TABLE sync_state ADD CONSTRAINT reject_cursor CHECK (last_fetched_block < 10)")?; Ok(()) }).await.unwrap();
+        let sync = SyncResult {
             block_num: 10,
             new_notes: vec![child],
-            consumed_notes: vec![]
-        }
-        .persist(&mut conn, solver)
-        .is_err());
-        assert_eq!(db::unresolved_settlements(&mut conn).unwrap().len(), 1);
-        assert!(db::get_active_orders(&mut conn).unwrap().is_empty());
+            consumed_notes: vec![],
+        };
+        assert!(pool
+            .write(move |conn| sync.persist_postgres_tx(conn, solver))
+            .await
+            .is_err());
+        assert_eq!(
+            pool.read(db::postgres_db::load_unresolved_attempts_tx)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pool
+            .read(db::postgres_db::get_active_orders_tx)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Mock MidenClient for testing.
@@ -882,8 +987,10 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn transient_ingest_rpc_failure_retries_without_cancelling_pipeline() {
-        let pool = db::init_db(":memory:", 1).unwrap();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = test_db.pool.clone();
         let (_, _, solver) = fixture();
         let mut mock = MockMidenClient::new();
         mock.add_notes(Vec::new(), 7);
@@ -906,7 +1013,12 @@ pub mod tests {
 
         let observed = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if db::get_last_fetched_block(&mut pool.write_conn().unwrap()).unwrap() == 7 {
+                if pool
+                    .read(db::postgres_db::get_last_fetched_block_tx)
+                    .await
+                    .unwrap()
+                    == 7
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;

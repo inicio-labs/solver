@@ -40,12 +40,12 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    pub fn new(
-        pool: DbPool,
-        subscribe_tx: SubscribeSender,
-        token_map: SharedTokenMap,
-    ) -> Self {
-        Self { pool, subscribe_tx, token_map }
+    pub fn new(pool: DbPool, subscribe_tx: SubscribeSender, token_map: SharedTokenMap) -> Self {
+        Self {
+            pool,
+            subscribe_tx,
+            token_map,
+        }
     }
 
     /// Build the admin router.
@@ -67,13 +67,15 @@ impl AdminState {
             .with_state(self)
     }
 
-    pub fn load_tokens_from_db(&self) -> anyhow::Result<Vec<TokenId>> {
-        db::load_registered_tokens(&self.pool)
+    pub async fn load_tokens_from_db(&self) -> anyhow::Result<Vec<TokenId>> {
+        self.pool
+            .read(db::postgres_db::load_registered_tokens_tx)
+            .await
     }
 
     /// Update the in-memory symbol cache. Lock held briefly, no awaits.
-    fn set_cache(&self, token: TokenId, symbol: Option<String>) {
-        let mut map = crate::price::write_token_map(&self.token_map);
+    fn set_cache(map_handle: &SharedTokenMap, token: TokenId, symbol: Option<String>) {
+        let mut map = crate::price::write_token_map(map_handle);
         match symbol {
             Some(s) => {
                 map.insert(token, s);
@@ -92,20 +94,38 @@ impl AdminState {
         let mut token_bytes = Vec::new();
         new_token.write_into(&mut token_bytes);
 
-        let mut conn = self.pool.write_conn()?;
-        let inserted = db::register_token(&mut conn, &token_bytes, external_symbol.as_deref())?;
+        let cache = self.token_map.clone();
+        let symbol_for_cache = external_symbol.clone();
+        let (inserted, existing) = self
+            .pool
+            .admin_write(
+                move |conn| {
+                    let inserted = db::postgres_db::register_token_tx(
+                        conn,
+                        &token_bytes,
+                        external_symbol.as_deref(),
+                    )?;
+                    let existing = if inserted {
+                        db::postgres_db::load_registered_tokens_tx(conn)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok((inserted, existing))
+                },
+                move |result| {
+                    if result.0 {
+                        Self::set_cache(&cache, new_token, symbol_for_cache);
+                    }
+                },
+            )
+            .await?;
 
         if inserted {
             // Reflect the new mapping in the in-memory cache (if any).
-            if external_symbol.is_some() {
-                self.set_cache(new_token, external_symbol.clone());
-            }
-
             // Tell the subscribe task to subscribe both directions of every
             // existing pair involving the new token. Channel send failures
             // are logged but don't fail the admin call — the DB row is the
             // source of truth and a restart will reconcile.
-            let existing = self.load_tokens_from_db()?;
             for token in &existing {
                 if *token != new_token {
                     if let Err(e) = self.subscribe_tx.send((new_token, *token)).await {
@@ -135,9 +155,7 @@ async fn require_bearer_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
     match provided {
-        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => {
-            Ok(next.run(req).await)
-        }
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -149,6 +167,7 @@ async fn list_tokens(
 ) -> Result<Json<Vec<TokenResponse>>, StatusCode> {
     let tokens = state
         .load_tokens_from_db()
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let response = tokens
@@ -170,8 +189,8 @@ async fn add_token(
     Json(req): Json<TokenRequest>,
 ) -> Result<(StatusCode, &'static str), StatusCode> {
     let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token =
+        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let inserted = state
         .register_token(token, req.external_symbol)
@@ -190,20 +209,28 @@ async fn update_token_symbol_handler(
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token =
+        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let mut conn = state
+    let cache = state.token_map.clone();
+    let symbol = req.external_symbol;
+    let symbol_for_cache = symbol.clone();
+    let updated = state
         .pool
-        .write_conn()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let updated = db::update_token_symbol(&mut conn, &bytes, req.external_symbol.as_deref())
+        .admin_write(
+            move |conn| db::postgres_db::update_token_symbol_tx(conn, &bytes, symbol.as_deref()),
+            move |updated| {
+                if *updated {
+                    AdminState::set_cache(&cache, token, symbol_for_cache);
+                }
+            },
+        )
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !updated {
         return Ok(StatusCode::NOT_FOUND);
     }
-    state.set_cache(token, req.external_symbol);
     Ok(StatusCode::OK)
 }
 
@@ -212,24 +239,29 @@ async fn remove_token(
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token =
+        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let mut conn = state
+    let cache = state.token_map.clone();
+    let deleted = state
         .pool
-        .write_conn()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deleted = db::unregister_token(&mut conn, &bytes)
+        .admin_write(
+            move |conn| db::postgres_db::unregister_token_tx(conn, &bytes),
+            move |deleted| {
+                if *deleted {
+                    AdminState::set_cache(&cache, token, None);
+                }
+            },
+        )
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if deleted {
-        state.set_cache(token, None);
         Ok(StatusCode::OK)
     } else {
         Ok(StatusCode::NOT_FOUND)
     }
 }
-
 
 #[derive(Deserialize)]
 pub struct TokenRequest {
@@ -247,15 +279,15 @@ pub struct TokenResponse {
 mod tests {
     use super::*;
     use axum_test::TestServer;
+    use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
     };
-    use miden_protocol::account::AccountId;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
-    use crate::db;
+    use crate::db::postgres_test::TestDb;
 
     fn test_token_a() -> TokenId {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()
@@ -265,51 +297,49 @@ mod tests {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
     }
 
-    fn unique_db_url() -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("file:admintest{}?mode=memory&cache=shared", n)
-    }
-
     const TEST_TOKEN: &str = "test-admin-token";
 
-    fn make_state_with_map() -> (Arc<AdminState>, SharedTokenMap) {
-        let pool = db::init_db(&unique_db_url(), 1).unwrap();
+    async fn make_state_with_map() -> (Arc<AdminState>, SharedTokenMap, TestDb) {
+        let test_db = TestDb::new().await.unwrap();
         // Tests don't exercise the subscribe path; create a channel whose
         // receiver is dropped immediately. Sends will fail but admin handlers
         // log and continue.
         let (subscribe_tx, _) = mpsc::channel::<(TokenId, TokenId)>(8);
         let token_map: SharedTokenMap = Arc::new(RwLock::new(HashMap::new()));
-        let state = Arc::new(AdminState::new(pool, subscribe_tx, token_map.clone()));
-        (state, token_map)
+        let state = Arc::new(AdminState::new(
+            test_db.pool.clone(),
+            subscribe_tx,
+            token_map.clone(),
+        ));
+        (state, token_map, test_db)
     }
 
-    pub fn make_state() -> Arc<AdminState> {
-        make_state_with_map().0
+    async fn make_state() -> (Arc<AdminState>, TestDb) {
+        let (state, _, db) = make_state_with_map().await;
+        (state, db)
     }
 
-    fn test_server() -> TestServer {
-        let state = make_state();
+    async fn test_server() -> (TestServer, TestDb) {
+        let (state, db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
             AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-admin-token"),
         );
-        server
+        (server, db)
     }
 
     /// Returns (server, cache) so tests can inspect the in-memory cache.
-    fn test_server_with_cache() -> (TestServer, SharedTokenMap) {
-        let (state, cache) = make_state_with_map();
+    async fn test_server_with_cache() -> (TestServer, SharedTokenMap, TestDb) {
+        let (state, cache, db) = make_state_with_map().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
             AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-admin-token"),
         );
-        (server, cache)
+        (server, cache, db)
     }
 
     fn token_hex(token: TokenId) -> String {
@@ -319,8 +349,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_created_first_time() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -330,8 +361,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_ok_on_duplicate() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.post("/admin/tokens").json(&body).await;
@@ -340,8 +372,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_bad_request_for_invalid_hex() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": "not_hex!" }))
@@ -350,8 +383,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_ok_when_found() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.delete("/admin/tokens").json(&body).await;
@@ -359,8 +393,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_not_found_when_missing() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .delete("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -369,8 +404,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_without_bearer_token_return_unauthorized() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let server = TestServer::new(state.router(Some(token)));
         let res = server.get("/admin/tokens").await;
@@ -378,8 +414,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_with_wrong_token_return_unauthorized() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
@@ -391,16 +428,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn router_with_no_admin_token_returns_404() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let server = TestServer::new(state.router(None));
         let res = server.get("/admin/tokens").await;
         res.assert_status(StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn list_tokens_returns_all_registered() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -422,8 +461,9 @@ mod tests {
     // ── New: symbol-cache tests ────────────────────────────────────────────
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_with_symbol_persists_to_cache() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({
@@ -433,12 +473,16 @@ mod tests {
             .await;
         res.assert_status(StatusCode::CREATED);
         let map = cache.read().unwrap();
-        assert_eq!(map.get(&test_token_a()).map(String::as_str), Some("usd-coin"));
+        assert_eq!(
+            map.get(&test_token_a()).map(String::as_str),
+            Some("usd-coin")
+        );
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn patch_token_symbol_updates_cache_and_db() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         // Register without a symbol.
         server
             .post("/admin/tokens")
@@ -454,12 +498,16 @@ mod tests {
             .await;
         res.assert_status(StatusCode::OK);
         let map = cache.read().unwrap();
-        assert_eq!(map.get(&test_token_a()).map(String::as_str), Some("ethereum"));
+        assert_eq!(
+            map.get(&test_token_a()).map(String::as_str),
+            Some("ethereum")
+        );
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn patch_token_symbol_returns_404_for_unknown() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let res = server
             .patch("/admin/tokens")
             .json(&json!({
@@ -472,8 +520,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn delete_token_clears_cache_entry() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let body = json!({
             "token_id": token_hex(test_token_a()),
             "external_symbol": "usd-coin"

@@ -90,7 +90,9 @@ pub async fn subscribe_all_pairs(
     db_pool: &db::DbPool,
     client: &mut dyn MidenClient,
 ) -> anyhow::Result<()> {
-    let tokens = db::load_registered_tokens(db_pool)?;
+    let tokens = db_pool
+        .read(db::postgres_db::load_registered_tokens_tx)
+        .await?;
     // Cache each registered token's on-chain metadata once, at boot. Config
     // `[[pairs]]` are seeded into the DB before this runs (`prepare_db`), so this
     // is the registration point for config tokens — the runtime (admin) path is
@@ -119,40 +121,44 @@ async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, 
 
     // Already cached? Check first so we never re-hit the RPC for a known token
     // (the admin path replays a token across every pair it forms).
-    match pool.write_conn() {
-        Ok(mut conn) => match db::get_registered_token(&mut conn, &key) {
-            Ok(Some(row)) if row.decimals.is_some() => return, // already have it
-            Ok(Some(_)) => {}                                  // registered, still missing → fetch
-            Ok(None) => return, // not registered → nothing to annotate
-            Err(e) => {
-                tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
-                return;
-            }
+    let lookup_key = key.clone();
+    match pool
+        .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &lookup_key))
+        .await
+    {
+        Ok(row) => match row {
+            Some(row) if row.decimals.is_some() => return, // already have it
+            Some(_) => {}                                  // registered, still missing → fetch
+            None => return,                                // not registered → nothing to annotate
         },
         Err(e) => {
-            tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed");
+            tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
             return;
         }
     }
 
     match client.fetch_token_metadata(token).await {
-        Ok(Some((decimals, ticker))) => match pool.write_conn() {
-            Ok(mut conn) => {
-                if let Err(e) = db::set_token_metadata(
-                    &mut conn,
-                    &key,
-                    Some(i32::from(decimals)),
-                    Some(&ticker),
-                ) {
-                    tracing::warn!(%token, error = %e, "ensure_token_metadata: persist failed");
-                } else {
-                    tracing::info!(%token, decimals, ticker = %ticker, "fetched on-chain token metadata");
+        Ok(Some((decimals, ticker))) => {
+            let ticker_for_db = ticker.clone();
+            let saved = pool
+                .write(move |conn| {
+                    db::postgres_db::set_token_metadata_tx(
+                        conn,
+                        &key,
+                        Some(i32::from(decimals)),
+                        Some(&ticker_for_db),
+                    )
+                })
+                .await;
+            match saved {
+                Ok(_) => {
+                    tracing::info!(%token, decimals, ticker = %ticker, "fetched on-chain token metadata")
+                }
+                Err(error) => {
+                    tracing::warn!(%token, %error, "ensure_token_metadata: persist failed")
                 }
             }
-            Err(e) => {
-                tracing::warn!(%token, error = %e, "ensure_token_metadata: write_conn failed")
-            }
-        },
+        }
         Ok(None) => {
             tracing::debug!(%token, "no on-chain metadata (private/non-faucet); will retry on next registration")
         }
@@ -236,10 +242,17 @@ pub fn create_channels() -> PipelineChannels {
 
 /// Token seed + symbol-map hydrate. Outstanding settlements stay reserved
 /// until the executor reconciles them; resetting them could rematch a consumed parent.
-pub fn prepare_db(config: &PipelineConfig) -> Result<()> {
-    db::seed_tokens_from_config(&config.db_pool, &config.initial_tokens)?;
+pub async fn prepare_db(config: &PipelineConfig) -> Result<()> {
+    let initial_tokens = config.initial_tokens.clone();
+    config
+        .db_pool
+        .write(move |conn| db::postgres_db::seed_tokens_from_config_tx(conn, &initial_tokens))
+        .await?;
     {
-        let loaded = db::load_token_symbols(&config.db_pool)?;
+        let loaded = config
+            .db_pool
+            .read(db::postgres_db::load_token_symbols_tx)
+            .await?;
         let mut map = crate::price::write_token_map(&config.token_map);
         *map = loaded;
     }
@@ -363,7 +376,7 @@ pub async fn spawn_ingest_tasks(
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
 
-    ingest::SyncResult::recover(&mut *adapter.lock().await, &db_pool, solver_id).await?;
+    ingest::SyncResult::recover_postgres(&mut *adapter.lock().await, &db_pool, solver_id).await?;
     let bootstrap = reconcile_clearing_book(&db_pool, &mut *adapter.lock().await).await?;
     clearing_bootstrap
         .send(bootstrap)
@@ -422,20 +435,21 @@ async fn reconcile_clearing_book(
     pool: &db::DbPool,
     client: &mut dyn MidenClient,
 ) -> Result<matcher::ClearingBootstrap> {
-    let (mut orders, decimals) = {
-        let mut conn = pool.read_conn()?;
-        let orders = db::load_active_orders_with_notes(&mut conn)?;
-        let mut decimals = HashMap::new();
-        for token in db::get_registered_tokens(&mut conn)? {
-            if let Some(value) = token.decimals {
-                decimals.insert(
-                    TokenId::read_from_bytes(&token.token_id)?,
-                    u8::try_from(value)?,
-                );
+    let (mut orders, decimals) = pool
+        .read(|conn| {
+            let orders = db::postgres_db::load_active_orders_with_notes_tx(conn)?;
+            let mut decimals = HashMap::new();
+            for token in db::postgres_db::get_registered_tokens_tx(conn)? {
+                if let Some(value) = token.decimals {
+                    decimals.insert(
+                        TokenId::read_from_bytes(&token.token_id)?,
+                        u8::try_from(value)?,
+                    );
+                }
             }
-        }
-        (orders, decimals)
-    };
+            Ok((orders, decimals))
+        })
+        .await?;
     let mut consumed = std::collections::HashSet::new();
     // Bound each RPC request; notes were decoded once at the DB boundary.
     for chunk in orders.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
@@ -451,9 +465,11 @@ async fn reconcile_clearing_book(
         );
     }
     if !consumed.is_empty() {
-        let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
-        let mut conn = pool.write_conn()?;
-        db::mark_orders_onchain_nullified(&mut conn, &ids)?;
+        let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
+        pool.write(move |conn| {
+            db::postgres_db::mark_orders_onchain_nullified_tx(conn, &ids).map(|_| ())
+        })
+        .await?;
         orders.retain(|order| !consumed.contains(&order.id()));
     }
     Ok(matcher::ClearingBootstrap { orders, decimals })
@@ -474,6 +490,7 @@ mod tests {
 
     use crate::admin::AdminState;
     use crate::db;
+    use crate::db::postgres_test::TestDb;
     use crate::ingest::tests::MockMidenClient;
     use crate::ingest::MidenClient;
     use crate::matching::price_feed::PriceFeed;
@@ -488,17 +505,8 @@ mod tests {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
     }
 
-    fn test_db_pool() -> db::DbPool {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let url = format!("file:pipelinetest{}?mode=memory&cache=shared", n);
-        db::init_db(&url, 1).expect("failed to create in-memory DB")
-    }
-
-    fn persist_clearing_notes(pool: &db::DbPool) -> Vec<NoteId> {
-        use crate::db::models::{NoteRow, OrderRow};
-        use crate::types::{Order, OrderStatus};
+    async fn persist_clearing_notes(pool: &db::DbPool) -> Vec<NoteId> {
+        use crate::db::postgres_models::NewOrderRow;
         use miden_protocol::asset::{AssetAmount, FungibleAsset};
         use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
         use miden_protocol::note::NoteType;
@@ -509,12 +517,9 @@ mod tests {
             .try_into()
             .unwrap();
         let mut rng = RandomCoin::new(Word::default());
-        let mut conn = pool.write_conn().unwrap();
         let mut ids = Vec::new();
-        for token in [test_token_a(), test_token_b()] {
-            db::register_token(&mut conn, &token.to_bytes(), None).unwrap();
-            db::set_token_metadata(&mut conn, &token.to_bytes(), Some(6), None).unwrap();
-        }
+        let mut note_rows = Vec::new();
+        let mut order_rows = Vec::new();
         for _ in 0..2 {
             let note: Note = PswapNote::builder()
                 .sender(creator)
@@ -531,38 +536,34 @@ mod tests {
                 .build()
                 .unwrap()
                 .into();
-            let order = Order::from_note(&note).unwrap();
-            db::insert_notes_batch(
-                &mut conn,
-                &[NoteRow {
-                    note_id: note.id().to_bytes(),
-                    account_id: creator.to_bytes(),
-                    raw_data: note.to_bytes(),
-                }],
-                &[OrderRow {
-                    note_id: note.id().to_bytes(),
-                    account_id: creator.to_bytes(),
-                    requested_asset: order.requested_faucet_id.to_bytes(),
-                    requested_amount: order.requested_amount as i64,
-                    offered_asset: order.offered_faucet_id.to_bytes(),
-                    offered_amount: order.offered_amount as i64,
-                    timestamp: 1,
-                    status: OrderStatus::Active.as_str().to_owned(),
-                    priority_seq: 0,
-                }],
-                1,
-            )
-            .unwrap();
+            let (note_row, order_row) = NewOrderRow::ingested(&note, 1).unwrap();
+            note_rows.push(note_row);
+            order_rows.push(order_row);
             ids.push(note.id());
         }
+        pool.write(move |conn| {
+            for token in [test_token_a(), test_token_b()] {
+                db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
+                db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(6), None)?;
+            }
+            db::postgres_db::insert_notes_batch_tx(conn, &note_rows, &order_rows, 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         ids
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn clearing_bootstrap_removes_consumed_notes_and_preserves_fifo_and_decimals() {
-        let pool = test_db_pool();
-        let ids = persist_clearing_notes(&pool);
-        let before = db::load_active_orders_with_notes(&mut pool.read_conn().unwrap()).unwrap();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
+        let ids = persist_clearing_notes(pool).await;
+        let before = pool
+            .read(db::postgres_db::load_active_orders_with_notes_tx)
+            .await
+            .unwrap();
         let mut client = MockMidenClient::new();
         client.mark_consumed_silent(vec![ids[0]]);
         let bootstrap = reconcile_clearing_book(&pool, &mut client).await.unwrap();
@@ -571,7 +572,8 @@ mod tests {
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(
-            db::load_active_orders_with_notes(&mut pool.read_conn().unwrap())
+            pool.read(db::postgres_db::load_active_orders_with_notes_tx)
+                .await
                 .unwrap()
                 .len(),
             1
@@ -579,14 +581,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn clearing_bootstrap_fails_closed_on_nullifier_rpc_error() {
-        let pool = test_db_pool();
-        persist_clearing_notes(&pool);
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
+        persist_clearing_notes(pool).await;
         let mut client = MockMidenClient::new();
         client.fail_consumed_check = true;
         assert!(reconcile_clearing_book(&pool, &mut client).await.is_err());
         assert_eq!(
-            db::load_active_orders_with_notes(&mut pool.read_conn().unwrap())
+            pool.read(db::postgres_db::load_active_orders_with_notes_tx)
+                .await
                 .unwrap()
                 .len(),
             2
@@ -701,45 +706,65 @@ mod tests {
         assert_eq!(result[&token_a].usd, 5.0);
     }
 
-    #[test]
-    fn seed_tokens_from_config_inserts_tokens() {
-        let pool = test_db_pool();
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn seed_tokens_from_config_inserts_tokens() {
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let tokens = vec![(test_token_a(), None), (test_token_b(), None)];
 
-        db::seed_tokens_from_config(&pool, &tokens).unwrap();
+        pool.write(move |conn| db::postgres_db::seed_tokens_from_config_tx(conn, &tokens))
+            .await
+            .unwrap();
 
-        let mut conn = pool.read_conn().unwrap();
-        let rows = db::get_registered_tokens(&mut conn).unwrap();
+        let rows = pool
+            .read(db::postgres_db::get_registered_tokens_tx)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2);
     }
 
-    #[test]
-    fn seed_tokens_from_config_is_idempotent() {
-        let pool = test_db_pool();
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn seed_tokens_from_config_is_idempotent() {
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let tokens = vec![(test_token_a(), None)];
 
-        db::seed_tokens_from_config(&pool, &tokens).unwrap();
-        db::seed_tokens_from_config(&pool, &tokens).unwrap();
+        for _ in 0..2 {
+            let tokens = tokens.clone();
+            pool.write(move |conn| db::postgres_db::seed_tokens_from_config_tx(conn, &tokens))
+                .await
+                .unwrap();
+        }
 
-        let mut conn = pool.read_conn().unwrap();
-        let rows = db::get_registered_tokens(&mut conn).unwrap();
+        let rows = pool
+            .read(db::postgres_db::get_registered_tokens_tx)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn load_tokens_from_db_round_trips() {
         use std::sync::RwLock;
-        let pool = test_db_pool();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = test_db.pool.clone();
         let token_a = test_token_a();
         let token_b = test_token_b();
 
-        db::seed_tokens_from_config(&pool, &[(token_a, None), (token_b, None)]).unwrap();
+        pool.write(move |conn| {
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+        })
+        .await
+        .unwrap();
 
         let (subscribe_tx, _rx) = mpsc::channel::<(TokenId, TokenId)>(8);
         let token_map = Arc::new(RwLock::new(HashMap::new()));
         let state = AdminState::new(pool, subscribe_tx, token_map);
 
-        let loaded = state.load_tokens_from_db().unwrap();
+        let loaded = state.load_tokens_from_db().await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert!(loaded.contains(&token_a));
         assert!(loaded.contains(&token_b));
@@ -792,12 +817,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn subscribe_all_pairs_with_two_tokens() {
-        let pool = test_db_pool();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let token_a = test_token_a();
         let token_b = test_token_b();
 
-        db::seed_tokens_from_config(&pool, &[(token_a, None), (token_b, None)]).unwrap();
+        pool.write(move |conn| {
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+        })
+        .await
+        .unwrap();
 
         let mut mock_client = MockMidenClient::new();
         let result = subscribe_all_pairs(&pool, &mut mock_client).await;
@@ -807,29 +838,36 @@ mod tests {
     /// Metadata is fetched + cached at registration (the subscribe pass), not on
     /// an ingest tick.
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn subscribe_all_pairs_caches_on_chain_metadata() {
-        let pool = test_db_pool();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let token_a = test_token_a();
         let token_b = test_token_b();
-        db::seed_tokens_from_config(&pool, &[(token_a, None), (token_b, None)]).unwrap();
+        pool.write(move |conn| {
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+        })
+        .await
+        .unwrap();
 
         // Freshly seeded rows carry no metadata yet.
         let key_a = token_a.to_bytes();
-        {
-            let mut conn = pool.read_conn().unwrap();
-            let row = db::get_registered_token(&mut conn, &key_a)
-                .unwrap()
-                .unwrap();
-            assert!(row.decimals.is_none() && row.ticker.is_none());
-        }
+        let lookup_key = key_a.clone();
+        let row = pool
+            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &lookup_key))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.decimals.is_none() && row.ticker.is_none());
 
         // Subscribing (the boot registration point) fetches + persists it once.
         let mut mock_client = MockMidenClient::new();
         mock_client.set_token_metadata(8, "MTA");
         subscribe_all_pairs(&pool, &mut mock_client).await.unwrap();
 
-        let mut conn = pool.read_conn().unwrap();
-        let row = db::get_registered_token(&mut conn, &key_a)
+        let row = pool
+            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &key_a))
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.decimals, Some(8));

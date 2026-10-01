@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::client_factory::ClientFactory;
-use crate::db::models::{SettlementAttemptRow, SettlementInputRow};
+use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow, SettlementStatus};
 use crate::db::{self, DbPool};
 use crate::ingest::{MidenClient, MidenClientAdapter};
 use crate::swap_eta::SettlementStats;
@@ -97,6 +97,9 @@ enum SubmitOutcome {
     /// revert to Active and re-feed so the live matcher reconsiders them
     /// (it dropped them on emit and never re-reads the DB mid-run).
     BuildFailed(String),
+    /// A lifecycle database operation failed; stop the pipeline and hydrate
+    /// from durable state on a whole-solver restart.
+    Critical(String),
     /// Cancellation during backoff leaves the attempted transaction reserved.
     Cancelled,
 }
@@ -151,15 +154,23 @@ impl PendingSettlement {
         })
     }
 
-    fn load(pool: &DbPool) -> Result<HashMap<TransactionId, Self>> {
-        let mut conn = pool.read_conn()?;
-        let attempts = db::unresolved_settlements(&mut conn)?;
+    async fn load(pool: &DbPool) -> Result<HashMap<TransactionId, Self>> {
+        let attempts = pool
+            .read(db::postgres_db::load_unresolved_attempts_tx)
+            .await?;
         let mut pending = HashMap::with_capacity(attempts.len());
 
-        for attempt in attempts {
+        for recovered in attempts {
+            let attempt = recovered.attempt;
+            attempt.settlement_status()?;
             let tx_id = TransactionId::read_from(&mut SliceReader::new(&attempt.tx_id))?;
-            let payback_id = db::settlement_payback_id(&mut conn, &attempt.tx_id)?;
-            let parent_notes = db::settlement_parents(&mut conn, &attempt.tx_id)?
+            let result = TransactionResult::read_from(&mut SliceReader::new(&attempt.tx_result))?;
+            if result.id() != tx_id {
+                return Err(SettlementError::RecordedTransactionIdMismatch.into());
+            }
+            let payback_id = recovered.payback_id;
+            let parent_notes = recovered
+                .parents
                 .into_iter()
                 .map(|parent| parent.note.as_ref().clone())
                 .collect();
@@ -187,11 +198,11 @@ impl PendingSettlement {
     }
 
     fn mark_rejected(&mut self) {
-        self.attempt.status = "rejected".to_string();
+        self.attempt.status = SettlementStatus::Rejected.as_str().to_string();
     }
 
     fn mark_uncertain(&mut self) {
-        self.attempt.status = "uncertain".to_string();
+        self.attempt.status = SettlementStatus::Uncertain.as_str().to_string();
     }
 }
 
@@ -388,23 +399,20 @@ async fn submit_with_rpc_backoff(
         Err(error) => return SubmitOutcome::TxError(error, None),
     };
     let tx_id = result.id().to_bytes().to_vec();
-    let attempt = SettlementAttemptRow {
-        tx_id: tx_id.clone(),
-        tx_result: result.to_bytes(),
-        status: "prepared".to_string(),
+    let attempt = match SettlementAttemptRow::prepared(&result, crate::types::now_unix()) {
+        Ok(attempt) => attempt,
+        Err(error) => return SubmitOutcome::BuildFailed(error.to_string()),
     };
     let pending = match PendingSettlement::prepared(attempt, components) {
         Ok(pending) => pending,
         Err(error) => return SubmitOutcome::BuildFailed(error.to_string()),
     };
+    let durable_attempt = pending.attempt.clone();
     let persisted = pool
-        .write_conn()
-        .map_err(anyhow::Error::from)
-        .and_then(|mut conn| db::prepare_settlement(&mut conn, &pending.attempt, &inputs));
+        .write(move |conn| db::postgres_db::prepare_settlement_tx(conn, &durable_attempt, &inputs))
+        .await;
     if let Err(error) = persisted {
-        return SubmitOutcome::BuildFailed(format!(
-            "persist settlement before submission: {error}"
-        ));
+        return SubmitOutcome::Critical(format!("persist settlement before submission: {error}"));
     }
 
     let mut backoff = INITIAL_SUBMISSION_BACKOFF;
@@ -416,10 +424,16 @@ async fn submit_with_rpc_backoff(
         };
         match submit_res {
             Ok(height) => {
-                if let Ok(mut conn) = pool.write_conn() {
-                    if let Err(error) = db::mark_settlement_submitted(&mut conn, &tx_id) {
-                        tracing::error!(%error, "accepted settlement status write failed");
-                    }
+                let accepted_tx_id = tx_id.clone();
+                if let Err(error) = pool
+                    .write(move |conn| {
+                        db::postgres_db::mark_settlement_submitted_tx(conn, &accepted_tx_id)
+                    })
+                    .await
+                {
+                    return SubmitOutcome::Critical(format!(
+                        "accepted settlement status write failed: {error}"
+                    ));
                 }
                 return match client.lock().await.apply_transaction(&result, height).await {
                     Ok(()) => SubmitOutcome::Success(pending),
@@ -470,8 +484,10 @@ async fn refeed_orders(
     book_tx: &mpsc::Sender<BookUpdate>,
     orders: Vec<BookOrder>,
 ) -> Result<()> {
-    pool.update_book(book_tx, |conn| db::active_book_update(conn, orders))
-        .await
+    pool.write_book(book_tx, move |conn| {
+        db::postgres_db::active_book_update_tx(conn, orders)
+    })
+    .await
 }
 
 /// On the TxError classification path, fetch which input notes are consumed
@@ -497,139 +513,6 @@ async fn classify_input_notes(
     Ok((consumed_ids, active_orders))
 }
 
-/// DIAGNOSTIC (temporary): on a tx failure, dump EVERYTHING about the batch consume.
-/// For each note being consumed: id / details-commitment / serial / nullifier / assets /
-/// attachments / offered+requested; whether its nullifier is already consumed on-chain;
-/// whether it exists in our executor store (looked up by id AND by details-commitment, to
-/// catch a row stored under a DIFFERENT id); and an explicit MATCH of the store copy vs the
-/// note we're actually consuming (state, commitment, attachments). Then the COMPLETE VM/tx
-/// error — Display + full nested Debug + the whole source chain. Nothing truncated.
-async fn log_batch_consume_diagnostics(
-    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
-    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
-    notes: &[Note],
-    error: &ClientError,
-) {
-    // On-chain "ever consumed?" nullifier check for the whole set, one query.
-    let consumed_set = {
-        let mut a = miden_adapter.lock().await;
-        a.check_consumed_notes(notes).await.unwrap_or_default()
-    };
-    // Store records: by-id lookup, plus a full scan to catch a row stored under a DIFFERENT id.
-    let by_id = {
-        let ids: Vec<_> = notes.iter().map(|n| n.id()).collect();
-        let c = client.lock().await;
-        c.get_input_notes(miden_client::store::NoteFilter::List(ids))
-            .await
-            .unwrap_or_default()
-    };
-    let all_store = {
-        let c = client.lock().await;
-        c.get_input_notes(miden_client::store::NoteFilter::All)
-            .await
-            .unwrap_or_default()
-    };
-
-    tracing::error!(
-        note_count = notes.len(),
-        "================ BATCH CONSUME DIAGNOSTICS ================"
-    );
-
-    for (i, note) in notes.iter().enumerate() {
-        let id = note.id();
-        let commitment_hex = note.details_commitment().to_hex();
-        let pswap = PswapNote::try_from(note).ok();
-        let (offered, requested) = match &pswap {
-            Some(p) => (
-                format!("{:?}", p.offered_asset()),
-                format!(
-                    "faucet={} amount={}",
-                    p.storage().requested_faucet_id(),
-                    p.storage().min_requested_asset().amount().as_u64()
-                ),
-            ),
-            None => (
-                "<non-PSWAP (p2id payback?)>".to_string(),
-                "<n/a>".to_string(),
-            ),
-        };
-
-        // (1) The note we are TRYING TO CONSUME (rebuilt from the order-book raw bytes).
-        tracing::error!(
-            idx = i,
-            note_id = %id,
-            details_commitment = %commitment_hex,
-            serial_number = ?note.serial_num(),
-            nullifier = %note.nullifier(),
-            nullifier_consumed_onchain = consumed_set.contains(&id),
-            attachments_count = note.attachments().num_attachments(),
-            attachments = ?note.attachments(),
-            assets = ?note.assets(),
-            offered = %offered,
-            requested = %requested,
-            "CONSUMING NOTE"
-        );
-
-        // (2) In our store under the SAME id?  (3) ... or under a DIFFERENT id but same details?
-        let by_id_hit = by_id.iter().find(|r| r.id() == Some(id));
-        let by_commitment_hit = all_store
-            .iter()
-            .find(|r| r.details_commitment().to_hex() == commitment_hex);
-        match (by_id_hit, by_commitment_hit) {
-            (Some(r), _) => {
-                let attachments_match = r.attachments() == note.attachments();
-                let verdict = if attachments_match {
-                    "IDENTICAL"
-                } else {
-                    "*** ATTACHMENTS MISMATCH ***"
-                };
-                tracing::error!(
-                    note_id = %id,
-                    store_state = ?r.state(),
-                    store_details_commitment = %r.details_commitment().to_hex(),
-                    store_attachments_count = r.attachments().num_attachments(),
-                    store_attachments = ?r.attachments(),
-                    store_inclusion_proof = ?r.inclusion_proof(),
-                    attachments_match,
-                    verdict,
-                    "  -> IN STORE (found by id): store copy vs consumed note"
-                );
-            }
-            (None, Some(r)) => tracing::error!(
-                consumed_note_id = %id,
-                store_note_id = ?r.id(),
-                store_state = ?r.state(),
-                consumed_attachments_count = note.attachments().num_attachments(),
-                store_attachments_count = r.attachments().num_attachments(),
-                consumed_attachments = ?note.attachments(),
-                store_attachments = ?r.attachments(),
-                store_inclusion_proof = ?r.inclusion_proof(),
-                "  -> *** ID DRIFT: store has this note under a DIFFERENT id (same details) — body differs ***"
-            ),
-            (None, None) => tracing::error!(
-                note_id = %id,
-                "  -> NOT IN STORE (neither by id nor by details) -> consumed UNAUTHENTICATED"
-            ),
-        }
-    }
-
-    // (4) THE WHOLE VM / TX ERROR — every word.
-    tracing::error!("================ FULL VM / TX ERROR (Display) ================");
-    tracing::error!("{}", error);
-    tracing::error!(
-        "================ FULL VM / TX ERROR (pretty Debug, complete nested) ================"
-    );
-    tracing::error!("{:#?}", error);
-    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
-    let mut depth = 0u32;
-    while let Some(s) = src {
-        tracing::error!(depth, "  caused by: {}", s);
-        src = s.source();
-        depth += 1;
-    }
-    tracing::error!("================ END BATCH CONSUME DIAGNOSTICS ================");
-}
-
 // ── Main loop ──────────────────────────────────────────────────────────────
 
 /// Submit batches and reconcile their on-chain outcomes. Local execution and
@@ -652,7 +535,7 @@ pub async fn run_executor(
     // Owned here (executor thread) and published over `stats_tx`. Ephemeral —
     // no DB persistence; rebuilds after a restart.
     let mut stats = SettlementStats::new();
-    let mut pending = match PendingSettlement::load(&pool) {
+    let mut pending = match PendingSettlement::load(&pool).await {
         Ok(pending) => pending,
         Err(error) => {
             tracing::error!(%error, "cannot restore pending settlements; stopping pipeline");
@@ -765,6 +648,57 @@ async fn reconcile_settlements(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryObservation {
+    MissingRecord,
+    AmbiguousDiscard,
+    DefiniteDiscard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    Wait,
+    Confirm,
+    ReleaseAfterNullifierCheck,
+    RetryRecordedTransaction,
+    MarkUncertain,
+}
+
+/// Decide only after the chain height (when needed) and payback inclusion have
+/// been observed in that order. A failed payback lookup never releases inputs.
+fn recovery_decision(
+    status: SettlementStatus,
+    observation: RecoveryObservation,
+    payback_included: Option<bool>,
+    expired: bool,
+    retry_due: bool,
+) -> RecoveryDecision {
+    match payback_included {
+        None => return RecoveryDecision::Wait,
+        Some(true) => return RecoveryDecision::Confirm,
+        Some(false) => {}
+    }
+    match observation {
+        RecoveryObservation::MissingRecord if expired => {
+            RecoveryDecision::ReleaseAfterNullifierCheck
+        }
+        RecoveryObservation::MissingRecord
+            if status != SettlementStatus::Uncertain && retry_due =>
+        {
+            RecoveryDecision::RetryRecordedTransaction
+        }
+        RecoveryObservation::MissingRecord => RecoveryDecision::Wait,
+        RecoveryObservation::AmbiguousDiscard if expired => {
+            RecoveryDecision::ReleaseAfterNullifierCheck
+        }
+        RecoveryObservation::AmbiguousDiscard if status != SettlementStatus::Uncertain => {
+            RecoveryDecision::MarkUncertain
+        }
+        RecoveryObservation::AmbiguousDiscard => RecoveryDecision::Wait,
+        RecoveryObservation::DefiniteDiscard => RecoveryDecision::ReleaseAfterNullifierCheck,
+    }
+}
+
 /// Returns `true` only after a terminal database and matcher transition.
 async fn reconcile_settlement(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
@@ -773,7 +707,8 @@ async fn reconcile_settlement(
     book_tx: &mpsc::Sender<BookUpdate>,
     settlement: &mut PendingSettlement,
 ) -> Result<bool> {
-    if settlement.attempt.status == "rejected" {
+    let status = settlement.attempt.settlement_status()?;
+    if status == SettlementStatus::Rejected {
         return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
     }
     let tx_id = settlement.id();
@@ -797,25 +732,30 @@ async fn reconcile_settlement(
         // Read height first so an older negative payback lookup can never be
         // combined with a newer, post-expiry chain height.
         let expired = settlement_has_expired(client, &settlement.attempt).await?;
-        let Some(payback_is_included) =
-            expected_payback_is_included(miden_adapter, settlement.payback_id).await?
-        else {
-            return Ok(false);
-        };
-        if payback_is_included {
-            activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
-            return Ok(true);
-        }
-        if expired {
-            return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
-        }
-        if settlement.attempt.status != "uncertain"
-            && settlement
-                .retry_at
-                .is_none_or(|at| tokio::time::Instant::now() >= at)
-        {
-            settlement.retry_at = Some(tokio::time::Instant::now() + RECOVERY_RETRY_DELAY);
-            retry_recorded_transaction(client, pool, settlement).await?;
+        let payback = expected_payback_is_included(miden_adapter, settlement.payback_id).await?;
+        let retry_due = settlement
+            .retry_at
+            .is_none_or(|at| tokio::time::Instant::now() >= at);
+        match recovery_decision(
+            status,
+            RecoveryObservation::MissingRecord,
+            payback,
+            expired,
+            retry_due,
+        ) {
+            RecoveryDecision::Confirm => {
+                activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
+                return Ok(true);
+            }
+            RecoveryDecision::ReleaseAfterNullifierCheck => {
+                return release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await;
+            }
+            RecoveryDecision::RetryRecordedTransaction => {
+                settlement.retry_at = Some(tokio::time::Instant::now() + RECOVERY_RETRY_DELAY);
+                retry_recorded_transaction(client, pool, settlement).await?;
+            }
+            RecoveryDecision::Wait => {}
+            RecoveryDecision::MarkUncertain => unreachable!("missing record cannot mark uncertain"),
         }
         return Ok(false);
     };
@@ -840,42 +780,46 @@ async fn reconcile_settlement(
             } else {
                 false
             };
-            let Some(payback_is_included) =
-                expected_payback_is_included(miden_adapter, settlement.payback_id).await?
-            else {
-                return Ok(false);
+            let payback =
+                expected_payback_is_included(miden_adapter, settlement.payback_id).await?;
+            let observation = if waits_for_expiry {
+                RecoveryObservation::AmbiguousDiscard
+            } else {
+                RecoveryObservation::DefiniteDiscard
             };
-            if payback_is_included {
-                activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
-                return Ok(true);
-            }
-
-            if waits_for_expiry {
-                // A local discard is not enough to release inputs. Wait for
-                // the transaction's on-chain expiration, then classify each
-                // parent by nullifier before reactivating anything.
-                if expired {
+            match recovery_decision(status, observation, payback, expired, false) {
+                RecoveryDecision::Confirm => {
+                    activate_confirmed_settlement(pool, settlement.id_bytes(), book_tx).await?;
+                    Ok(true)
+                }
+                RecoveryDecision::ReleaseAfterNullifierCheck => {
                     let released =
                         release_rejected_settlement(miden_adapter, pool, settlement, book_tx)
                             .await?;
-                    if released {
+                    if waits_for_expiry && released {
                         tracing::warn!(%tx_id, "expired settlement released after nullifier check");
+                    } else if !waits_for_expiry {
+                        tracing::warn!(%tx_id, %reason, "discarded settlement classified by input nullifiers");
                     }
-                    return Ok(released);
+                    Ok(released)
                 }
-                if settlement.attempt.status != "uncertain" {
-                    let mut conn = pool.write_conn()?;
-                    db::mark_settlement_uncertain(&mut conn, settlement.id_bytes())?;
+                RecoveryDecision::MarkUncertain => {
+                    // A local ambiguous discard cannot release inputs before
+                    // expiry and a negative payback observation.
+                    let attempt_id = settlement.id_bytes().to_vec();
+                    pool.write(move |conn| {
+                        db::postgres_db::mark_settlement_uncertain_tx(conn, &attempt_id)
+                    })
+                    .await?;
                     settlement.mark_uncertain();
                     tracing::warn!(%tx_id, "discarded settlement remains reserved until expiry");
+                    Ok(false)
                 }
-                return Ok(false);
+                RecoveryDecision::Wait => Ok(false),
+                RecoveryDecision::RetryRecordedTransaction => {
+                    unreachable!("discarded record cannot retry here")
+                }
             }
-
-            let released =
-                release_rejected_settlement(miden_adapter, pool, settlement, book_tx).await?;
-            tracing::warn!(%tx_id, %reason, "discarded settlement classified by input nullifiers");
-            Ok(released)
         }
         TransactionStatus::Pending => Ok(false),
     }
@@ -899,8 +843,9 @@ async fn release_rejected_settlement(
             return Ok(false);
         }
     };
-    pool.update_book(book_tx, |conn| {
-        db::finish_discarded_settlement(conn, settlement.id_bytes(), &consumed)
+    let attempt_id = settlement.id_bytes().to_vec();
+    pool.write_book(book_tx, move |conn| {
+        db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed)
     })
     .await?;
     Ok(true)
@@ -942,11 +887,14 @@ async fn activate_confirmed_settlement(
     tx_id: &[u8],
     book_tx: &mpsc::Sender<BookUpdate>,
 ) -> Result<()> {
-    pool.update_book(book_tx, |conn| db::confirm_settlement(conn, tx_id))
-        .await
+    let attempt_id = tx_id.to_vec();
+    pool.write_book(book_tx, move |conn| {
+        db::postgres_db::confirm_settlement_tx(conn, &attempt_id)
+    })
+    .await
 }
 
-/// A crash may occur after the SQLite prepare write but before the client
+/// A crash may occur after the PostgreSQL prepare write but before the client
 /// stores submission. Re-proving and submitting this *same* executed result
 /// retains its ID. A deliberate rejection is ambiguous if the first copy
 /// already landed, so it is quarantined rather than reactivating parents.
@@ -974,10 +922,12 @@ async fn retry_recorded_transaction(
         .await;
     match submission {
         Ok(height) => {
-            let mut conn = pool.write_conn()?;
-            db::mark_settlement_submitted(&mut conn, &attempt.tx_id)?;
+            let attempt_id = attempt.tx_id.clone();
+            pool.write(move |conn| {
+                db::postgres_db::mark_settlement_submitted_tx(conn, &attempt_id)
+            })
+            .await?;
             settlement.attempt.status = "submitted".to_string();
-            drop(conn);
             if let Err(error) = client.lock().await.apply_transaction(&result, height).await {
                 tracing::warn!(tx_id = %result.id(), %error, "recovered submission accepted but local store update failed");
             }
@@ -993,8 +943,11 @@ async fn retry_recorded_transaction(
             tracing::warn!(tx_id = %result.id(), %error, "recovery retry rejected; waiting for expiry");
         }
         Err(error) => {
-            let mut conn = pool.write_conn()?;
-            db::mark_settlement_uncertain(&mut conn, &attempt.tx_id)?;
+            let attempt_id = attempt.tx_id.clone();
+            pool.write(move |conn| {
+                db::postgres_db::mark_settlement_uncertain_tx(conn, &attempt_id)
+            })
+            .await?;
             settlement.mark_uncertain();
             tracing::error!(tx_id = %result.id(), %error,
                 "recorded transaction rejected; parents remain reserved for inspection");
@@ -1166,6 +1119,9 @@ async fn execute_batch(
             tracing::error!(error = %msg, "tx build failed; re-fed active orders");
             Ok(BatchSubmission::Returned)
         }
+        SubmitOutcome::Critical(message) => {
+            Err(anyhow!("critical settlement database failure: {message}"))
+        }
         SubmitOutcome::Cancelled => {
             tracing::info!(
                 "submit cancelled during backoff; orders remain Settling for reconciliation"
@@ -1174,14 +1130,16 @@ async fn execute_batch(
         }
         SubmitOutcome::TxError(e, mut settlement) => {
             if let Some(settlement) = settlement.as_mut() {
-                db::mark_settlement_rejected(&mut *pool.write_conn()?, settlement.id_bytes())?;
+                let attempt_id = settlement.id_bytes().to_vec();
+                pool.write(move |conn| {
+                    db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_id)
+                })
+                .await?;
                 settlement.mark_rejected();
             }
-            // DIAGNOSTIC: full per-note dump (id/serial/nullifier/attachments/offered+
-            // requested), on-chain nullifier check, store-existence + store-vs-consumed
-            // MATCH, and the COMPLETE VM/tx error — nothing truncated.
             let input_notes = components.notes();
-            log_batch_consume_diagnostics(client, miden_adapter, &input_notes, &e).await;
+            let note_ids: Vec<_> = input_notes.iter().map(|note| note.id()).collect();
+            tracing::error!(error = %e, ?note_ids, "settlement transaction failed; classifying input nullifiers");
 
             let (consumed, active_orders) = match classify_input_notes(
                 miden_adapter,
@@ -1220,15 +1178,16 @@ async fn execute_batch(
 
             // DB updates first, then re-feed the actives. Idempotent against
             // a concurrent ingest update (status guard in mark_orders_onchain_nullified).
-            pool.update_book(book_tx, |conn| {
+            pool.write_book(book_tx, move |conn| {
                 if let Some(tx_id) = rejected_tx_id {
                     // Release parents and delete the attempt in one transaction.
-                    db::finish_discarded_settlement(conn, &tx_id, &consumed)
+                    db::postgres_db::finish_discarded_settlement_tx(conn, &tx_id, &consumed)
                 } else {
                     // Execution/proving failed before durable reservation.
-                    let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes()).collect();
-                    db::mark_orders_onchain_nullified(conn, &consumed_bytes)?;
-                    let mut update = db::active_book_update(conn, active_orders)?;
+                    let consumed_bytes: Vec<_> =
+                        consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
+                    db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
+                    let mut update = db::postgres_db::active_book_update_tx(conn, active_orders)?;
                     update.removed.extend(consumed);
                     Ok(update)
                 }
@@ -1609,6 +1568,140 @@ mod claim_tests {
         assert!(!submission_outcome_is_unknown(&error));
     }
 
+    #[test]
+    fn recovery_keeps_ambiguous_settlements_reserved_until_chain_evidence_is_safe() {
+        use RecoveryDecision as Decision;
+        use RecoveryObservation as Observation;
+        use SettlementStatus as Status;
+
+        let cases = [
+            (
+                "missing included payback",
+                Status::Submitted,
+                Observation::MissingRecord,
+                Some(true),
+                false,
+                true,
+                Decision::Confirm,
+            ),
+            (
+                "missing payback lookup failed",
+                Status::Submitted,
+                Observation::MissingRecord,
+                None,
+                true,
+                true,
+                Decision::Wait,
+            ),
+            (
+                "missing expired and absent",
+                Status::Submitted,
+                Observation::MissingRecord,
+                Some(false),
+                true,
+                true,
+                Decision::ReleaseAfterNullifierCheck,
+            ),
+            (
+                "missing prepared retry",
+                Status::Prepared,
+                Observation::MissingRecord,
+                Some(false),
+                false,
+                true,
+                Decision::RetryRecordedTransaction,
+            ),
+            (
+                "missing submitted retry not due",
+                Status::Submitted,
+                Observation::MissingRecord,
+                Some(false),
+                false,
+                false,
+                Decision::Wait,
+            ),
+            (
+                "missing uncertain never retries",
+                Status::Uncertain,
+                Observation::MissingRecord,
+                Some(false),
+                false,
+                true,
+                Decision::Wait,
+            ),
+            (
+                "stale included payback",
+                Status::Submitted,
+                Observation::AmbiguousDiscard,
+                Some(true),
+                false,
+                false,
+                Decision::Confirm,
+            ),
+            (
+                "stale payback lookup failed",
+                Status::Submitted,
+                Observation::AmbiguousDiscard,
+                None,
+                true,
+                false,
+                Decision::Wait,
+            ),
+            (
+                "stale unexpired",
+                Status::Submitted,
+                Observation::AmbiguousDiscard,
+                Some(false),
+                false,
+                false,
+                Decision::MarkUncertain,
+            ),
+            (
+                "stale already uncertain",
+                Status::Uncertain,
+                Observation::AmbiguousDiscard,
+                Some(false),
+                false,
+                false,
+                Decision::Wait,
+            ),
+            (
+                "stale expired and absent",
+                Status::Uncertain,
+                Observation::AmbiguousDiscard,
+                Some(false),
+                true,
+                false,
+                Decision::ReleaseAfterNullifierCheck,
+            ),
+            (
+                "definite discard included",
+                Status::Submitted,
+                Observation::DefiniteDiscard,
+                Some(true),
+                false,
+                false,
+                Decision::Confirm,
+            ),
+            (
+                "definite discard absent",
+                Status::Submitted,
+                Observation::DefiniteDiscard,
+                Some(false),
+                false,
+                false,
+                Decision::ReleaseAfterNullifierCheck,
+            ),
+        ];
+        for (name, status, observation, payback, expired, retry_due, expected) in cases {
+            assert_eq!(
+                recovery_decision(status, observation, payback, expired, retry_due),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
     fn fee_faucet() -> AccountId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
     }
@@ -1901,5 +1994,166 @@ mod claim_tests {
             select_claimable(notes, Some((fee_faucet(), BASE_FEE))).len(),
             MAX_CLAIM_NOTES
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::db::postgres_models::NewOrderRow;
+    use crate::db::postgres_schema::{orders, settlement_attempts};
+    use crate::db::postgres_test::TestDb;
+    use crate::ingest::SyncResult;
+    use diesel::prelude::*;
+    use miden_protocol::asset::AssetAmount;
+    use miden_protocol::note::NoteType;
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+    };
+    use miden_protocol::Word;
+    use miden_standards::note::PswapNoteStorage;
+
+    struct RecoveryAdapter {
+        consumed: bool,
+        fail_nullifier_lookup: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MidenClient for RecoveryAdapter {
+        async fn subscribe_pair(&mut self, _: TokenId, _: TokenId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn sync_state(&mut self) -> Result<SyncResult> {
+            bail!("unexpected sync in rejected-settlement recovery test")
+        }
+
+        async fn stored_notes(&mut self) -> Result<Vec<Note>> {
+            Ok(Vec::new())
+        }
+
+        async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>> {
+            if self.fail_nullifier_lookup {
+                bail!("nullifier lookup unavailable");
+            }
+            Ok(if self.consumed {
+                notes.iter().map(Note::id).collect()
+            } else {
+                HashSet::new()
+            })
+        }
+
+        async fn note_is_included(&mut self, _: NoteId) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn fetch_token_metadata(&mut self, _: TokenId) -> Result<Option<(u8, String)>> {
+            Ok(None)
+        }
+    }
+
+    fn parent_note() -> Result<Note> {
+        let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE.try_into()?;
+        let sender = ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE.try_into()?;
+        let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into()?;
+        let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into()?;
+        let storage = PswapNoteStorage::builder()
+            .min_requested_asset(FungibleAsset::new(requested, 10)?)
+            .min_fill_step(AssetAmount::new(1)?)
+            .creator_account_id(creator)
+            .build();
+        Ok(PswapNote::builder()
+            .sender(sender)
+            .storage(storage)
+            .serial_number(Word::default())
+            .note_type(NoteType::Public)
+            .offered_asset(FungibleAsset::new(offered, 11)?)
+            .build()?
+            .into())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn rejected_settlement_release_uses_nullifier_evidence_before_book_update() -> Result<()>
+    {
+        for (consumed, fail_lookup, expected_status) in [
+            (false, false, "active"),
+            (true, false, "onchain_nullified"),
+            (false, true, "settling"),
+        ] {
+            let test_db = TestDb::new().await?;
+            let pool = test_db.pool.clone();
+            let parent = parent_note()?;
+            let parent_id = parent.id();
+            let tx_id = TransactionId::new(
+                Word::default(),
+                Word::default(),
+                Word::default(),
+                Word::default(),
+            );
+            let attempt = SettlementAttemptRow {
+                tx_id: tx_id.to_bytes().to_vec(),
+                tx_result: vec![1],
+                status: SettlementStatus::Prepared.as_str().into(),
+                created_at_unix: 1,
+            };
+            let attempt_for_write = attempt.clone();
+            let (note_row, order_row) = NewOrderRow::ingested(&parent, 1)?;
+            let input = SettlementInputRow {
+                tx_id: attempt.tx_id.clone(),
+                parent_note_id: parent_id.to_bytes().to_vec(),
+                payback_note_id: parent_id.to_bytes().to_vec(),
+                child_note_id: None,
+                child_note_data: None,
+            };
+            pool.write(move |conn| {
+                db::postgres_db::insert_notes_batch_tx(conn, &[note_row], &[order_row], 1)?;
+                db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input])?;
+                db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_for_write.tx_id)
+            })
+            .await?;
+
+            let mut rejected_attempt = attempt;
+            rejected_attempt.status = SettlementStatus::Rejected.as_str().into();
+            let settlement = PendingSettlement {
+                tx_id,
+                attempt: rejected_attempt,
+                payback_id: parent_id,
+                parent_notes: vec![parent],
+                retry_at: None,
+            };
+            let adapter: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(RecoveryAdapter {
+                consumed,
+                fail_nullifier_lookup: fail_lookup,
+            }));
+            let (book_tx, mut book_rx) = mpsc::channel(1);
+            let resolved =
+                release_rejected_settlement(&adapter, &pool, &settlement, &book_tx).await?;
+            assert_eq!(resolved, !fail_lookup);
+
+            let parent_bytes = parent_id.to_bytes().to_vec();
+            let (status, unresolved) = pool
+                .read(move |conn| {
+                    let status = orders::table
+                        .find(parent_bytes)
+                        .select(orders::status)
+                        .first::<String>(conn)?;
+                    let unresolved = settlement_attempts::table.count().get_result::<i64>(conn)?;
+                    Ok((status, unresolved))
+                })
+                .await?;
+            assert_eq!(status, expected_status);
+            assert_eq!(unresolved, i64::from(fail_lookup));
+            if fail_lookup {
+                assert!(book_rx.try_recv().is_err());
+            } else {
+                let update = book_rx.try_recv()?;
+                assert_eq!(update.active.len(), usize::from(!consumed));
+                assert_eq!(update.removed.len(), usize::from(consumed));
+            }
+        }
+        Ok(())
     }
 }

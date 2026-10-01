@@ -17,7 +17,7 @@ enum ConfigError {
     InvalidClearingFee { fee: u32, maximum: u32 },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SolverConfig {
     pub rpc: RpcConfig,
     pub solver: SolverAccountConfig,
@@ -25,7 +25,7 @@ pub struct SolverConfig {
     pub engine: EngineConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RpcConfig {
     pub endpoint: String,
     pub timeout_ms: u64,
@@ -38,21 +38,18 @@ pub struct RpcConfig {
     pub prover_endpoint: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SolverAccountConfig {
     pub account_id: String,
     pub keystore_path: String,
-    /// Diesel/SQLite **application DB** path (orders, notes, tokens, sync
-    /// state). Distinct from the two miden-client stores below.
-    pub app_db_path: String,
     /// **Executor** miden-client sqlite store path. The signing path; the
     /// solver account state lives here, its keys in `keystore_path`.
     pub executor_store_path: String,
     /// **Keyless ingest** miden-client sqlite store path. The chain-watching
     /// path holds no signing keys and syncs independently of the executor.
-    /// Must be a different file from `executor_store_path` and `app_db_path`.
+    /// Must be a different file from `executor_store_path`.
     pub ingest_store_path: String,
-    /// Number of concurrent SQLite read connections. Defaults to 4 if omitted.
+    /// Number of concurrent PostgreSQL read connections. Defaults to 4 if omitted.
     /// Bump if the matcher hydration / admin queries become read-contended.
     #[serde(default = "default_read_pool_size")]
     pub read_pool_size: u32,
@@ -62,7 +59,7 @@ fn default_read_pool_size() -> u32 {
     4
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssetPairConfig {
     pub name: String,
     pub asset_x_faucet_id: String,
@@ -78,7 +75,7 @@ pub struct AssetPairConfig {
     pub asset_y_external_symbol: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineConfig {
     pub pulse_interval_ms: u64,
     pub fetch_interval_ms: u64,

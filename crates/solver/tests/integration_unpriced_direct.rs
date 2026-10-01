@@ -24,24 +24,24 @@ use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder}
 use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
-use solver::config::{
-    AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig,
-};
+use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, vault_balance, MockClientFactory};
+use common::{build_test_client, temp_paths, vault_balance, MockClientFactory, PgSchema};
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let _pg = PgSchema::new().await?;
             let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
 
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
-            let mut user_client =
-                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?);
+            let mut user_client = TestClient::new(
+                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?,
+            );
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -65,12 +65,25 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
             let foo_id = foo.id();
             let eth_id = eth.id();
 
-            user_client.mint_and_consume(alice.id(), foo_id, NoteType::Public).await?;
             rpc.prove_block();
-            user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync a: {e}"))?;
-            user_client.mint_and_consume(bob.id(), eth_id, NoteType::Public).await?;
+            user_client.sync_state().await?;
+
+            user_client
+                .mint_and_consume(alice.id(), foo_id, NoteType::Public)
+                .await?;
             rpc.prove_block();
-            user_client.sync_state().await.map_err(|e| anyhow::anyhow!("sync b: {e}"))?;
+            user_client
+                .sync_state()
+                .await
+                .map_err(|e| anyhow::anyhow!("sync a: {e}"))?;
+            user_client
+                .mint_and_consume(bob.id(), eth_id, NoteType::Public)
+                .await?;
+            rpc.prove_block();
+            user_client
+                .sync_state()
+                .await
+                .map_err(|e| anyhow::anyhow!("sync b: {e}"))?;
 
             // Raw-balanced reciprocal pair (would settle under raw-ratio
             // matching): alice 120 FOO ⇄ 1 ETH ; bob 1 ETH ⇄ 100 FOO.
@@ -99,12 +112,14 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
 
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = TestClient::new(build_test_client(
-                    rpc.clone(),
-                    solver_keystore_path.clone(),
-                    solver_store_path.clone(),
-                )
-                .await?);
+                let mut sc = TestClient::new(
+                    build_test_client(
+                        rpc.clone(),
+                        solver_keystore_path.clone(),
+                        solver_store_path.clone(),
+                    )
+                    .await?,
+                );
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
@@ -122,13 +137,15 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 executor_store: solver_store_path,
                 keystore: solver_keystore_path.clone(),
             });
-            let solver_db = solver_temp.path().join("solver.sqlite3");
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
+                rpc: RpcConfig {
+                    endpoint: "http://unused".into(),
+                    timeout_ms: 1_000,
+                    prover_endpoint: None,
+                },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    app_db_path: solver_db.to_string_lossy().into_owned(),
                     executor_store_path,
                     ingest_store_path,
                     read_pool_size: 2,
@@ -224,8 +241,8 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 println!("[test] FAILED: {e}");
             }
             cancel.cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
-                .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle).await;
             drop(user_temp);
             drop(solver_temp);
             verdict

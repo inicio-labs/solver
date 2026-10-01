@@ -27,9 +27,6 @@ pub fn solver_executor_store() -> String {
 pub fn solver_ingest_store() -> String {
     format!("{E2E_DIR}/solver_ingest.sqlite3")
 }
-pub fn solver_app_db() -> String {
-    format!("{E2E_DIR}/solver_app.sqlite3")
-}
 pub fn solver_keystore() -> String {
     format!("{E2E_DIR}/solver_keystore")
 }
@@ -66,7 +63,6 @@ pub struct Artifacts {
     pub solver_keystore_path: String,
     pub solver_executor_store_path: String,
     pub solver_ingest_store_path: String,
-    pub solver_app_db_path: String,
     /// Operator context (faucets + user wallets).
     pub operator_store_path: String,
     pub operator_keystore_path: String,
@@ -98,7 +94,6 @@ timeout_ms = 10000
 [solver]
 account_id = "{solver}"
 keystore_path = "{keystore}"
-app_db_path = "{app_db}"
 executor_store_path = "{exec_store}"
 ingest_store_path = "{ingest_store}"
 read_pool_size = 4
@@ -124,7 +119,6 @@ price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
             rpc = self.rpc_endpoint,
             solver = self.solver_account_id,
             keystore = self.solver_keystore_path,
-            app_db = self.solver_app_db_path,
             exec_store = self.solver_executor_store_path,
             ingest_store = self.solver_ingest_store_path,
             sym_a = self.token_a.symbol,

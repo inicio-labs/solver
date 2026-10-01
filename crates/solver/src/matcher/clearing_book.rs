@@ -225,8 +225,10 @@ impl ClearingBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clearing::ReferencePrice;
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
+    use crate::price::PriceData;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -406,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn worker_routes_an_unmatched_note_without_legacy_matcher() {
+    async fn worker_routes_only_after_executor_capacity_returns() {
         let mut rng = RandomCoin::new(Word::default());
         let order = fixture(false, 10, 18, 1, &mut rng);
         let pair = Order::from_book_order(&order).unwrap().index_key().0;
@@ -432,7 +434,13 @@ mod tests {
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -442,12 +450,99 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        let handover = tokio::time::timeout(Duration::from_secs(1), route_rx.recv())
+        // The first tick cannot clear, so it must not bypass internal
+        // matching by routing an order to an external DEX either.
+        snapshot_rx.changed().await.unwrap();
+        assert!(route_rx.try_recv().is_err());
+        assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let handover = tokio::time::timeout(Duration::from_secs(2), route_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(handover.items[0].note_id, order.id());
         assert!(exec_rx.try_recv().is_err());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_executor_queue_does_not_route_an_internal_cross_to_a_dex() {
+        let mut rng = RandomCoin::new(Word::default());
+        let seller = fixture(false, 11, 18, 1, &mut rng);
+        let buyer = fixture(true, 22, 10, 2, &mut rng);
+        let pair = Order::from_book_order(&seller).unwrap().index_key().0;
+        let (routing, mut route_rx) = routing_fixture(&seller);
+        let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                decimals: [(pair.0, 0), (pair.1, 0)].into_iter().collect(),
+            })
+            .is_ok());
+        let observed_at = now_millis();
+        let mut prices = crate::price::PreciseSnapshot::new();
+        for (token, price) in [(pair.0, "2"), (pair.1, "1")] {
+            prices.insert(
+                token,
+                PriceData {
+                    usd: price.parse().unwrap(),
+                    exact_reference: Some(ReferencePrice::from_decimal(price).unwrap()),
+                    source_updated_at_unix_ms: Some(observed_at),
+                    observed_at_unix_ms: observed_at,
+                },
+            );
+        }
+        let (_, prices_rx) = watch::channel(prices);
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices: prices_rx,
+            pairs: vec![pair],
+            config: ClearingConfig::default(),
+            max_price_age_ms: 1_000,
+            max_source_age_ms: 1_000,
+            max_source_skew_ms: 0,
+            routing: Some(routing),
+        };
+        let (_book_tx, book_rx) = mpsc::channel(1);
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_matcher(
+            book_rx,
+            exec_tx,
+            Duration::from_secs(1),
+            snapshot_tx,
+            runtime,
+            cancel.clone(),
+        ));
+
+        snapshot_rx.changed().await.unwrap();
+        assert!(route_rx.try_recv().is_err());
+        assert_eq!(
+            snapshot_rx.borrow().len(),
+            2,
+            "orders stay live on a skipped tick"
+        );
+        assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let execution = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.filled_notes.len(), 2);
+        assert!(
+            route_rx.try_recv().is_err(),
+            "internal matches must not route"
+        );
         cancel.cancel();
         task.await.unwrap().unwrap();
     }

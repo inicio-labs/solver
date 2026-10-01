@@ -1,6 +1,4 @@
-//! Price-API unit tests (axum-test). Uses a temp-file DB so the API's read pool
-//! sees what the test wrote via the write pool (separate r2d2 pools → `:memory:`
-//! would be two distinct databases).
+//! Price-API tests against an isolated PostgreSQL schema.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -19,6 +17,7 @@ use tokio::sync::watch;
 use super::{build_app, PriceApiConfig, PriceApiState};
 use crate::config::PricePrecision;
 use crate::db;
+use crate::db::postgres_test::TestDb;
 use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
 use crate::price::{PreciseSnapshot, PriceData};
 use crate::swap_eta::SettlementStats;
@@ -35,12 +34,15 @@ fn key(id: AccountId) -> Vec<u8> {
     b
 }
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 struct Harness {
     server: TestServer,
-    _tmp: tempfile::NamedTempFile,
+    _db: TestDb,
 }
 
 fn cfg() -> PriceApiConfig {
@@ -65,32 +67,46 @@ fn cfg() -> PriceApiConfig {
 /// Build a harness (quote currency `usd`). `registered` = (faucet, decimals,
 /// ticker) rows; `prices` = (faucet, usd) precise-snapshot entries; `last_update`
 /// = freshness.
-fn harness(
+async fn harness(
     registered: &[(AccountId, Option<i32>, Option<&str>)],
     prices: &[(AccountId, f64)],
     last_update: i64,
 ) -> Harness {
-    harness_vs(registered, prices, last_update, "usd")
+    harness_vs(registered, prices, last_update, "usd").await
 }
 
-fn harness_vs(
+async fn harness_vs(
     registered: &[(AccountId, Option<i32>, Option<&str>)],
     prices: &[(AccountId, f64)],
     last_update: i64,
     vs: &str,
 ) -> Harness {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let pool = db::init_db(tmp.path().to_str().unwrap(), 2).unwrap();
-    {
-        let mut conn = pool.write_conn().unwrap();
-        for (id, dec, tick) in registered {
-            db::register_token(&mut conn, &key(*id), Some("usd-coin")).unwrap();
-            db::set_token_metadata(&mut conn, &key(*id), *dec, *tick).unwrap();
+    let test_db = TestDb::new().await.unwrap();
+    let pool = test_db.pool.clone();
+    let rows: Vec<_> = registered
+        .iter()
+        .map(|(id, dec, tick)| (*id, *dec, tick.map(str::to_owned)))
+        .collect();
+    pool.write(move |conn| {
+        for (id, dec, tick) in rows {
+            db::postgres_db::register_token_tx(conn, &key(id), Some("usd-coin"))?;
+            db::postgres_db::set_token_metadata_tx(conn, &key(id), dec, tick.as_deref())?;
         }
-    }
+        Ok(())
+    })
+    .await
+    .unwrap();
     let mut snap = PreciseSnapshot::new();
     for (id, usd) in prices {
-        snap.insert(*id, PriceData { usd: *usd, exact_reference: None, source_updated_at_unix_ms: None, observed_at_unix_ms: 0 });
+        snap.insert(
+            *id,
+            PriceData {
+                usd: *usd,
+                exact_reference: None,
+                source_updated_at_unix_ms: None,
+                observed_at_unix_ms: 0,
+            },
+        );
     }
     let (_tx, rx) = watch::channel(snap); // rx retains the value after _tx drops
     let (_stx, swap_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
@@ -110,43 +126,57 @@ fn harness_vs(
     };
     let mut c = cfg();
     c.vs_currency = vs.into();
-    Harness { server: TestServer::new(build_app(state, &c)), _tmp: tmp }
+    Harness {
+        server: TestServer::new(build_app(state, &c)),
+        _db: test_db,
+    }
 }
 
 /// Build a server for the `/v1/swap-eta` tests: seeds registered tokens (with
 /// decimals), oracle prices, a top-of-book snapshot, and the settlement window.
 #[allow(clippy::type_complexity)]
-fn swap_server(
+async fn swap_server(
     registered: &[(AccountId, Option<i32>)],
     prices: &[(AccountId, f64)],
     snapshot: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
-    swap_server_with_update(now(), registered, prices, snapshot, stats)
+    swap_server_with_update(now(), registered, prices, snapshot, stats).await
 }
 
 /// Like [`swap_server`] but with an explicit `last_price_update` timestamp, so a
 /// test can drive the staleness gate on the oracle side of `/v1/swap-eta`.
 #[allow(clippy::type_complexity)]
-fn swap_server_with_update(
+async fn swap_server_with_update(
     last_update: i64,
     registered: &[(AccountId, Option<i32>)],
     prices: &[(AccountId, f64)],
     snapshot: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let pool = db::init_db(tmp.path().to_str().unwrap(), 2).unwrap();
-    {
-        let mut conn = pool.write_conn().unwrap();
-        for (id, dec) in registered {
-            db::register_token(&mut conn, &key(*id), Some("usd-coin")).unwrap();
-            db::set_token_metadata(&mut conn, &key(*id), *dec, None).unwrap();
+    let test_db = TestDb::new().await.unwrap();
+    let pool = test_db.pool.clone();
+    let rows: Vec<_> = registered.to_vec();
+    pool.write(move |conn| {
+        for (id, dec) in rows {
+            db::postgres_db::register_token_tx(conn, &key(id), Some("usd-coin"))?;
+            db::postgres_db::set_token_metadata_tx(conn, &key(id), dec, None)?;
         }
-    }
+        Ok(())
+    })
+    .await
+    .unwrap();
     let mut snap = PreciseSnapshot::new();
     for (id, usd) in prices {
-        snap.insert(*id, PriceData { usd: *usd, exact_reference: None, source_updated_at_unix_ms: None, observed_at_unix_ms: 0 });
+        snap.insert(
+            *id,
+            PriceData {
+                usd: *usd,
+                exact_reference: None,
+                source_updated_at_unix_ms: None,
+                observed_at_unix_ms: 0,
+            },
+        );
     }
     let (_tx, precise_rx) = watch::channel(snap);
     let (_stx, swap_rx) = watch::channel(Arc::new(snapshot));
@@ -164,7 +194,10 @@ fn swap_server_with_update(
         swap_eta_secs: 14,
         swap_offmarket_tol_bps: 50,
     };
-    Harness { server: TestServer::new(build_app(state, &cfg())), _tmp: tmp }
+    Harness {
+        server: TestServer::new(build_app(state, &cfg())),
+        _db: test_db,
+    }
 }
 
 /// Query string for the swap-eta endpoint.
@@ -186,7 +219,13 @@ fn level(
     offered: u64,
     volume: u64,
 ) -> ((AccountId, AccountId), BestLevel) {
-    ((offered_tok, requested_tok), BestLevel { rate: RateKey::new(requested, offered), volume })
+    (
+        (offered_tok, requested_tok),
+        BestLevel {
+            rate: RateKey::new(requested, offered),
+            volume,
+        },
+    )
 }
 
 fn url(faucet: AccountId, q: &str) -> String {
@@ -194,26 +233,30 @@ fn url(faucet: AccountId, q: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unknown_faucet_is_404() {
-    let h = harness(&[], &[], now());
+    let h = harness(&[], &[], now()).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn registered_but_unpriced_is_503() {
-    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], now());
+    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], now()).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn happy_path_returns_price_decimals_ticker() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDC"))],
         &[(faucet_a(), 0.99987)],
         now(),
-    );
+    )
+    .await;
     let r = h.server.get(&url(faucet_a(), "?precision=full")).await;
     assert_eq!(r.status_code(), StatusCode::OK);
     let v: Value = r.json();
@@ -225,13 +268,23 @@ async fn happy_path_returns_price_decimals_ticker() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_formatting_and_subcent_preserved() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 0.0034)], now());
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), 0.0034)],
+        now(),
+    )
+    .await;
     // Fixed precision rounds for display...
     let r2: Value = h.server.get(&url(faucet_a(), "?precision=2")).await.json();
     assert_eq!(r2["price"].as_str().unwrap(), "0.00");
     // ...but `full` preserves the sub-cent value (not $0.00).
-    let rf: Value = h.server.get(&url(faucet_a(), "?precision=full")).await.json();
+    let rf: Value = h
+        .server
+        .get(&url(faucet_a(), "?precision=full"))
+        .await
+        .json();
     assert_eq!(rf["price"].as_str().unwrap(), "0.0034");
     // Garbage precision → 400.
     let rb = h.server.get(&url(faucet_a(), "?precision=abc")).await;
@@ -239,16 +292,23 @@ async fn precision_formatting_and_subcent_preserved() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn decimals_null_until_fetched() {
-    let h = harness(&[(faucet_a(), None, None)], &[(faucet_a(), 1.0)], now());
+    let h = harness(&[(faucet_a(), None, None)], &[(faucet_a(), 1.0)], now()).await;
     let v: Value = h.server.get(&url(faucet_a(), "")).await.json();
     assert!(v["decimals"].is_null());
     assert!(v.get("ticker").map(|t| t.is_null()).unwrap_or(true));
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn stale_fails_closed_unless_allowed() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now() - 10_000);
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), 1.0)],
+        now() - 10_000,
+    )
+    .await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     let r2 = h.server.get(&url(faucet_a(), "?allow_stale=true")).await;
@@ -257,6 +317,7 @@ async fn stale_fails_closed_unless_allowed() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_returns_map_and_caps_size() {
     let h = harness(
         &[
@@ -265,7 +326,8 @@ async fn batch_returns_map_and_caps_size() {
         ],
         &[(faucet_a(), 1.0), (faucet_b(), 3000.0)],
         now(),
-    );
+    )
+    .await;
     let ids = format!("{},{}", faucet_a().to_hex(), faucet_b().to_hex());
     let r = h.server.get(&format!("/v1/prices?ids={ids}")).await;
     assert_eq!(r.status_code(), StatusCode::OK);
@@ -278,8 +340,14 @@ async fn batch_returns_map_and_caps_size() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_boundaries_and_config_default() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 0.99987)], now());
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), 0.99987)],
+        now(),
+    )
+    .await;
     // precision=0 → integer string (rounds 0.99987 → "1").
     let r0: Value = h.server.get(&url(faucet_a(), "?precision=0")).await.json();
     assert_eq!(r0["price"].as_str().unwrap(), "1");
@@ -301,8 +369,9 @@ async fn precision_boundaries_and_config_default() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn malformed_faucet_id_is_400() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now());
+    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now()).await;
     // Not 404: a syntactically invalid id is a client error, distinct from an
     // unknown (but well-formed) faucet.
     let r = h.server.get("/v1/price/not-a-hex-id").await;
@@ -312,13 +381,18 @@ async fn malformed_faucet_id_is_400() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
     // faucet_a: registered + priced; faucet_b: registered but UNPRICED.
     let h = harness(
-        &[(faucet_a(), Some(6), Some("USDC")), (faucet_b(), Some(8), Some("ETH"))],
+        &[
+            (faucet_a(), Some(6), Some("USDC")),
+            (faucet_b(), Some(8), Some("ETH")),
+        ],
         &[(faucet_a(), 1.0)],
         now(),
-    );
+    )
+    .await;
     // ids = priced + unpriced → only the priced one appears (CoinGecko-style omit).
     let ids = format!("{},{}", faucet_a().to_hex(), faucet_b().to_hex());
     let v: Value = h.server.get(&format!("/v1/prices?ids={ids}")).await.json();
@@ -333,32 +407,52 @@ async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn vs_currency_is_configurable_and_reflected() {
-    let h = harness_vs(&[(faucet_a(), Some(6), Some("USDC"))], &[(faucet_a(), 0.92)], now(), "eur");
+    let h = harness_vs(
+        &[(faucet_a(), Some(6), Some("USDC"))],
+        &[(faucet_a(), 0.92)],
+        now(),
+        "eur",
+    )
+    .await;
     let v: Value = h.server.get(&url(faucet_a(), "")).await.json();
     assert_eq!(v["vs_currency"].as_str().unwrap(), "eur");
     assert_eq!(v["price"].as_str().unwrap(), "0.92");
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn routing_is_v1_scoped_and_get_only() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now());
+    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now()).await;
     // Unknown route under /v1 → 404.
     let r1 = h.server.get("/v1/bogus").await;
     assert_eq!(r1.status_code(), StatusCode::NOT_FOUND);
     // The same handler without the /v1 prefix is not mounted → 404.
-    let r2 = h.server.get(&format!("/price/{}", faucet_a().to_hex())).await;
+    let r2 = h
+        .server
+        .get(&format!("/price/{}", faucet_a().to_hex()))
+        .await;
     assert_eq!(r2.status_code(), StatusCode::NOT_FOUND);
     // Wrong method on a real route → 405.
-    let r3 = h.server.post(&format!("/v1/price/{}", faucet_a().to_hex())).await;
+    let r3 = h
+        .server
+        .post(&format!("/v1/price/{}", faucet_a().to_hex()))
+        .await;
     assert_eq!(r3.status_code(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn cors_header_present_for_browser_clients() {
     // A browser wallet / extension fetches cross-origin → the response must
     // carry Access-Control-Allow-Origin, else the browser blocks it.
-    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[(faucet_a(), 1.0)], now());
+    let h = harness(
+        &[(faucet_a(), Some(6), Some("USDC"))],
+        &[(faucet_a(), 1.0)],
+        now(),
+    )
+    .await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::OK);
     let acao = r
@@ -370,6 +464,7 @@ async fn cors_header_present_for_browser_clients() {
 // ── swap-eta ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_has_liquidity_crosses_with_eta() {
     // Opposite book (offer B, request A) top level: 300 B for 100 A, depth 300.
     let mut snap = SwapBookSnapshot::new();
@@ -381,8 +476,13 @@ async fn swap_eta_has_liquidity_crosses_with_eta() {
         &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
         snap,
         SettlementStats::new(),
-    );
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await.json();
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .await
+        .json();
     assert!(v["canFill"].as_bool().unwrap());
     assert_eq!(v["estimatedSeconds"].as_u64().unwrap(), 14);
     assert_eq!(v["offMarket"].as_bool().unwrap(), false);
@@ -391,43 +491,72 @@ async fn swap_eta_has_liquidity_crosses_with_eta() {
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_no_cross_not_fillable() {
     // Opposite top gives only 150 B per 100 A → user wanting 200 B doesn't cross.
     let mut snap = SwapBookSnapshot::new();
     let (k, val) = level(faucet_b(), faucet_a(), 100, 150, 1000);
     snap.insert(k, val);
-    let h = swap_server(&[(faucet_a(), Some(8)), (faucet_b(), Some(8))], &[], snap, SettlementStats::new());
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await.json();
+    let h = swap_server(
+        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &[],
+        snap,
+        SettlementStats::new(),
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .await
+        .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
     assert!(v["estimatedSeconds"].is_null());
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_crosses_but_thin_volume() {
     // Crosses on rate but only 50 B available < 200 requested → not fillable,
     // and no threshold (price is fine, depth is the blocker).
     let mut snap = SwapBookSnapshot::new();
     let (k, val) = level(faucet_b(), faucet_a(), 100, 300, 50);
     snap.insert(k, val);
-    let h = swap_server(&[(faucet_a(), Some(8)), (faucet_b(), Some(8))], &[], snap, SettlementStats::new());
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await.json();
+    let h = swap_server(
+        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &[],
+        snap,
+        SettlementStats::new(),
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .await
+        .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_empty_book_not_fillable() {
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
         &[],
         SwapBookSnapshot::new(),
         SettlementStats::new(),
-    );
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await.json();
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .await
+        .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
     assert!(v["median24hSeconds"].is_null());
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_median_present_and_off_market_true() {
     let mut stats = SettlementStats::new();
     for d in [10u64, 30, 20] {
@@ -439,13 +568,19 @@ async fn swap_eta_median_present_and_off_market_true() {
         &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
         SwapBookSnapshot::new(),
         stats,
-    );
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 500)).await.json();
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 500))
+        .await
+        .json();
     assert_eq!(v["median24hSeconds"].as_u64().unwrap(), 20); // median of 10,20,30
     assert_eq!(v["offMarket"].as_bool().unwrap(), true);
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_stale_oracle_fails_closed_to_null() {
     // Same greedy, priced order as the off-market test, but with a price feed
     // older than `staleness_secs`: the oracle verdict must fail closed to null
@@ -457,13 +592,25 @@ async fn swap_eta_stale_oracle_fails_closed_to_null() {
         &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
         SwapBookSnapshot::new(),
         SettlementStats::new(),
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 500))
+        .await
+        .json();
+    assert!(
+        v["offMarket"].is_null(),
+        "stale oracle → offMarket null, not a stale verdict"
     );
-    let v: Value = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 500)).await.json();
-    assert!(v["offMarket"].is_null(), "stale oracle → offMarket null, not a stale verdict");
-    assert!(v["marketPrice"].is_null(), "stale oracle → marketPrice null");
+    assert!(
+        v["marketPrice"].is_null(),
+        "stale oracle → marketPrice null"
+    );
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_response_is_not_cached() {
     // `/v1/swap-eta` must override the router-level `max-age` cache layer with
     // `no-store`, since its fields come from independently-updated snapshots.
@@ -472,29 +619,44 @@ async fn swap_eta_response_is_not_cached() {
         &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
         SwapBookSnapshot::new(),
         SettlementStats::new(),
-    );
-    let r = h.server.get(&swap_url(faucet_a(), 100, faucet_b(), 200)).await;
+    )
+    .await;
+    let r = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .await;
     let cache = r.headers().get("cache-control").cloned();
     assert_eq!(
-        cache.expect("cache-control header present").to_str().unwrap(),
+        cache
+            .expect("cache-control header present")
+            .to_str()
+            .unwrap(),
         "no-store",
         "swap-eta must not inherit the router's price-interval max-age",
     );
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_bad_input() {
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
         &[],
         SwapBookSnapshot::new(),
         SettlementStats::new(),
-    );
+    )
+    .await;
     // zero amount → 400
-    let r0 = h.server.get(&swap_url(faucet_a(), 0, faucet_b(), 200)).await;
+    let r0 = h
+        .server
+        .get(&swap_url(faucet_a(), 0, faucet_b(), 200))
+        .await;
     assert_eq!(r0.status_code(), StatusCode::BAD_REQUEST);
     // same faucet → 400
-    let rs = h.server.get(&swap_url(faucet_a(), 100, faucet_a(), 200)).await;
+    let rs = h
+        .server
+        .get(&swap_url(faucet_a(), 100, faucet_a(), 200))
+        .await;
     assert_eq!(rs.status_code(), StatusCode::BAD_REQUEST);
     // bad hex → 400
     let rb = h
@@ -503,7 +665,10 @@ async fn swap_eta_bad_input() {
         .await;
     assert_eq!(rb.status_code(), StatusCode::BAD_REQUEST);
     // unknown (well-formed) faucet → 404
-    let ru = h.server.get(&swap_url(faucet_unregistered(), 100, faucet_b(), 200)).await;
+    let ru = h
+        .server
+        .get(&swap_url(faucet_unregistered(), 100, faucet_b(), 200))
+        .await;
     assert_eq!(ru.status_code(), StatusCode::NOT_FOUND);
 }
 

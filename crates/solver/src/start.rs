@@ -34,6 +34,44 @@ use crate::types::TokenId;
 #[error("critical solver worker stopped unexpectedly")]
 struct CriticalWorkerStopped;
 
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
+
+async fn join_client_threads(
+    ingest: std::thread::JoinHandle<()>,
+    executor: std::thread::JoinHandle<()>,
+    price_api: std::thread::JoinHandle<()>,
+    router: Option<std::thread::JoinHandle<()>>,
+) -> Result<()> {
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut failed = false;
+        for (name, handle) in [
+            ("ingest", ingest),
+            ("executor", executor),
+            ("price-api", price_api),
+        ] {
+            if let Err(error) = handle.join() {
+                tracing::error!(thread = name, ?error, "solver worker panicked");
+                failed = true;
+            }
+        }
+        if let Some(router) = router {
+            if let Err(error) = router.join() {
+                tracing::error!(thread = "router", ?error, "solver worker panicked");
+                failed = true;
+            }
+        }
+        if failed {
+            Err(anyhow!("a solver worker panicked during shutdown"))
+        } else {
+            Ok(())
+        }
+    });
+    tokio::time::timeout(SHUTDOWN_DEADLINE, joined)
+        .await
+        .context("solver workers did not stop within fifteen seconds; supervisor must restart")?
+        .context("solver worker join task stopped")?
+}
+
 /// Build a `current_thread` tokio runtime + `LocalSet` and run `fut` to
 /// completion on it. Used as the body of each client OS thread so the `!Send`
 /// `Client` it constructs never crosses a thread boundary.
@@ -86,8 +124,20 @@ pub async fn start(
     let shutdown_requested = cancel;
     let cancel = shutdown_requested.child_token();
     // 1. DB pool (caller-owned so HttpPriceClient + executor can share it).
-    let db_pool =
-        db::init_db(&config.solver.app_db_path, config.solver.read_pool_size).context("init_db")?;
+    let writer_url = std::env::var("SOLVER_DATABASE_URL")
+        .context("set SOLVER_DATABASE_URL for the PostgreSQL application database")?;
+    let reader_url = std::env::var("SOLVER_READ_DATABASE_URL")
+        .context("set SOLVER_READ_DATABASE_URL for the PostgreSQL read-only role")?;
+    let app_name = format!("solver/{}", solver_id.to_hex());
+    let db_pool = db::DbPool::open(
+        writer_url,
+        reader_url,
+        config.solver.read_pool_size,
+        app_name,
+    )
+    .await
+    .context("open PostgreSQL application database")?;
+    let db_fatal = db_pool.fatal_token();
 
     // 2. Env-sourced secrets.
     let admin_token = std::env::var("SOLVER_ADMIN_TOKEN").ok();
@@ -127,11 +177,13 @@ pub async fn start(
     //    own OS thread below (a `!Send` `Client` cannot cross threads). The
     //    `factory` carries only `Send` config and is cloned into each thread.
 
-    // 7. Build the observability state. The shared `last_sync` atomic is
+    // 7. Build the channels and observability state. The shared `last_sync` atomic is
     //    initialised to `now()` here so /readyz is healthy during the boot
     //    grace period before the first sync completes.
+    let channels = pipeline::create_channels();
     let obs_state =
-        crate::obs::ObsState::new(db_pool.clone(), config.engine.readiness_freshness_secs);
+        crate::obs::ObsState::new(db_pool.clone(), config.engine.readiness_freshness_secs)
+            .with_channels(channels.book_tx.clone(), channels.exec_tx.clone());
     let last_sync_handle = obs_state.last_sync_handle();
 
     // 8. Build the PipelineConfig.
@@ -145,9 +197,10 @@ pub async fn start(
         last_sync_handle.clone(),
     );
 
-    // 9. Cross-thread channels + DB-only boot work (no client) on this thread.
-    let channels = pipeline::create_channels();
-    pipeline::prepare_db(&pipeline_config).context("prepare_db")?;
+    // 9. DB-only boot work (no client) on this thread.
+    pipeline::prepare_db(&pipeline_config)
+        .await
+        .context("prepare_db")?;
 
     // Last successful price-refresh timestamp (shared: bumped by the price feed,
     // read by the price-query API for staleness). Init to 0 so the API reports
@@ -237,13 +290,22 @@ pub async fn start(
     // Finish durable-note recovery and book hydration before the executor can
     // confirm/reactivate attempts. This prevents a stale startup snapshot from
     // overwriting an outcome produced concurrently with hydration.
-    let ingest_ready = match ingest_ready_rx.await {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("ingest thread exited before signalling readiness")),
+    let ingest_ready = tokio::select! {
+        ready = ingest_ready_rx => match ready {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("ingest thread exited before signalling readiness")),
+        },
+        _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during ingest startup")),
     };
     if let Err(error) = ingest_ready {
         cancel.cancel();
-        let _ = tokio::task::spawn_blocking(move || ingest_thread.join()).await;
+        let joined = tokio::task::spawn_blocking(move || ingest_thread.join());
+        if tokio::time::timeout(SHUTDOWN_DEADLINE, joined)
+            .await
+            .is_err()
+        {
+            tracing::error!("ingest thread did not stop within shutdown deadline");
+        }
         return Err(error).context("ingest startup recovery failed");
     }
     let (executor_thread, exec_ready_rx) = crate::executor::spawn_executor_thread(
@@ -322,12 +384,12 @@ pub async fn start(
                 // (same cancel + join path as a startup-gate failure) so nothing is
                 // left running after `start` returns.
                 cancel.cancel();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = ingest_thread.join();
-                    let _ = executor_thread.join();
-                    let _ = price_api_thread.join();
-                })
-                .await;
+                if let Err(join_error) =
+                    join_client_threads(ingest_thread, executor_thread, price_api_thread, None)
+                        .await
+                {
+                    tracing::error!(%join_error, "solver workers did not stop cleanly");
+                }
                 return Err(e).context("router startup failed");
             }
         }
@@ -338,7 +400,8 @@ pub async fn start(
     // 14. Startup gate: both client threads must report ready (client built +
     //     tasks spawned) before startup is considered successful. Any build /
     //     subscribe failure -> cancel everything, join, return the error.
-    let startup: Result<()> = async {
+    let startup: Result<()> = tokio::select! {
+      result = async {
         match exec_ready_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
@@ -365,20 +428,22 @@ pub async fn start(
             }
         }
         Ok(())
-    }
-    .await;
+      } => result,
+      _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during startup")),
+    };
 
     if let Err(e) = startup {
         cancel.cancel();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = ingest_thread.join();
-            let _ = executor_thread.join();
-            let _ = price_api_thread.join();
-            if let Some(t) = router_thread {
-                let _ = t.join();
-            }
-        })
-        .await;
+        if let Err(join_error) = join_client_threads(
+            ingest_thread,
+            executor_thread,
+            price_api_thread,
+            router_thread,
+        )
+        .await
+        {
+            tracing::error!(%join_error, "solver workers did not stop cleanly");
+        }
         return Err(e).context("startup failed");
     }
     tracing::info!("ingest + executor + price-api threads ready; solver running");
@@ -386,6 +451,9 @@ pub async fn start(
     // 15. Await shutdown: cancellation, or any main-thread Send service
     //     exiting. The client threads are joined in step 16.
     tokio::select! {
+        _ = db_fatal.cancelled() => {
+            tracing::error!("critical PostgreSQL failure; stopping the whole solver");
+        }
         _ = cancel.cancelled() => {
             tracing::info!("cancellation received");
         }
@@ -406,23 +474,13 @@ pub async fn start(
     // 16. Trigger cancel (idempotent) and join the client threads so their
     //     runtimes drain before the process exits.
     cancel.cancel();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Err(e) = ingest_thread.join() {
-            tracing::error!(?e, "ingest thread panicked");
-        }
-        if let Err(e) = executor_thread.join() {
-            tracing::error!(?e, "executor thread panicked");
-        }
-        if let Err(e) = price_api_thread.join() {
-            tracing::error!(?e, "price-api thread panicked");
-        }
-        if let Some(t) = router_thread {
-            if let Err(e) = t.join() {
-                tracing::error!(?e, "router thread panicked");
-            }
-        }
-    })
-    .await;
+    join_client_threads(
+        ingest_thread,
+        executor_thread,
+        price_api_thread,
+        router_thread,
+    )
+    .await?;
     if !shutdown_requested.is_cancelled() {
         return Err(CriticalWorkerStopped.into());
     }

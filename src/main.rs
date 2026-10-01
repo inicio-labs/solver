@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use miden_protocol::account::AccountId;
@@ -48,9 +49,8 @@ fn init_tracing() {
     }
 }
 
-/// CLI surface: an optional `--config <PATH>` plus two operator subcommands,
-/// `provision-account` and `fund-account` (see [`provision`]); with no
-/// subcommand the solver runs. Config precedence is clap-native — explicit
+/// CLI surface: an optional `--config <PATH>` plus operator subcommands.
+/// With no subcommand the solver runs. Config precedence is clap-native — explicit
 /// flag > `$SOLVER_CONFIG` env > the `solver.toml` default. `--help`/`--version`
 /// are auto-generated; an unknown flag or `--config` with no value is a clap
 /// usage error (non-zero exit).
@@ -66,22 +66,24 @@ fn cli() -> clap::Command {
                 .global(true)
                 .help("Path to the TOML config file"),
         )
-        .subcommand(
-            clap::Command::new("provision-account")
-                .about("Create the solver account in the executor store and keystore, and print its id"),
-        )
+        .subcommand(clap::Command::new("provision-account").about(
+            "Create the solver account in the executor store and keystore, and print its id",
+        ))
         .subcommand(
             clap::Command::new("fund-account")
                 .about("Consume the notes sent to the solver account, which deploys and funds it"),
         )
+        .subcommand(
+            clap::Command::new("migrate-db")
+                .about("Apply PostgreSQL schema migrations using SOLVER_MIGRATION_DATABASE_URL"),
+        )
+        .subcommand(
+            clap::Command::new("check-db")
+                .about("Check PostgreSQL schema compatibility using SOLVER_DATABASE_URL"),
+        )
 }
 
-async fn run() -> Result<()> {
-    // Init the global tracing subscriber before any other log lines fire.
-    init_tracing();
-
-    // Parses argv; `--help` / `--version` / usage errors print and exit here.
-    let matches = cli().get_matches();
+async fn run(matches: clap::ArgMatches) -> Result<()> {
     let config_path = matches
         .get_one::<String>("config")
         .expect("`config` always has a default_value")
@@ -140,6 +142,33 @@ async fn run() -> Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
+    // Run operator-only PostgreSQL commands before creating a Tokio runtime:
+    // Diesel performs synchronous network I/O.
+    let matches = cli().get_matches();
+    match matches.subcommand_name() {
+        Some("migrate-db") => {
+            let url = env::var("SOLVER_MIGRATION_DATABASE_URL")
+                .context("set SOLVER_MIGRATION_DATABASE_URL for migrate-db")?;
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            let applied = solver::db::postgres_migrations::migrate(&mut conn)?;
+            println!(
+                "PostgreSQL schema ready ({} new migration(s))",
+                applied.len()
+            );
+            return Ok(());
+        }
+        Some("check-db") => {
+            let url =
+                env::var("SOLVER_DATABASE_URL").context("set SOLVER_DATABASE_URL for check-db")?;
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            solver::db::postgres_migrations::verify(&mut conn)?;
+            println!("PostgreSQL schema matches this solver binary");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Single-threaded runtime + LocalSet. Required because `Client` is `!Send`
     // (its `Arc<dyn Trait>` fields lack `Send + Sync` bounds upstream), so the
     // pipeline tasks must use `tokio::task::spawn_local` and stay on this thread.
@@ -147,5 +176,12 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, run())
+    let result = local.block_on(&rt, run(matches));
+    drop(local);
+    // A lost PostgreSQL reply can leave a synchronous libpq call running on a
+    // blocking worker. Do not let runtime teardown hang the process after the
+    // solver has decided to fail-stop; the process supervisor starts a fresh
+    // instance that hydrates from committed state.
+    rt.shutdown_timeout(Duration::from_secs(5));
+    result
 }

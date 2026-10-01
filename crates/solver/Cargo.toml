@@ -24,7 +24,8 @@ rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 toml = "0.8"
-diesel = { version = "2.2", features = ["sqlite", "r2d2"] }
+diesel = { version = "2.2", default-features = false, features = ["postgres", "r2d2"] }
+diesel_migrations = "2.3"
 axum = { version = "0.8", features = ["json", "ws"] }
 # Public price-API protections: request timeout + response cache header.
 # (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's

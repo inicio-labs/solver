@@ -24,18 +24,25 @@ pub async fn run() -> Result<()> {
     artifacts::ensure_dir()?;
 
     // 1. Solver context (its store == the solver runtime's executor store).
-    let (mut solver_cli, solver_ks) =
-        devnet::build_client(&artifacts::solver_executor_store(), &artifacts::solver_keystore())
-            .await
-            .context("build solver-provisioning client")?;
+    let (mut solver_cli, solver_ks) = devnet::build_client(
+        &artifacts::solver_executor_store(),
+        &artifacts::solver_keystore(),
+    )
+    .await
+    .context("build solver-provisioning client")?;
 
     // 2. Operator context (faucets).
-    let (mut op_cli, op_ks) =
-        devnet::build_client(&artifacts::operator_store(), &artifacts::operator_keystore())
-            .await
-            .context("build operator client")?;
+    let (mut op_cli, op_ks) = devnet::build_client(
+        &artifacts::operator_store(),
+        &artifacts::operator_keystore(),
+    )
+    .await
+    .context("build operator client")?;
 
-    solver_cli.sync_state().await.context("initial solver sync")?;
+    solver_cli
+        .sync_state()
+        .await
+        .context("initial solver sync")?;
     op_cli.sync_state().await.context("initial operator sync")?;
 
     // 3. Create accounts (deployed lazily on first tx).
@@ -44,29 +51,41 @@ pub async fn run() -> Result<()> {
     tracing::info!(%solver_id, "solver wallet created");
 
     tracing::info!("creating faucet A (MTA)…");
-    let faucet_a = accounts::create_faucet(&mut op_cli, &op_ks, "MTA", DECIMALS, MAX_SUPPLY).await?;
+    let faucet_a =
+        accounts::create_faucet(&mut op_cli, &op_ks, "MTA", DECIMALS, MAX_SUPPLY).await?;
     tracing::info!("creating faucet B (MTB)…");
-    let faucet_b = accounts::create_faucet(&mut op_cli, &op_ks, "MTB", DECIMALS, MAX_SUPPLY).await?;
+    let faucet_b =
+        accounts::create_faucet(&mut op_cli, &op_ks, "MTB", DECIMALS, MAX_SUPPLY).await?;
     tracing::info!(%faucet_a, %faucet_b, "faucets created");
 
     // 4. Mint the solver's buffer (this also DEPLOYS each faucet on its first tx).
     tracing::info!("minting solver buffer from faucet A…");
     let (mint_a, _) = accounts::mint(&mut op_cli, faucet_a, solver_id, SOLVER_BUFFER).await?;
-    accounts::wait_for_tx(&mut op_cli, mint_a).await.context("await mint A")?;
+    accounts::wait_for_tx(&mut op_cli, mint_a)
+        .await
+        .context("await mint A")?;
     tracing::info!("minting solver buffer from faucet B…");
     let (mint_b, _) = accounts::mint(&mut op_cli, faucet_b, solver_id, SOLVER_BUFFER).await?;
-    accounts::wait_for_tx(&mut op_cli, mint_b).await.context("await mint B")?;
+    accounts::wait_for_tx(&mut op_cli, mint_b)
+        .await
+        .context("await mint B")?;
 
     // 5. Solver consumes the two mint notes (deploys the solver wallet + credits
     //    its vault). Poll sync until both committed notes are visible.
     let notes = wait_for_committed_notes(&mut solver_cli, 2).await?;
     tracing::info!(count = notes.len(), "solver consuming mint notes…");
     let consume_tx = accounts::consume(&mut solver_cli, solver_id, notes).await?;
-    accounts::wait_for_tx(&mut solver_cli, consume_tx).await.context("await consume")?;
+    accounts::wait_for_tx(&mut solver_cli, consume_tx)
+        .await
+        .context("await consume")?;
 
     // 6. Verify balances.
-    let bal_a = accounts::balance(&solver_cli, solver_id, faucet_a).await.unwrap_or(0);
-    let bal_b = accounts::balance(&solver_cli, solver_id, faucet_b).await.unwrap_or(0);
+    let bal_a = accounts::balance(&solver_cli, solver_id, faucet_a)
+        .await
+        .unwrap_or(0);
+    let bal_b = accounts::balance(&solver_cli, solver_id, faucet_b)
+        .await
+        .unwrap_or(0);
 
     // 7. Persist artifacts + solver config.
     let art = Artifacts {
@@ -87,7 +106,6 @@ pub async fn run() -> Result<()> {
         solver_keystore_path: artifacts::solver_keystore(),
         solver_executor_store_path: artifacts::solver_executor_store(),
         solver_ingest_store_path: artifacts::solver_ingest_store(),
-        solver_app_db_path: artifacts::solver_app_db(),
         operator_store_path: artifacts::operator_store(),
         operator_keystore_path: artifacts::operator_keystore(),
     };
@@ -104,12 +122,20 @@ async fn wait_for_committed_notes(
     n: usize,
 ) -> Result<Vec<miden_client::note::Note>> {
     for attempt in 0..40 {
-        client.sync_state().await.context("sync while waiting for notes")?;
+        client
+            .sync_state()
+            .await
+            .context("sync while waiting for notes")?;
         let notes = accounts::committed_input_notes(client).await?;
         if notes.len() >= n {
             return Ok(notes);
         }
-        tracing::debug!(attempt, have = notes.len(), want = n, "waiting for committed notes…");
+        tracing::debug!(
+            attempt,
+            have = notes.len(),
+            want = n,
+            "waiting for committed notes…"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
     anyhow::bail!("timed out waiting for {n} committed notes for the solver account")

@@ -128,9 +128,11 @@ impl IntoResponse for ApiError {
             ApiError::BadFaucetId(m) => (StatusCode::BAD_REQUEST, "bad_faucet_id", m),
             ApiError::BadAmount(m) => (StatusCode::BAD_REQUEST, "bad_amount", m),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m),
-            ApiError::UnknownFaucet => {
-                (StatusCode::NOT_FOUND, "unknown_faucet", "faucet not registered".into())
-            }
+            ApiError::UnknownFaucet => (
+                StatusCode::NOT_FOUND,
+                "unknown_faucet",
+                "faucet not registered".into(),
+            ),
             ApiError::NoPrice => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_price",
@@ -139,7 +141,9 @@ impl IntoResponse for ApiError {
             ApiError::Stale(as_of) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "stale",
-                format!("prices are stale; last update {as_of} (use ?allow_stale=true to override)"),
+                format!(
+                    "prices are stale; last update {as_of} (use ?allow_stale=true to override)"
+                ),
             ),
             ApiError::BadPrecision(m) => (StatusCode::BAD_REQUEST, "bad_precision", m),
             ApiError::BatchTooLarge(max) => (
@@ -147,9 +151,11 @@ impl IntoResponse for ApiError {
                 "batch_too_large",
                 format!("at most {max} ids per request"),
             ),
-            ApiError::Internal => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".into())
-            }
+            ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error".into(),
+            ),
         };
         (status, Json(json!({ "error": code, "message": message }))).into_response()
     }
@@ -184,41 +190,38 @@ fn resolve_precision(
     q: &HashMap<String, String>,
 ) -> Result<PricePrecision, ApiError> {
     match q.get("precision") {
-        Some(p) => PricePrecision::parse(p)
-            .ok_or_else(|| ApiError::BadPrecision(format!("must be \"full\" or 0..=18, got {p:?}"))),
+        Some(p) => PricePrecision::parse(p).ok_or_else(|| {
+            ApiError::BadPrecision(format!("must be \"full\" or 0..=18, got {p:?}"))
+        }),
         None => Ok(state.default_precision),
     }
 }
 
 fn wants_stale(q: &HashMap<String, String>) -> bool {
-    q.get("allow_stale").map(|v| v == "true" || v == "1").unwrap_or(false)
+    q.get("allow_stale")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
 
 /// Current snapshot age. Returns `(as_of, is_stale)`.
 fn staleness(state: &PriceApiState) -> (i64, bool) {
     let as_of = state.last_price_update.load(Ordering::Relaxed);
-    (as_of, now_secs().saturating_sub(as_of) > state.staleness_secs)
+    (
+        as_of,
+        now_secs().saturating_sub(as_of) > state.staleness_secs,
+    )
 }
 
 /// Resolve one faucet → quote. `404` if unregistered, `503` if registered but
 /// unpriced. Staleness is gated by the caller (it's a global property).
-fn quote_one(
+fn quote_from_row(
     state: &PriceApiState,
-    faucet_hex: &str,
+    account_id: AccountId,
+    row: db::postgres_models::RegisteredTokenRow,
     precision: PricePrecision,
     as_of: i64,
     stale: bool,
 ) -> Result<PriceResponse, ApiError> {
-    let account_id =
-        AccountId::from_hex(faucet_hex).map_err(|e| ApiError::BadFaucetId(format!("{e}")))?;
-
-    // Registered? (DB is the source of truth for the registered set + decimals.)
-    let mut key = Vec::new();
-    account_id.write_into(&mut key);
-    let row = db::fetch_token_row(&state.pool, &key)
-        .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::UnknownFaucet)?;
-
     // Price from the precise side-channel.
     let usd = {
         let snap = state.precise_rx.borrow();
@@ -252,7 +255,18 @@ async fn get_price(
     if stale && !wants_stale(&q) {
         return Err(ApiError::Stale(as_of));
     }
-    Ok(Json(quote_one(&state, &faucet_id, precision, as_of, stale)?))
+    let account_id = AccountId::from_hex(&faucet_id)
+        .map_err(|error| ApiError::BadFaucetId(error.to_string()))?;
+    let key = key_bytes(account_id);
+    let row = state
+        .pool
+        .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &key))
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::UnknownFaucet)?;
+    Ok(Json(quote_from_row(
+        &state, account_id, row, precision, as_of, stale,
+    )?))
 }
 
 /// `GET /v1/prices?ids=a,b,c&precision=&allow_stale=` → `{ "<faucet_id>": {..} }`
@@ -277,9 +291,22 @@ async fn get_prices(
     if stale && !wants_stale(&q) {
         return Err(ApiError::Stale(as_of));
     }
+    let accounts: Vec<_> = ids
+        .into_iter()
+        .filter_map(|id| AccountId::from_hex(id).ok())
+        .collect();
+    let keys: Vec<_> = accounts.iter().copied().map(key_bytes).collect();
+    let rows = state
+        .pool
+        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
+        .await
+        .map_err(|_| ApiError::Internal)?;
     let mut out = HashMap::new();
-    for id in ids {
-        if let Ok(resp) = quote_one(&state, id, precision, as_of, stale) {
+    for account_id in accounts {
+        let Some(row) = rows.get(&key_bytes(account_id)).cloned() else {
+            continue;
+        };
+        if let Ok(resp) = quote_from_row(&state, account_id, row, precision, as_of, stale) {
             out.insert(resp.faucet_id.clone(), resp);
         }
     }
@@ -318,7 +345,9 @@ fn key_bytes(id: AccountId) -> Vec<u8> {
 }
 
 fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
-    let raw = q.get(key).ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))?;
+    let raw = q
+        .get(key)
+        .ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))?;
     let v: u64 = raw
         .parse()
         .map_err(|_| ApiError::BadAmount(format!("`{key}` must be a u64, got {raw:?}")))?;
@@ -329,7 +358,9 @@ fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError>
 }
 
 fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, ApiError> {
-    let raw = q.get(key).ok_or_else(|| ApiError::BadFaucetId(format!("missing `{key}`")))?;
+    let raw = q
+        .get(key)
+        .ok_or_else(|| ApiError::BadFaucetId(format!("missing `{key}`")))?;
     AccountId::from_hex(raw).map_err(|e| ApiError::BadFaucetId(format!("`{key}`: {e}")))
 }
 
@@ -353,12 +384,15 @@ async fn get_swap_eta(
     let requested_amount = parse_amount(&q, "requested_amount")?;
 
     // Registration gate + decimals (for the oracle compare).
-    let row_a = db::fetch_token_row(&state.pool, &key_bytes(a))
-        .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::UnknownFaucet)?;
-    let row_b = db::fetch_token_row(&state.pool, &key_bytes(b))
-        .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::UnknownFaucet)?;
+    let key_a = key_bytes(a);
+    let key_b = key_bytes(b);
+    let rows = state
+        .pool
+        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &[key_a, key_b]))
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let row_a = rows.get(&key_bytes(a)).ok_or(ApiError::UnknownFaucet)?;
+    let row_b = rows.get(&key_bytes(b)).ok_or(ApiError::UnknownFaucet)?;
     let d_a = row_a.decimals.map(|d| d as u8);
     let d_b = row_b.decimals.map(|d| d as u8);
 
@@ -366,7 +400,11 @@ async fn get_swap_eta(
     // OPPOSITE pair (offer B, request A).
     let best = state.swap_rx.borrow().get(&(b, a)).copied();
     let can_fill = eval_can_fill(offered_amount, requested_amount, best);
-    let estimated_seconds = if can_fill { Some(state.swap_eta_secs) } else { None };
+    let estimated_seconds = if can_fill {
+        Some(state.swap_eta_secs)
+    } else {
+        None
+    };
 
     // Oracle check (advisory; independent of the book). Fail closed on a stale
     // feed: if the price snapshot is older than the staleness bound, treat both
@@ -407,11 +445,18 @@ async fn get_swap_eta(
     // can_fill, off_market, and median24h_seconds come from independently-updated
     // snapshots, so a shared max-age would serve stale fillability. `no-store`
     // wins because the layer is `if_not_present`.
-    Ok(([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], body))
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        body,
+    ))
 }
 
 /// Concurrency limiter: acquire a permit per request, shed with `503` if none.
-async fn concurrency_guard(State(sem): State<Arc<Semaphore>>, req: Request, next: Next) -> Response {
+async fn concurrency_guard(
+    State(sem): State<Arc<Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
     match sem.try_acquire_owned() {
         Ok(_permit) => next.run(req).await,
         Err(_) => (
@@ -440,12 +485,17 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     // Public read-only price data → permissive CORS so browser wallets /
     // extensions can fetch it cross-origin. Any origin, GET only (the API is
     // GET-only); preflight OPTIONS is handled by this layer.
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET]);
 
     Router::new()
         .nest("/v1", v1)
         // Outer protections (applied to all routes):
-        .layer(SetResponseHeaderLayer::if_not_present(header::CACHE_CONTROL, cache_value))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            cache_value,
+        ))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_millis(cfg.timeout_ms),
@@ -474,7 +524,10 @@ pub fn spawn_price_api_thread(
     let handle = thread::Builder::new()
         .name("price-api".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(anyhow!("price-api runtime: {e}")));
@@ -521,7 +574,10 @@ pub fn spawn_price_api_thread(
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "price-query API listening");
                 let shutdown = async move { cancel.cancelled().await };
-                if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
+                if let Err(e) = axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                {
                     tracing::error!(error = %e, "price-query API server error");
                 }
             });

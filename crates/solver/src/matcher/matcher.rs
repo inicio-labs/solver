@@ -1,5 +1,6 @@
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -12,6 +13,12 @@ use crate::clearing::{
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
 use crate::types::*;
+
+static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn skipped_executor_full_ticks() -> u64 {
+    SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
+}
 
 /// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
 /// oracle prices pause clearing, but do not disable fixed-limit RFQ selection.
@@ -59,7 +66,8 @@ pub async fn run_matcher(
     runtime: ClearingRuntime,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // One cancellation boundary covers bootstrap, matching, and a blocked send.
+    // One cancellation boundary covers bootstrap and matching. Executor
+    // backpressure cannot block this worker from receiving book updates.
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
         result = run_worker(book_rx, exec_tx, match_interval, swap_snapshot_tx, runtime) => result,
@@ -94,11 +102,14 @@ pub(super) async fn run_worker(
                 if let Some(routing) = runtime.routing.as_mut() {
                     routing.release_expired(&mut book, now)?;
                 }
-                internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now).await?;
-                if let Some(routing) = runtime.routing.as_mut() {
-                    // Executor backpressure may have delayed this tick. Check RFQ
-                    // expiry against the handover time, not the old tick timestamp.
-                    routing.dispatch(&mut book, now_millis())?;
+                let clearing = internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now)?;
+                if clearing == ClearingTickOutcome::Completed {
+                    if let Some(routing) = runtime.routing.as_mut() {
+                        // External dispatch assumes internal clearing already
+                        // removed its matches. When executor capacity is full,
+                        // skip both paths and leave all orders active.
+                        routing.dispatch(&mut book, now_millis())?;
+                    }
                 }
                 // Latest order-book levels for the price API's swap-ETA estimates.
                 snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
@@ -140,14 +151,34 @@ fn fresh_reference_prices(
     Some((base_price.exact_reference?, quote_price.exact_reference?))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClearingTickOutcome {
+    Completed,
+    SkippedExecutorFull,
+}
+
 /// Solve all pairs from the live book using one frozen price snapshot.
-pub(super) async fn internal_clear(
+pub(super) fn internal_clear(
     book: &mut ClearingBook,
     decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
     now_ms: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ClearingTickOutcome> {
+    // Do not wait on a full executor queue: the matcher must remain able to
+    // receive lifecycle updates. A skipped tick changes no order state and
+    // clearing retries against the current book at the next tick.
+    let permit = match exec_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            SKIPPED_EXECUTOR_FULL_TICKS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("executor queue full; skipping clearing tick");
+            return Ok(ClearingTickOutcome::SkippedExecutorFull);
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            anyhow::bail!("executor stopped: execution batch receiver closed");
+        }
+    };
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor
@@ -233,14 +264,10 @@ pub(super) async fn internal_clear(
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
-        return Ok(());
+        return Ok(ClearingTickOutcome::Completed);
     }
-    // Reserve before changing the book. Once reserved, deactivation and send
-    // are synchronous: cancellation cannot leave half of the handoff applied.
-    let permit = exec_tx
-        .reserve()
-        .await
-        .context("executor stopped: execution batch receiver closed")?;
+    // Deactivation and send are synchronous after acquiring capacity, so a
+    // cancelled task cannot leave half of the handoff applied.
     // Keep the parents in memory but off the matchable index. A definite
     // failure reactivates them; confirmation removes them permanently.
     for filled in &combined.filled_notes {
@@ -252,7 +279,7 @@ pub(super) async fn internal_clear(
         "combined clearing batch sent to executor"
     );
     permit.send(combined);
-    Ok(())
+    Ok(ClearingTickOutcome::Completed)
 }
 
 #[cfg(test)]
@@ -320,10 +347,11 @@ mod tests {
         assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 1).is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn exact_price_runtime_combines_two_pairs_in_one_execution_batch() {
-        use crate::db::models::{NoteRow, OrderRow};
-        use crate::db::{init_db, insert_notes_batch, register_token, set_token_metadata};
+        use crate::db::postgres_models::NewOrderRow;
+        use crate::db::postgres_test::TestDb;
         use miden_protocol::asset::{AssetAmount, FungibleAsset};
         use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
         use miden_protocol::note::{Note, NoteType};
@@ -331,8 +359,8 @@ mod tests {
         use miden_protocol::Word;
         use miden_standards::note::{PswapNote, PswapNoteStorage};
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let pool = init_db(tmp.path().to_str().unwrap(), 2).unwrap();
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
         let solver_id =
             AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
         let mut rng = RandomCoin::new(Word::default());
@@ -374,40 +402,24 @@ mod tests {
                 FungibleAsset::new(ieth(), 10).unwrap(),
             ),
         ];
-        {
-            let mut conn = pool.write_conn().unwrap();
+        pool.write(move |conn| {
             for token in [imiden(), iusdt(), ieth()] {
-                register_token(&mut conn, &token.to_bytes(), None).unwrap();
-                set_token_metadata(&mut conn, &token.to_bytes(), Some(0), None).unwrap();
+                db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
+                db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(0), None)?;
             }
-            let note_rows: Vec<_> = notes
+            let (note_rows, order_rows): (Vec<_>, Vec<_>) = notes
                 .iter()
-                .map(|note| NoteRow {
-                    note_id: note.id().to_bytes().to_vec(),
-                    account_id: solver_id.to_bytes().to_vec(),
-                    raw_data: note.to_bytes(),
-                })
-                .collect();
-            let order_rows: Vec<_> = notes
-                .iter()
-                .map(|note| {
-                    let order = crate::types::Order::from_note(note).unwrap();
-                    OrderRow {
-                        note_id: note.id().to_bytes().to_vec(),
-                        account_id: solver_id.to_bytes().to_vec(),
-                        requested_asset: order.requested_faucet_id.to_bytes().to_vec(),
-                        requested_amount: order.requested_amount as i64,
-                        offered_asset: order.offered_faucet_id.to_bytes().to_vec(),
-                        offered_amount: order.offered_amount as i64,
-                        timestamp: 1,
-                        status: OrderStatus::Active.as_str().to_owned(),
-                        priority_seq: 0,
-                    }
-                })
-                .collect();
-            insert_notes_batch(&mut conn, &note_rows, &order_rows, 1).unwrap();
-        }
-        let persisted = db::load_active_orders_with_notes(&mut pool.read_conn().unwrap()).unwrap();
+                .map(|note| NewOrderRow::ingested(note, 1).unwrap())
+                .unzip();
+            db::postgres_db::insert_notes_batch_tx(conn, &note_rows, &order_rows, 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let persisted = pool
+            .read(db::postgres_db::load_active_orders_with_notes_tx)
+            .await
+            .unwrap();
         let mut book = ClearingBook::default();
         for order in &persisted {
             book.insert(order).unwrap();
@@ -442,18 +454,31 @@ mod tests {
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
-        let error = internal_clear(&mut book, &decimals, &runtime, &closed_tx, 1_500)
-            .await
-            .unwrap_err();
+        let error = internal_clear(&mut book, &decimals, &runtime, &closed_tx, 1_500).unwrap_err();
         assert!(error.to_string().contains("executor stopped"));
         assert_eq!(
             book.best_levels_snapshot().len(),
             4,
             "failed dispatch must leave orders live"
         );
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
-            .await
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
             .unwrap();
+        assert_eq!(
+            internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap(),
+            ClearingTickOutcome::SkippedExecutorFull
+        );
+        assert_eq!(
+            book.best_levels_snapshot().len(),
+            4,
+            "a full executor queue must leave orders active for a later tick"
+        );
+        assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
         let execution = exec_rx.try_recv().unwrap();
         assert_eq!(execution.filled_notes.len(), 4);
         assert_eq!(execution.group_ends, vec![2, 4]);
@@ -466,9 +491,7 @@ mod tests {
         }
         assert!(exec_rx.try_recv().is_err());
         assert!(book.best_levels_snapshot().is_empty());
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
-            .await
-            .unwrap();
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
         assert!(
             exec_rx.try_recv().is_err(),
             "pending orders must not be dispatched twice"
@@ -476,14 +499,83 @@ mod tests {
         for order in &persisted {
             book.insert(order).unwrap();
         }
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500)
-            .await
-            .unwrap();
+        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
         let retried = exec_rx.try_recv().unwrap();
         for (first, next) in execution.filled_notes.iter().zip(&retried.filled_notes) {
             assert_eq!(first.note_id, next.note_id);
             assert_eq!(first.arrival_unix, next.arrival_unix);
             assert!(Arc::ptr_eq(&first.note, &next.note));
         }
+
+        // A full executor queue must not stop the worker from receiving a
+        // committed book update. Once capacity returns, the next tick clears
+        // only against the updated book.
+        let mut fresh_prices = runtime.prices.borrow().clone();
+        let observed_at = now_millis();
+        for data in fresh_prices.values_mut() {
+            data.observed_at_unix_ms = observed_at;
+            data.source_updated_at_unix_ms = Some(observed_at);
+        }
+        let (_fresh_prices_tx, fresh_prices_rx) = watch::channel(fresh_prices);
+        let (bootstrap_tx, bootstrap_rx) = oneshot::channel();
+        let (book_tx, book_rx) = mpsc::channel(1);
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let worker_runtime = ClearingRuntime {
+            bootstrap: bootstrap_rx,
+            prices: fresh_prices_rx,
+            pairs: runtime.pairs.clone(),
+            config: runtime.config,
+            max_price_age_ms: 30_000,
+            max_source_age_ms: 30_000,
+            max_source_skew_ms: 0,
+            routing: None,
+        };
+        let removed_id = persisted[0].id();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let worker = tokio::task::spawn_local(run_worker(
+                    book_rx,
+                    exec_tx,
+                    Duration::from_secs(1),
+                    snapshot_tx,
+                    worker_runtime,
+                ));
+                assert!(bootstrap_tx
+                    .send(ClearingBootstrap {
+                        orders: persisted,
+                        decimals,
+                    })
+                    .is_ok());
+                snapshot_rx.changed().await.unwrap();
+                assert_eq!(snapshot_rx.borrow().len(), 4);
+
+                book_tx
+                    .send(BookUpdate {
+                        removed: vec![removed_id],
+                        active: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                snapshot_rx.changed().await.unwrap();
+                assert_eq!(snapshot_rx.borrow().len(), 3);
+                assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+                tokio::time::advance(Duration::from_secs(1)).await;
+                snapshot_rx.changed().await.unwrap();
+                assert_eq!(exec_rx.try_recv().unwrap().filled_notes.len(), 2);
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+            })
+            .await;
     }
 }

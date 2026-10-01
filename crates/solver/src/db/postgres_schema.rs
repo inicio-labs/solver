@@ -1,6 +1,9 @@
+//! Diesel mapping for the PostgreSQL application schema. Keep this in sync
+//! with `migrations_postgres`.
+
 diesel::table! {
     sync_state (id) {
-        id -> Integer,
+        id -> SmallInt,
         last_fetched_block -> BigInt,
     }
 }
@@ -21,7 +24,7 @@ diesel::table! {
         requested_amount -> BigInt,
         offered_asset -> Binary,
         offered_amount -> BigInt,
-        timestamp -> BigInt,
+        arrival_unix -> BigInt,
         status -> Text,
         priority_seq -> BigInt,
     }
@@ -32,6 +35,7 @@ diesel::table! {
         tx_id -> Binary,
         tx_result -> Binary,
         status -> Text,
+        created_at_unix -> BigInt,
     }
 }
 
@@ -46,25 +50,18 @@ diesel::table! {
 }
 
 diesel::table! {
-    generated_notes (note_id) {
-        note_id -> Binary,
-        account_id -> Binary,
-        source_note_a -> Binary,
-        source_note_b -> Binary,
-        data -> Binary,
-        created_at -> BigInt,
-    }
-}
-
-diesel::table! {
     registered_tokens (token_id) {
         token_id -> Binary,
-        created_at -> BigInt,
+        created_at_unix -> BigInt,
         external_symbol -> Nullable<Text>,
         decimals -> Nullable<Integer>,
         ticker -> Nullable<Text>,
     }
 }
+
+diesel::joinable!(orders -> notes (note_id));
+diesel::joinable!(settlement_inputs -> orders (parent_note_id));
+diesel::joinable!(settlement_inputs -> settlement_attempts (tx_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     sync_state,
@@ -72,6 +69,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     orders,
     settlement_attempts,
     settlement_inputs,
-    generated_notes,
     registered_tokens,
 );

@@ -37,7 +37,7 @@ flowchart TB
         subgraph exethr["executor OS thread — !Send KEYSTORE client"]
             EXEC["Executor<br/>build + submit settlement tx,<br/>capture surplus"]
         end
-        DB[("App DB — SQLite/diesel<br/>orders · tokens · sync state")]
+        DB[("App DB — PostgreSQL/diesel<br/>orders · tokens · sync state")]
         KS["Filesystem keystore<br/>Falcon-512 signing key"]
     end
 
@@ -46,7 +46,7 @@ flowchart TB
     EXEC -.->|prove| PROVER
     CG -->|prices| PRICE
     OPS -->|Bearer token| ADMIN
-    OPS -->|/health /readyz| OBS
+    OPS -->|/health /readyz /metrics| OBS
 
     INGEST -->|new orders / consumed notes| MATCH
     MATCH -->|matched batch| EXEC
@@ -74,7 +74,7 @@ contexts** connected only by `Send` channels:
 
 Data flow: `ingest → matcher` (new orders + consumed-note events) → `matcher →
 executor` (matched batches) → `executor → matcher` (re-feed of orders that
-didn't settle). All three persist to a shared SQLite app DB. The order lifecycle
+didn't settle). All three persist to a shared PostgreSQL app DB. The order lifecycle
 is `Active → Settling → Executed → OnchainNullified` (the last is terminal and
 authoritative — the chain nullifier is the source of truth).
 
@@ -103,6 +103,47 @@ cp solver.toml.example solver.toml
 Config can be pointed at any path via `--config <path>` or the `SOLVER_CONFIG`
 env var (default: `./solver.toml`).
 
+### PostgreSQL schema preparation
+
+The solver application database is PostgreSQL. The two Miden client stores
+remain separate SQLite files. Prepare a fresh application database before the
+first run; ordinary startup only verifies its migration history and acquires
+one PostgreSQL-held solver ownership lock:
+
+```bash
+SOLVER_MIGRATION_DATABASE_URL='postgresql://…' cargo run --bin solver-bin -- migrate-db
+SOLVER_DATABASE_URL='postgresql://…' cargo run --bin solver-bin -- check-db
+SOLVER_DATABASE_URL='postgresql://writer@…?connect_timeout=5&sslmode=verify-full' \
+SOLVER_READ_DATABASE_URL='postgresql://reader@…?connect_timeout=5&sslmode=verify-full' \
+  cargo run --bin solver-bin
+```
+
+`migrate-db` uses a role allowed to create the schema and its migration-history
+table. `check-db` only reads that history and requires an exact match with the
+migrations compiled into this solver binary. A missing, older, or newer schema
+causes an error. The normal runtime role needs `SELECT` permission on
+`__diesel_schema_migrations`; it does not need schema-creation permission.
+PostgreSQL credentials belong in environment variables or the deployment's
+secret store, not in committed configuration.
+The writer role needs DML on the application tables and sequence usage; the
+reader role needs SELECT on those tables and the migration-history table.
+The runtime does not run migrations, copy SQLite data, or open a second writer.
+
+The PostgreSQL schema and query tests use a real database and each create an
+isolated temporary schema inside it. Run them with an operator-capable test URL:
+
+```bash
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --lib -- --ignored --test-threads=2
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_startup_failure -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_already_consumed -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_three_user_direct -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_partial_fill -- --ignored
+```
+
+The separate `integration_unpriced_direct` test is intentionally red for the
+pre-existing unpriced-token audit finding C2 and is not part of this migration
+gate.
+
 ### `[rpc]`
 | Field | Req | Description |
 |---|---|---|
@@ -114,10 +155,9 @@ env var (default: `./solver.toml`).
 |---|---|---|
 | `account_id` | ✅ | Hex id of the solver's on-chain account. Must be a **0.15-format** id provisioned on the target network. |
 | `keystore_path` | ✅ | Filesystem keystore **directory** holding the account's Falcon-512 key (see [Credentials](#credentials)). |
-| `app_db_path` | ✅ | SQLite application DB (orders / tokens / sync state). |
 | `executor_store_path` | ✅ | miden-client store for the **executor** (signing) client. The solver account state lives here. |
-| `ingest_store_path` | ✅ | miden-client store for the **keyless ingest** client. **Must be a distinct file** from the two above. |
-| `read_pool_size` | — | Concurrent SQLite read connections. Default `4`. |
+| `ingest_store_path` | ✅ | miden-client store for the **keyless ingest** client. **Must be a distinct file** from the executor store. |
+| `read_pool_size` | — | Concurrent PostgreSQL read connections. Default `4`. |
 
 ### `[[pairs]]` (one block per trading pair)
 | Field | Req | Description |
@@ -276,7 +316,8 @@ crossing orders between them automatically.
 ## Observability
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
-- `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if the DB is reachable **and** the last sync is within `readiness_freshness_secs`; otherwise 503.
+- `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if the PostgreSQL schema, original writer ownership, and recent sync are healthy; otherwise 503.
+- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure.
 
 ---
 
@@ -319,15 +360,16 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
 
 ```bash
 cargo test -p solver               # unit + integration + adversarial proptest
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver -- --ignored
 cargo test -p consume-script       # MASM script compiles + behaves
 ```
 - **Adversarial fuzzing:** `crates/solver/src/matching/tests/test_proptest_adversarial.rs`
   (proptest) checks the matcher never makes the solver lose funds and never
   panics on arbitrary amounts. See the assessment in
   [docs/security/pentest-2026-06-19.md](docs/security/pentest-2026-06-19.md).
-- **Price-query API** (`crates/solver/src/price_api/tests.rs`, `axum-test`,
-  `cargo test -p solver --release price_api`): 12 cases exercising the public
-  surface end-to-end against a real temp-file DB —
+- **Price-query API** (`crates/solver/src/price_api/tests.rs`, `axum-test`):
+  end-to-end cases against isolated PostgreSQL schemas. Run them with
+  `SOLVER_TEST_DATABASE_URL` and `cargo test -p solver price_api -- --ignored` —
   - **Registered-vs-priced:** unregistered faucet → `404`; registered but no
     price yet → `503` (not a misleading 404).
   - **Faithful price:** a sub-$1 value (`0.0034`) is preserved at `full`, never

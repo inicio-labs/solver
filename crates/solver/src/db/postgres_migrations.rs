@@ -259,6 +259,16 @@ mod tests {
             conn,
             "UPDATE sync_state SET last_fetched_block = -1 WHERE id = 1",
         )?;
+        // The price API reads decimals as a u8.
+        conn.batch_execute(
+            "INSERT INTO registered_tokens (token_id, decimals) VALUES (decode('aa', 'hex'), 255)",
+        )?;
+        for decimals in [-1, 256] {
+            rejects(
+                conn,
+                &format!("UPDATE registered_tokens SET decimals = {decimals}"),
+            )?;
+        }
 
         conn.batch_execute(
             "INSERT INTO settlement_attempts (tx_id, tx_result, status)

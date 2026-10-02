@@ -48,6 +48,6 @@ WHERE child_note_id IS NOT NULL;
 CREATE TABLE registered_tokens (
     token_id BYTEA PRIMARY KEY,
     external_symbol TEXT,
-    decimals INTEGER,
+    decimals INTEGER CHECK (decimals BETWEEN 0 AND 255),
     ticker TEXT
 );

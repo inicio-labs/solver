@@ -12,6 +12,13 @@ active-active mode in V1.
    base backups, WAL archiving/PITR, and a tested database restart procedure.
    Budget at least ten connections for the solver: one persistent writer, four
    readers by default, one migration/operations connection, and headroom.
+   Connect the solver **directly** to PostgreSQL, or through a pooler in
+   **session** mode only. A transaction-mode pooler (PgBouncer
+   `pool_mode = transaction`, Supabase's pooled port 6543, and similar) moves
+   the writer between server connections between transactions. That breaks
+   the session-held ownership lock and the per-session settings, and conflicts
+   with Diesel's prepared-statement cache; the solver would detect a
+   different backend and stop. The solver already pools its own connections.
 2. Create a dedicated schema and three roles: migration owner, solver writer,
    and solver reader. The writer needs schema `USAGE`, DML on application
    tables, `USAGE, SELECT` on the `orders_priority_seq_seq` identity sequence,
@@ -142,6 +149,34 @@ matching ticks.
 Scrape PostgreSQL statistics separately for order/attempt counts and server
 deadlocks; the solver endpoint does not scan the full orders table on every
 scrape. Do not log credentials, serialized notes, or transaction payloads.
+
+### Query statistics and table maintenance
+
+Enable `pg_stat_statements` (`shared_preload_libraries`, then
+`CREATE EXTENSION pg_stat_statements` in the application database) and review
+the top statements by total and mean time after load tests and periodically
+in production. Every solver query is a short, parameterised Diesel statement,
+so a statement that climbs that list points at a missing index or a plan
+change.
+
+`orders` only grows: executed and consumed orders stay as history, and every
+order changes status two or three times, leaving dead row versions behind.
+Watch `n_dead_tup`, `last_autovacuum` and `last_autoanalyze` for `orders` in
+`pg_stat_user_tables`. Once the table holds a few hundred thousand rows, lower
+its autovacuum thresholds so cleanup keeps pace:
+
+```sql
+ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_analyze_scale_factor = 0.01
+);
+```
+
+Active-book hydration reads only the partial index on active orders, so query
+speed does not degrade with history; storage and backup size do (roughly
+800 bytes per order). A retention policy for retired orders needs its own
+design, because startup recovery uses stored note IDs to recognise notes it
+has already ingested.
 
 ## Backup and restore
 

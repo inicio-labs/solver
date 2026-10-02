@@ -110,6 +110,12 @@ pub struct EngineConfig {
     /// block time + expected RPC latency. Defaults to 60s.
     #[serde(default = "default_readiness_freshness_secs")]
     pub readiness_freshness_secs: u64,
+    /// While the executor is in verification mode (it cannot settle: no fee
+    /// headroom, node RPC or PostgreSQL unavailable), how often it re-checks
+    /// whether it can settle again. It retries without limit; the matcher
+    /// keeps orders live meanwhile. Defaults to 5000.
+    #[serde(default = "default_verify_interval_ms")]
+    pub verify_interval_ms: u64,
     /// Override the price-API base URL. Defaults to the public CoinGecko
     /// endpoint. Point this at a self-hosted or **mock** CoinGecko-compatible
     /// service (e.g. `http://127.0.0.1:8089/api/v3/simple/price`) for devnet /
@@ -228,6 +234,10 @@ fn default_obs_port() -> u16 {
 
 fn default_readiness_freshness_secs() -> u64 {
     60
+}
+
+fn default_verify_interval_ms() -> u64 {
+    5_000
 }
 
 fn default_price_query_port() -> u16 {

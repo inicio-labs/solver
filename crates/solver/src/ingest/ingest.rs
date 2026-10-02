@@ -2,14 +2,12 @@ use async_trait::async_trait;
 use diesel::pg::PgConnection;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
-use miden_client::rpc::{NodeRpcClient, RpcError};
-use miden_client::store::NoteRecordError;
-use miden_client::{Client, ClientError};
+use miden_client::rpc::NodeRpcClient;
+use miden_client::Client;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
-use miden_protocol::errors::AssetError;
 use miden_protocol::note::{Note, NoteId};
 use miden_protocol::transaction::TransactionId;
 use miden_standards::note::PswapNote;
@@ -21,58 +19,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use super::error::{ChainError, ChainResult, IngestError};
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_models::NewOrderRow;
 use crate::db::{self, DbError, DbPool, DbResult};
 use crate::types::Order as PipelineOrder;
 use crate::types::{BookOrder, BookUpdate, TokenId};
-
-/// Errors from the Miden node or the local Miden client store.
-#[derive(Debug, thiserror::Error)]
-pub enum ChainError {
-    /// Boxed: `ClientError` alone would make every chain `Result` large.
-    #[error(transparent)]
-    Client(Box<ClientError>),
-    #[error(transparent)]
-    Rpc(#[from] RpcError),
-    #[error("invalid asset for a note tag")]
-    Asset(#[from] AssetError),
-    #[error("stored client note does not convert to a note")]
-    NoteRecord(#[from] NoteRecordError),
-    #[error("synced note {0} is missing from the client store")]
-    MissingSyncedNote(NoteId),
-    #[cfg(test)]
-    #[error("test chain failure: {0}")]
-    Test(&'static str),
-}
-
-impl ChainError {
-    /// A node RPC failure: the same request may succeed on a later tick.
-    pub fn is_rpc(&self) -> bool {
-        match self {
-            Self::Rpc(_) => true,
-            Self::Client(error) => matches!(**error, ClientError::RpcError(_)),
-            _ => false,
-        }
-    }
-}
-
-impl From<ClientError> for ChainError {
-    fn from(error: ClientError) -> Self {
-        Self::Client(Box::new(error))
-    }
-}
-
-pub type ChainResult<T> = Result<T, ChainError>;
-
-/// Errors of startup recovery: reading the client, or writing PostgreSQL.
-#[derive(Debug, thiserror::Error)]
-pub enum IngestError {
-    #[error(transparent)]
-    Chain(#[from] ChainError),
-    #[error(transparent)]
-    Db(#[from] DbError),
-}
 
 /// Notes per startup-recovery write transaction. Keeps each transaction well
 /// inside the writer's statement timeout however much history the client has.
@@ -663,6 +615,7 @@ pub mod tests {
     use anyhow::Result;
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
+    use miden_client::{rpc::RpcError, ClientError};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,

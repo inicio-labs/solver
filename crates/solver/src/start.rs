@@ -317,6 +317,7 @@ pub async fn start(
         channels.book_tx.clone(),
         channels.stats_tx,
         Duration::from_millis(config.engine.fetch_interval_ms),
+        Duration::from_millis(config.engine.verify_interval_ms),
     )?;
 
     // 13b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +

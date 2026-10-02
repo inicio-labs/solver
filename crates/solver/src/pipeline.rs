@@ -148,8 +148,8 @@ async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, 
                 .write(move |conn| {
                     db::postgres_db::set_token_metadata_tx(
                         conn,
-                        &key,
-                        Some(i32::from(decimals)),
+                        token,
+                        Some(decimals),
                         Some(&ticker_for_db),
                     )
                 })
@@ -545,8 +545,8 @@ mod tests {
         }
         pool.write(move |conn| {
             for token in [test_token_a(), test_token_b()] {
-                db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
-                db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(6), None)?;
+                db::postgres_db::register_token_tx(conn, token, None)?;
+                db::postgres_db::set_token_metadata_tx(conn, token, Some(6), None)?;
             }
             db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
             Ok(())

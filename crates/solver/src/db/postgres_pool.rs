@@ -555,7 +555,6 @@ pub struct PgPool {
     fatal_db: CancellationToken,
     operation_deadline: Duration,
     reconnect_window: Duration,
-    admin_order: Arc<Mutex<()>>,
     publish_order: Arc<Mutex<()>>,
     readers: r2d2::Pool<ConnectionManager<PgConnection>>,
     read_slots: Arc<Semaphore>,
@@ -622,7 +621,6 @@ impl PgPool {
             fatal_db: CancellationToken::new(),
             operation_deadline: DEFAULT_OPERATION_DEADLINE,
             reconnect_window: DEFAULT_RECONNECT_WINDOW,
-            admin_order: Arc::new(Mutex::new(())),
             publish_order: Arc::new(Mutex::new(())),
             readers,
             read_slots: Arc::new(Semaphore::new(read_pool_size as usize)),
@@ -884,27 +882,6 @@ impl PgPool {
         Ok(())
     }
 
-    /// Serialize each admin token mutation and its synchronous symbol-cache
-    /// update. Once the operation starts, an HTTP caller dropping its future
-    /// cannot abandon the cache update after the database commit. Subscription
-    /// delivery belongs after this method returns, outside both guards.
-    pub async fn admin_write<T, F, C>(&self, operation: F, update_cache: C) -> DbResult<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
-        C: FnOnce(&T) + Send + 'static,
-    {
-        let admin_guard = self.admin_order.clone().lock_owned().await;
-        let pool = self.clone();
-        tokio::spawn(async move {
-            let _admin_guard = admin_guard;
-            let result = pool.write(operation).await?;
-            update_cache(&result);
-            Ok(result)
-        })
-        .await?
-    }
-
     /// Readiness proves the read pool answers and the original writer backend
     /// still holds its advisory lock. The schema was verified at `open` and
     /// cannot change under a running binary, so it is not re-checked here.
@@ -944,7 +921,6 @@ mod tests {
     use crate::db::postgres_schema::sync_state;
     use anyhow::{bail, Context, Result};
     use miden_protocol::crypto::utils::{Deserializable, SliceReader};
-    use std::sync::atomic::AtomicI64;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
@@ -1075,43 +1051,6 @@ mod tests {
         publication.await??;
         let sent = receiver.recv().await.context("missing committed update")?;
         assert_eq!(sent.removed.len(), 1);
-
-        let cache = Arc::new(AtomicI64::new(0));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let first_pool = pool.clone();
-        let first_cache = cache.clone();
-        let first_admin = tokio::spawn(async move {
-            first_pool
-                .admin_write(
-                    move |conn| {
-                        let _ = started_tx.send(());
-                        std::thread::sleep(Duration::from_millis(80));
-                        diesel::update(sync_state::table.find(1_i16))
-                            .set(sync_state::last_fetched_block.eq(4_i64))
-                            .execute(conn)?;
-                        Ok(4_i64)
-                    },
-                    move |value| first_cache.store(*value, Ordering::Release),
-                )
-                .await
-        });
-        started_rx.await?;
-        first_admin.abort();
-        let second_cache = cache.clone();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            pool.admin_write(
-                |conn| {
-                    diesel::update(sync_state::table.find(1_i16))
-                        .set(sync_state::last_fetched_block.eq(5_i64))
-                        .execute(conn)?;
-                    Ok(5_i64)
-                },
-                move |value| second_cache.store(*value, Ordering::Release),
-            ),
-        )
-        .await??;
-        assert_eq!(cache.load(Ordering::Acquire), 5);
 
         let lock_key = pool.writer_config.lock_key;
         pool.write(move |conn| {

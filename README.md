@@ -182,6 +182,7 @@ Deploy and rollback order for later schema changes is in
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
 | `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
+| `verify_interval_ms` | — | `5000` | In verification mode (cannot settle: no fee headroom, RPC or PostgreSQL down), how often the executor re-checks before accepting batches again. |
 | `router_enabled` | — | `false` | Must remain disabled: the clearing matcher does not route notes externally. |
 
 > The RFQ router library is retained for separate integration; the running solver uses only pair clearing. Historical design:

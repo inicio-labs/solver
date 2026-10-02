@@ -99,10 +99,6 @@ pub enum DbError {
     MissingSyncCursor,
     #[error("sync height {0} exceeds PostgreSQL BIGINT")]
     BlockOutOfRange(u64),
-    #[error("token ID is not a canonical serialized account ID")]
-    InvalidTokenId,
-    #[error("token decimals {0} do not fit a u8")]
-    InvalidDecimals(i32),
     #[error("invalid settlement status transition {from} -> {to}")]
     InvalidTransition { from: String, to: &'static str },
     #[error("settlement attempt missing during {0} transition")]

@@ -233,7 +233,8 @@ mod tests {
     use super::*;
     use crate::clearing::ReferencePrice;
     use crate::matcher::matcher::run_matcher;
-    use crate::matcher::matcher::{run_worker, ClearingRuntime, MatcherError};
+    use crate::matcher::matcher::{run_worker, ClearingRuntime};
+    use crate::matcher::MatcherError;
     use crate::price::PriceData;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};

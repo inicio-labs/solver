@@ -68,6 +68,9 @@ admin_port = 3001
 # and `/metrics` (Prometheus text counters and gauges). No auth.
 # Defaults to 9090.
 # obs_port = 9090
+# While the executor cannot settle (no fee headroom, node RPC or PostgreSQL
+# unavailable) it pauses and re-checks this often. Defaults to 5000.
+# verify_interval_ms = 5000
 # How fresh the last successful sync must be for /readyz to return 200.
 # Defaults to 60s. Bump if chain block time + RPC latency exceeds 60s
 # under normal conditions.

@@ -106,9 +106,11 @@ caller and handled in place:
 
 When the executor cannot settle — no fee headroom, the node RPC or the
 database writer unavailable — it enters **verification mode**: it stops
-reading the matcher queue, holds the batch it was working on, and every five
-seconds checks that the node answers, the fee balance covers one settlement,
-and the writer commits. Once all three pass it runs the held batch and resumes.
+reading the matcher queue, holds the batch it was working on, and every
+`engine.verify_interval_ms` (default 5 s) checks that the node answers, the fee
+balance covers one settlement, the writer commits, and any orders it owes the
+matcher are returned. It retries without limit. Once all checks pass it runs
+the held batch and resumes.
 The matcher keeps one candidate batch queued and leaves every other order live
 in its book, so nothing is re-matched at a stale price. Watch for
 `executor entering verification mode` in the logs; a long stay means the

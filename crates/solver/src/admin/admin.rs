@@ -4,13 +4,14 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use diesel::PgConnection;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::db::{self, DbPool};
+use crate::db::{self, DbPool, DbResult};
 use crate::price::SharedTokenMap;
 use crate::types::TokenId;
 
@@ -37,6 +38,8 @@ pub struct AdminState {
     /// Mutated atomically alongside DB writes so the price client always sees
     /// the latest mapping without a DB read per fetch.
     token_map: SharedTokenMap,
+    /// One token mutation (database write + cache update) at a time.
+    write_order: Arc<Mutex<()>>,
 }
 
 impl AdminState {
@@ -45,6 +48,7 @@ impl AdminState {
             pool,
             subscribe_tx,
             token_map,
+            write_order: Arc::new(Mutex::new(())),
         }
     }
 
@@ -67,80 +71,85 @@ impl AdminState {
             .with_state(self)
     }
 
-    pub async fn load_tokens_from_db(&self) -> anyhow::Result<Vec<TokenId>> {
+    pub async fn load_tokens_from_db(&self) -> DbResult<Vec<TokenId>> {
         self.pool
             .read(db::postgres_db::load_registered_tokens_tx)
             .await
-            .map_err(Into::into)
     }
 
-    /// Update the in-memory symbol cache. Lock held briefly, no awaits.
-    fn set_cache(map_handle: &SharedTokenMap, token: TokenId, symbol: Option<String>) {
-        let mut map = crate::price::write_token_map(map_handle);
-        match symbol {
-            Some(s) => {
-                map.insert(token, s);
-            }
-            None => {
-                map.remove(&token);
-            }
-        }
-    }
-
-    async fn register_token(
+    /// Run one token mutation and keep the in-memory symbol cache equal to
+    /// the database. `operation` returns `(changed, value)`; when `changed`,
+    /// the cache entry for `token` becomes `symbol` (`None` removes it).
+    ///
+    /// Mutations run one at a time, each with its cache update, so the cache
+    /// changes in commit order. They run in their own task: an HTTP caller
+    /// that disconnects mid-request cannot leave a committed row without its
+    /// cache update.
+    async fn write_token<T, F>(
         &self,
-        new_token: TokenId,
-        external_symbol: Option<String>,
-    ) -> anyhow::Result<bool> {
-        let mut token_bytes = Vec::new();
-        new_token.write_into(&mut token_bytes);
+        token: TokenId,
+        symbol: Option<String>,
+        operation: F,
+    ) -> DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<(bool, T)> + Send + 'static,
+    {
+        let order = self.write_order.clone().lock_owned().await;
+        let (pool, token_map) = (self.pool.clone(), self.token_map.clone());
+        tokio::spawn(async move {
+            let _order = order;
+            let (changed, value) = pool.write(operation).await?;
+            if changed {
+                let mut map = crate::price::write_token_map(&token_map);
+                match symbol {
+                    Some(symbol) => map.insert(token, symbol),
+                    None => map.remove(&token),
+                };
+            }
+            Ok(value)
+        })
+        .await?
+    }
 
-        let cache = self.token_map.clone();
-        let symbol_for_cache = external_symbol.clone();
-        let (inserted, existing) = self
-            .pool
-            .admin_write(
-                move |conn| {
-                    let inserted = db::postgres_db::register_token_tx(
-                        conn,
-                        &token_bytes,
-                        external_symbol.as_deref(),
-                    )?;
-                    let existing = if inserted {
-                        db::postgres_db::load_registered_tokens_tx(conn)?
-                    } else {
-                        Vec::new()
-                    };
-                    Ok((inserted, existing))
-                },
-                move |result| {
-                    if result.0 {
-                        Self::set_cache(&cache, new_token, symbol_for_cache);
-                    }
-                },
-            )
+    /// Register `token`; `true` when it is new. A new token is subscribed
+    /// against every registered token, in both directions.
+    async fn register_token(&self, token: TokenId, symbol: Option<String>) -> DbResult<bool> {
+        let db_symbol = symbol.clone();
+        let existing = self
+            .write_token(token, symbol, move |conn| {
+                if !db::postgres_db::register_token_tx(conn, token, db_symbol.as_deref())? {
+                    return Ok((false, None));
+                }
+                let existing = db::postgres_db::load_registered_tokens_tx(conn)?;
+                Ok((true, Some(existing)))
+            })
             .await?;
-
-        if inserted {
-            // Reflect the new mapping in the in-memory cache (if any).
-            // Tell the subscribe task to subscribe both directions of every
-            // existing pair involving the new token. Channel send failures
-            // are logged but don't fail the admin call — the DB row is the
-            // source of truth and a restart will reconcile.
-            for token in &existing {
-                if *token != new_token {
-                    if let Err(e) = self.subscribe_tx.send((new_token, *token)).await {
-                        tracing::warn!(error = %e, "admin: subscribe channel send failed");
-                    }
-                    if let Err(e) = self.subscribe_tx.send((*token, new_token)).await {
-                        tracing::warn!(error = %e, "admin: subscribe channel send failed");
-                    }
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        // Send failures only log: the database row is the source of truth and
+        // a restart re-subscribes every registered pair.
+        for other in existing.into_iter().filter(|other| *other != token) {
+            for pair in [(token, other), (other, token)] {
+                if let Err(error) = self.subscribe_tx.send(pair).await {
+                    tracing::warn!(%error, "admin: subscribe channel send failed");
                 }
             }
         }
-
-        Ok(inserted)
+        Ok(true)
     }
+}
+
+/// Parse a hex token ID; only its canonical serialization is accepted.
+fn parse_token(hex_id: &str) -> Result<TokenId, StatusCode> {
+    let bytes = hex::decode(hex_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token =
+        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if token.to_bytes() != bytes {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(token)
 }
 
 // ── Auth Middleware ─────────────────────────────────────────────────────────
@@ -189,15 +198,11 @@ async fn add_token(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<(StatusCode, &'static str), StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token =
-        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
-
+    let token = parse_token(&req.token_id)?;
     let inserted = state
         .register_token(token, req.external_symbol)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     if inserted {
         Ok((StatusCode::CREATED, "registered"))
     } else {
@@ -209,59 +214,41 @@ async fn update_token_symbol_handler(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token =
-        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let cache = state.token_map.clone();
+    let token = parse_token(&req.token_id)?;
     let symbol = req.external_symbol;
-    let symbol_for_cache = symbol.clone();
+    let db_symbol = symbol.clone();
     let updated = state
-        .pool
-        .admin_write(
-            move |conn| db::postgres_db::update_token_symbol_tx(conn, &bytes, symbol.as_deref()),
-            move |updated| {
-                if *updated {
-                    AdminState::set_cache(&cache, token, symbol_for_cache);
-                }
-            },
-        )
+        .write_token(token, symbol, move |conn| {
+            let updated =
+                db::postgres_db::update_token_symbol_tx(conn, token, db_symbol.as_deref())?;
+            Ok((updated, updated))
+        })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !updated {
-        return Ok(StatusCode::NOT_FOUND);
-    }
-    Ok(StatusCode::OK)
+    Ok(if updated {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    })
 }
 
 async fn remove_token(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token =
-        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let cache = state.token_map.clone();
+    let token = parse_token(&req.token_id)?;
     let deleted = state
-        .pool
-        .admin_write(
-            move |conn| db::postgres_db::unregister_token_tx(conn, &bytes),
-            move |deleted| {
-                if *deleted {
-                    AdminState::set_cache(&cache, token, None);
-                }
-            },
-        )
+        .write_token(token, None, move |conn| {
+            let deleted = db::postgres_db::unregister_token_tx(conn, token)?;
+            Ok((deleted, deleted))
+        })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if deleted {
-        Ok(StatusCode::OK)
+    Ok(if deleted {
+        StatusCode::OK
     } else {
-        Ok(StatusCode::NOT_FOUND)
-    }
+        StatusCode::NOT_FOUND
+    })
 }
 
 #[derive(Deserialize)]
@@ -537,5 +524,41 @@ mod tests {
             .await;
         res.assert_status(StatusCode::OK);
         assert!(!cache.read().unwrap().contains_key(&test_token_a()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn token_writes_update_the_cache_in_commit_order_despite_caller_abort() {
+        let (state, map, _db) = make_state_with_map().await;
+        let token = test_token_a();
+        assert!(state.register_token(token, None).await.unwrap());
+
+        // The first caller disconnects after its write started; its cache
+        // update must still land, and before the second write's.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .write_token(token, Some("first".into()), move |conn| {
+                    let _ = started_tx.send(());
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    db::postgres_db::update_token_symbol_tx(conn, token, Some("first"))?;
+                    Ok((true, ()))
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        state
+            .write_token(token, Some("second".into()), move |conn| {
+                db::postgres_db::update_token_symbol_tx(conn, token, Some("second"))?;
+                Ok((true, ()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            map.read().unwrap().get(&token).map(String::as_str),
+            Some("second")
+        );
     }
 }

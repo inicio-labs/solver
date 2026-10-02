@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use miden_protocol::account::AccountId;
-use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
 };
@@ -27,11 +26,6 @@ fn faucet_a() -> AccountId {
 }
 fn faucet_b() -> AccountId {
     AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
-}
-fn key(id: AccountId) -> Vec<u8> {
-    let mut b = Vec::new();
-    id.write_into(&mut b);
-    b
 }
 fn now() -> i64 {
     SystemTime::now()
@@ -68,7 +62,7 @@ fn cfg() -> PriceApiConfig {
 /// ticker) rows; `prices` = (faucet, usd) precise-snapshot entries; `last_update`
 /// = freshness.
 async fn harness(
-    registered: &[(AccountId, Option<i32>, Option<&str>)],
+    registered: &[(AccountId, Option<u8>, Option<&str>)],
     prices: &[(AccountId, f64)],
     last_update: i64,
 ) -> Harness {
@@ -76,7 +70,7 @@ async fn harness(
 }
 
 async fn harness_vs(
-    registered: &[(AccountId, Option<i32>, Option<&str>)],
+    registered: &[(AccountId, Option<u8>, Option<&str>)],
     prices: &[(AccountId, f64)],
     last_update: i64,
     vs: &str,
@@ -89,8 +83,8 @@ async fn harness_vs(
         .collect();
     pool.write(move |conn| {
         for (id, dec, tick) in rows {
-            db::postgres_db::register_token_tx(conn, &key(id), Some("usd-coin"))?;
-            db::postgres_db::set_token_metadata_tx(conn, &key(id), dec, tick.as_deref())?;
+            db::postgres_db::register_token_tx(conn, id, Some("usd-coin"))?;
+            db::postgres_db::set_token_metadata_tx(conn, id, dec, tick.as_deref())?;
         }
         Ok(())
     })
@@ -136,7 +130,7 @@ async fn harness_vs(
 /// decimals), oracle prices, a top-of-book snapshot, and the settlement window.
 #[allow(clippy::type_complexity)]
 async fn swap_server(
-    registered: &[(AccountId, Option<i32>)],
+    registered: &[(AccountId, Option<u8>)],
     prices: &[(AccountId, f64)],
     snapshot: SwapBookSnapshot,
     stats: SettlementStats,
@@ -149,7 +143,7 @@ async fn swap_server(
 #[allow(clippy::type_complexity)]
 async fn swap_server_with_update(
     last_update: i64,
-    registered: &[(AccountId, Option<i32>)],
+    registered: &[(AccountId, Option<u8>)],
     prices: &[(AccountId, f64)],
     snapshot: SwapBookSnapshot,
     stats: SettlementStats,
@@ -159,8 +153,8 @@ async fn swap_server_with_update(
     let rows: Vec<_> = registered.to_vec();
     pool.write(move |conn| {
         for (id, dec) in rows {
-            db::postgres_db::register_token_tx(conn, &key(id), Some("usd-coin"))?;
-            db::postgres_db::set_token_metadata_tx(conn, &key(id), dec, None)?;
+            db::postgres_db::register_token_tx(conn, id, Some("usd-coin"))?;
+            db::postgres_db::set_token_metadata_tx(conn, id, dec, None)?;
         }
         Ok(())
     })

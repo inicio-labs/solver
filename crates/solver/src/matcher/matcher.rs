@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{ClearingBook, ClearingBootstrap};
+use super::error::MatcherError;
 use crate::clearing::{
     self, ClearingConfig, ClearingError, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
 };
@@ -18,21 +19,6 @@ static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
-}
-
-/// Why the matcher stopped. Every variant requires a whole-solver restart.
-#[derive(Debug, thiserror::Error)]
-pub enum MatcherError {
-    #[error("invalid clearing configuration")]
-    Config(#[from] ClearingError),
-    #[error("startup reconciliation stopped before sending the initial book")]
-    BootstrapLost(#[from] oneshot::error::RecvError),
-    #[error("ingestion stopped: book update channel closed")]
-    IngestStopped,
-    #[error("executor stopped: execution batch receiver closed")]
-    ExecutorStopped,
-    #[error("RFQ routing failed")]
-    Routing(#[source] anyhow::Error),
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
@@ -315,7 +301,6 @@ mod tests {
     use crate::db;
     use crate::price::PriceData;
     use miden_protocol::account::AccountId;
-    use miden_protocol::crypto::utils::Serializable;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
@@ -431,8 +416,8 @@ mod tests {
         ];
         pool.write(move |conn| {
             for token in [imiden(), iusdt(), ieth()] {
-                db::postgres_db::register_token_tx(conn, &token.to_bytes(), None)?;
-                db::postgres_db::set_token_metadata_tx(conn, &token.to_bytes(), Some(0), None)?;
+                db::postgres_db::register_token_tx(conn, token, None)?;
+                db::postgres_db::set_token_metadata_tx(conn, token, Some(0), None)?;
             }
             let order_rows: Vec<_> = notes
                 .iter()

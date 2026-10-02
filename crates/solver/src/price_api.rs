@@ -36,6 +36,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::config::PricePrecision;
+use crate::db::postgres_models::RegisteredTokenRow;
 use crate::db::{self, DbPool};
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
@@ -217,7 +218,7 @@ fn staleness(state: &PriceApiState) -> (i64, bool) {
 fn quote_from_row(
     state: &PriceApiState,
     account_id: AccountId,
-    row: db::postgres_models::RegisteredTokenRow,
+    row: RegisteredTokenRow,
     precision: PricePrecision,
     as_of: i64,
     stale: bool,
@@ -257,12 +258,9 @@ async fn get_price(
     }
     let account_id = AccountId::from_hex(&faucet_id)
         .map_err(|error| ApiError::BadFaucetId(error.to_string()))?;
-    let key = key_bytes(account_id);
-    let row = state
-        .pool
-        .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &key))
-        .await
-        .map_err(|_| ApiError::Internal)?
+    let row = token_rows(&state, vec![account_id])
+        .await?
+        .remove(&account_id)
         .ok_or(ApiError::UnknownFaucet)?;
     Ok(Json(quote_from_row(
         &state, account_id, row, precision, as_of, stale,
@@ -295,15 +293,10 @@ async fn get_prices(
         .into_iter()
         .filter_map(|id| AccountId::from_hex(id).ok())
         .collect();
-    let keys: Vec<_> = accounts.iter().copied().map(key_bytes).collect();
-    let rows = state
-        .pool
-        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    let mut rows = token_rows(&state, accounts.clone()).await?;
     let mut out = HashMap::new();
     for account_id in accounts {
-        let Some(row) = rows.get(&key_bytes(account_id)).cloned() else {
+        let Some(row) = rows.remove(&account_id) else {
             continue;
         };
         if let Ok(resp) = quote_from_row(&state, account_id, row, precision, as_of, stale) {
@@ -338,10 +331,22 @@ struct SwapEtaResponse {
     median24h_seconds: Option<u64>,
 }
 
-fn key_bytes(id: AccountId) -> Vec<u8> {
-    let mut k = Vec::new();
-    id.write_into(&mut k);
-    k
+/// Registered-token rows for `tokens`, in one read; unregistered ones are
+/// absent. Any database failure is a 500.
+async fn token_rows(
+    state: &PriceApiState,
+    tokens: Vec<AccountId>,
+) -> Result<HashMap<AccountId, RegisteredTokenRow>, ApiError> {
+    let keys: Vec<_> = tokens.iter().map(Serializable::to_bytes).collect();
+    let mut rows = state
+        .pool
+        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(tokens
+        .into_iter()
+        .filter_map(|token| Some((token, rows.remove(&token.to_bytes())?)))
+        .collect())
 }
 
 fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
@@ -384,15 +389,9 @@ async fn get_swap_eta(
     let requested_amount = parse_amount(&q, "requested_amount")?;
 
     // Registration gate + decimals (for the oracle compare).
-    let key_a = key_bytes(a);
-    let key_b = key_bytes(b);
-    let rows = state
-        .pool
-        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &[key_a, key_b]))
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    let row_a = rows.get(&key_bytes(a)).ok_or(ApiError::UnknownFaucet)?;
-    let row_b = rows.get(&key_bytes(b)).ok_or(ApiError::UnknownFaucet)?;
+    let rows = token_rows(&state, vec![a, b]).await?;
+    let row_a = rows.get(&a).ok_or(ApiError::UnknownFaucet)?;
+    let row_b = rows.get(&b).ok_or(ApiError::UnknownFaucet)?;
     let d_a = row_a.decimals.map(|d| d as u8);
     let d_b = row_b.decimals.map(|d| d as u8);
 

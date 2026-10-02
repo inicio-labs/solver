@@ -20,7 +20,7 @@ use miden_protocol::Word;
 use miden_standards::note::{PswapNote, PswapNoteStorage};
 use solver::db::postgres_models::NewOrderRow;
 use solver::db::postgres_schema::orders;
-use solver::db::{postgres_db, postgres_migrations, DbPool};
+use solver::db::{postgres_db, postgres_migrations, DbError, DbPool};
 use solver::types::{BookUpdate, OrderId};
 use tokio::sync::mpsc;
 
@@ -62,7 +62,7 @@ async fn crash_worker() -> Result<()> {
         let parent = postgres_db::get_active_orders_tx(conn)?
             .into_iter()
             .min_by_key(|order| order.priority_seq)
-            .context("crash fixture has no active parent")?;
+            .ok_or(DbError::Corrupt("crash fixture has no active parent"))?;
         diesel::update(orders::table.find(&parent.note_id))
             .set(orders::status.eq("onchain_nullified"))
             .execute(conn)?;

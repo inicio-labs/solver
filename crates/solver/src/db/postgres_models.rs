@@ -4,26 +4,23 @@
 //! orders have no `priority_seq` insertion field: the database assigns it.
 //! Only a settlement remainder inherits its parent's priority.
 
-use anyhow::{ensure, Result};
+use std::sync::Arc;
+
 use diesel::prelude::*;
 use miden_client::transaction::TransactionResult;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
-use thiserror::Error;
 
+use super::error::{DbError, DbResult};
 use super::postgres_schema::{
     orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
 };
-use crate::types::{BookOrder, Order, OrderId, OrderStatus};
+use crate::types::{BookOrder, Order, OrderId, OrderStatus, SettlementError};
 
-#[derive(Debug, Error)]
-pub enum StoredOrderError {
-    #[error("stored order and note IDs differ")]
-    NoteIdMismatch,
-}
-
-/// An unresolved settlement. Confirmed and released attempts are deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An unresolved settlement, stored as its snake_case name. Confirmed and
+/// released attempts are deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum SettlementStatus {
     /// Proven and reserved; may be (re)submitted.
     Prepared,
@@ -35,29 +32,8 @@ pub enum SettlementStatus {
 }
 
 impl SettlementStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepared => "prepared",
-            Self::Uncertain => "uncertain",
-            Self::Rejected => "rejected",
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-#[error("invalid stored settlement status: {0}")]
-pub struct InvalidSettlementStatus(pub String);
-
-impl TryFrom<&str> for SettlementStatus {
-    type Error = InvalidSettlementStatus;
-
-    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        match value {
-            "prepared" => Ok(Self::Prepared),
-            "uncertain" => Ok(Self::Uncertain),
-            "rejected" => Ok(Self::Rejected),
-            other => Err(InvalidSettlementStatus(other.to_owned())),
-        }
+    pub fn as_str(self) -> &'static str {
+        self.into()
     }
 }
 
@@ -79,27 +55,32 @@ pub struct OrderRow {
 }
 
 impl OrderRow {
-    pub fn order_status(&self) -> Result<OrderStatus> {
-        OrderStatus::parse(&self.status)
-            .ok_or_else(|| anyhow::anyhow!("invalid stored order status: {}", self.status))
+    pub fn order_status(&self) -> DbResult<OrderStatus> {
+        self.status
+            .parse()
+            .map_err(|_| DbError::Corrupt("unknown stored order status"))
     }
 
-    pub fn note(&self) -> Result<Note> {
+    pub fn note(&self) -> DbResult<Note> {
         Ok(Note::read_from(&mut SliceReader::new(&self.raw_data))?)
     }
 
-    pub fn into_book_order(self) -> Result<BookOrder> {
+    /// Only a hand-edited or corrupted row fails the checks below: every
+    /// write derives `note_id` from the note and the priority from PostgreSQL.
+    pub fn into_book_order(self) -> DbResult<BookOrder> {
         let note = self.note()?;
         let note_id = OrderId::read_from(&mut SliceReader::new(&self.note_id))?;
         if note.id() != note_id {
-            return Err(StoredOrderError::NoteIdMismatch.into());
+            return Err(DbError::Corrupt("stored order ID differs from its note"));
         }
         let priority_seq = u64::try_from(self.priority_seq)?;
-        ensure!(priority_seq > 0, "stored order lacks FIFO priority");
+        if priority_seq == 0 {
+            return Err(DbError::Corrupt("stored order lacks a FIFO priority"));
+        }
         Ok(BookOrder {
             priority_seq,
             arrival_unix: u64::try_from(self.arrival_unix)?,
-            note: std::sync::Arc::new(note),
+            note: Arc::new(note),
         })
     }
 }
@@ -126,7 +107,7 @@ pub struct NewRemainderOrderRow {
 
 impl NewOrderRow {
     /// Rejects a note that is not a valid PSWAP order.
-    pub fn ingested(note: &Note, arrival_unix: u64) -> Result<Self> {
+    pub fn ingested(note: &Note, arrival_unix: u64) -> DbResult<Self> {
         Order::from_note(note)?;
         Ok(Self {
             note_id: note.id().to_bytes().to_vec(),
@@ -138,14 +119,15 @@ impl NewOrderRow {
 
 impl NewRemainderOrderRow {
     /// Rejects a child that is not a valid PSWAP order of the same creator.
-    pub fn from_parent(parent: &OrderRow, child: &Note) -> Result<Self> {
+    pub fn from_parent(parent: &OrderRow, child: &Note) -> DbResult<Self> {
         let child_terms = Order::from_note(child)?;
         let parent_terms = Order::from_note(&parent.note()?)?;
-        ensure!(
-            child_terms.creator_id == parent_terms.creator_id,
-            "settlement remainder creator differs from parent"
-        );
-        ensure!(parent.priority_seq > 0, "parent lacks FIFO priority");
+        if child_terms.creator_id != parent_terms.creator_id {
+            return Err(SettlementError::InvalidRemainder.into());
+        }
+        if parent.priority_seq <= 0 {
+            return Err(DbError::Corrupt("parent order lacks a FIFO priority"));
+        }
         Ok(Self {
             note_id: child.id().to_bytes().to_vec(),
             raw_data: child.to_bytes(),
@@ -172,8 +154,10 @@ impl SettlementAttemptRow {
         }
     }
 
-    pub fn settlement_status(&self) -> Result<SettlementStatus> {
-        Ok(SettlementStatus::try_from(self.status.as_str())?)
+    pub fn settlement_status(&self) -> DbResult<SettlementStatus> {
+        self.status
+            .parse()
+            .map_err(|_| DbError::Corrupt("unknown stored settlement status"))
     }
 }
 
@@ -198,6 +182,7 @@ pub struct RegisteredTokenRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::NoteType;

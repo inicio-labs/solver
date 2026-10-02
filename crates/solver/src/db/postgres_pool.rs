@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
 use diesel::connection::{AnsiTransactionManager, SimpleConnection, TransactionManager};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
@@ -19,6 +18,7 @@ use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use super::error::{DbError, DbResult};
 use super::postgres_migrations;
 use super::postgres_schema::sync_state;
 use crate::types::BookUpdate;
@@ -101,34 +101,29 @@ fn load_buckets(buckets: &[AtomicU64; 9]) -> [u64; 9] {
     std::array::from_fn(|index| buckets[index].load(Ordering::Relaxed))
 }
 
-// `diesel::r2d2::Error` is Diesel's own enum; a failed pool checkout surfaces
-// as the r2d2 crate's `PoolError`. Both mean the connection is unusable.
-// Message matching below relies on `lc_messages = 'C'` from `configure_session`.
-fn database_error_class(error: &anyhow::Error) -> &'static str {
-    if error.downcast_ref::<r2d2::Error>().is_some()
-        || error.downcast_ref::<r2d2::PoolError>().is_some()
-    {
-        return "connection";
-    }
-    match error.downcast_ref::<DieselError>() {
-        Some(DieselError::DatabaseError(DatabaseErrorKind::ClosedConnection, _)) => "connection",
-        Some(DieselError::DatabaseError(_, info))
-            if info.message().contains("deadlock detected") =>
-        {
-            "deadlock"
+/// Telemetry class of a database error. Message matching relies on
+/// `lc_messages = 'C'` from `configure_session`.
+fn database_error_class(error: &DbError) -> &'static str {
+    match error {
+        DbError::Connect(_) | DbError::ReadPool(_) => "connection",
+        DbError::Query(DieselError::DatabaseError(DatabaseErrorKind::ClosedConnection, _)) => {
+            "connection"
         }
-        Some(DieselError::DatabaseError(_, info)) if info.message().contains("lock timeout") => {
-            "lock_timeout"
+        DbError::Query(DieselError::DatabaseError(_, info)) => {
+            let message = info.message();
+            if message.contains("deadlock detected") {
+                "deadlock"
+            } else if message.contains("lock timeout") {
+                "lock_timeout"
+            } else if message.contains("statement timeout") {
+                "statement_timeout"
+            } else {
+                "database"
+            }
         }
-        Some(DieselError::DatabaseError(_, info))
-            if info.message().contains("statement timeout") =>
-        {
-            "statement_timeout"
-        }
-        Some(DieselError::DatabaseError(_, _)) => "database",
-        Some(DieselError::NotFound) => "not_found",
-        Some(_) => "diesel",
-        None => "other",
+        DbError::Query(DieselError::NotFound) => "not_found",
+        DbError::Query(_) => "diesel",
+        _ => "other",
     }
 }
 
@@ -164,7 +159,7 @@ struct DatabaseIdentity {
     server_port: Option<i32>,
 }
 
-fn database_identity(conn: &mut PgConnection) -> Result<DatabaseIdentity> {
+fn database_identity(conn: &mut PgConnection) -> diesel::QueryResult<DatabaseIdentity> {
     diesel::sql_query(
         "SELECT current_database()::text AS database_name,
                 n.nspname::text AS schema_name,
@@ -175,7 +170,6 @@ fn database_identity(conn: &mut PgConnection) -> Result<DatabaseIdentity> {
          WHERE c.oid = 'sync_state'::regclass",
     )
     .get_result::<DatabaseIdentity>(conn)
-    .context("resolve PostgreSQL application database and schema")
 }
 
 // Public is the normal application schema and uses the documented fixed key.
@@ -267,15 +261,15 @@ fn claim_owner_epoch(conn: &mut PgConnection) -> diesel::QueryResult<i64> {
 /// committed and whether the solver can continue.
 enum WriteFailure<T> {
     /// Rolled back on a live session that still owns the database.
-    Failed(anyhow::Error),
+    Failed(DbError),
     /// The session is alive but no longer holds the ownership lock.
-    OwnershipLost(anyhow::Error),
+    OwnershipLost,
     /// The session was lost before COMMIT was sent: nothing was committed.
-    LostBeforeCommit(anyhow::Error),
+    LostBeforeCommit(DbError),
     /// The session was lost while committing. `xid` decides the outcome; a
     /// transaction that wrote nothing has none and committed nothing.
     LostAtCommit {
-        error: anyhow::Error,
+        error: DbError,
         value: T,
         xid: Option<String>,
     },
@@ -286,12 +280,12 @@ enum WriteFailure<T> {
 /// step it happened in.
 fn run_write_transaction<T>(
     conn: &mut PgConnection,
-    operation: impl FnOnce(&mut PgConnection) -> Result<T>,
+    operation: impl FnOnce(&mut PgConnection) -> DbResult<T>,
     lock_key: i64,
     expected_pid: i32,
-) -> std::result::Result<T, WriteFailure<T>> {
+) -> Result<T, WriteFailure<T>> {
     let staged = AnsiTransactionManager::begin_transaction(conn)
-        .map_err(anyhow::Error::from)
+        .map_err(DbError::from)
         .and_then(|()| {
             let value = operation(conn)?;
             let xid = current_transaction_id(conn)?;
@@ -300,7 +294,7 @@ fn run_write_transaction<T>(
     let (error, committing) = match staged {
         Ok((value, xid)) => match AnsiTransactionManager::commit_transaction(conn) {
             Ok(()) => return Ok(value),
-            Err(error) => (anyhow::Error::from(error), Some((value, xid))),
+            Err(error) => (DbError::from(error), Some((value, xid))),
         },
         Err(error) => {
             let _ = AnsiTransactionManager::rollback_transaction(conn);
@@ -311,7 +305,7 @@ fn run_write_transaction<T>(
         Ok(health) if health.backend_pid == expected_pid && health.owns_advisory_lock => {
             Err(WriteFailure::Failed(error))
         }
-        Ok(_) => Err(WriteFailure::OwnershipLost(error)),
+        Ok(_) => Err(WriteFailure::OwnershipLost),
         Err(_) => Err(match committing {
             Some((value, xid)) => WriteFailure::LostAtCommit { error, value, xid },
             None => WriteFailure::LostBeforeCommit(error),
@@ -319,32 +313,31 @@ fn run_write_transaction<T>(
     }
 }
 
-enum ReconnectError {
-    /// Transient: the database may come back within the reconnect window.
-    Retry(anyhow::Error),
-    /// Another solver owns, or has owned, the database: never resume.
-    Stop(anyhow::Error),
+/// A reconnect attempt either may succeed later (`Retry`) or must never be
+/// retried because another solver is or was the owner (`Stop`).
+enum Reconnect {
+    Retry(DbError),
+    Stop(DbError),
 }
 
-fn retryable<E: Into<anyhow::Error>>(error: E) -> ReconnectError {
-    ReconnectError::Retry(error.into())
+impl<E: Into<DbError>> From<E> for Reconnect {
+    fn from(error: E) -> Self {
+        Self::Retry(error.into())
+    }
 }
 
 /// One attempt to replace a lost writer session: connect, re-take the
 /// advisory lock, and confirm the ownership epoch is still ours.
 fn reconnect_once(
-    url: &str,
-    application_name: &str,
-    lock_key: i64,
+    config: &WriterConfig,
     previous_pid: i32,
-    epoch: i64,
-) -> std::result::Result<(PgConnection, i32), ReconnectError> {
-    let mut conn = postgres_migrations::connect(url).map_err(retryable)?;
-    configure_session(&mut conn, application_name).map_err(retryable)?;
+) -> Result<(PgConnection, i32), Reconnect> {
+    let lock_key = config.lock_key;
+    let mut conn = postgres_migrations::connect(&config.url)?;
+    configure_session(&mut conn, &config.application_name)?;
     let lock = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
         .bind::<BigInt, _>(lock_key)
-        .get_result::<LockResult>(&mut conn)
-        .map_err(retryable)?;
+        .get_result::<LockResult>(&mut conn)?;
     if !lock.acquired {
         // After a network cut our previous backend can outlive the client
         // and keep the lock until it notices; that one is safe to end.
@@ -358,41 +351,32 @@ fn reconnect_once(
         .bind::<BigInt, _>(((lock_key as u64 >> 32) & 0xffff_ffff) as i64)
         .bind::<BigInt, _>((lock_key as u64 & 0xffff_ffff) as i64)
         .get_result::<OptionalPid>(&mut conn)
-        .optional()
-        .map_err(retryable)?
+        .optional()?
         .and_then(|row| row.pid);
         return Err(match holder {
             Some(pid) if pid == previous_pid => {
                 diesel::sql_query("SELECT pg_terminate_backend($1)")
                     .bind::<Integer, _>(pid)
-                    .execute(&mut conn)
-                    .map_err(retryable)?;
-                ReconnectError::Retry(anyhow::anyhow!(
-                    "previous writer backend still held the ownership lock; ended it"
-                ))
+                    .execute(&mut conn)?;
+                Reconnect::Retry(DbError::OwnershipLost)
             }
-            Some(_) => ReconnectError::Stop(anyhow::anyhow!(
-                "another solver holds the ownership lock after the writer session was lost"
-            )),
-            None => ReconnectError::Retry(anyhow::anyhow!("ownership lock was briefly held")),
+            Some(_) => Reconnect::Stop(DbError::LockTakenAfterDisconnect),
+            None => Reconnect::Retry(DbError::OwnershipLost),
         });
     }
     let current: i64 = sync_state::table
         .find(1_i16)
         .select(sync_state::owner_epoch)
-        .first(&mut conn)
-        .map_err(retryable)?;
-    if current != epoch {
-        return Err(ReconnectError::Stop(anyhow::anyhow!(
-            "another solver owned the database while the writer was disconnected \
-             (owner epoch {epoch} -> {current})"
-        )));
+        .first(&mut conn)?;
+    if current != config.owner_epoch {
+        return Err(Reconnect::Stop(DbError::OwnerEpochMoved {
+            ours: config.owner_epoch,
+            current,
+        }));
     }
-    let health = writer_health(&mut conn, lock_key).map_err(retryable)?;
+    let health = writer_health(&mut conn, lock_key)?;
     if !health.owns_advisory_lock {
-        return Err(ReconnectError::Retry(anyhow::anyhow!(
-            "reconnected writer does not hold the ownership lock"
-        )));
+        return Err(Reconnect::Retry(DbError::OwnershipLost));
     }
     Ok((conn, health.backend_pid))
 }
@@ -400,24 +384,18 @@ fn reconnect_once(
 /// Whether the transaction a lost session was committing took effect. Only
 /// called once the ownership lock is re-held, so that session has ended and
 /// its transaction is final.
-fn transaction_committed(
-    conn: &mut PgConnection,
-    xid: &str,
-) -> std::result::Result<bool, ReconnectError> {
+fn transaction_committed(conn: &mut PgConnection, xid: &str) -> Result<bool, Reconnect> {
     let status = diesel::sql_query("SELECT pg_xact_status($1::xid8)::text AS value")
         .bind::<Text, _>(xid)
-        .get_result::<OptionalText>(conn)
-        .map_err(retryable)?
+        .get_result::<OptionalText>(conn)?
         .value;
     match status.as_deref() {
         Some("committed") => Ok(true),
         Some("aborted") => Ok(false),
-        Some("in progress") => Err(ReconnectError::Retry(anyhow::anyhow!(
-            "lost transaction {xid} is still finishing"
-        ))),
-        other => Err(ReconnectError::Stop(anyhow::anyhow!(
-            "cannot determine whether transaction {xid} committed: {other:?}"
-        ))),
+        _ => Err(Reconnect::Stop(DbError::CommitOutcomeUnknown {
+            xid: xid.to_owned(),
+            status,
+        })),
     }
 }
 
@@ -429,22 +407,14 @@ fn recover_writer(
     previous_pid: i32,
     xid: Option<&str>,
     window: Duration,
-) -> Result<(i32, Option<bool>)> {
+) -> DbResult<(i32, Option<bool>)> {
     let deadline = Instant::now() + window;
     let mut backoff = Duration::from_millis(100);
     loop {
-        let attempt = reconnect_once(
-            &config.url,
-            &config.application_name,
-            config.lock_key,
-            previous_pid,
-            config.owner_epoch,
-        )
-        .and_then(|(mut fresh, pid)| {
-            let committed = match xid {
-                Some(xid) => Some(transaction_committed(&mut fresh, xid)?),
-                None => None,
-            };
+        let attempt = reconnect_once(config, previous_pid).and_then(|(mut fresh, pid)| {
+            let committed = xid
+                .map(|xid| transaction_committed(&mut fresh, xid))
+                .transpose()?;
             Ok((fresh, pid, committed))
         });
         match attempt {
@@ -452,16 +422,17 @@ fn recover_writer(
                 *conn = fresh;
                 return Ok((pid, committed));
             }
-            Err(ReconnectError::Stop(error)) => return Err(error),
-            Err(ReconnectError::Retry(error)) if Instant::now() + backoff < deadline => {
-                tracing::warn!(error = %format!("{error:#}"), "PostgreSQL writer reconnect attempt failed; retrying");
+            Err(Reconnect::Stop(error)) => return Err(error),
+            Err(Reconnect::Retry(error)) if Instant::now() + backoff < deadline => {
+                tracing::warn!(%error, "PostgreSQL writer reconnect attempt failed; retrying");
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
-            Err(ReconnectError::Retry(error)) => {
-                return Err(error.context(format!(
-                    "PostgreSQL writer did not reconnect within {window:?}"
-                )))
+            Err(Reconnect::Retry(error)) => {
+                return Err(DbError::ReconnectTimedOut {
+                    window,
+                    last: Box::new(error),
+                })
             }
         }
     }
@@ -536,35 +507,32 @@ impl PgPool {
         reader_url: String,
         read_pool_size: u32,
         application_name: String,
-    ) -> Result<Self> {
+    ) -> DbResult<Self> {
         if read_pool_size == 0 {
-            bail!("PostgreSQL read_pool_size must be at least one");
+            return Err(DbError::InvalidReadPoolSize);
         }
         let config_name = application_name.clone();
         let config_url = writer_url.clone();
-        let (writer, writer_backend_pid, readers, lock_key, owner_epoch) =
-            tokio::time::timeout(DEFAULT_OPERATION_DEADLINE, tokio::task::spawn_blocking(move || -> Result<_> {
+        let (writer, writer_backend_pid, readers, lock_key, owner_epoch) = tokio::time::timeout(
+            DEFAULT_OPERATION_DEADLINE,
+            tokio::task::spawn_blocking(move || -> DbResult<_> {
                 let mut writer = postgres_migrations::connect(&writer_url)?;
-                configure_session(&mut writer, &application_name)
-                    .context("configure PostgreSQL writer session")?;
+                configure_session(&mut writer, &application_name)?;
                 postgres_migrations::verify(&mut writer)?;
                 let writer_identity = database_identity(&mut writer)?;
                 let lock_key = schema_lock_key(&writer_identity.schema_name);
                 let lock = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                     .bind::<BigInt, _>(lock_key)
-                    .get_result::<LockResult>(&mut writer)
-                    .context("acquire PostgreSQL solver ownership")?;
+                    .get_result::<LockResult>(&mut writer)?;
                 if !lock.acquired {
-                    bail!("another solver already owns this PostgreSQL application database");
+                    return Err(DbError::AlreadyOwned);
                 }
-                let health = writer_health(&mut writer, lock_key)
-                    .context("verify PostgreSQL writer owns its advisory lock")?;
+                let health = writer_health(&mut writer, lock_key)?;
                 if !health.owns_advisory_lock {
-                    bail!("PostgreSQL writer did not retain the application advisory lock");
+                    return Err(DbError::OwnershipLost);
                 }
                 let writer_backend_pid = health.backend_pid;
-                let owner_epoch = claim_owner_epoch(&mut writer)
-                    .context("claim PostgreSQL solver ownership epoch")?;
+                let owner_epoch = claim_owner_epoch(&mut writer)?;
 
                 let readers = r2d2::Pool::builder()
                     .max_size(read_pool_size)
@@ -573,21 +541,26 @@ impl PgPool {
                     .connection_customizer(Box::new(ReadCustomizer {
                         application_name: format!("{application_name}/read"),
                     }))
-                    .build(ConnectionManager::<PgConnection>::new(reader_url))
-                    .context("open PostgreSQL read pool")?;
+                    .build(ConnectionManager::<PgConnection>::new(reader_url))?;
                 {
-                    let mut reader = readers.get().context("check PostgreSQL read pool")?;
+                    let mut reader = readers.get()?;
                     postgres_migrations::verify(&mut reader)?;
                     let reader_identity = database_identity(&mut reader)?;
                     if reader_identity != writer_identity {
-                        bail!("PostgreSQL reader target differs from writer application database/schema: writer={writer_identity:?}, reader={reader_identity:?}");
+                        return Err(DbError::ReaderTargetMismatch {
+                            writer: format!("{writer_identity:?}"),
+                            reader: format!("{reader_identity:?}"),
+                        });
                     }
                 }
                 Ok((writer, writer_backend_pid, readers, lock_key, owner_epoch))
-            }))
-            .await
-            .context("PostgreSQL startup exceeded thirty seconds; restart the whole solver")?
-            .context("PostgreSQL startup worker stopped")??;
+            }),
+        )
+        .await
+        .map_err(|_| DbError::Deadline {
+            operation: "startup",
+            deadline: DEFAULT_OPERATION_DEADLINE,
+        })???;
 
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
@@ -647,13 +620,13 @@ impl PgPool {
     /// Reads never request a solver shutdown. The read pool holds no
     /// ownership state, so a failed read is reported to its caller and the
     /// pool reconnects on the next checkout. Only the writer can be fatal.
-    pub async fn read<T, F>(&self, operation: F) -> Result<T>
+    pub async fn read<T, F>(&self, operation: F) -> DbResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut PgConnection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
     {
         if self.fatal_db.is_cancelled() {
-            bail!("PostgreSQL operation failed critically; restart the whole solver");
+            return Err(DbError::WriterUnsafe);
         }
         let operation_name = std::any::type_name::<F>();
         self.telemetry.read_total.fetch_add(1, Ordering::Relaxed);
@@ -670,13 +643,13 @@ impl PgPool {
         record_latency(&self.telemetry.read_wait_buckets, wait_us);
         let permit = match permit {
             Ok(Ok(permit)) => permit,
-            Ok(Err(error)) => {
+            Ok(Err(_)) => {
                 self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(error).context("PostgreSQL read pool closed");
+                return Err(DbError::ReadPoolClosed);
             }
             Err(_) => {
                 self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                bail!("PostgreSQL read pool wait exceeded five seconds");
+                return Err(DbError::ReadPoolBusy(Duration::from_secs(5)));
             }
         };
         let readers = self.readers.clone();
@@ -685,22 +658,20 @@ impl PgPool {
             self.operation_deadline,
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let mut conn = readers
-                    .get()
-                    .context("check out PostgreSQL read connection")?;
+                let mut conn = readers.get()?;
                 operation(&mut conn)
             }),
         )
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(error).context("PostgreSQL read worker stopped"),
+            Ok(Err(panicked)) => Err(DbError::WorkerStopped(panicked)),
             // The blocking worker keeps its permit until libpq returns, so a
             // lost reply costs one read slot until then, not the solver.
-            Err(_) => Err(anyhow::anyhow!(
-                "PostgreSQL read exceeded {:?}",
-                self.operation_deadline
-            )),
+            Err(_) => Err(DbError::Deadline {
+                operation: "read",
+                deadline: self.operation_deadline,
+            }),
         };
         let duration_us = elapsed_us(started);
         self.telemetry
@@ -731,16 +702,16 @@ impl PgPool {
     /// owner, a worker panic, an unrecoverable session, or a deadline with the
     /// session still busy stop the solver. Lock and statement timeouts roll
     /// back one transaction; the caller re-feeds or retries.
-    pub async fn write<T, F>(&self, operation: F) -> Result<T>
+    pub async fn write<T, F>(&self, operation: F) -> DbResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut PgConnection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
     {
         let operation_name = std::any::type_name::<F>();
         self.telemetry.write_total.fetch_add(1, Ordering::Relaxed);
-        if self.ownership_lost.load(Ordering::Acquire) || self.fatal_db.is_cancelled() {
+        if self.writer_unsafe() {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
-            bail!("PostgreSQL writer is no longer safe; restart the whole solver");
+            return Err(DbError::WriterUnsafe);
         }
         let waiting_since = Instant::now();
         let mut writer =
@@ -755,10 +726,7 @@ impl PgPool {
                         .fetch_add(wait_us, Ordering::Relaxed);
                     record_latency(&self.telemetry.writer_wait_buckets, wait_us);
                     self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
-                    self.fatal_db.cancel();
-                    bail!(
-                        "PostgreSQL writer wait exceeded thirty seconds; restart the whole solver"
-                    );
+                    return Err(self.stop(DbError::WriterBusy(Duration::from_secs(30))));
                 }
             };
         let wait_us = elapsed_us(waiting_since);
@@ -766,9 +734,9 @@ impl PgPool {
             .writer_wait_us
             .fetch_add(wait_us, Ordering::Relaxed);
         record_latency(&self.telemetry.writer_wait_buckets, wait_us);
-        if self.ownership_lost.load(Ordering::Acquire) || self.fatal_db.is_cancelled() {
+        if self.writer_unsafe() {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
-            bail!("PostgreSQL writer is no longer safe; restart the whole solver");
+            return Err(DbError::WriterUnsafe);
         }
         let expected_pid = self.writer_backend_pid.load(Ordering::Acquire);
         let lock_key = self.lock_key;
@@ -784,37 +752,26 @@ impl PgPool {
         let result = match attempt {
             Ok(Ok((_, Ok(value)))) => Ok(value),
             Ok(Ok((_, Err(WriteFailure::Failed(error))))) => Err(error),
-            Ok(Ok((_, Err(WriteFailure::OwnershipLost(error))))) => {
-                Err(self.stop(error.context("PostgreSQL writer lost its ownership lock")))
-            }
-            Ok(Ok((writer, Err(WriteFailure::LostBeforeCommit(error))))) => {
-                match self.recover(writer, expected_pid, None).await {
-                    Ok(_) => Err(error.context(
-                        "PostgreSQL writer session was lost before commit; reconnected, nothing was written",
-                    )),
-                    Err(fatal) => Err(fatal),
-                }
-            }
+            Ok(Ok((_, Err(WriteFailure::OwnershipLost)))) => Err(self.stop(DbError::OwnershipLost)),
+            Ok(Ok((writer, Err(WriteFailure::LostBeforeCommit(error))))) => self
+                .recover(writer, expected_pid, None)
+                .await
+                .and(Err(DbError::LostBeforeCommit(Box::new(error)))),
             Ok(Ok((writer, Err(WriteFailure::LostAtCommit { error, value, xid })))) => {
-                match self.recover(writer, expected_pid, xid).await {
+                match self.recover(writer, expected_pid, xid).await? {
                     // A transaction that wrote nothing has no ID and no effect;
                     // its result was computed from a consistent snapshot.
-                    Ok(Some(true) | None) => Ok(value),
-                    Ok(Some(false)) => Err(error.context(
-                        "PostgreSQL writer session was lost during commit; reconnected, the commit did not take effect",
-                    )),
-                    Err(fatal) => Err(fatal),
+                    Some(true) | None => Ok(value),
+                    Some(false) => Err(DbError::CommitDidNotApply(Box::new(error))),
                 }
             }
-            Ok(Err(panicked)) => Err(self.stop(
-                anyhow::Error::from(panicked).context("PostgreSQL writer worker stopped"),
-            )),
+            Ok(Err(panicked)) => Err(self.stop(DbError::WorkerStopped(panicked))),
             // The blocking worker still holds the session, so it cannot be
             // replaced from here; a whole-solver restart recovers.
-            Err(_) => Err(self.stop(anyhow::anyhow!(
-                "PostgreSQL write exceeded {:?}; commit outcome is uncertain; restart the whole solver",
-                self.operation_deadline
-            ))),
+            Err(_) => Err(self.stop(DbError::Deadline {
+                operation: "write",
+                deadline: self.operation_deadline,
+            })),
         };
         let duration_us = elapsed_us(started);
         self.telemetry
@@ -836,8 +793,12 @@ impl PgPool {
         result
     }
 
+    fn writer_unsafe(&self) -> bool {
+        self.ownership_lost.load(Ordering::Acquire) || self.fatal_db.is_cancelled()
+    }
+
     /// Mark the writer unsafe and request a whole-solver stop.
-    fn stop(&self, error: anyhow::Error) -> anyhow::Error {
+    fn stop(&self, error: DbError) -> DbError {
         self.ownership_lost.store(true, Ordering::Release);
         self.fatal_db.cancel();
         error
@@ -851,7 +812,7 @@ impl PgPool {
         mut writer: tokio::sync::OwnedMutexGuard<PgConnection>,
         previous_pid: i32,
         xid: Option<String>,
-    ) -> Result<Option<bool>> {
+    ) -> DbResult<Option<bool>> {
         tracing::warn!(previous_pid, "PostgreSQL writer session lost; reconnecting");
         let config = self.writer_config.clone();
         let window = self.reconnect_window;
@@ -876,11 +837,8 @@ impl PgPool {
                 );
                 Ok(committed)
             }
-            Ok(Err(error)) => {
-                Err(self.stop(error.context("PostgreSQL writer could not be recovered")))
-            }
-            Err(panicked) => Err(self
-                .stop(anyhow::Error::from(panicked).context("PostgreSQL writer recovery stopped"))),
+            Ok(Err(error)) => Err(self.stop(error)),
+            Err(panicked) => Err(self.stop(DbError::WorkerStopped(panicked))),
         }
     }
 
@@ -892,9 +850,13 @@ impl PgPool {
     /// The publish guard spans commit and send. Plain `write` calls do not
     /// take it, so a full matcher channel delays only other publishers, and
     /// the matcher never takes it, so waiting for capacity cannot deadlock.
-    pub async fn write_book<F>(&self, sender: &mpsc::Sender<BookUpdate>, operation: F) -> Result<()>
+    pub async fn write_book<F>(
+        &self,
+        sender: &mpsc::Sender<BookUpdate>,
+        operation: F,
+    ) -> DbResult<()>
     where
-        F: FnOnce(&mut PgConnection) -> Result<BookUpdate> + Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<BookUpdate> + Send + 'static,
     {
         let _publish = self.publish_order.lock().await;
         let update = self.write(operation).await?;
@@ -902,7 +864,7 @@ impl PgPool {
             sender
                 .send(update)
                 .await
-                .context("matcher stopped: book update receiver closed")?;
+                .map_err(|_| DbError::MatcherStopped)?;
         }
         Ok(())
     }
@@ -911,10 +873,10 @@ impl PgPool {
     /// update. Once the operation starts, an HTTP caller dropping its future
     /// cannot abandon the cache update after the database commit. Subscription
     /// delivery belongs after this method returns, outside both guards.
-    pub async fn admin_write<T, F, C>(&self, operation: F, update_cache: C) -> Result<T>
+    pub async fn admin_write<T, F, C>(&self, operation: F, update_cache: C) -> DbResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut PgConnection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
         C: FnOnce(&T) + Send + 'static,
     {
         let admin_guard = self.admin_order.clone().lock_owned().await;
@@ -925,8 +887,7 @@ impl PgPool {
             update_cache(&result);
             Ok(result)
         })
-        .await
-        .context("PostgreSQL admin mutation worker stopped")?
+        .await?
     }
 
     /// Readiness proves the read pool answers and the original writer backend
@@ -936,16 +897,15 @@ impl PgPool {
     /// A probe must never queue behind application writes or stop the
     /// solver: a busy writer is reported healthy (every failed write already
     /// re-verifies ownership), and a failed probe only returns an error.
-    pub async fn readiness_check(&self) -> Result<()> {
-        if self.ownership_lost.load(Ordering::Acquire) || self.fatal_db.is_cancelled() {
-            bail!("PostgreSQL writer is no longer safe; restart the whole solver");
+    pub async fn readiness_check(&self) -> DbResult<()> {
+        if self.writer_unsafe() {
+            return Err(DbError::WriterUnsafe);
         }
         self.read(|conn| {
             diesel::sql_query("SELECT 1").execute(conn)?;
             Ok(())
         })
-        .await
-        .context("PostgreSQL read pool is unavailable")?;
+        .await?;
         let Ok(mut writer) = self.writer.clone().try_lock_owned() else {
             return Ok(());
         };
@@ -956,15 +916,15 @@ impl PgPool {
             tokio::task::spawn_blocking(move || writer_health(&mut writer, lock_key)),
         )
         .await
-        .context("PostgreSQL writer ownership probe timed out")?
-        .context("PostgreSQL writer ownership probe stopped")?
+        .map_err(|_| DbError::Deadline {
+            operation: "readiness probe",
+            deadline: Duration::from_secs(5),
+        })??
         // A dead session is replaced by the next write; only a live session
         // without the lock is fatal here.
-        .context("query PostgreSQL writer ownership")?;
+        ?;
         if health.backend_pid != expected_pid || !health.owns_advisory_lock {
-            self.ownership_lost.store(true, Ordering::Release);
-            self.fatal_db.cancel();
-            bail!("PostgreSQL writer lost its original ownership session or advisory lock");
+            return Err(self.stop(DbError::OwnershipLost));
         }
         Ok(())
     }
@@ -975,6 +935,7 @@ mod tests {
     use super::*;
     use crate::db::postgres_migrations;
     use crate::db::postgres_schema::sync_state;
+    use anyhow::{bail, Context, Result};
     use miden_protocol::crypto::utils::{Deserializable, SliceReader};
     use std::sync::atomic::AtomicI64;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1022,7 +983,7 @@ mod tests {
         pool.readiness_check().await?;
         match PgPool::open(url.clone(), url.clone(), 1, "solver/second".into()).await {
             Ok(_) => bail!("a second solver acquired the application ownership lock"),
-            Err(error) => assert!(error.to_string().contains("another solver already owns")),
+            Err(error) => assert!(matches!(error, DbError::AlreadyOwned), "{error:?}"),
         }
         let other_schema = PoolFixture::new()?;
         let independent = PgPool::open(
@@ -1253,7 +1214,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("matcher stopped"));
+        assert!(matches!(error, DbError::MatcherStopped), "{error:?}");
         drop(pool);
 
         let restarted = PgPool::open(url.clone(), url, 1, "solver/restarted".into()).await?;
@@ -1285,7 +1246,10 @@ mod tests {
             Ok(_) => bail!("reader in another schema was accepted"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("reader target differs"));
+        assert!(
+            matches!(error, DbError::ReaderTargetMismatch { .. }),
+            "{error:?}"
+        );
         Ok(())
     }
 
@@ -1313,7 +1277,7 @@ mod tests {
         });
         started_rx.await?;
         let error = pool.read(|_| Ok(())).await.unwrap_err();
-        assert!(error.to_string().contains("read pool wait exceeded"));
+        assert!(matches!(error, DbError::ReadPoolBusy(_)), "{error:?}");
         occupied.await??;
         assert_eq!(pool.telemetry_snapshot().read_errors, 1);
         Ok(())
@@ -1341,7 +1305,16 @@ mod tests {
             })
             .await
             .expect_err("the client must stop waiting for the write reply");
-        assert!(error.to_string().contains("commit outcome is uncertain"));
+        assert!(
+            matches!(
+                error,
+                DbError::Deadline {
+                    operation: "write",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         assert!(pool.fatal_token().is_cancelled());
         assert!(pool.write(|_| Ok(())).await.is_err());
 
@@ -1381,7 +1354,16 @@ mod tests {
             })
             .await
             .expect_err("the client must stop waiting for the read reply");
-        assert!(error.to_string().contains("read exceeded"));
+        assert!(
+            matches!(
+                error,
+                DbError::Deadline {
+                    operation: "read",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!pool.fatal_token().is_cancelled());
         pool.readiness_check().await?;
         pool.write(|_| Ok(())).await?;
@@ -1443,7 +1425,7 @@ mod tests {
             .await;
         fixture.admin.batch_execute("ROLLBACK")?;
         let error = blocked.expect_err("the writer must not wait indefinitely on a row lock");
-        assert!(error.to_string().contains("lock timeout"));
+        assert!(matches!(error, DbError::Query(_)), "{error:?}");
         assert_eq!(pool.telemetry_snapshot().lock_timeouts, 1);
         // One rolled-back transaction on a healthy session is the caller's
         // problem, not the solver's.
@@ -1477,7 +1459,7 @@ mod tests {
             })
             .await
             .expect_err("a timed-out statement must fail the transaction");
-        assert!(error.to_string().contains("statement timeout"));
+        assert!(matches!(error, DbError::Query(_)), "{error:?}");
         assert_eq!(pool.telemetry_snapshot().statement_timeouts, 1);
         assert!(!pool.fatal_token().is_cancelled());
         pool.write(|_| Ok(())).await?;
@@ -1536,10 +1518,7 @@ mod tests {
         // Nothing was in flight: the write that finds the dead session reports
         // an ordinary error after reconnecting, and the next one succeeds.
         let error = pool.write(|_| Ok(())).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("nothing was written"),
-            "{error:#}"
-        );
+        assert!(matches!(error, DbError::LostBeforeCommit(_)), "{error:?}");
         assert!(!pool.fatal_token().is_cancelled());
         assert_ne!(pool.writer_backend_pid.load(Ordering::Acquire), first_pid);
         pool.write(|conn| {
@@ -1625,10 +1604,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("did not take effect"),
-            "{error:#}"
-        );
+        assert!(matches!(error, DbError::CommitDidNotApply(_)), "{error:?}");
         assert!(!pool.fatal_token().is_cancelled());
         assert_eq!(cursor(&fixture.url)?, 0);
 
@@ -1697,8 +1673,8 @@ mod tests {
 
         let error = pool.write(|_| Ok(())).await.unwrap_err();
         assert!(
-            format!("{error:#}").contains("another solver holds"),
-            "{error:#}"
+            matches!(error, DbError::LockTakenAfterDisconnect),
+            "{error:?}"
         );
         assert!(pool.fatal_token().is_cancelled());
         assert!(pool.write(|_| Ok(())).await.is_err());
@@ -1729,7 +1705,10 @@ mod tests {
             fixture.name
         ))?;
         let error = pool.write(|_| Ok(())).await.unwrap_err();
-        assert!(format!("{error:#}").contains("owner epoch"), "{error:#}");
+        assert!(
+            matches!(error, DbError::OwnerEpochMoved { .. }),
+            "{error:?}"
+        );
         assert!(pool.fatal_token().is_cancelled());
         Ok(())
     }

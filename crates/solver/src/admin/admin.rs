@@ -71,6 +71,7 @@ impl AdminState {
         self.pool
             .read(db::postgres_db::load_registered_tokens_tx)
             .await
+            .map_err(Into::into)
     }
 
     /// Update the in-memory symbol cache. Lock held briefly, no awaits.

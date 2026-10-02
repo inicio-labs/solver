@@ -178,10 +178,11 @@ fn main() -> anyhow::Result<()> {
     let local = tokio::task::LocalSet::new();
     let result = local.block_on(&rt, run(matches));
     drop(local);
-    // A lost PostgreSQL reply can leave a synchronous libpq call running on a
-    // blocking worker. Do not let runtime teardown hang the process after the
-    // solver has decided to fail-stop; the process supervisor starts a fresh
-    // instance that hydrates from committed state.
+    // Dropping a runtime waits for every `spawn_blocking` task to return. A
+    // database call whose reply was lost (the case that makes the solver stop)
+    // can stay blocked inside libpq indefinitely, so a plain drop could hang
+    // the exit forever. Wait at most 5s, then exit anyway; the supervisor
+    // restarts the solver, which reloads from committed PostgreSQL state.
     rt.shutdown_timeout(Duration::from_secs(5));
     result
 }

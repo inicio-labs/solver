@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{bail, ensure, Context, Result};
+use super::error::{DbError, DbResult};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
@@ -25,7 +25,7 @@ use crate::types::{BookOrder, BookUpdate, OrderId, OrderStatus, SettlementError,
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
 const INSERT_CHUNK_ROWS: usize = 1_000;
 
-pub fn get_last_fetched_block_tx(conn: &mut PgConnection) -> Result<u64> {
+pub fn get_last_fetched_block_tx(conn: &mut PgConnection) -> DbResult<u64> {
     let block: i64 = sync_state::table
         .find(1_i16)
         .select(sync_state::last_fetched_block)
@@ -40,9 +40,9 @@ pub fn insert_orders_batch_tx(
     conn: &mut PgConnection,
     new_orders: &[NewOrderRow],
     block_number: u64,
-) -> Result<HashMap<Vec<u8>, u64>> {
+) -> DbResult<HashMap<Vec<u8>, u64>> {
     let block_number =
-        i64::try_from(block_number).context("sync height exceeds PostgreSQL BIGINT")?;
+        i64::try_from(block_number).map_err(|_| DbError::BlockOutOfRange(block_number))?;
     let mut inserted: Vec<(Vec<u8>, i64)> = Vec::with_capacity(new_orders.len());
     for chunk in new_orders.chunks(INSERT_CHUNK_ROWS) {
         inserted.extend(
@@ -57,7 +57,9 @@ pub fn insert_orders_batch_tx(
     let advanced = diesel::update(sync_state::table.find(1_i16))
         .set(sync_state::last_fetched_block.eq(block_number))
         .execute(conn)?;
-    ensure!(advanced == 1, "PostgreSQL sync cursor row is missing");
+    if advanced != 1 {
+        return Err(DbError::MissingSyncCursor);
+    }
     tracing::debug!(
         inserted_orders = inserted.len(),
         block_number,
@@ -74,7 +76,7 @@ pub fn insert_orders_batch_tx(
 pub fn existing_note_ids_tx(
     conn: &mut PgConnection,
     note_ids: &[Vec<u8>],
-) -> Result<HashSet<Vec<u8>>> {
+) -> DbResult<HashSet<Vec<u8>>> {
     if note_ids.is_empty() {
         return Ok(HashSet::new());
     }
@@ -86,14 +88,14 @@ pub fn existing_note_ids_tx(
         .collect())
 }
 
-pub fn get_active_orders_tx(conn: &mut PgConnection) -> Result<Vec<OrderRow>> {
+pub fn get_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<OrderRow>> {
     Ok(orders::table
         .filter(orders::status.eq(OrderStatus::Active.as_str()))
         .select(OrderRow::as_select())
         .load(conn)?)
 }
 
-pub fn load_active_orders_tx(conn: &mut PgConnection) -> Result<Vec<BookOrder>> {
+pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
     let rows: Vec<OrderRow> = orders::table
         .filter(orders::status.eq(OrderStatus::Active.as_str()))
         .order(orders::priority_seq.asc())
@@ -114,7 +116,7 @@ pub fn load_active_orders_tx(conn: &mut PgConnection) -> Result<Vec<BookOrder>> 
 pub fn active_book_update_tx(
     conn: &mut PgConnection,
     candidates: Vec<BookOrder>,
-) -> Result<BookUpdate> {
+) -> DbResult<BookUpdate> {
     let ids: Vec<_> = candidates
         .iter()
         .map(|order| order.id().to_bytes().to_vec())
@@ -143,7 +145,7 @@ pub fn active_book_update_tx(
 pub fn mark_orders_onchain_nullified_tx(
     conn: &mut PgConnection,
     note_ids: &[Vec<u8>],
-) -> Result<usize> {
+) -> DbResult<usize> {
     if note_ids.is_empty() {
         return Ok(0);
     }
@@ -191,12 +193,13 @@ pub fn prepare_settlement_tx(
     conn: &mut PgConnection,
     attempt: &SettlementAttemptRow,
     inputs: &[SettlementInputRow],
-) -> Result<()> {
-    ensure!(!inputs.is_empty(), "settlement has no inputs");
-    ensure!(
-        attempt.settlement_status()? == SettlementStatus::Prepared,
-        "new settlement is not prepared"
-    );
+) -> DbResult<()> {
+    if inputs.is_empty() {
+        return Err(SettlementError::NoInputs.into());
+    }
+    if attempt.settlement_status()? != SettlementStatus::Prepared {
+        return Err(SettlementError::NotPrepared.into());
+    }
     let mut parent_ids: Vec<_> = inputs
         .iter()
         .map(|input| input.parent_note_id.clone())
@@ -205,17 +208,15 @@ pub fn prepare_settlement_tx(
         if input.tx_id != attempt.tx_id {
             return Err(SettlementError::InputTransactionMismatch.into());
         }
-        ensure!(
-            input.child_note_id.is_some() == input.child_note_data.is_some(),
-            "settlement child ID/data pair is incomplete"
-        );
+        if input.child_note_id.is_some() != input.child_note_data.is_some() {
+            return Err(SettlementError::IncompleteChild.into());
+        }
     }
     parent_ids.sort();
     parent_ids.dedup();
-    ensure!(
-        parent_ids.len() == inputs.len(),
-        "duplicate settlement parent"
-    );
+    if parent_ids.len() != inputs.len() {
+        return Err(SettlementError::DuplicateParent.into());
+    }
     diesel::insert_into(settlement_attempts::table)
         .values(attempt)
         .execute(conn)?;
@@ -226,7 +227,7 @@ pub fn prepare_settlement_tx(
         .select(OrderRow::as_select())
         .load(conn)?;
     if locked.len() != parent_ids.len() {
-        bail!("settlement input order missing");
+        return Err(SettlementError::MissingInputOrder.into());
     }
     if locked
         .iter()
@@ -241,16 +242,14 @@ pub fn prepare_settlement_tx(
     // The only validation of a child: confirmation and ingest rely on it.
     for input in inputs {
         if let (Some(child_id), Some(raw_child)) = (&input.child_note_id, &input.child_note_data) {
-            let child = Note::read_from(&mut SliceReader::new(raw_child))
-                .context("expected settlement child bytes do not decode")?;
+            let child = Note::read_from(&mut SliceReader::new(raw_child))?;
             if child.id().to_bytes().as_slice() != child_id {
                 return Err(SettlementError::ChildIdMismatch.into());
             }
             let parent = parents
                 .get(input.parent_note_id.as_slice())
-                .context("settlement child parent was not locked")?;
-            NewRemainderOrderRow::from_parent(parent, &child)
-                .context("expected settlement child is not a valid remainder order")?;
+                .ok_or(SettlementError::MissingInputOrder)?;
+            NewRemainderOrderRow::from_parent(parent, &child)?;
         }
     }
     let changed = diesel::update(
@@ -277,7 +276,7 @@ fn transition_attempt_status_tx(
     tx_id: &[u8],
     from: &[SettlementStatus],
     to: SettlementStatus,
-) -> Result<()> {
+) -> DbResult<()> {
     let from: Vec<_> = from.iter().map(|status| status.as_str()).collect();
     let to = to.as_str();
     let changed = diesel::update(
@@ -298,12 +297,15 @@ fn transition_attempt_status_tx(
     match current.as_deref() {
         // Repeated observations are harmless.
         Some(status) if status == to => Ok(()),
-        Some(status) => bail!("invalid settlement status transition {status} -> {to}"),
-        None => bail!("settlement attempt missing during {to} transition"),
+        Some(status) => Err(DbError::InvalidTransition {
+            from: status.to_owned(),
+            to,
+        }),
+        None => Err(DbError::MissingAttempt(to)),
     }
 }
 
-pub fn mark_settlement_uncertain_tx(conn: &mut PgConnection, tx_id: &[u8]) -> Result<()> {
+pub fn mark_settlement_uncertain_tx(conn: &mut PgConnection, tx_id: &[u8]) -> DbResult<()> {
     transition_attempt_status_tx(
         conn,
         tx_id,
@@ -312,7 +314,7 @@ pub fn mark_settlement_uncertain_tx(conn: &mut PgConnection, tx_id: &[u8]) -> Re
     )
 }
 
-pub fn mark_settlement_rejected_tx(conn: &mut PgConnection, tx_id: &[u8]) -> Result<()> {
+pub fn mark_settlement_rejected_tx(conn: &mut PgConnection, tx_id: &[u8]) -> DbResult<()> {
     transition_attempt_status_tx(
         conn,
         tx_id,
@@ -338,7 +340,7 @@ type UnresolvedAttemptJoinRow = (
     Option<OrderRow>,
 );
 
-pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> Result<Vec<UnresolvedAttempt>> {
+pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> DbResult<Vec<UnresolvedAttempt>> {
     let rows: Vec<UnresolvedAttemptJoinRow> = settlement_attempts::table
         .left_join(
             settlement_inputs::table.on(settlement_attempts::tx_id.eq(settlement_inputs::tx_id)),
@@ -356,19 +358,21 @@ pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> Result<Vec<Unreso
         .load(conn)?;
     let mut attempts = BTreeMap::<Vec<u8>, UnresolvedAttempt>::new();
     for (attempt, input, parent_row) in rows {
-        let input = input.context("unresolved settlement has no input")?;
-        let parent_row = parent_row.context("unresolved settlement parent order is missing")?;
-        ensure!(
-            attempt.tx_id == input.tx_id && input.parent_note_id == parent_row.note_id,
-            "unresolved settlement mapping does not match its parent"
-        );
+        let input = input.ok_or(DbError::Corrupt("unresolved settlement has no input"))?;
+        let parent_row = parent_row.ok_or(DbError::Corrupt(
+            "unresolved settlement parent order is missing",
+        ))?;
+        if attempt.tx_id != input.tx_id || input.parent_note_id != parent_row.note_id {
+            return Err(DbError::Corrupt(
+                "unresolved settlement mapping does not match its parent",
+            ));
+        }
         let parent = parent_row.into_book_order()?;
         let child = input
             .child_note_data
             .as_deref()
             .map(|raw| Note::read_from(&mut SliceReader::new(raw)))
-            .transpose()
-            .context("unresolved settlement child does not decode")?;
+            .transpose()?;
         match attempts.entry(attempt.tx_id.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(UnresolvedAttempt {
@@ -395,7 +399,7 @@ pub fn finish_discarded_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed: &HashSet<OrderId>,
-) -> Result<BookUpdate> {
+) -> DbResult<BookUpdate> {
     let exists = settlement_attempts::table
         .find(tx_id)
         .for_update()
@@ -466,7 +470,7 @@ pub fn confirm_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
-) -> Result<BookUpdate> {
+) -> DbResult<BookUpdate> {
     let exists = settlement_attempts::table
         .find(tx_id)
         .for_update()
@@ -584,7 +588,7 @@ pub fn confirm_settlement_tx(
 pub fn ingest_expected_remainders_tx(
     conn: &mut PgConnection,
     observed: &[Note],
-) -> Result<(HashSet<Vec<u8>>, Vec<BookOrder>)> {
+) -> DbResult<(HashSet<Vec<u8>>, Vec<BookOrder>)> {
     if observed.is_empty() {
         return Ok((HashSet::new(), Vec::new()));
     }
@@ -641,7 +645,7 @@ pub fn ingest_expected_remainders_tx(
     Ok((expected, active))
 }
 
-pub fn get_registered_tokens_tx(conn: &mut PgConnection) -> Result<Vec<RegisteredTokenRow>> {
+pub fn get_registered_tokens_tx(conn: &mut PgConnection) -> DbResult<Vec<RegisteredTokenRow>> {
     Ok(registered_tokens::table
         .select(RegisteredTokenRow::as_select())
         .load(conn)?)
@@ -650,7 +654,7 @@ pub fn get_registered_tokens_tx(conn: &mut PgConnection) -> Result<Vec<Registere
 pub fn get_registered_token_tx(
     conn: &mut PgConnection,
     token_id: &[u8],
-) -> Result<Option<RegisteredTokenRow>> {
+) -> DbResult<Option<RegisteredTokenRow>> {
     Ok(registered_tokens::table
         .find(token_id)
         .select(RegisteredTokenRow::as_select())
@@ -662,7 +666,7 @@ pub fn get_registered_token_tx(
 pub fn fetch_token_rows_tx(
     conn: &mut PgConnection,
     token_ids: &[Vec<u8>],
-) -> Result<HashMap<Vec<u8>, RegisteredTokenRow>> {
+) -> DbResult<HashMap<Vec<u8>, RegisteredTokenRow>> {
     if token_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -679,7 +683,7 @@ pub fn register_token_tx(
     conn: &mut PgConnection,
     token_id: &[u8],
     external_symbol: Option<&str>,
-) -> Result<bool> {
+) -> DbResult<bool> {
     validate_token_id(token_id)?;
     let row = RegisteredTokenRow {
         token_id: token_id.to_vec(),
@@ -700,10 +704,10 @@ pub fn set_token_metadata_tx(
     token_id: &[u8],
     decimals: Option<i32>,
     ticker: Option<&str>,
-) -> Result<bool> {
+) -> DbResult<bool> {
     validate_token_id(token_id)?;
     if let Some(decimals) = decimals {
-        u8::try_from(decimals).context("token decimals must fit a u8")?;
+        u8::try_from(decimals).map_err(|_| DbError::InvalidDecimals(decimals))?;
     }
     Ok(diesel::update(registered_tokens::table.find(token_id))
         .set((
@@ -718,7 +722,7 @@ pub fn update_token_symbol_tx(
     conn: &mut PgConnection,
     token_id: &[u8],
     symbol: Option<&str>,
-) -> Result<bool> {
+) -> DbResult<bool> {
     validate_token_id(token_id)?;
     Ok(diesel::update(registered_tokens::table.find(token_id))
         .set(registered_tokens::external_symbol.eq(symbol.map(str::to_owned)))
@@ -726,22 +730,21 @@ pub fn update_token_symbol_tx(
         == 1)
 }
 
-pub fn unregister_token_tx(conn: &mut PgConnection, token_id: &[u8]) -> Result<bool> {
+pub fn unregister_token_tx(conn: &mut PgConnection, token_id: &[u8]) -> DbResult<bool> {
     validate_token_id(token_id)?;
     Ok(diesel::delete(registered_tokens::table.find(token_id)).execute(conn)? == 1)
 }
 
-fn validate_token_id(bytes: &[u8]) -> Result<TokenId> {
-    let token = TokenId::read_from(&mut SliceReader::new(bytes))
-        .context("token ID is not a valid serialized account ID")?;
-    ensure!(
-        token.to_bytes() == bytes,
-        "token ID bytes are not canonical"
-    );
+fn validate_token_id(bytes: &[u8]) -> DbResult<TokenId> {
+    let token =
+        TokenId::read_from(&mut SliceReader::new(bytes)).map_err(|_| DbError::InvalidTokenId)?;
+    if token.to_bytes() != bytes {
+        return Err(DbError::InvalidTokenId);
+    }
     Ok(token)
 }
 
-pub fn load_token_symbols_tx(conn: &mut PgConnection) -> Result<HashMap<TokenId, String>> {
+pub fn load_token_symbols_tx(conn: &mut PgConnection) -> DbResult<HashMap<TokenId, String>> {
     let mut result = HashMap::new();
     for row in get_registered_tokens_tx(conn)? {
         if let Some(symbol) = row.external_symbol {
@@ -752,7 +755,7 @@ pub fn load_token_symbols_tx(conn: &mut PgConnection) -> Result<HashMap<TokenId,
     Ok(result)
 }
 
-pub fn load_registered_tokens_tx(conn: &mut PgConnection) -> Result<Vec<TokenId>> {
+pub fn load_registered_tokens_tx(conn: &mut PgConnection) -> DbResult<Vec<TokenId>> {
     get_registered_tokens_tx(conn)?
         .into_iter()
         .map(|row| Ok(TokenId::read_from(&mut SliceReader::new(&row.token_id))?))
@@ -762,7 +765,7 @@ pub fn load_registered_tokens_tx(conn: &mut PgConnection) -> Result<Vec<TokenId>
 pub fn seed_tokens_from_config_tx(
     conn: &mut PgConnection,
     tokens: &[(TokenId, Option<String>)],
-) -> Result<()> {
+) -> DbResult<()> {
     for (token, symbol) in tokens {
         register_token_tx(conn, &token.to_bytes(), symbol.as_deref())?;
     }
@@ -773,6 +776,7 @@ pub fn seed_tokens_from_config_tx(
 mod tests {
     use super::*;
     use crate::db::postgres_migrations;
+    use anyhow::Result;
     use diesel::connection::SimpleConnection;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -858,15 +862,13 @@ mod tests {
                 child_note_data: Some(child.to_bytes()),
             });
         }
-        let inserted = conn.transaction::<_, anyhow::Error, _>(|conn| {
-            insert_orders_batch_tx(conn, &order_rows, 42)
-        })?;
+        let inserted = conn
+            .transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &order_rows, 42))?;
         assert_eq!(inserted.len(), 511);
         assert!(inserted.values().all(|priority| *priority > 0));
         assert_eq!(get_last_fetched_block_tx(conn)?, 42);
-        let duplicate = conn.transaction::<_, anyhow::Error, _>(|conn| {
-            insert_orders_batch_tx(conn, &order_rows, 43)
-        })?;
+        let duplicate = conn
+            .transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &order_rows, 43))?;
         assert!(duplicate.is_empty());
         assert_eq!(get_last_fetched_block_tx(conn)?, 43);
 
@@ -875,9 +877,7 @@ mod tests {
             tx_result: vec![9],
             status: "prepared".into(),
         };
-        conn.transaction::<_, anyhow::Error, _>(|conn| {
-            prepare_settlement_tx(conn, &attempt, &inputs)
-        })?;
+        conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, &inputs))?;
         let settling: i64 = orders::table
             .filter(orders::status.eq(OrderStatus::Settling.as_str()))
             .count()
@@ -898,7 +898,7 @@ mod tests {
             })
             .collect();
         assert!(conn
-            .transaction::<_, anyhow::Error, _>(|conn| {
+            .transaction::<_, DbError, _>(|conn| {
                 prepare_settlement_tx(conn, &competing, &competing_inputs)
             })
             .is_err());
@@ -906,7 +906,7 @@ mod tests {
         let mappings: i64 = settlement_inputs::table.count().get_result(conn)?;
         assert_eq!((attempts, mappings), (1, 511));
 
-        let update = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let update = conn.transaction::<_, DbError, _>(|conn| {
             confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
         })?;
         assert_eq!(update.removed.len(), 511);
@@ -923,7 +923,7 @@ mod tests {
                 "a remainder must retain its parent's FIFO priority"
             );
         }
-        let duplicate = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let duplicate = conn.transaction::<_, DbError, _>(|conn| {
             confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
         })?;
         assert!(duplicate.is_empty());
@@ -942,7 +942,7 @@ mod tests {
         let note = order_note(Word::default())?;
         let id = note.id().to_bytes();
         let order_row = NewOrderRow::ingested(&note, 10)?;
-        fixture.conn.transaction::<_, anyhow::Error, _>(|conn| {
+        fixture.conn.transaction::<_, DbError, _>(|conn| {
             insert_orders_batch_tx(conn, &[order_row], 1)?;
             prepare_settlement_tx(
                 conn,
@@ -971,7 +971,7 @@ mod tests {
                 let mut conn = postgres_migrations::connect(&url)?;
                 conn.batch_execute(&format!("SET search_path TO {schema}"))?;
                 barrier.wait();
-                let update = conn.transaction::<_, anyhow::Error, _>(|conn| {
+                let update = conn.transaction::<_, DbError, _>(|conn| {
                     confirm_settlement_tx(conn, &[7], &HashSet::new())
                 })?;
                 Ok(update.removed.len())
@@ -997,7 +997,7 @@ mod tests {
         let mut fixture = SchemaFixture::new()?;
         let note = order_note(Word::default())?;
         let order_row = NewOrderRow::ingested(&note, 10)?;
-        fixture.conn.transaction::<_, anyhow::Error, _>(|conn| {
+        fixture.conn.transaction::<_, DbError, _>(|conn| {
             insert_orders_batch_tx(conn, &[order_row], 1)?;
             Ok(())
         })?;
@@ -1025,12 +1025,12 @@ mod tests {
                     child_note_data: None,
                 };
                 barrier.wait();
-                match conn.transaction::<_, anyhow::Error, _>(|conn| {
+                match conn.transaction::<_, DbError, _>(|conn| {
                     prepare_settlement_tx(conn, &attempt, &[input])
                 }) {
                     Ok(()) => Ok(true),
-                    Err(error) if error.to_string().contains("not active") => Ok(false),
-                    Err(error) => Err(error),
+                    Err(DbError::Settlement(SettlementError::InputOrderNotActive)) => Ok(false),
+                    Err(error) => Err(error.into()),
                 }
             }));
         }
@@ -1056,7 +1056,7 @@ mod tests {
         let mut fixture = SchemaFixture::new()?;
         let note = order_note(Word::default())?;
         let order_row = NewOrderRow::ingested(&note, 10)?;
-        fixture.conn.transaction::<_, anyhow::Error, _>(|conn| {
+        fixture.conn.transaction::<_, DbError, _>(|conn| {
             insert_orders_batch_tx(conn, &[order_row], 1)?;
             prepare_settlement_tx(
                 conn,
@@ -1083,17 +1083,19 @@ mod tests {
             let mut conn = postgres_migrations::connect(&confirm_url)?;
             conn.batch_execute(&format!("SET search_path TO {confirm_schema}"))?;
             confirm_barrier.wait();
-            conn.transaction::<_, anyhow::Error, _>(|conn| {
+            conn.transaction::<_, DbError, _>(|conn| {
                 confirm_settlement_tx(conn, &[41], &HashSet::new())
             })
+            .map_err(Into::into)
         });
         let discarder = std::thread::spawn(move || -> Result<BookUpdate> {
             let mut conn = postgres_migrations::connect(&url)?;
             conn.batch_execute(&format!("SET search_path TO {schema}"))?;
             barrier.wait();
-            conn.transaction::<_, anyhow::Error, _>(|conn| {
+            conn.transaction::<_, DbError, _>(|conn| {
                 finish_discarded_settlement_tx(conn, &[41], &HashSet::new())
             })
+            .map_err(Into::into)
         });
         let confirmed = confirmer.join().expect("confirmation worker panicked")?;
         let discarded = discarder.join().expect("discard worker panicked")?;
@@ -1124,7 +1126,7 @@ mod tests {
         let note = order_note(Word::default())?;
         let parent_id = note.id().to_bytes();
         let order_row = NewOrderRow::ingested(&note, 10)?;
-        fixture.conn.transaction::<_, anyhow::Error, _>(|conn| {
+        fixture.conn.transaction::<_, DbError, _>(|conn| {
             insert_orders_batch_tx(conn, &[order_row], 1)?;
             Ok(())
         })?;
@@ -1139,7 +1141,7 @@ mod tests {
             let mut conn = postgres_migrations::connect(&prepare_url)?;
             conn.batch_execute(&format!("SET search_path TO {prepare_schema}"))?;
             prepare_barrier.wait();
-            match conn.transaction::<_, anyhow::Error, _>(|conn| {
+            match conn.transaction::<_, DbError, _>(|conn| {
                 prepare_settlement_tx(
                     conn,
                     &SettlementAttemptRow {
@@ -1156,17 +1158,18 @@ mod tests {
                 )
             }) {
                 Ok(()) => Ok(true),
-                Err(error) if error.to_string().contains("not active") => Ok(false),
-                Err(error) => Err(error),
+                Err(DbError::Settlement(SettlementError::InputOrderNotActive)) => Ok(false),
+                Err(error) => Err(error.into()),
             }
         });
         let observer = std::thread::spawn(move || -> Result<usize> {
             let mut conn = postgres_migrations::connect(&url)?;
             conn.batch_execute(&format!("SET search_path TO {schema}"))?;
             barrier.wait();
-            conn.transaction::<_, anyhow::Error, _>(|conn| {
+            conn.transaction::<_, DbError, _>(|conn| {
                 mark_orders_onchain_nullified_tx(conn, &[parent_id])
             })
+            .map_err(Into::into)
         });
         let prepared = preparer.join().expect("prepare worker panicked")?;
         let changed = observer.join().expect("nullifier worker panicked")?;
@@ -1200,7 +1203,13 @@ mod tests {
             .execute(&mut fixture.conn)?;
         let error = load_unresolved_attempts_tx(&mut fixture.conn)
             .expect_err("incomplete attempt must not disappear from recovery");
-        assert!(error.to_string().contains("no input"));
+        assert!(
+            matches!(
+                error,
+                DbError::Corrupt("unresolved settlement has no input")
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 
@@ -1226,9 +1235,7 @@ mod tests {
         assert!(NewOrderRow::ingested(&Note::from(not_an_order), 10).is_err());
 
         let order_row = NewOrderRow::ingested(&note, 10)?;
-        conn.transaction::<_, anyhow::Error, _>(|conn| {
-            insert_orders_batch_tx(conn, &[order_row], 1)
-        })?;
+        conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &[order_row], 1))?;
         let attempt = SettlementAttemptRow {
             tx_id: vec![7],
             tx_result: vec![8],
@@ -1241,7 +1248,7 @@ mod tests {
             child_note_data: Some(vec![11]),
         };
         assert!(conn
-            .transaction::<_, anyhow::Error, _>(|conn| {
+            .transaction::<_, DbError, _>(|conn| {
                 prepare_settlement_tx(conn, &attempt, &[input])
             })
             .is_err());
@@ -1266,11 +1273,9 @@ mod tests {
         let note = order_note(Word::default())?;
         let order_row = NewOrderRow::ingested(&note, 10)?;
         let error = conn
-            .transaction::<_, anyhow::Error, _>(|conn| {
-                insert_orders_batch_tx(conn, &[order_row], 9)
-            })
+            .transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &[order_row], 9))
             .expect_err("ingest must not commit notes without its sync cursor");
-        assert!(error.to_string().contains("sync cursor row is missing"));
+        assert!(matches!(error, DbError::MissingSyncCursor), "{error:?}");
         assert_eq!(orders::table.count().get_result::<i64>(conn)?, 0);
         Ok(())
     }
@@ -1336,7 +1341,7 @@ mod tests {
             })
             .collect();
         let inserted =
-            conn.transaction::<_, anyhow::Error, _>(|conn| insert_orders_batch_tx(conn, &rows, 5))?;
+            conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &rows, 5))?;
         assert_eq!(inserted.len(), 22_000);
         let priorities: HashSet<u64> = inserted.values().copied().collect();
         assert_eq!(
@@ -1347,7 +1352,7 @@ mod tests {
         assert_eq!(get_last_fetched_block_tx(conn)?, 5);
 
         let again =
-            conn.transaction::<_, anyhow::Error, _>(|conn| insert_orders_batch_tx(conn, &rows, 6))?;
+            conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &rows, 6))?;
         assert!(again.is_empty(), "a replayed batch inserts nothing");
         Ok(())
     }

@@ -40,6 +40,7 @@ tracing = "0.1"
 ruint = "1.18"
 range-set-blaze = "0.7"
 thiserror = "2"
+strum = { version = "0.28", features = ["derive"] }
 
 [dev-dependencies]
 miden-crypto.workspace = true

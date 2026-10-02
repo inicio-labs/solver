@@ -1,8 +1,8 @@
-use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,21 @@ static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
+}
+
+/// Why the matcher stopped. Every variant requires a whole-solver restart.
+#[derive(Debug, thiserror::Error)]
+pub enum MatcherError {
+    #[error("invalid clearing configuration")]
+    Config(#[from] ClearingError),
+    #[error("startup reconciliation stopped before sending the initial book")]
+    BootstrapLost(#[from] oneshot::error::RecvError),
+    #[error("ingestion stopped: book update channel closed")]
+    IngestStopped,
+    #[error("executor stopped: execution batch receiver closed")]
+    ExecutorStopped,
+    #[error("RFQ routing failed")]
+    Routing(#[source] anyhow::Error),
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
@@ -65,7 +80,7 @@ pub async fn run_matcher(
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     runtime: ClearingRuntime,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
+) -> Result<(), MatcherError> {
     // One cancellation boundary covers bootstrap and matching. Executor
     // backpressure cannot block this worker from receiving book updates.
     tokio::select! {
@@ -80,41 +95,58 @@ pub(super) async fn run_worker(
     match_interval: Duration,
     snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     mut runtime: ClearingRuntime,
-) -> anyhow::Result<()> {
+) -> Result<(), MatcherError> {
     // Configuration is frozen for this worker; validate before admitting orders.
     runtime.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
     let mut book = ClearingBook::default();
-    for order in bootstrap.orders {
-        book.insert(&order)?;
+    for order in &bootstrap.orders {
+        book.insert_or_skip(order);
     }
     let mut interval = tokio::time::interval(match_interval);
     loop {
         // Update the book immediately; run matching only on the batch timer.
         tokio::select! {
             update = book_rx.recv() => {
-                let update = update.context("ingestion stopped: book update channel closed")?;
-                book.apply(update)?;
+                book.apply(update.ok_or(MatcherError::IngestStopped)?);
             }
             _ = interval.tick() => {
-                book.apply_pending(&mut book_rx)?;
+                book.apply_pending(&mut book_rx);
                 let now = now_millis();
                 if let Some(routing) = runtime.routing.as_mut() {
-                    routing.release_expired(&mut book, now)?;
+                    routing.release_expired(&mut book, now).map_err(MatcherError::Routing)?;
                 }
-                let clearing = internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now)?;
-                if clearing == ClearingTickOutcome::Completed {
+                // Internal clearing has first claim on the book. While the
+                // executor queue is full (busy, or verifying it can settle),
+                // skip the whole tick: routing would otherwise send external
+                // fillers orders that should cross internally next tick.
+                if let Some(slot) = reserve_executor_slot(&exec_tx)? {
+                    internal_clear(&mut book, &bootstrap.decimals, &runtime, slot, now);
                     if let Some(routing) = runtime.routing.as_mut() {
-                        // External dispatch assumes internal clearing already
-                        // removed its matches. When executor capacity is full,
-                        // skip both paths and leave all orders active.
-                        routing.dispatch(&mut book, now_millis())?;
+                        routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
                 }
                 // Latest order-book levels for the price API's swap-ETA estimates.
                 snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
             }
         }
+    }
+}
+
+/// One executor queue slot for this tick's batch, or `None` while the queue
+/// is full. Never waits: the matcher must keep receiving book updates. A
+/// skipped tick changes no order state; the next tick clears the current book.
+pub(super) fn reserve_executor_slot(
+    exec_tx: &mpsc::Sender<ExecutionBatch>,
+) -> Result<Option<mpsc::Permit<'_, ExecutionBatch>>, MatcherError> {
+    match exec_tx.try_reserve() {
+        Ok(slot) => Ok(Some(slot)),
+        Err(TrySendError::Full(())) => {
+            SKIPPED_EXECUTOR_FULL_TICKS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("executor queue full; skipping clearing tick");
+            Ok(None)
+        }
+        Err(TrySendError::Closed(())) => Err(MatcherError::ExecutorStopped),
     }
 }
 
@@ -151,34 +183,16 @@ fn fresh_reference_prices(
     Some((base_price.exact_reference?, quote_price.exact_reference?))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ClearingTickOutcome {
-    Completed,
-    SkippedExecutorFull,
-}
-
-/// Solve all pairs from the live book using one frozen price snapshot.
+/// Solve all pairs from the live book using one frozen price snapshot and
+/// send the combined batch into the reserved executor `slot`. A pair that
+/// fails to clear is logged and skipped; an empty batch releases the slot.
 pub(super) fn internal_clear(
     book: &mut ClearingBook,
     decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
-    exec_tx: &mpsc::Sender<ExecutionBatch>,
+    slot: mpsc::Permit<'_, ExecutionBatch>,
     now_ms: u64,
-) -> anyhow::Result<ClearingTickOutcome> {
-    // Do not wait on a full executor queue: the matcher must remain able to
-    // receive lifecycle updates. A skipped tick changes no order state and
-    // clearing retries against the current book at the next tick.
-    let permit = match exec_tx.try_reserve() {
-        Ok(permit) => permit,
-        Err(mpsc::error::TrySendError::Full(())) => {
-            SKIPPED_EXECUTOR_FULL_TICKS.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("executor queue full; skipping clearing tick");
-            return Ok(ClearingTickOutcome::SkippedExecutorFull);
-        }
-        Err(mpsc::error::TrySendError::Closed(())) => {
-            anyhow::bail!("executor stopped: execution batch receiver closed");
-        }
-    };
+) {
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor
@@ -264,7 +278,7 @@ pub(super) fn internal_clear(
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
-        return Ok(ClearingTickOutcome::Completed);
+        return;
     }
     // Deactivation and send are synchronous after acquiring capacity, so a
     // cancelled task cannot leave half of the handoff applied.
@@ -278,8 +292,7 @@ pub(super) fn internal_clear(
         orders = combined.filled_notes.len(),
         "combined clearing batch sent to executor"
     );
-    permit.send(combined);
-    Ok(ClearingTickOutcome::Completed)
+    slot.send(combined);
 }
 
 #[cfg(test)]
@@ -454,12 +467,19 @@ mod tests {
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
-        let error = internal_clear(&mut book, &decimals, &runtime, &closed_tx, 1_500).unwrap_err();
-        assert!(error.to_string().contains("executor stopped"));
+        let clear = |book: &mut ClearingBook, exec_tx: &mpsc::Sender<ExecutionBatch>| {
+            if let Some(slot) = reserve_executor_slot(exec_tx).unwrap() {
+                internal_clear(book, &decimals, &runtime, slot, 1_500);
+            }
+        };
+        assert!(matches!(
+            reserve_executor_slot(&closed_tx),
+            Err(MatcherError::ExecutorStopped)
+        ));
         assert_eq!(
             book.best_levels_snapshot().len(),
             4,
-            "failed dispatch must leave orders live"
+            "a stopped executor must leave orders live"
         );
         exec_tx
             .try_send(ExecutionBatch {
@@ -467,10 +487,7 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        assert_eq!(
-            internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap(),
-            ClearingTickOutcome::SkippedExecutorFull
-        );
+        assert!(reserve_executor_slot(&exec_tx).unwrap().is_none());
         assert_eq!(
             book.best_levels_snapshot().len(),
             4,
@@ -478,7 +495,7 @@ mod tests {
         );
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
+        clear(&mut book, &exec_tx);
         let execution = exec_rx.try_recv().unwrap();
         assert_eq!(execution.filled_notes.len(), 4);
         assert_eq!(execution.group_ends, vec![2, 4]);
@@ -491,7 +508,7 @@ mod tests {
         }
         assert!(exec_rx.try_recv().is_err());
         assert!(book.best_levels_snapshot().is_empty());
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
+        clear(&mut book, &exec_tx);
         assert!(
             exec_rx.try_recv().is_err(),
             "pending orders must not be dispatched twice"
@@ -499,7 +516,7 @@ mod tests {
         for order in &persisted {
             book.insert(order).unwrap();
         }
-        internal_clear(&mut book, &decimals, &runtime, &exec_tx, 1_500).unwrap();
+        clear(&mut book, &exec_tx);
         let retried = exec_rx.try_recv().unwrap();
         for (first, next) in execution.filled_notes.iter().zip(&retried.filled_notes) {
             assert_eq!(first.note_id, next.note_id);

@@ -1,14 +1,15 @@
-use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use diesel::pg::PgConnection;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteType;
 use miden_client::rpc::{NodeRpcClient, RpcError};
+use miden_client::store::NoteRecordError;
 use miden_client::{Client, ClientError};
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
+use miden_protocol::errors::AssetError;
 use miden_protocol::note::{Note, NoteId};
 use miden_protocol::transaction::TransactionId;
 use miden_standards::note::PswapNote;
@@ -16,15 +17,62 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_models::NewOrderRow;
-use crate::db::{self, DbPool};
+use crate::db::{self, DbError, DbPool, DbResult};
 use crate::types::Order as PipelineOrder;
 use crate::types::{BookOrder, BookUpdate, TokenId};
+
+/// Errors from the Miden node or the local Miden client store.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainError {
+    /// Boxed: `ClientError` alone would make every chain `Result` large.
+    #[error(transparent)]
+    Client(Box<ClientError>),
+    #[error(transparent)]
+    Rpc(#[from] RpcError),
+    #[error("invalid asset for a note tag")]
+    Asset(#[from] AssetError),
+    #[error("stored client note does not convert to a note")]
+    NoteRecord(#[from] NoteRecordError),
+    #[error("synced note {0} is missing from the client store")]
+    MissingSyncedNote(NoteId),
+    #[cfg(test)]
+    #[error("test chain failure: {0}")]
+    Test(&'static str),
+}
+
+impl ChainError {
+    /// A node RPC failure: the same request may succeed on a later tick.
+    pub fn is_rpc(&self) -> bool {
+        match self {
+            Self::Rpc(_) => true,
+            Self::Client(error) => matches!(**error, ClientError::RpcError(_)),
+            _ => false,
+        }
+    }
+}
+
+impl From<ClientError> for ChainError {
+    fn from(error: ClientError) -> Self {
+        Self::Client(Box::new(error))
+    }
+}
+
+pub type ChainResult<T> = Result<T, ChainError>;
+
+/// Errors of startup recovery: reading the client, or writing PostgreSQL.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error(transparent)]
+    Chain(#[from] ChainError),
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
 
 /// Notes per startup-recovery write transaction. Keeps each transaction well
 /// inside the writer's statement timeout however much history the client has.
@@ -53,22 +101,22 @@ pub struct SyncResult {
 pub trait MidenClient {
     /// Register note tags for a trading pair (both directions).
     /// Must be called before sync_state to receive notes for this pair.
-    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> Result<()>;
+    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> ChainResult<()>;
 
     /// Sync client state with the Miden Node.
     /// Returns the new block number, newly received notes, and IDs of notes
     /// whose nullifiers just appeared on-chain.
-    async fn sync_state(&mut self) -> Result<SyncResult>;
+    async fn sync_state(&mut self) -> ChainResult<SyncResult>;
 
     /// Included notes retained by the client, including notes discovered before
     /// a crash interrupted persistence into the solver database.
-    async fn stored_notes(&mut self) -> Result<Vec<Note>>;
+    async fn stored_notes(&mut self) -> ChainResult<Vec<Note>>;
 
     /// Given a slice of notes the solver currently believes are matchable,
     /// return the subset whose nullifiers are already on-chain. Used by the
     /// executor after a non-RPC submit error to identify which input notes
     /// are zombies vs. which are still legitimately active.
-    async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>>;
+    async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>>;
 
     /// Whether the node has committed transaction `tx_id` of `account_id` in
     /// blocks `from..=to`. This is the only evidence a settlement landed:
@@ -80,17 +128,20 @@ pub trait MidenClient {
         tx_id: TransactionId,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> Result<bool>;
+    ) -> ChainResult<bool>;
 
     /// Fetch a public fungible faucet's on-chain metadata `(decimals, ticker)`
     /// by id. Returns `None` if the account isn't a public faucet / doesn't
     /// exist. Keyless — no signing, no pre-tracking.
-    async fn fetch_token_metadata(&mut self, faucet_id: TokenId) -> Result<Option<(u8, String)>>;
+    async fn fetch_token_metadata(
+        &mut self,
+        faucet_id: TokenId,
+    ) -> ChainResult<Option<(u8, String)>>;
 
     /// The chain tip's fee parameters `(fee faucet, verification base fee)`, or
     /// `None` when this client can't report them — mocks, which skip the
     /// executor's fee pre-flight.
-    async fn fee_parameters(&mut self) -> Result<Option<(TokenId, u32)>> {
+    async fn fee_parameters(&mut self) -> ChainResult<Option<(TokenId, u32)>> {
         Ok(None)
     }
 }
@@ -120,7 +171,7 @@ pub async fn run_ingest(
             Some(retry) => Some(retry),
             None => match client.lock().await.sync_state().await {
                 Ok(sync) => Some((sync, 0)),
-                Err(error) if is_rpc_error(&error) => {
+                Err(error) if error.is_rpc() => {
                     tracing::warn!(%error, "ingest RPC failed; retrying next tick");
                     None
                 }
@@ -141,10 +192,7 @@ pub async fn run_ingest(
                 .await
             {
                 Ok(()) => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
+                    let now = i64::try_from(crate::types::now_unix()).unwrap_or(i64::MAX);
                     last_sync_unix_seconds.store(now, Ordering::Relaxed);
                 }
                 Err(error)
@@ -173,13 +221,6 @@ pub async fn run_ingest(
     tracing::info!("ingest cancelled, shutting down");
 }
 
-fn is_rpc_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<ClientError>()
-        .is_some_and(|error| matches!(error, ClientError::RpcError(_)))
-        || error.downcast_ref::<RpcError>().is_some()
-}
-
 impl SyncResult {
     /// Replays the keyless client's durable note discoveries into PostgreSQL
     /// before matcher hydration. The Miden client itself never crosses the
@@ -193,7 +234,7 @@ impl SyncResult {
         client: &mut dyn MidenClient,
         pool: &DbPool,
         solver_id: AccountId,
-    ) -> Result<()> {
+    ) -> Result<(), IngestError> {
         let sync = client.sync_state().await?;
         let stored = client.stored_notes().await?;
         let mut consumed_notes = sync.consumed_notes;
@@ -249,7 +290,7 @@ impl SyncResult {
         self,
         conn: &mut PgConnection,
         solver_id: AccountId,
-    ) -> Result<BookUpdate> {
+    ) -> DbResult<BookUpdate> {
         let SyncResult {
             block_num,
             new_notes,
@@ -284,7 +325,7 @@ impl SyncResult {
                 tracing::warn!(note_id = %note.id(), "skipping PSWAP note whose creator is the solver account");
                 continue;
             }
-            let arrival_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let arrival_unix = crate::types::now_unix();
             // Parsed as a valid PSWAP order just above.
             order_rows.push(NewOrderRow {
                 note_id: note.id().to_bytes().to_vec(),
@@ -365,7 +406,7 @@ pub(crate) struct MidenClientAdapter {
 
 #[async_trait(?Send)]
 impl MidenClient for MidenClientAdapter {
-    async fn stored_notes(&mut self) -> Result<Vec<Note>> {
+    async fn stored_notes(&mut self) -> ChainResult<Vec<Note>> {
         let mut records = self
             .client
             .lock()
@@ -381,7 +422,7 @@ impl MidenClient for MidenClientAdapter {
                 (record.is_authenticated() || record.is_consumed())
                     && record.details().recipient().script().root() == PswapNote::script_root()
             })
-            .map(|record| record.try_into().map_err(anyhow::Error::from))
+            .map(|record| Ok(record.try_into()?))
             .collect()
     }
 
@@ -391,7 +432,7 @@ impl MidenClient for MidenClientAdapter {
         tx_id: TransactionId,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> Result<bool> {
+    ) -> ChainResult<bool> {
         if from > to {
             return Ok(false);
         }
@@ -404,27 +445,22 @@ impl MidenClient for MidenClientAdapter {
             .any(|record| record.transaction_header.id() == tx_id))
     }
 
-    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> Result<()> {
+    async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> ChainResult<()> {
         // PSWAP discovery tags only depend on faucet IDs; the amounts in the
         // FungibleAsset args to `create_tag` are placeholders.
-        let offered_asset = FungibleAsset::new(offered, 1)
-            .map_err(|e| anyhow!("invalid offered asset for tag: {e}"))?;
-        let requested_asset = FungibleAsset::new(requested, 1)
-            .map_err(|e| anyhow!("invalid requested asset for tag: {e}"))?;
+        let offered_asset = FungibleAsset::new(offered, 1)?;
+        let requested_asset = FungibleAsset::new(requested, 1)?;
         let tag = PswapNote::create_tag(NoteType::Public, &offered_asset, &requested_asset);
 
         let mut client = self.client.lock().await;
-        client
-            .add_note_tag(tag)
-            .await
-            .map_err(|e| anyhow!("add_note_tag failed: {e}"))?;
+        client.add_note_tag(tag).await?;
         Ok(())
     }
 
     #[tracing::instrument(skip(self), fields(block_num, new_pub, new_priv))]
-    async fn sync_state(&mut self) -> Result<SyncResult> {
+    async fn sync_state(&mut self) -> ChainResult<SyncResult> {
         let mut client = self.client.lock().await;
-        let summary = client.sync_state().await.context("sync_state failed")?;
+        let summary = client.sync_state().await?;
 
         // Populate span fields so structured logs carry sync stats.
         let span = tracing::Span::current();
@@ -443,14 +479,11 @@ impl MidenClient for MidenClientAdapter {
             .iter()
             .chain(summary.new_private_notes.iter())
         {
-            match client.get_input_note(*note_id).await {
-                Ok(Some(record)) => match (&record).try_into() {
-                    Ok(note) => new_notes.push(note),
-                    Err(e) => return Err(anyhow!("cannot recover synced note {note_id}: {e}")),
-                },
-                Ok(None) => return Err(anyhow!("synced note {note_id} missing from client store")),
-                Err(e) => return Err(e.into()),
-            }
+            let record = client
+                .get_input_note(*note_id)
+                .await?
+                .ok_or(ChainError::MissingSyncedNote(*note_id))?;
+            new_notes.push((&record).try_into()?);
         }
 
         Ok(SyncResult {
@@ -460,7 +493,7 @@ impl MidenClient for MidenClientAdapter {
         })
     }
 
-    async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>> {
+    async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>> {
         if notes.is_empty() {
             return Ok(HashSet::new());
         }
@@ -485,8 +518,7 @@ impl MidenClient for MidenClientAdapter {
         let heights = self
             .rpc
             .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
-            .await
-            .context("get_nullifier_commit_heights failed")?;
+            .await?;
 
         let mut consumed = HashSet::new();
         for (nullifier, maybe_height) in heights {
@@ -499,29 +531,24 @@ impl MidenClient for MidenClientAdapter {
         Ok(consumed)
     }
 
-    async fn fetch_token_metadata(&mut self, faucet_id: TokenId) -> Result<Option<(u8, String)>> {
+    async fn fetch_token_metadata(
+        &mut self,
+        faucet_id: TokenId,
+    ) -> ChainResult<Option<(u8, String)>> {
         let client = self.client.lock().await;
-        let meta = client
-            .fetch_remote_token_metadata(faucet_id)
-            .await
-            .map_err(|e| anyhow!("fetch_remote_token_metadata failed: {e}"))?;
+        let meta = client.fetch_remote_token_metadata(faucet_id).await?;
         Ok(meta.map(|m| (m.decimals, m.symbol)))
     }
 
-    async fn fee_parameters(&mut self) -> Result<Option<(TokenId, u32)>> {
-        let (header, _) = self
-            .rpc
-            .get_block_header_by_number(None, false)
-            .await
-            .map_err(|e| anyhow!("fetch chain-tip header: {e}"))?;
+    async fn fee_parameters(&mut self) -> ChainResult<Option<(TokenId, u32)>> {
+        let (header, _) = self.rpc.get_block_header_by_number(None, false).await?;
         let fees = header.fee_parameters();
         let config = self
             .client
             .lock()
             .await
             .get_protocol_config(header.protocol_config_commitment())
-            .await
-            .map_err(|e| anyhow!("load protocol config for chain tip: {e}"))?;
+            .await?;
         Ok(Some((
             config.fee_asset_id().faucet_id(),
             fees.verification_base_fee(),
@@ -548,8 +575,12 @@ pub(crate) fn spawn_ingest_thread(
     last_sync: Arc<AtomicI64>,
     solver_id: AccountId,
     clearing_bootstrap: oneshot::Sender<crate::matcher::ClearingBootstrap>,
-) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
-    let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<Result<()>>();
+) -> anyhow::Result<(
+    thread::JoinHandle<()>,
+    oneshot::Receiver<anyhow::Result<()>>,
+)> {
+    use anyhow::Context;
+    let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<anyhow::Result<()>>();
     let ingest_factory = factory;
     let ingest_db = db_pool;
     let ingest_cancel = cancel;
@@ -647,6 +678,7 @@ pub mod tests {
     use super::*;
     use crate::db::postgres_test::TestDb;
     use crate::types::OrderStatus;
+    use anyhow::Result;
     use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
     use miden_protocol::testing::account_id::{
@@ -656,6 +688,7 @@ pub mod tests {
     };
     use miden_protocol::{asset::AssetAmount, Word};
     use miden_standards::note::PswapNoteStorage;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct PostgresFixture {
         conn: PgConnection,
@@ -692,7 +725,7 @@ pub mod tests {
         let mut pg_fixture = PostgresFixture::new()?;
         let conn = &mut pg_fixture.conn;
         let (parent, child, solver) = fixture();
-        let first = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let first = conn.transaction::<_, DbError, _>(|conn| {
             SyncResult {
                 block_num: 1,
                 new_notes: vec![parent.clone()],
@@ -708,7 +741,7 @@ pub mod tests {
             .first(conn)?;
         assert_eq!(stored_note, parent.to_bytes());
 
-        let duplicate = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let duplicate = conn.transaction::<_, DbError, _>(|conn| {
             SyncResult {
                 block_num: 2,
                 new_notes: vec![parent.clone()],
@@ -723,7 +756,7 @@ pub mod tests {
             .select(orders::priority_seq)
             .first(conn)?;
         let tx_id = vec![7; 32];
-        conn.transaction::<_, anyhow::Error, _>(|conn| {
+        conn.transaction::<_, DbError, _>(|conn| {
             db::postgres_db::prepare_settlement_tx(
                 conn,
                 &db::postgres_models::SettlementAttemptRow {
@@ -743,7 +776,7 @@ pub mod tests {
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].parents.len(), 1);
         assert_eq!(unresolved[0].parents[0].id(), parent.id());
-        let update = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let update = conn.transaction::<_, DbError, _>(|conn| {
             SyncResult {
                 block_num: 3,
                 new_notes: vec![child.clone()],
@@ -772,7 +805,7 @@ pub mod tests {
         // The node confirmed our transaction ID. The remainder is already
         // retired, so confirmation retires the parent and activates nothing.
         let consumed_child: HashSet<_> = [child.id()].into_iter().collect();
-        let update = conn.transaction::<_, anyhow::Error, _>(|conn| {
+        let update = conn.transaction::<_, DbError, _>(|conn| {
             db::postgres_db::confirm_settlement_tx(conn, &tx_id, &consumed_child)
         })?;
         assert!(update.active.is_empty());
@@ -1076,7 +1109,7 @@ pub mod tests {
 
     #[async_trait(?Send)]
     impl MidenClient for MockMidenClient {
-        async fn stored_notes(&mut self) -> Result<Vec<Note>> {
+        async fn stored_notes(&mut self) -> ChainResult<Vec<Note>> {
             Ok(self.stored.clone())
         }
         async fn transaction_committed(
@@ -1085,15 +1118,19 @@ pub mod tests {
             _tx_id: TransactionId,
             _from: BlockNumber,
             _to: BlockNumber,
-        ) -> Result<bool> {
+        ) -> ChainResult<bool> {
             Ok(false)
         }
 
-        async fn subscribe_pair(&mut self, _offered: TokenId, _requested: TokenId) -> Result<()> {
+        async fn subscribe_pair(
+            &mut self,
+            _offered: TokenId,
+            _requested: TokenId,
+        ) -> ChainResult<()> {
             Ok(())
         }
 
-        async fn sync_state(&mut self) -> Result<SyncResult> {
+        async fn sync_state(&mut self) -> ChainResult<SyncResult> {
             if self.sync_rpc_failures > 0 {
                 self.sync_rpc_failures -= 1;
                 return Err(ClientError::RpcError(RpcError::InvalidNodeEndpoint(
@@ -1109,8 +1146,10 @@ pub mod tests {
             })
         }
 
-        async fn check_consumed_notes(&mut self, notes: &[Note]) -> Result<HashSet<NoteId>> {
-            anyhow::ensure!(!self.fail_consumed_check, "mock nullifier RPC unavailable");
+        async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>> {
+            if self.fail_consumed_check {
+                return Err(ChainError::Test("mock nullifier RPC unavailable"));
+            }
             Ok(notes
                 .iter()
                 .map(|n| n.id())
@@ -1121,7 +1160,7 @@ pub mod tests {
         async fn fetch_token_metadata(
             &mut self,
             _faucet_id: TokenId,
-        ) -> Result<Option<(u8, String)>> {
+        ) -> ChainResult<Option<(u8, String)>> {
             Ok(self.token_metadata.clone())
         }
     }

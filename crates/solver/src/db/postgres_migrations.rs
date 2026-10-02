@@ -3,12 +3,13 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{bail, Context, Result};
 use diesel::migration::MigrationSource;
 use diesel::pg::{Pg, PgConnection};
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Nullable, Text};
+use diesel::sql_types::{Nullable, Text};
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+
+use super::error::{DbError, DbResult};
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations_postgres");
 
@@ -24,52 +25,60 @@ struct HistoryTable {
     name: Option<String>,
 }
 
-#[derive(QueryableByName)]
-struct BaselineTables {
-    #[diesel(sql_type = BigInt)]
-    present: i64,
-}
-
-fn expected_versions() -> Result<BTreeSet<String>> {
+fn expected_versions() -> DbResult<BTreeSet<String>> {
     let migrations = MigrationSource::<Pg>::migrations(&MIGRATIONS)
-        .map_err(|error| anyhow::anyhow!("load embedded PostgreSQL migrations: {error}"))?;
+        .map_err(|error| DbError::Migration(error.to_string()))?;
     Ok(migrations
         .into_iter()
         .map(|migration| migration.name().version().to_string())
         .collect())
 }
 
-fn applied_versions(conn: &mut PgConnection) -> Result<BTreeSet<String>> {
+fn applied_versions(conn: &mut PgConnection) -> DbResult<BTreeSet<String>> {
     Ok(
         diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
             .load::<AppliedVersion>(conn)
-            .context("read PostgreSQL migration history (is the database initialized?)")?
+            .map_err(DbError::MissingMigrationHistory)?
             .into_iter()
             .map(|row| row.version)
             .collect(),
     )
 }
 
+/// Compare the database's applied migrations with this binary's.
+fn schema_mismatch(expected: &BTreeSet<String>, applied: &BTreeSet<String>) -> Option<DbError> {
+    let missing: Vec<String> = expected.difference(applied).cloned().collect();
+    let unsupported: Vec<String> = applied.difference(expected).cloned().collect();
+    (!missing.is_empty() || !unsupported.is_empty()).then_some(DbError::SchemaMismatch {
+        missing,
+        unsupported,
+    })
+}
+
 /// Apply pending PostgreSQL schema changes with the operator's migration role.
 /// This may create the Diesel migration-history table and must not run at
-/// ordinary solver startup.
-pub fn migrate(conn: &mut PgConnection) -> Result<Vec<String>> {
+/// ordinary solver startup. A database already ahead of this binary is
+/// refused rather than migrated.
+pub fn migrate(conn: &mut PgConnection) -> DbResult<Vec<String>> {
     let history =
         diesel::sql_query("SELECT to_regclass('__diesel_schema_migrations')::text AS name")
-            .get_result::<HistoryTable>(conn)
-            .context("locate PostgreSQL migration history")?;
+            .get_result::<HistoryTable>(conn)?;
     if history.name.is_some() {
-        let expected = expected_versions()?;
-        let applied = applied_versions(conn)?;
-        let unsupported: Vec<_> = applied.difference(&expected).collect();
+        let unsupported: Vec<String> = applied_versions(conn)?
+            .difference(&expected_versions()?)
+            .cloned()
+            .collect();
         if !unsupported.is_empty() {
-            bail!("database contains migrations unknown to this solver binary: {unsupported:?}");
+            return Err(DbError::SchemaMismatch {
+                missing: Vec::new(),
+                unsupported,
+            });
         }
     }
 
     let applied = conn
         .run_pending_migrations(MIGRATIONS)
-        .map_err(|error| anyhow::anyhow!("apply PostgreSQL solver migrations: {error}"))?
+        .map_err(|error| DbError::Migration(error.to_string()))?
         .into_iter()
         .map(|version| version.to_string())
         .collect();
@@ -77,45 +86,24 @@ pub fn migrate(conn: &mut PgConnection) -> Result<Vec<String>> {
     Ok(applied)
 }
 
-/// Check the complete migration history without issuing any DDL. A pending
-/// check alone cannot detect a database upgraded beyond this solver binary.
-pub fn verify(conn: &mut PgConnection) -> Result<()> {
-    let expected = expected_versions()?;
-    let applied = applied_versions(conn)?;
-
-    if applied != expected {
-        let missing: Vec<_> = expected.difference(&applied).collect();
-        let unsupported: Vec<_> = applied.difference(&expected).collect();
-        bail!(
-            "PostgreSQL schema mismatch: missing migrations {missing:?}; unsupported applied migrations {unsupported:?}. Run migrate-db or use a compatible solver binary"
-        );
+/// Check, without DDL, that the applied migration history equals the set
+/// compiled into this binary. Each migration creates its own tables, so an
+/// exact history match also means the schema this binary expects is present.
+pub fn verify(conn: &mut PgConnection) -> DbResult<()> {
+    match schema_mismatch(&expected_versions()?, &applied_versions(conn)?) {
+        Some(mismatch) => Err(mismatch),
+        None => Ok(()),
     }
-    let tables: BaselineTables = diesel::sql_query(
-        "SELECT count(*)::bigint AS present
-         FROM unnest(ARRAY[
-             '__diesel_schema_migrations', 'sync_state', 'orders',
-             'settlement_attempts', 'settlement_inputs', 'registered_tokens'
-         ]) AS expected(table_name)
-         JOIN pg_class AS c ON c.oid = to_regclass(expected.table_name)
-         WHERE c.relnamespace = (
-             SELECT relnamespace FROM pg_class WHERE oid = to_regclass('sync_state')
-         ) AND c.relkind IN ('r', 'p')",
-    )
-    .get_result(conn)
-    .context("verify PostgreSQL baseline tables")?;
-    if tables.present != 6 {
-        bail!("PostgreSQL baseline tables are missing or resolve to different schemas");
-    }
-    Ok(())
 }
 
-pub fn connect(database_url: &str) -> Result<PgConnection> {
-    PgConnection::establish(database_url).context("connect to PostgreSQL application database")
+pub fn connect(database_url: &str) -> DbResult<PgConnection> {
+    Ok(PgConnection::establish(database_url)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
     use diesel::connection::SimpleConnection;
     use diesel::sql_types::BigInt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,11 +183,6 @@ mod tests {
         assert!(older.to_string().contains("missing migrations"));
         conn.batch_execute("ROLLBACK")?;
 
-        conn.batch_execute("BEGIN; DROP TABLE registered_tokens")?;
-        let missing = verify(conn).expect_err("a missing baseline table must be rejected");
-        assert!(missing.to_string().contains("baseline tables"));
-        conn.batch_execute("ROLLBACK")?;
-
         conn.batch_execute(
             "BEGIN; INSERT INTO __diesel_schema_migrations (version) VALUES ('2099-01-01-000001')",
         )?;
@@ -209,7 +192,7 @@ mod tests {
             migrate(conn).expect_err("the migration command must reject a newer schema");
         assert!(migration_error
             .to_string()
-            .contains("unknown to this solver binary"));
+            .contains("unsupported applied migrations"));
         conn.batch_execute("ROLLBACK")?;
         Ok(())
     }

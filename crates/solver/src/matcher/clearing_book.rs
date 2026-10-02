@@ -27,38 +27,35 @@ pub(crate) struct ClearingBook {
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
-    ///
-    /// One order that cannot be indexed — malformed, or a stale parent whose
-    /// remainder already holds its FIFO slot — is left out of the live book
-    /// rather than stopping matching for every other order. It stays Active
-    /// in the database and is rehydrated on the next boot.
-    pub(super) fn apply(&mut self, update: BookUpdate) -> Result<(), ClearingError> {
+    pub(super) fn apply(&mut self, update: BookUpdate) {
         for id in update.removed {
             self.remove(id);
         }
-        for order in update.active {
-            if let Err(error) = self.insert(&order) {
-                let id = order.id();
-                self.remove(id);
-                tracing::warn!(note_id = %id, %error, "skipping order the live book cannot index");
-            }
+        for order in &update.active {
+            self.insert_or_skip(order);
         }
-        Ok(())
     }
 
     /// Apply the updates queued at the start of the tick. New arrivals wait for
     /// the next receive, so a busy producer cannot postpone matching forever.
-    pub(super) fn apply_pending(
-        &mut self,
-        updates: &mut mpsc::Receiver<BookUpdate>,
-    ) -> Result<(), ClearingError> {
+    pub(super) fn apply_pending(&mut self, updates: &mut mpsc::Receiver<BookUpdate>) {
         for _ in 0..updates.len() {
             let Ok(update) = updates.try_recv() else {
                 break;
             };
-            self.apply(update)?;
+            self.apply(update);
         }
-        Ok(())
+    }
+
+    /// Index `order`, or leave it out of the live book if it cannot be
+    /// indexed: a malformed note, or a stale parent whose remainder already
+    /// holds its FIFO slot. One bad order must not stop matching for every
+    /// other one; it stays Active in the database and returns on next boot.
+    pub(super) fn insert_or_skip(&mut self, order: &BookOrder) {
+        if let Err(error) = self.insert(order) {
+            self.remove(order.id());
+            tracing::warn!(note_id = %order.id(), %error, "order left out of the live book");
+        }
     }
 
     fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
@@ -236,7 +233,7 @@ mod tests {
     use super::*;
     use crate::clearing::ReferencePrice;
     use crate::matcher::matcher::run_matcher;
-    use crate::matcher::matcher::{run_worker, ClearingRuntime};
+    use crate::matcher::matcher::{run_worker, ClearingRuntime, MatcherError};
     use crate::price::PriceData;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
@@ -705,8 +702,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: vec![parent.id()],
             active: vec![child.clone()],
-        })
-        .unwrap();
+        });
         assert_eq!(admit(&book, false, 100)[0].order().id(), child.id());
     }
 
@@ -743,7 +739,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("book update channel closed"));
+        assert!(matches!(error, MatcherError::IngestStopped), "{error:?}");
     }
 
     #[test]
@@ -797,8 +793,8 @@ mod tests {
         .await
         .expect("invalid config must not wait for bootstrap");
         assert!(matches!(
-            result.unwrap_err().downcast_ref::<ClearingError>(),
-            Some(ClearingError::InvalidConfig)
+            result,
+            Err(MatcherError::Config(ClearingError::InvalidConfig))
         ));
     }
 
@@ -939,8 +935,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: Vec::new(),
             active: vec![holder.clone(), stale.clone(), other.clone()],
-        })
-        .expect("one unindexable order must not stop the matcher");
+        });
 
         assert!(book.orders.contains_key(&holder.id()));
         assert!(book.orders.contains_key(&other.id()));

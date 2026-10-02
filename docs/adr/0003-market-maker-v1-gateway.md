@@ -2,6 +2,7 @@
 
 - **Status:** Proposed design. Product constraints identified as agreed below; open protocol and operating choices remain before implementation.
 - **Date:** 2026-10-02
+- **Revised:** 2026-10-02 — cancellation by cutoff and the `live_orders` view; maker intake and activation in parallel with ingest and settlement. Builds on PR #34.
 - **Deciders:** Vaibhav Jindal for maker-facing requirements; solver implementation review pending.
 - **Related:** [ADR 0001](0001-external-liquidity-routing.md) for public external routing, [ADR 0002](0002-filler-sdk.md) for the filler interface.
 
@@ -11,7 +12,7 @@ Market makers create private PSWAP notes and submit them to Miden themselves. Th
 
 The chain and the solver answer different questions. Miden client synchronization can verify that a note is committed or spent. It cannot reveal our private order intake, book eligibility, maker-scoped cancel cutoffs, local reservation or ambiguous settlement submission. Conversely, our off-chain cancellation does not revoke an on-chain note or reverse a transaction that may already have been broadcast. The API and its recovery contract must state exactly which of these facts each response means.
 
-The inspected solver baseline stores business records in SQLite/Diesel, maintains an in-memory matching book, and submits settlements through an executor. This ADR proposes a PostgreSQL business store, maker gateway and executor recovery protocol; it does not claim those changes have been implemented. The existing public external-liquidity router remains a separate path. Private maker orders require explicit routing classification.
+The inspected solver baseline stores business records in SQLite/Diesel, maintains an in-memory matching book, and submits settlements through an executor. [PR #34](https://github.com/inicio-labs/solver/pull/34) replaces SQLite with PostgreSQL: a single ownership-locked writer session, `write_book` (book updates published to the matcher in commit order), a settlement journal written before any broadcast, confirmation only by our transaction ID, and remainders that inherit their parent's FIFO slot. This ADR builds the maker gateway on that store; it does not claim the gateway itself has been implemented. The existing public external-liquidity router remains a separate path. Private maker orders require explicit routing classification.
 
 The design favors a small number of components and readable Rust. The difficult work is not the transport itself; it is deciding when a request is durable, when an on-chain note may enter the book, which side wins a cancellation race, and how to recover a transaction that might have reached Miden.
 
@@ -53,7 +54,7 @@ These are responsibilities within one solver deployment, not new microservices:
 
 1. **API boundary:** authenticate, validate request shape, call a domain operation and map its result to gRPC. Stream committed events separately.
 2. **Order operations:** submit, cancel, activate and reserve candidates for execution. Each operation owns its business rule and database transaction.
-3. **Existing chain workers:** one shared Miden sync task verifies notes; the matcher selects/reserves candidates; the executor owns settlement submission and reconciliation.
+3. **Chain workers:** the existing ingest task keeps discovering public notes; a new maker-note watcher verifies private maker notes through node RPC (see *Intake and activation in parallel*); the matcher selects candidates; the executor reserves, submits and reconciles settlements.
 4. **Store:** focused queries and transactions using the solver's database stack. Event reading and cleanup are small background tasks.
 
 Reuse the existing module layout. Add a file when it has a clear responsibility; do not create a framework, service bus or generic repository abstraction for this gateway.
@@ -65,7 +66,7 @@ A channel or PostgreSQL notification only wakes a worker. The worker reads durab
 - Keep handlers thin and domain operations named for their work, such as `submit_order`, `cancel_scope`, `reserve_candidate` and `record_settled_transaction`. These are illustrative function names, not separate system roles.
 - Use ordinary Rust structs/enums, explicit functions and short database transactions. Keep proof generation, network requests and socket delivery outside transactions.
 - Validate immutable note data once at intake and convert it into validated domain types. Recheck changing facts—cancellation, reservation, chain freshness and spend status—at the decision points where they matter.
-- Keep one shared eligibility rule for activation, the current-state read, restart and reservation. Enforce it against authoritative state when reserving; a stale cached answer is insufficient.
+- Keep one shared eligibility rule for activation, the current-state read, restart and reservation: the `live_orders` view (see *Cancellation rule*). Enforce it against authoritative state when reserving; a stale cached answer is insufficient.
 - Derive facts from their authoritative object where safe. Keep genuinely different identifiers explicit: command sequence, event sequence, order ID and current note ID are not interchangeable.
 - Use one meaningful command result. Do not add queued/received/applied acknowledgements for every stage, or a durable event for routine worker retries.
 - No separate broker, hand-written WAL, custom NTL transport, custom state-machine framework, active-active execution or event-sourcing rebuild of the entire application.
@@ -79,8 +80,8 @@ Use libraries to remove protocol and storage boilerplate while keeping financial
 - **[Tonic](https://docs.rs/tonic/latest/tonic/) and [Prost](https://docs.rs/prost/latest/prost/):** define the protocol once in Protobuf; generate message types and clients/services with compatible [tonic-prost-build](https://docs.rs/tonic-prost-build/latest/tonic_prost_build/) tooling. Do not hand-maintain duplicate wire models.
 - **[Tower](https://docs.rs/tower/latest/tower/):** reuse Tonic-compatible middleware where useful for bounded concurrency and authentication. For awaited credential checks, a shared async handler helper is sufficient initially; introduce a custom layer only if it reduces repetition. Tonic's [interceptor](https://docs.rs/tonic/latest/tonic/service/trait.Interceptor.html) is synchronous.
 - **Existing Tokio:** use bounded channels and existing shutdown/task facilities. One shared sync task avoids a sync operation per order.
-- **Existing Diesel:** use its PostgreSQL backend, [row derives](https://docs.diesel.rs/master/diesel/prelude/index.html), schema macros and migration tooling. Select one nonblocking integration for database calls; [diesel-async](https://docs.rs/diesel-async/latest/diesel_async/) is an option. Reuse the migration's chosen stack instead of adding SQLx alongside it.
-- **Error and serialization derives:** use `#[derive(thiserror::Error)]` for distinct domain failures if adding [thiserror](https://docs.rs/thiserror/latest/thiserror/) reduces boilerplate; retain existing `anyhow` for internal context. Use existing Serde derives where configuration or JSON actually needs them, not automatically on every Protobuf type.
+- **Existing Diesel:** use its PostgreSQL backend, [row derives](https://docs.diesel.rs/master/diesel/prelude/index.html), schema macros and migration tooling. Reuse PR #34's `PgPool`, which runs blocking Diesel on worker threads behind async `read`, `write` and `write_book`; do not add diesel-async or SQLx alongside it.
+- **Error and serialization derives:** use `#[derive(thiserror::Error)]` for distinct domain failures, one `error.rs` per module as PR #34 does; keep `anyhow` only at startup and thread-spawn boundaries. Use existing Serde derives where configuration or JSON actually needs them, not automatically on every Protobuf type.
 - **Existing tests and diagnostics:** use `#[tokio::test]`, existing `proptest!` and focused fixtures for the failure rules below. Use existing tracing with explicit safe fields.
 
 Macros should remove repetitive code, not conceal transaction boundaries, cancellation decisions or accounting. No custom procedural-macro DSL is needed. Avoid logging generated `Debug` output for private notes or credentials; tracing instrumentation must skip those inputs.
@@ -128,9 +129,10 @@ Recommended minimal V1 feed, pending maker agreement. Maker-initiated commands h
 
 - **OrderStatus:** the order becomes Live, is rejected after an earlier Accepted response, or becomes unavailable because its note was verified spent elsewhere. Include order/version and reason. A confirmed remainder that becomes Live later uses this event; if the settlement result already reports it Live, do not repeat the transition.
 - **SettlementPending:** one event per transaction once its recoverable transaction record is durable and broadcast can be attempted. Include batch/transaction ID, input order/notes and versions, intended fill amounts and clearing price. Candidate selection, proving attempts and retries do not each produce events.
+- **CancelApplied:** one event per cancel command — never one per affected order — carrying scope, cutoff and request ID, so every session of the same maker identity learns the cutoff from the stream.
 - **SettlementResolved:** one event per transaction when verified committed or definitively voided. For commitment, include actual amounts, price, actual earned surplus/fees and settlement cost, resulting order status, and the payment/remainder note data or a stable authorized retrieval reference. For a voided attempt, include the resulting order status and no realized fill or revenue. Preserve unresolved exposure as Pending and show it in status queries/current-state reads; do not call a timeout voided.
 
-SubmitOrder Accepted and Cancel Applied belong in their durable unary responses and request-ID status lookup; duplicate stream events add no new information for the caller. The maker can inspect active cancellation cutoffs through the current-state read. If several independent maker processes use the same identity, they must share their command outcomes or refresh that read; without a cancel event, another process is not notified immediately by our stream. A committed outcome should be published with its recovery notes durably available. Routine imports, sync ticks, socket delivery, worker retries and heartbeats do not produce maker events. Expiry/dead-man events exist only if those features are later selected. Command failures remain queryable/retryable through their stored command outcome.
+SubmitOrder Accepted belongs in its durable unary response and request-ID status lookup; a duplicate stream event adds nothing for the caller. Cancel Applied is likewise the unary response; the single scoped CancelApplied event exists so other sessions of the same maker identity learn the cutoff without coordinating or polling. Active cutoffs also appear in the current-state read. A committed outcome should be published with its recovery notes durably available. Routine imports, sync ticks, socket delivery, worker retries and heartbeats do not produce maker events. Expiry/dead-man events exist only if those features are later selected. Command failures remain queryable/retryable through their stored command outcome.
 
 Events carry maker-scoped event sequence, event ID, relevant request ID, order ID/version, state and time. Sequence defines order; timestamps do not. Keep scoped events meaningful even when there is no single order ID.
 
@@ -142,10 +144,10 @@ SettlementPending reports identify batch, settlement transaction, order/input ve
 
 1. MM creates its private PSWAP note and submits ExpectedNote plus its sync hint.
 2. Validate the approved pinned script, network, creator field, asset IDs, integer amounts and full note identity. A PSWAP tag alone is not identity or proof.
-3. Persist accepted command and payload, acknowledge, then import into the Miden client idempotently. Recover interrupted imports from those records.
+3. Persist the accepted command and payload on the intake session (group commit), then acknowledge. The note is not imported into the ingest client, so public ingest never sees a private maker note.
 4. MM submits note creation independently. Support both note-data-before-chain and chain-before-note-data arrival.
-5. A committed-block notification wakes shared client synchronization; periodic polling is the fallback. Verify the exact note as committed and unspent against authenticated chain state.
-6. Recheck effective cancellation and any enabled expiry, then persist eligibility and its event before matching can use it.
+5. The maker-note watcher, woken per new block with polling as the fallback, checks new intake by note ID and pending intake incrementally by PSWAP tag, and verifies the exact note as committed (inclusion proof) and unspent (nullifier sync) through node RPC.
+6. In one core-writer commit, recheck the cutoff under the maker control lock and any enabled expiry, then insert the order — Active, or Stopped below a cutoff — with its OrderStatus event and book update, before matching can use it.
 
 Recommended simple meaning of Live: **durably eligible after chain verification**. Update the book after commit and recover missed cache updates from durable state. If Live must promise actual installation in the matcher, retain a matcher acknowledgement instead. This wording remains a decision to close before implementation.
 
@@ -163,20 +165,82 @@ An order is stopped when its root submission sequence is below any applicable cu
 
 Example: cancel-all 100 applies before delayed submit 90 arrives. Submit 90 is stopped. A delayed cancel 80 cannot lower the barrier. Submit 101 may become eligible normally. A remainder from submit 90 retains root sequence 90 and stays stopped.
 
-A valid empty scope still installs its barrier for later arrivals. ACK need not wait for a row-by-row sweep; remove stale book entries asynchronously and derive effective state from the cutoff. Counts, if returned, describe a specific as-of view.
+**The cutoff is the authority; a cancel never rewrites order rows.** One shared rule decides whether an order can trade, as a PostgreSQL view, which costs no writes:
+
+```sql
+CREATE VIEW live_orders AS
+SELECT o.* FROM orders o
+WHERE o.status = 'active'
+  AND NOT EXISTS (                -- no applicable cutoff above this order
+      SELECT 1 FROM maker_cutoffs c
+      WHERE c.maker_id = o.maker_id
+        AND o.root_seq < c.cutoff
+        AND (c.market    IS NULL OR c.market    = o.market)
+        AND (c.direction IS NULL OR c.direction = o.direction));
+```
+
+Columns are illustrative; an order-type filter joins the same way once more than PSWAP exists. A targeted CancelOrder works the same way: it stores one stop row for the root order identity and adds one more `NOT EXISTS` to this view, so it rewrites no order rows either. In this section, "below a cutoff" includes a targeted stop. Public orders have no maker and no cutoffs, so the view leaves them unchanged. Restart hydration, executor reservation, release after a failed settlement and `GetMakerState` read liveness only through this view; nothing tests `status = 'active'` directly for liveness.
+
+A cancel is one short commit on the intake session (see *Intake and activation in parallel*): raise the cutoff under the maker control row lock, store the Applied result with the exposure already reserved as of that commit, and insert one CancelApplied event. Its cost does not depend on how many orders it stops. After the commit the cutoff goes to the matcher, which drops that maker's matching entries from its in-memory book at once.
+
+The cutoff is checked only where a row is about to become live, inside writes that already happen:
+
+| Write that already happens | Below a cutoff |
+|---|---|
+| Activation of a (possibly delayed) submission | inserted Stopped, not Active |
+| Confirmation inserting a remainder (it inherits the root sequence) | inserted Stopped |
+| Release of inputs after a definitively voided settlement | set Stopped, not Active |
+
+No sweep follows a cancel. Rows below a cutoff keep `status = 'active'` until a write that happens anyway changes them, usually the maker reclaiming the note, which the spend watcher records. A cancel therefore adds no work to the writer that ingest and settlement share, however large the book. Accepted costs: the status column lags, so liveness is always read through the view; and the active-order index keeps cancelled notes that are never reclaimed, which a metric watches. Add idle-time cleanup only if that ever matters.
+
+Cutoffs only rise, so their order relative to book updates does not matter. The matcher keeps the current cutoffs (hydrated at startup), drops entries when a cutoff arrives, and ignores any later Active update below one. A cutoff message therefore needs no commit-order lock.
+
+A valid empty scope still installs its barrier for later arrivals. Counts, if returned, describe the as-of view of the cancel commit.
 
 Bulk cancellation may filter by order type, market and direction; provided filters combine as an intersection. Market filters use network-specific asset IDs. BTC → ETH and ETH → BTC are different directions; cancelling both requires an explicit market-wide scope. Order type is separate from pair/direction. V1 accepts only PSWAP, so a PSWAP-only filter does not narrow the current order set unless combined with a market filter. Invalid or ambiguous filters must never broaden cancellation. For targeted cancellation, use a stable root order/note identity, including before a delayed submit arrives; exact encoding remains open.
 
 #### Where cancel meets matching
 
-Immediately before handing a candidate to the executor, the matcher checks authoritative eligibility and durably reserves its inputs. This is a solver-side reservation, not a credit or on-chain lock. Cancellation and reservation serialize against the same maker control state in their transactions, with consistent lock order for multi-maker candidates.
+Reservation happens once, in the executor, after proving and before any possible broadcast: PR #34's `prepare_settlement_tx` commit. That transaction locks the control rows of every maker among the inputs (shared, in maker-ID order), checks every input against `live_orders`, then reserves the whole exact input notes and stores the transaction record. A cancel raises its cutoff under the same row with an exclusive lock, so the two serialize:
 
-- Cancel wins: recalculate the candidate in the matcher.
-- Reservation wins: disclose the in-flight exposure and stop all future remainder matching.
+- Cancel wins: the reservation fails, nothing is broadcast, and the inputs return to the matcher through the same view, so the stopped ones stay out. The proof is wasted, which is acceptable.
+- Reservation wins: the cancel reply lists that settlement as in-flight exposure; whatever it leaves behind comes back Stopped.
 
-An earlier unprotected cutoff read is insufficient. A partial fill still reserves the **whole exact input note/version**, because consuming it creates a new remainder note. Two candidates cannot reserve different portions of that input independently.
+Candidates the matcher handed over before it received the cutoff are caught by this check, so the matcher's in-memory drop is an optimization, not the guarantee. Reserving after proving also means a cancel that arrives while a proof is running still wins. A partial fill still reserves the **whole exact input note/version**, because consuming it creates a new remainder note; two candidates cannot reserve different portions of one input.
 
 The executor receives approved frozen candidates. Our reservation does not lock the note on-chain; independent maker activity can still invalidate it.
+
+### Intake and activation in parallel
+
+Maker traffic must not slow public ingest or settlement, and a cancel must never wait behind submits or core writes. PR #34's ownership-locked core writer stays the only session that changes the book or settlements; maker intake gets its own path.
+
+| Work | Where it runs | Database | Miden client |
+|---|---|---|---|
+| gRPC handlers: authenticate, decode, validate | gateway thread (own OS thread and multi-thread runtime, like the price API) | none | none |
+| Intake writer: submits and cancels | one task on the gateway thread | dedicated **intake session** from the existing pool | none |
+| Maker-note watcher: activation and spends | one task on the gateway thread | core writer, one `write_book` per block | none; node RPC only |
+| Public ingest | ingest thread, unchanged | core writer | ingest client |
+| Executor | executor thread, unchanged | core writer | executor client |
+
+**Handlers** run concurrently and do only CPU work: authenticate, decode, and validate the note once into domain types. They pass the validated command to the intake writer over bounded channels, with a separate small channel for cancels, and await its reply. A full channel returns UNAVAILABLE ("durable acceptance unavailable") instead of hanging.
+
+**Intake writer (group commit).** One task owns the intake session. Each round it takes every waiting cancel first, then up to N submits or whatever arrived within a short window (illustrative: 500 commands or 2 ms), and writes them in one transaction using statements that cannot fail per command (`INSERT … ON CONFLICT DO NOTHING RETURNING`), so one bad command never aborts the batch. It classifies each outcome from the returned rows (Accepted, retry of a stored result, idempotency conflict, note already registered), commits once, then replies to every handler. Atomicity remains per command: if the transaction itself fails, none of its commands was acknowledged and each is retryable by request ID. One fsync per batch gives high throughput on one session; per-command latency is the window plus one commit.
+
+A separate session is safe because maker commands only append facts (commands, notes, cutoffs, events) and never move orders or settlements; execution authority stays with the core writer. The pool opens the intake session only after it owns the database and closes it when the pool's fatal token fires. Cancel and reservation serialize through the maker control row lock, which works across sessions. Submits and cancels add no work to the core writer.
+
+**Maker-note watcher.** One task, woken per new block with polling as the fallback, using its own `Send` node RPC handle:
+
+1. New intake: one batched `get_notes_by_id` (up to the node's `note_ids_limit` per call) catches notes committed before their data arrived.
+2. Still-pending intake: incremental `sync_notes` from the last checked block over the PSWAP tags of pending notes catches later commitments without re-querying every pending ID each block.
+3. Candidates: verify the exact note ID and its inclusion proof, and that the note is unspent.
+4. Live maker orders: incremental `sync_nullifiers` over their nullifier prefixes finds notes the maker reclaimed or traded elsewhere.
+5. One `write_book` per block for everything found: activations (Active, or Stopped below a cutoff, checked under the maker control lock), spent orders marked OnchainNullified, their OrderStatus events and the book update.
+
+Maker notes are never imported into the ingest client, so public ingest is unchanged and no private note reaches the book without the gateway's checks. The executor already consumes notes unauthenticated from our stored copy, so settling a private note needs no client import. If the watcher's last verified block falls behind the chain tip by more than the freshness bound, it pauses activation; cancels continue.
+
+**Event delivery** also runs on the gateway thread: per-stream readers, woken in-process after any commit that inserts that maker's events, read through a capped read budget (like PR #34's public-read cap) so streams cannot starve pipeline reads. Both sessions take the same per-maker event-counter row briefly, which keeps each maker's event sequence contiguous.
+
+Lock order, which rules out deadlocks between the two sessions: maker control rows (by maker ID), then order rows, then the per-maker event counter.
 
 ### Settlement and remainder recovery
 
@@ -244,7 +308,7 @@ If history expires, explicitly return REPLAY_CURSOR_EXPIRED and a complete recov
 
 Keep the matching book in memory and perform the final authoritative check when reserving a candidate. No database read on every matching comparison. Send events after commit; never wait for a maker socket or its acknowledgement inside matching/settlement.
 
-Use bounded stream buffers. Disconnect a slow event consumer and let it replay from its recoverable cursor. Preserve cancellation capacity under load; return a clear failure when durable acceptance is unavailable. These are resource protections, not business order quotas.
+Use bounded stream buffers. Disconnect a slow event consumer and let it replay from its recoverable cursor. Preserve cancellation capacity under load: cancels have their own channel, are written first in every intake round, and commit on a session separate from the core writer. Return a clear failure when durable acceptance is unavailable. These are resource protections, not business order quotas.
 
 PostgreSQL transactions and WAL remove the need for a separate queue/WAL service, but still cost storage and commit latency. Start with indexed tables and batched cleanup. Measure peak command load, event volume, sync delay, admission latency and recovery lag before quoting capacity or a monthly cost.
 
@@ -260,15 +324,14 @@ The main costs remain application compute, database/storage/backups and any repl
 
 The implementation should make these boundaries visible in ordinary domain functions and database transactions:
 
-1. **Submit:** one PostgreSQL commit stores the authenticated maker, request ID, maker sequence, canonical payload, exact private note material and Accepted result. Only after that commit may the API return Accepted. No separate AwaitingCommitment event or initial order row is required.
-2. **Cancel:** one commit stores the maximum applicable scoped cutoff and durable Applied result. The command reply states the scope, sequence and any already reserved exposure. There is no required per-order bulk-cancel sweep or maker event.
-3. **Activate:** after shared Miden sync verifies the exact note committed and unspent, one commit makes the order durably eligible and records its OrderStatus event. Book-cache installation follows and is recovered on restart. This assumes the recommended durable-eligibility meaning of Live.
-4. **Reserve:** the matcher rechecks effective eligibility and locks the relevant maker control state; one commit reserves every exact input note/version in the approved candidate. Cancellation uses the same serialization point. Proof generation and network I/O occur outside this transaction.
-5. **Prepare transaction:** before a possible broadcast, one commit records enough final transaction and input linkage to reconcile the outcome, together with SettlementPending when that event is emitted. The candidate can be discarded only when the protocol proves no broadcast could have happened.
-6. **Finalize:** after authenticated chain verification, one commit applies each committed transaction's actual fills, output notes, lineage, earned surplus/fees, settlement cost and SettlementResolved event. A definitive void has its own resolved outcome without realized order revenue. A transaction that might still land remains Pending.
-7. **Event cleanup:** the maker's cumulative cursor is persisted independently of its heartbeat packet; cleanup removes only a contiguous prefix that the maker says it can recover without, subject to the agreed retention policy. It never removes command deduplication, cutoffs, live order data or still-relevant recovery notes.
+1. **Submit:** one PostgreSQL commit on the intake session stores the authenticated maker, request ID, maker sequence, canonical payload, exact private note material and Accepted result. Several submits may share one group commit; each keeps its own atomic outcome. Only after that commit may the API return Accepted. No separate AwaitingCommitment event or initial order row is required.
+2. **Cancel:** one commit on the intake session raises the scoped cutoff to the maximum, stores the durable Applied result with the exposure reserved as of that commit, and inserts one CancelApplied event. No order row changes and no sweep follows; the matcher receives the cutoff after the commit.
+3. **Activate:** after the maker-note watcher verifies the exact note committed and unspent, one core-writer commit inserts the order (Active, or Stopped below a cutoff) with its OrderStatus event and publishes the book update in commit order. This assumes the recommended durable-eligibility meaning of Live.
+4. **Reserve and prepare:** after proving and before any possible broadcast, one core-writer commit checks every input against `live_orders` under the makers' control locks, reserves each exact input note/version, and records enough final transaction and input linkage to reconcile the outcome, together with SettlementPending. Cancellation serializes on the same lock. If this commit fails, nothing was broadcast and the candidate is recalculated.
+5. **Finalize:** after authenticated chain verification, one commit applies each committed transaction's actual fills, output notes, lineage, earned surplus/fees, settlement cost and SettlementResolved event. A definitive void has its own resolved outcome without realized order revenue. A transaction that might still land remains Pending. Remainders and released inputs below a cutoff are written Stopped.
+6. **Event cleanup:** the maker's cumulative cursor is persisted independently of its heartbeat packet; cleanup removes only a contiguous prefix that the maker says it can recover without, subject to the agreed retention policy. It never removes command deduplication, cutoffs, live order data or still-relevant recovery notes.
 
-Each event insert shares the business transaction that produced it. A PostgreSQL notification or in-process channel only wakes a reader; it is not an additional durability layer. The first, second, fourth, fifth and sixth boundaries add ordinary database commit latency. Chain commitment and sync add separate latency before Live and final settlement. No exact millisecond promise is made without measuring the selected deployment.
+Each event insert shares the business transaction that produced it. A PostgreSQL notification or in-process channel only wakes a reader; it is not an additional durability layer. Submit and cancel commit on the intake session; activation, reserve-and-prepare and finalize commit on the core writer. Each adds ordinary commit latency. Chain commitment and sync add separate latency before Live and final settlement. No exact millisecond promise is made without measuring the selected deployment.
 
 ## Alternatives considered
 
@@ -277,6 +340,8 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 - **mTLS, creator-account proof and signatures on every command.** They add account or certificate coupling the facilitator contract does not require. Use high-entropy API keys over TLS, maker-scoped authorization and key rotation. A maker spending key never belongs in the gateway.
 - **A broker, hand-written WAL or durable in-memory channel.** PostgreSQL already provides atomic business records, an outbox table and crash recovery. Bounded channels and notifications are wake-up hints only.
 - **Server-assigned cancellation sequence or synchronous order sweep.** A maker-assigned prefix cutoff can stop delayed submissions with lower maker sequence and all descendant remainders. Persisting one barrier avoids an unbounded acknowledgement transaction.
+- **Rewriting order rows on cancel, synchronously or by a background sweep.** The cost grows with the book and occupies the writer that ingest and settlement share. The cutoff plus the `live_orders` view gives the same guarantee with one constant-size commit.
+- **Importing maker notes into the ingest client.** Ingest would turn them into ordinary orders without maker attribution, cutoffs or routing class, and every import would contend for the ingest client. The watcher's batched node RPC avoids both.
 - **Atomic replace or multi-command batch.** V1 uses one command per request; cancelling one order and submitting a new note are separate outcomes. This avoids a premature atomic-readiness contract for a replacement note.
 - **Full recovery-grade snapshot.** Ordinary replay covers missed solver events; a small GetMakerState read shows current solver state. A gapless historical snapshot across unbounded, concurrently changing pages would require a stronger protocol and is not part of this V1 design.
 - **A stream event for every acknowledgement and worker stage.** Accepted and Applied already have stored command results. Push solver-discovered order and transaction transitions; retain routine import/sync/proving attempts in internal diagnostics.
@@ -285,8 +350,9 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 
 - The maker can independently consume or reclaim its current note. The solver can stop only its own future matching. A late cancel may leave a previously reserved fill in flight; the result must disclose that exposure and stop all future remainder matching.
 - PostgreSQL becomes the business authority. A process crash after a committed command or settlement must replay/reconcile from durable records. The SDK's own store is reconciled from the business journal rather than treated as the maker command log.
-- A short database commit is on submit, cancel, candidate reservation and each settlement transition. Event rows do not require a second commit. The matcher does not read PostgreSQL on every price comparison or wait for a maker socket.
-- The minimal feed does not push CancelApplied. Multiple independent maker command writers sharing one identity must coordinate their cancellations or refresh GetMakerState; otherwise they do not get immediate cross-session cancellation notification. If that guarantee is required, add one scoped cancel event per command, never one per affected order.
+- A short database commit is on submit, cancel, activation, reserve-and-prepare and each settlement resolution. Event rows do not require a second commit. Maker submits and cancels commit on their own session and add no work to the core writer; activations cost one core-writer commit per block. The matcher does not read PostgreSQL on every price comparison or wait for a maker socket.
+- Each cancel produces one scoped CancelApplied event, never one per affected order, so every session of a maker identity learns the cutoff from the stream.
+- Order rows below a cutoff keep `status = 'active'` until their note is reclaimed. Liveness must always be read through `live_orders`; reading the status column alone is a bug.
 - The current-state read is an ordinary paginated PostgreSQL query. Its pages may see concurrent changes and must not masquerade as one atomic historical snapshot. It does not recreate deleted fill history.
 - If the maker acknowledges a recoverable event cursor and later loses the state/backups that made it recoverable, Miden client can recover on-chain note facts but cannot reconstruct deleted off-chain cancellation or reservation history. Finalize the replay horizon and recovery procedure before event pruning is enabled.
 - PostgreSQL fsync/synchronous commit protects acknowledged records against ordinary process restart with intact storage. Primary storage loss without acknowledged-data loss requires an appropriate synchronous replica and controlled failover; backup alone is insufficient.
@@ -297,10 +363,10 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 
 Correctness comes from these tested rules, not the choice of gRPC or macros. Each implementation PR contains its own relevant tests.
 
-1. **Protocol and PostgreSQL foundation.** Freeze the contract and durable transaction boundaries. Test retry conflicts, duplicate notes, same-note resubmission after cancel, cross-maker isolation, rollback and interrupted commit/notification. Test concurrent event writers for committed ordering and rollback gaps.
+1. **Protocol and PostgreSQL foundation.** Freeze the contract and durable transaction boundaries. Test retry conflicts, duplicate notes, same-note resubmission after cancel, cross-maker isolation, rollback, interrupted commit/notification, and a group-commit batch in which one command conflicts. Test concurrent event writers for committed ordering and rollback gaps.
 2. **Authenticated gateway and recovery.** Add unary operations, event streaming, heartbeat and the maker-filtered current-state read. Test key rotation/revocation including open streams, disconnect after send, duplicate replay, missing/malformed events, stale session cursors, cursors beyond sent data, cancellation cutoffs and reserved exposure in the read, and replay during cleanup. Do not present independently read pages as one atomic snapshot.
-3. **Private note activation.** Add validation, retryable import and shared sync wake-up/fallback. Test wrong script/network, malformed creator without account-control proof, tag collisions, both arrival orders, spent-before-activation, cancel-before-commit, interrupted cache update and stale sync.
-4. **Cancellation and matcher reservation.** Add scoped monotone cutoffs and whole-note reservations. Test cancel/reservation races, cancel 100 then 80, delayed submit 90, empty scope then delayed submit, market/direction isolation, targeted scope, inherited remainder sequence, no per-order bulk-cancel events, lost cancel reply recovered by retry/status, cutoff visible in the current-state read and crash after cancel ACK.
+3. **Private note activation.** Add validation and the maker-note watcher (batched note-ID check, incremental tag and nullifier sync, one activation commit per block). Test wrong script/network, malformed creator without account-control proof, tag collisions, both arrival orders, spent-before-activation, cancel-before-commit, interrupted cache update, stale sync, and that public ingest never activates a maker note.
+4. **Cancellation and matcher reservation.** Add scoped monotone cutoffs and whole-note reservations. Test cancel/reservation races, cancel 100 then 80, delayed submit 90, empty scope then delayed submit, market/direction isolation, targeted scope, inherited remainder sequence, no per-order bulk-cancel events, lost cancel reply recovered by retry/status, cutoff visible in the current-state read and crash after cancel ACK. Also test the cutoff reaching the matcher before and after an activation's book update, reservation failing for a candidate handed over before the cutoff, inputs of a voided settlement staying Stopped, a cancel never updating order rows, unchanged cancel latency with 100,000 live orders, and a submit flood not delaying cancels or ingest commits.
 5. **Executor recovery and reporting.** Add journal/reconciliation, transaction-specific Pending/Resolved reports, notes and accounting only after verified settlement. Test chain-success-before-DB-write crash, timeout after node acceptance, definitive failure, external consumption while proving/submitting, two partial-fill candidates using one input, all late-cancel outcomes, repeated partial fills, rounding/accounting and maker reclaim with the solver offline.
 6. **Release rehearsal.** Exercise the complete pipeline under peak load, slow clients, database failure, restore and stale execution authority. Verify privacy and recovery procedures; measure latency. Enable production maker fills only after the complete path passes.
 
@@ -310,7 +376,8 @@ These are proposed reviewable changes, not six independent production releases. 
 
 Before implementation of the corresponding feature, agree:
 
-- Whether to adopt the recommended minimal event feed above. Omitting a cancel event assumes maker command writers coordinate their own cancels or refresh the current-state read; otherwise a single scoped cancel event may be needed for immediate cross-session notification.
+- Whether to adopt the recommended minimal event feed above: OrderStatus, SettlementPending, SettlementResolved, and one scoped CancelApplied per cancel.
+- Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
 - Exact identity encoding for the earlier single-order/note cancellation requirement; bulk filters are maker-wide with optional order type, market and direction.
 - Replay grace/horizon, command-result retention and the complete expired-cursor recovery procedure.
@@ -322,8 +389,9 @@ Expiry/clock details, dead-man behavior and sequence-allocator failure recovery 
 
 This is a reviewed design, not an implementation audit or runtime verification. Source observations refer to the baseline reviewed on 27 September 2026; check the actual implementation branch and pinned dependencies before coding.
 
-- [Solver executor](../../crates/solver/src/executor/executor.rs): the inspected submission loop discards its returned transaction ID and can return inputs to Active after exhausted RPC retries. Replace that ambiguous-submission assumption wherever it remains.
+- [Solver executor](../../crates/solver/src/executor/executor.rs): the inspected baseline discarded its returned transaction ID and could return inputs to Active after exhausted RPC retries. PR #34 replaced this with a journal written before broadcast and confirmation only by transaction ID.
 - [Business database](../../crates/solver/src/db/db.rs) and [manifest](../../crates/solver/Cargo.toml): the baseline uses SQLite/Diesel; PostgreSQL is the selected target. Reuse any completed migration work.
 - [PSWAP script](https://github.com/0xMiden/protocol/blob/next/crates/miden-standards/asm/standards/notes/pswap.masm) and [SDK lineage source](https://github.com/0xMiden/rust-sdk/blob/next/crates/rust-client/src/pswap/lineage.rs): verify facilities against the exact pinned release; these links track upstream branches.
+- Node RPC in the pinned `miden-client` 0.17.0-rc.2: `NodeRpcClient` is `Send + Sync` and provides batched `get_notes_by_id` (with inclusion proofs for private notes), `sync_notes` by tag, `sync_nullifiers` by prefix and `RpcLimits`. The maker-note watcher relies on these.
 - PostgreSQL [transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html), [locking](https://www.postgresql.org/docs/current/explicit-locking.html), [sequence behavior](https://www.postgresql.org/docs/current/functions-sequence.html), [durability settings](https://www.postgresql.org/docs/current/runtime-config-wal.html), [LISTEN startup](https://www.postgresql.org/docs/current/sql-listen.html), [NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html) and [PITR](https://www.postgresql.org/docs/current/continuous-archiving.html).
 - gRPC [RPC types and stream ordering](https://grpc.io/docs/what-is-grpc/core-concepts/) and [authentication](https://grpc.io/docs/guides/auth/). One client channel is not a promise of exactly one physical connection. Rust references are beside their proposed uses above.

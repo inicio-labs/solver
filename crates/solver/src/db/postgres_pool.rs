@@ -1035,10 +1035,13 @@ mod tests {
         let settings = pool
             .write(|conn| {
                 Ok(diesel::sql_query(
-                    "SELECT current_setting('tcp_keepalives_idle') AS idle,
-                            current_setting('tcp_keepalives_interval') AS interval,
-                            current_setting('tcp_keepalives_count') AS count,
-                            current_setting('tcp_user_timeout') AS user_timeout",
+                    // Raw values in base units (seconds; ms for the user
+                    // timeout), independent of how the server formats them.
+                    "SELECT max(setting) FILTER (WHERE name = 'tcp_keepalives_idle') AS idle,
+                            max(setting) FILTER (WHERE name = 'tcp_keepalives_interval') AS interval,
+                            max(setting) FILTER (WHERE name = 'tcp_keepalives_count') AS count,
+                            max(setting) FILTER (WHERE name = 'tcp_user_timeout') AS user_timeout
+                     FROM pg_settings",
                 )
                 .get_result::<Keepalives>(conn)?)
             })
@@ -1048,7 +1051,11 @@ mod tests {
         assert_eq!(settings.interval, "5");
         assert_eq!(settings.count, "3");
         // Linux servers apply it; servers without TCP_USER_TIMEOUT keep 0.
-        assert!(matches!(settings.user_timeout.as_str(), "25s" | "0"));
+        assert!(
+            matches!(settings.user_timeout.as_str(), "25000" | "0"),
+            "tcp_user_timeout = {}",
+            settings.user_timeout
+        );
         Ok(())
     }
 

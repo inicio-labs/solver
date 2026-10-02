@@ -1,9 +1,13 @@
 -- Initial application database for a fresh solver deployment. The Miden client
 -- stores remain separate SQLite databases.
 
+-- `owner_epoch` is bumped by every solver start. A writer that reconnects
+-- after losing its session resumes only if the epoch is still its own, i.e.
+-- no other solver owned the database in between.
 CREATE TABLE sync_state (
     id SMALLINT PRIMARY KEY CHECK (id = 1),
-    last_fetched_block BIGINT NOT NULL DEFAULT 0 CHECK (last_fetched_block >= 0)
+    last_fetched_block BIGINT NOT NULL DEFAULT 0 CHECK (last_fetched_block >= 0),
+    owner_epoch BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO sync_state (id, last_fetched_block) VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;

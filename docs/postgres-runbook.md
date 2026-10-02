@@ -8,7 +8,7 @@ active-active mode in V1.
 
 ## Fresh deployment
 
-1. Provision PostgreSQL near the solver with TLS, monitored free space, daily
+1. Provision PostgreSQL 14 or newer near the solver with TLS, monitored free space, daily
    base backups, WAL archiving/PITR, and a tested database restart procedure.
    Budget at least ten connections for the solver: one persistent writer, four
    readers by default, one migration/operations connection, and headroom.
@@ -72,11 +72,21 @@ first production order.
 
 ## Failure and restart
 
-The solver holds one PostgreSQL advisory lock on its original writer session.
-Only losing that session stops the solver: a dropped writer connection, a lost
-advisory lock, a crashed database worker, or a write that passed the 30-second
-client deadline with an uncertain commit. Every other database error is
-returned to the caller and handled in place:
+The solver holds one PostgreSQL advisory lock on its writer session. If that
+session is lost (database restart or failover, network cut, terminated
+backend), the solver reconnects in place for up to 30 seconds while holding
+its internal writer lock, re-takes the advisory lock, and checks the
+`sync_state.owner_epoch` it claimed at startup. A write lost before `COMMIT`
+returns an ordinary error; a write lost during `COMMIT` is resolved with
+`pg_xact_status` and returns its real outcome. If the previous backend still
+holds the lock after a network cut, the solver terminates that backend.
+
+The solver stops only when it cannot safely continue: another solver holds
+the lock or advanced the owner epoch while it was disconnected, the writer
+does not come back within the reconnect window, the live session no longer
+holds its lock, a database worker panics, or a write is still running after
+the 30-second client deadline. Every other database error is returned to the
+caller and handled in place:
 
 - A failed read (including the public price API and `/readyz`) returns an
   error to that caller; the read pool reconnects on the next checkout.
@@ -97,17 +107,20 @@ in its book, so nothing is re-matched at a stale price. Watch for
 `executor entering verification mode` in the logs; a long stay means the
 node, the fee balance, or PostgreSQL needs attention, not the solver.
 
-If the writer session is lost, restart the whole solver; restarting only a
-Rust task does not rebuild the matcher. A lost PostgreSQL response does not
-prove that a write failed. The restart reconciles durable notes and unresolved
-settlements and rehydrates the matcher from what committed.
+The solver sets `idle_session_timeout = 0` on its own sessions, so a server or
+role default that closes idle clients does not end the writer session.
+
+When the solver does stop, restart the whole solver; restarting only a Rust
+task does not rebuild the matcher. The restart reconciles durable notes and
+unresolved settlements and rehydrates the matcher from what committed. Alert
+on `solver_db_writer_reconnects_total` increasing: each step is a recovered
+session loss worth explaining.
 
 Use a process supervisor with `Restart=on-failure`, bounded restart backoff,
 and a shutdown deadline (for example, systemd `TimeoutStopSec=30s` followed
 by its final kill signal). The database's `statement_timeout=10s` and
 `lock_timeout=2s` bound server work. The solver also stops waiting after 30
-seconds for one client-side database operation, marks the whole pipeline
-unhealthy, and bounds worker joins to 15 seconds and main-runtime teardown to
+seconds for one client-side write, stops the whole pipeline, and bounds worker joins to 15 seconds and main-runtime teardown to
 5 seconds. An already-running blocking query is not cancelled by that deadline;
 its commit outcome may be uncertain and restart hydration checks durable state.
 Configure libpq/TCP failure detection and alert if the supervisor has to

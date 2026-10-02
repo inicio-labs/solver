@@ -127,6 +127,7 @@ async fn metrics(
          solver_db_lock_timeouts_total {}\n\
          solver_db_statement_timeouts_total {}\n\
          solver_db_deadlocks_total {}\n\
+         solver_db_writer_reconnects_total {}\n\
          solver_db_read_connections {}\n\
          solver_db_read_idle_connections {}\n\
          solver_db_writer_busy {}\n\
@@ -146,6 +147,7 @@ async fn metrics(
         pool.lock_timeouts,
         pool.statement_timeouts,
         pool.deadlocks,
+        pool.writer_reconnects,
         pool.read_connections,
         pool.read_idle_connections,
         u8::from(pool.writer_busy),

@@ -5,6 +5,7 @@ diesel::table! {
     sync_state (id) {
         id -> SmallInt,
         last_fetched_block -> BigInt,
+        owner_epoch -> BigInt,
     }
 }
 

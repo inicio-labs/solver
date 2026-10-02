@@ -619,7 +619,7 @@ async fn verify_ready(
     book_tx: &mpsc::Sender<BookUpdate>,
     held: &mut Vec<BookOrder>,
 ) -> ExecResult<()> {
-    check_fee_headroom(client, miden_adapter, solver_id, FeePreflight::Strict).await?;
+    check_fee_headroom(client, miden_adapter, solver_id).await?;
     pool.write(|_| Ok(())).await?;
     release_held(miden_adapter, pool, book_tx, held).await
 }
@@ -1232,10 +1232,9 @@ async fn execute_batch(
     };
 
     // Fee pre-flight (Miden 0.16): each settlement's fee is paid in the native
-    // asset from the solver's own vault.
-    if let Err(e) =
-        check_fee_headroom(client, miden_adapter, solver_id, FeePreflight::Lenient).await
-    {
+    // asset from the solver's own vault. A low balance, or a fee or balance
+    // lookup that fails, pauses into verification mode; nothing is submitted.
+    if let Err(e) = check_fee_headroom(client, miden_adapter, solver_id).await {
         return Ok(BatchSubmission::Paused(e));
     }
 
@@ -1325,58 +1324,37 @@ async fn execute_batch(
     }
 }
 
-/// How a failed fee or balance lookup is treated by `check_fee_headroom`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FeePreflight {
-    /// Before a settlement: a failed lookup is logged and lets the batch
-    /// through — the submit itself is the real check.
-    Lenient,
-    /// While verifying readiness: the lookups must succeed.
-    Strict,
-}
-
 /// `Err` when the chain charges a fee and the solver's fee-asset balance is below
-/// one settlement's worst case. The balance comes from the local store, so it lags
-/// the chain by up to one sync interval.
+/// one settlement's worst case, or when either lookup fails: the solver never
+/// submits without knowing it can pay. The balance comes from the local store,
+/// so it lags the chain by up to one sync interval.
 async fn check_fee_headroom(
     client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     solver_id: AccountId,
-    mode: FeePreflight,
 ) -> ExecResult<()> {
-    let fees = miden_adapter.lock().await.fee_parameters().await;
-    let (fee_faucet, base_fee) = match fees {
-        Ok(Some(params)) => params,
-        Ok(None) => return Ok(()),
-        Err(e) if mode == FeePreflight::Strict => return Err(e.into()),
-        Err(e) => {
-            tracing::warn!(error = %e, "fee parameters unavailable; skipping fee pre-flight");
-            return Ok(());
-        }
+    let Some((fee_faucet, base_fee)) = miden_adapter.lock().await.fee_parameters().await? else {
+        return Ok(());
     };
     if base_fee == 0 {
         return Ok(());
     }
     let need = u64::from(base_fee) * FEE_HEADROOM_MULTIPLIER;
-    let balance = client
+    let have = client
         .lock()
         .await
         .account_reader(solver_id)
         .get_balance(fee_faucet)
-        .await;
-    match balance {
-        Ok(have) if have.as_u64() < need => Err(ExecutorError::InsufficientFee {
-            have: have.as_u64(),
+        .await?
+        .as_u64();
+    if have < need {
+        return Err(ExecutorError::InsufficientFee {
+            have,
             need,
             faucet: fee_faucet,
-        }),
-        Ok(_) => Ok(()),
-        Err(e) if mode == FeePreflight::Strict => Err(e.into()),
-        Err(e) => {
-            tracing::warn!(error = %e, "solver fee-asset balance unavailable; skipping fee pre-flight");
-            Ok(())
-        }
+        });
     }
+    Ok(())
 }
 
 /// Incoming P2ID/P2IDE notes worth claiming into the solver's vault. On a

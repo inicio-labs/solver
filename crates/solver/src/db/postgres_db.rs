@@ -362,33 +362,75 @@ pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> DbResult<Vec<Unre
         let parent_row = parent_row.ok_or(DbError::Corrupt(
             "unresolved settlement parent order is missing",
         ))?;
-        if attempt.tx_id != input.tx_id || input.parent_note_id != parent_row.note_id {
-            return Err(DbError::Corrupt(
-                "unresolved settlement mapping does not match its parent",
-            ));
-        }
         let parent = parent_row.into_book_order()?;
         let child = input
             .child_note_data
             .as_deref()
             .map(|raw| Note::read_from(&mut SliceReader::new(raw)))
             .transpose()?;
-        match attempts.entry(attempt.tx_id.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(UnresolvedAttempt {
-                    attempt,
-                    parents: vec![parent],
-                    children: child.into_iter().collect(),
-                });
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                entry.parents.push(parent);
-                entry.children.extend(child);
-            }
-        }
+        let entry = attempts
+            .entry(attempt.tx_id.clone())
+            .or_insert_with(|| UnresolvedAttempt {
+                attempt,
+                parents: Vec::new(),
+                children: Vec::new(),
+            });
+        entry.parents.push(parent);
+        entry.children.extend(child);
     }
     Ok(attempts.into_values().collect())
+}
+
+/// Lock an unresolved attempt row; `false` when it was already resolved.
+fn lock_attempt(conn: &mut PgConnection, tx_id: &[u8]) -> DbResult<bool> {
+    Ok(settlement_attempts::table
+        .find(tx_id)
+        .for_update()
+        .select(settlement_attempts::tx_id)
+        .first::<Vec<u8>>(conn)
+        .optional()?
+        .is_some())
+}
+
+/// A remainder inherits its parent's FIFO slot and arrival time. Its ID
+/// matched a child validated at prepare, and a note ID commits to the note's
+/// contents, so the row is built directly.
+fn remainder_of(
+    parent: &OrderRow,
+    note: Note,
+    raw_data: Vec<u8>,
+) -> DbResult<(NewRemainderOrderRow, BookOrder)> {
+    let row = NewRemainderOrderRow {
+        note_id: note.id().to_bytes().to_vec(),
+        raw_data,
+        arrival_unix: parent.arrival_unix,
+        priority_seq: parent.priority_seq,
+    };
+    let order = BookOrder {
+        priority_seq: u64::try_from(parent.priority_seq)?,
+        arrival_unix: u64::try_from(parent.arrival_unix)?,
+        note: std::sync::Arc::new(note),
+    };
+    Ok((row, order))
+}
+
+/// Insert remainders, skipping any already stored (ingest and confirmation
+/// may both see one). Returns the IDs inserted by this call.
+fn insert_remainders(
+    conn: &mut PgConnection,
+    rows: &[NewRemainderOrderRow],
+) -> DbResult<HashSet<Vec<u8>>> {
+    if rows.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(diesel::insert_into(orders::table)
+        .values(rows)
+        .on_conflict(orders::note_id)
+        .do_nothing()
+        .returning(orders::note_id)
+        .get_results::<Vec<u8>>(conn)?
+        .into_iter()
+        .collect())
 }
 
 /// Release a settlement whose transaction never commits, once the parents'
@@ -400,14 +442,7 @@ pub fn finish_discarded_settlement_tx(
     tx_id: &[u8],
     consumed: &HashSet<OrderId>,
 ) -> DbResult<BookUpdate> {
-    let exists = settlement_attempts::table
-        .find(tx_id)
-        .for_update()
-        .select(settlement_attempts::tx_id)
-        .first::<Vec<u8>>(conn)
-        .optional()?
-        .is_some();
-    if !exists {
+    if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
     }
     let rows: Vec<OrderRow> = settlement_inputs::table
@@ -471,14 +506,7 @@ pub fn confirm_settlement_tx(
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
 ) -> DbResult<BookUpdate> {
-    let exists = settlement_attempts::table
-        .find(tx_id)
-        .for_update()
-        .select(settlement_attempts::tx_id)
-        .first::<Vec<u8>>(conn)
-        .optional()?
-        .is_some();
-    if !exists {
+    if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
     }
     let rows: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
@@ -505,33 +533,14 @@ pub fn confirm_settlement_tx(
         // Validated against this parent at prepare time.
         if let Some(raw) = input.child_note_data {
             let child_note = Note::read_from(&mut SliceReader::new(&raw))?;
-            child_rows.push(NewRemainderOrderRow {
-                note_id: child_note.id().to_bytes().to_vec(),
-                raw_data: raw,
-                arrival_unix: parent.arrival_unix,
-                priority_seq: parent.priority_seq,
-            });
-            children.push(BookOrder {
-                priority_seq: u64::try_from(parent.priority_seq)?,
-                arrival_unix: u64::try_from(parent.arrival_unix)?,
-                note: std::sync::Arc::new(child_note),
-            });
+            let (row, child) = remainder_of(&parent, child_note, raw)?;
+            child_rows.push(row);
+            children.push(child);
         }
     }
     // Ingest may already have inserted and announced a remainder; only the
     // ones inserted here are new to the matcher.
-    let newly_inserted: HashSet<Vec<u8>> = if child_rows.is_empty() {
-        HashSet::new()
-    } else {
-        diesel::insert_into(orders::table)
-            .values(&child_rows)
-            .on_conflict(orders::note_id)
-            .do_nothing()
-            .returning(orders::note_id)
-            .get_results::<Vec<u8>>(conn)?
-            .into_iter()
-            .collect()
-    };
+    let newly_inserted = insert_remainders(conn, &child_rows)?;
     let consumed_child_ids: Vec<_> = children
         .iter()
         .filter(|child| consumed_children.contains(&child.id()))
@@ -613,31 +622,11 @@ pub fn ingest_expected_remainders_tx(
         let Some(parent) = parents.get(note.id().to_bytes().as_slice()) else {
             continue;
         };
-        // Its ID matched a child validated at prepare, and a note ID commits
-        // to the note's contents: the row is built directly, never rejected.
-        rows.push(NewRemainderOrderRow {
-            note_id: note.id().to_bytes().to_vec(),
-            raw_data: note.to_bytes(),
-            arrival_unix: parent.arrival_unix,
-            priority_seq: parent.priority_seq,
-        });
-        candidates.push(BookOrder {
-            priority_seq: u64::try_from(parent.priority_seq)?,
-            arrival_unix: u64::try_from(parent.arrival_unix)?,
-            note: std::sync::Arc::new(note.clone()),
-        });
+        let (row, candidate) = remainder_of(parent, note.clone(), note.to_bytes())?;
+        rows.push(row);
+        candidates.push(candidate);
     }
-    if rows.is_empty() {
-        return Ok((expected, Vec::new()));
-    }
-    let inserted: HashSet<Vec<u8>> = diesel::insert_into(orders::table)
-        .values(&rows)
-        .on_conflict(orders::note_id)
-        .do_nothing()
-        .returning(orders::note_id)
-        .get_results::<Vec<u8>>(conn)?
-        .into_iter()
-        .collect();
+    let inserted = insert_remainders(conn, &rows)?;
     let active = candidates
         .into_iter()
         .filter(|order| inserted.contains(order.id().to_bytes().as_slice()))

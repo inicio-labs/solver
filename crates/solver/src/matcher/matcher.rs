@@ -120,8 +120,8 @@ pub(super) async fn run_worker(
                 // executor queue is full (busy, or verifying it can settle),
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
-                if let Some(slot) = reserve_executor_slot(&exec_tx)? {
-                    internal_clear(&mut book, &bootstrap.decimals, &runtime, slot, now);
+                if executor_accepting(&exec_tx)? {
+                    internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
@@ -133,21 +133,22 @@ pub(super) async fn run_worker(
     }
 }
 
-/// One executor queue slot for this tick's batch, or `None` while the queue
-/// is full. Never waits: the matcher must keep receiving book updates. A
-/// skipped tick changes no order state; the next tick clears the current book.
-pub(super) fn reserve_executor_slot(
+/// Whether the executor can take a batch this tick. `false` while its queue
+/// is full (busy, or in verification mode); the tick is skipped and changes
+/// no order state. The matcher is the queue's only sender, so a `true` here
+/// cannot turn into a full queue before `internal_clear` sends.
+pub(super) fn executor_accepting(
     exec_tx: &mpsc::Sender<ExecutionBatch>,
-) -> Result<Option<mpsc::Permit<'_, ExecutionBatch>>, MatcherError> {
-    match exec_tx.try_reserve() {
-        Ok(slot) => Ok(Some(slot)),
-        Err(TrySendError::Full(())) => {
-            SKIPPED_EXECUTOR_FULL_TICKS.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("executor queue full; skipping clearing tick");
-            Ok(None)
-        }
-        Err(TrySendError::Closed(())) => Err(MatcherError::ExecutorStopped),
+) -> Result<bool, MatcherError> {
+    if exec_tx.is_closed() {
+        return Err(MatcherError::ExecutorStopped);
     }
+    let accepting = exec_tx.capacity() > 0;
+    if !accepting {
+        SKIPPED_EXECUTOR_FULL_TICKS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("executor queue full; skipping clearing tick");
+    }
+    Ok(accepting)
 }
 
 fn fresh_reference_prices(
@@ -184,15 +185,15 @@ fn fresh_reference_prices(
 }
 
 /// Solve all pairs from the live book using one frozen price snapshot and
-/// send the combined batch into the reserved executor `slot`. A pair that
-/// fails to clear is logged and skipped; an empty batch releases the slot.
+/// send the combined batch to the executor. A pair that fails to clear is
+/// logged and skipped; an empty batch sends nothing.
 pub(super) fn internal_clear(
     book: &mut ClearingBook,
     decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
-    slot: mpsc::Permit<'_, ExecutionBatch>,
+    exec_tx: &mpsc::Sender<ExecutionBatch>,
     now_ms: u64,
-) {
+) -> Result<(), MatcherError> {
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor
@@ -278,21 +279,34 @@ pub(super) fn internal_clear(
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
-        return;
+        return Ok(());
     }
-    // Deactivation and send are synchronous after acquiring capacity, so a
-    // cancelled task cannot leave half of the handoff applied.
+    let sent: Vec<_> = combined
+        .filled_notes
+        .iter()
+        .map(|filled| filled.note_id)
+        .collect();
+    match exec_tx.try_send(combined) {
+        Ok(()) => {}
+        // Unreachable while the matcher is the only sender; if it ever
+        // happens the orders simply stay active for the next tick.
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!("executor queue filled unexpectedly; batch dropped");
+            return Ok(());
+        }
+        Err(TrySendError::Closed(_)) => return Err(MatcherError::ExecutorStopped),
+    }
     // Keep the parents in memory but off the matchable index. A definite
     // failure reactivates them; confirmation removes them permanently.
-    for filled in &combined.filled_notes {
-        book.deactivate(filled.note_id);
+    for note_id in &sent {
+        book.deactivate(*note_id);
     }
     tracing::info!(
         pairs = included_pairs,
-        orders = combined.filled_notes.len(),
+        orders = sent.len(),
         "combined clearing batch sent to executor"
     );
-    slot.send(combined);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -468,12 +482,12 @@ mod tests {
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let clear = |book: &mut ClearingBook, exec_tx: &mpsc::Sender<ExecutionBatch>| {
-            if let Some(slot) = reserve_executor_slot(exec_tx).unwrap() {
-                internal_clear(book, &decimals, &runtime, slot, 1_500);
+            if executor_accepting(exec_tx).unwrap() {
+                internal_clear(book, &decimals, &runtime, exec_tx, 1_500).unwrap();
             }
         };
         assert!(matches!(
-            reserve_executor_slot(&closed_tx),
+            executor_accepting(&closed_tx),
             Err(MatcherError::ExecutorStopped)
         ));
         assert_eq!(
@@ -487,7 +501,7 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        assert!(reserve_executor_slot(&exec_tx).unwrap().is_none());
+        assert!(!executor_accepting(&exec_tx).unwrap());
         assert_eq!(
             book.best_levels_snapshot().len(),
             4,

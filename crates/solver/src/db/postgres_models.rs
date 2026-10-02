@@ -12,10 +12,8 @@ use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
 use super::error::{DbError, DbResult};
-use super::postgres_schema::{
-    orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
-};
-use crate::types::{BookOrder, Order, OrderId, OrderStatus, SettlementError};
+use super::postgres_schema::{orders, registered_tokens, settlement_attempts, settlement_inputs};
+use crate::types::{BookOrder, Order, OrderId, SettlementError};
 
 /// An unresolved settlement, stored as its snake_case name. Confirmed and
 /// released attempts are deleted.
@@ -37,13 +35,6 @@ impl SettlementStatus {
     }
 }
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = sync_state)]
-pub struct SyncState {
-    pub id: i16,
-    pub last_fetched_block: i64,
-}
-
 #[derive(Queryable, Selectable, Debug, Clone)]
 #[diesel(table_name = orders)]
 pub struct OrderRow {
@@ -55,12 +46,6 @@ pub struct OrderRow {
 }
 
 impl OrderRow {
-    pub fn order_status(&self) -> DbResult<OrderStatus> {
-        self.status
-            .parse()
-            .map_err(|_| DbError::Corrupt("unknown stored order status"))
-    }
-
     pub fn note(&self) -> DbResult<Note> {
         Ok(Note::read_from(&mut SliceReader::new(&self.raw_data))?)
     }
@@ -109,6 +94,11 @@ impl NewOrderRow {
     /// Rejects a note that is not a valid PSWAP order.
     pub fn ingested(note: &Note, arrival_unix: u64) -> DbResult<Self> {
         Order::from_note(note)?;
+        Self::parsed(note, arrival_unix)
+    }
+
+    /// For a note the caller already parsed as a valid PSWAP order.
+    pub fn parsed(note: &Note, arrival_unix: u64) -> DbResult<Self> {
         Ok(Self {
             note_id: note.id().to_bytes().to_vec(),
             raw_data: note.to_bytes(),
@@ -182,6 +172,7 @@ pub struct RegisteredTokenRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::OrderStatus;
     use anyhow::Result;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};

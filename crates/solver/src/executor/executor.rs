@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow, SettlementStatus};
-use crate::db::{self, DbError, DbPool, DbResult};
+use crate::db::{self, DbError, DbPool};
 use crate::ingest::{ChainError, MidenClient, MidenClientAdapter};
 use crate::swap_eta::SettlementStats;
 use crate::types::{BookOrder, BookUpdate, ExecutionBatch, SettlementError, TokenId};
@@ -122,6 +122,13 @@ pub enum ExecutorError {
     Cancelled,
 }
 
+impl ExecutorError {
+    /// Whether the solver must stop (see `DbError::is_fatal`).
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Db(error) if error.is_fatal())
+    }
+}
+
 impl From<ClientError> for ExecutorError {
     fn from(error: ClientError) -> Self {
         Self::Client(Box::new(error))
@@ -157,18 +164,19 @@ enum SubmitOutcome {
 }
 
 enum BatchSubmission {
+    /// Submitted; confirmation is reconciled later.
     Accepted(PendingSettlement),
+    /// Maybe submitted; inputs stay reserved until reconciliation decides.
     Uncertain(PendingSettlement),
-    Returned,
+    /// A submitted transaction failed and its parents were already released.
+    Released,
+    /// Nothing was reserved and this batch cannot run as built: hand its
+    /// orders back to the matcher.
+    GiveBack(Vec<BookOrder>),
     /// The executor cannot settle right now (no fee headroom, RPC or database
-    /// unavailable). Nothing was reserved; the orders are still Active. The
-    /// executor stops accepting batches and enters verification mode.
-    Paused {
-        reason: ExecutorError,
-        /// `None`: retry this transaction once verification passes.
-        /// `Some`: these orders go back to the matcher instead.
-        give_back: Option<Vec<BookOrder>>,
-    },
+    /// unavailable). Nothing was reserved; the orders are still Active. Retry
+    /// this transaction after verification mode passes.
+    Paused(ExecutorError),
 }
 
 /// Keep each input and its predicted outputs together, in batch order.
@@ -298,7 +306,7 @@ impl BatchComponents {
             let note_args = PswapNote::create_args(0, filled.requested_filled)?;
 
             let (p2id, remainder) = pswap.execute(solver_id, None, Some(fill_asset))?;
-            let payback_id = Note::from(p2id.clone()).id();
+            let payback_id = p2id.id();
 
             *flow.entry(requested_token).or_default() -= note_asset_amount(&p2id) as i128;
             // Payback + remainder settle to the order CREATOR, not the solver. Declare them
@@ -313,7 +321,7 @@ impl BatchComponents {
 
             let remainder = remainder.map(Note::from);
             if let Some(rem_note) = &remainder {
-                *flow.entry(offered_token).or_default() -= note_asset_amount(&rem_note) as i128;
+                *flow.entry(offered_token).or_default() -= note_asset_amount(rem_note) as i128;
                 expected_output_recipients.push(rem_note.recipient().clone());
             }
             inputs.push(PreparedInput {
@@ -519,36 +527,6 @@ fn submission_outcome_is_unknown(error: &ClientError) -> bool {
     matches!(error, ClientError::SubmissionOutcomeUnknown { .. })
 }
 
-/// Shutdown-aware re-feed into the matcher via the same channel ingest uses.
-/// Stops early if the matcher channel is closed (it's tearing down).
-async fn refeed_orders(
-    pool: &DbPool,
-    book_tx: &mpsc::Sender<BookUpdate>,
-    orders: Vec<BookOrder>,
-) -> DbResult<()> {
-    pool.write_book(book_tx, move |conn| {
-        db::postgres_db::active_book_update_tx(conn, orders)
-    })
-    .await
-}
-
-/// Hand orders that were never reserved straight back to the matcher. If the
-/// write does not commit, the executor pauses until they can be returned.
-async fn give_back(
-    pool: &DbPool,
-    book_tx: &mpsc::Sender<BookUpdate>,
-    orders: Vec<BookOrder>,
-) -> ExecResult<BatchSubmission> {
-    match refeed_orders(pool, book_tx, orders.clone()).await {
-        Ok(()) => Ok(BatchSubmission::Returned),
-        Err(error) if error.is_fatal() => Err(error.into()),
-        Err(error) => Ok(BatchSubmission::Paused {
-            reason: error.into(),
-            give_back: Some(orders),
-        }),
-    }
-}
-
 /// Verification-mode bookkeeping, kept apart from the I/O so it is testable.
 /// While `active`, the executor stops reading its queue; held transactions
 /// run, in their original order, once verification passes.
@@ -562,19 +540,9 @@ struct Verification {
 }
 
 impl Verification {
-    /// Pause on `current`. It is retried after verification unless its
-    /// orders are owed back instead; the rest of the tick queues behind it.
-    fn pause(
-        &mut self,
-        current: ExecutionBatch,
-        give_back: Option<Vec<BookOrder>>,
-        rest: impl Iterator<Item = ExecutionBatch>,
-    ) {
-        match give_back {
-            Some(orders) => self.returning.extend(orders),
-            None => self.retry.push_back(current),
-        }
-        self.retry.extend(rest);
+    /// Enter verification mode; `retry` runs, in order, once it passes.
+    fn pause(&mut self, retry: impl IntoIterator<Item = ExecutionBatch>) {
+        self.retry.extend(retry);
         self.active = true;
     }
 
@@ -592,9 +560,10 @@ impl Verification {
     }
 }
 
-/// Return orders to the matcher, minus any whose note is already consumed on
-/// chain (those are marked OnchainNullified instead). Leaves `held` intact on
-/// error, so verification retries the return once RPC and DB are back.
+/// Give orders that were never reserved back to the matcher, minus any whose
+/// note is already consumed on chain (those are marked OnchainNullified). The
+/// only give-back path. Leaves `held` intact on error, so verification
+/// retries the return once RPC and DB are back.
 async fn release_held(
     miden_adapter: &Arc<Mutex<dyn MidenClient>>,
     pool: &DbPool,
@@ -655,29 +624,6 @@ async fn verify_ready(
     release_held(miden_adapter, pool, book_tx, held).await
 }
 
-/// On the TxError classification path, fetch which input notes are consumed
-/// on-chain. Keep IDs typed until the database boundary.
-async fn classify_input_notes(
-    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
-    batch: &ExecutionBatch,
-    input_notes: &[Note],
-) -> Result<(HashSet<NoteId>, Vec<BookOrder>), ChainError> {
-    let consumed_ids = {
-        let mut adapter = miden_adapter.lock().await;
-        adapter.check_consumed_notes(input_notes).await?
-    };
-
-    let mut active_orders: Vec<BookOrder> = Vec::new();
-
-    for filled in &batch.filled_notes {
-        if !consumed_ids.contains(&filled.note_id) {
-            active_orders.push(filled.to_book_order());
-        }
-    }
-
-    Ok((consumed_ids, active_orders))
-}
-
 // ── Main loop ──────────────────────────────────────────────────────────────
 
 /// Submit batches and reconcile their on-chain outcomes. Local execution and
@@ -691,23 +637,50 @@ pub async fn run_executor(
     miden_adapter: Arc<Mutex<dyn MidenClient>>,
     solver_id: AccountId,
     pool: DbPool,
-    mut exec_rx: mpsc::Receiver<ExecutionBatch>,
+    exec_rx: mpsc::Receiver<ExecutionBatch>,
     book_tx: mpsc::Sender<BookUpdate>,
     // In-memory swap-eta settlement-time window; republished on each success.
     stats_tx: watch::Sender<Arc<SettlementStats>>,
     cancel: CancellationToken,
 ) {
+    let result = executor_loop(
+        &client,
+        &miden_adapter,
+        solver_id,
+        &pool,
+        exec_rx,
+        &book_tx,
+        &stats_tx,
+        &cancel,
+    )
+    .await;
+    match result {
+        Ok(()) | Err(ExecutorError::Cancelled) => {}
+        // Only fatal database failures and broken durable state reach here;
+        // everything else is handled per batch or by verification mode.
+        Err(error) => {
+            tracing::error!(%error, "executor failed; stopping pipeline");
+            cancel.cancel();
+        }
+    }
+    tracing::info!("executor shutting down");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn executor_loop(
+    client: &Arc<Mutex<Client<FilesystemKeyStore>>>,
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    solver_id: AccountId,
+    pool: &DbPool,
+    mut exec_rx: mpsc::Receiver<ExecutionBatch>,
+    book_tx: &mpsc::Sender<BookUpdate>,
+    stats_tx: &watch::Sender<Arc<SettlementStats>>,
+    cancel: &CancellationToken,
+) -> ExecResult<()> {
     // Owned here (executor thread) and published over `stats_tx`. Ephemeral —
     // no DB persistence; rebuilds after a restart.
     let mut stats = SettlementStats::new();
-    let mut pending = match PendingSettlement::load(&pool).await {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::error!(%error, "cannot restore pending settlements; stopping pipeline");
-            cancel.cancel();
-            return;
-        }
-    };
+    let mut pending = PendingSettlement::load(pool).await?;
     let mut reconcile_tick = tokio::time::interval(SETTLEMENT_RECONCILE_INTERVAL);
     reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut verify_tick = tokio::time::interval(VERIFY_INTERVAL);
@@ -724,64 +697,46 @@ pub async fn run_executor(
             // starts, only the backoff sleep is cancel-aware — the on-chain
             // submit runs to completion before a result is observed.
             let mut batch = tokio::select! {
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => return Ok(()),
                 _ = reconcile_tick.tick() => {
-                    if let Err(error) = reconcile_settlements(&client, &miden_adapter, solver_id, &pool, &book_tx, &mut pending).await {
-                        // RPC failures are handled per settlement inside reconciliation.
-                        // Reaching here means local durable state or the matcher channel
-                        // is unavailable, so continuing would leave the book inconsistent.
-                        tracing::error!(%error, "settlement reconciliation failed; stopping pipeline");
-                        cancel.cancel();
-                        return;
-                    }
+                    // RPC failures are handled per settlement inside; an error
+                    // here means durable state or the matcher is unavailable.
+                    reconcile_settlements(client, miden_adapter, solver_id, pool, book_tx, &mut pending).await?;
                     continue;
                 }
                 _ = verify_tick.tick(), if verification.active => {
-                    match verify_ready(&client, &miden_adapter, solver_id, &pool, &book_tx, &mut verification.returning).await {
+                    match verify_ready(client, miden_adapter, solver_id, pool, book_tx, &mut verification.returning).await {
                         Ok(()) => {
                             verification.resume();
                             tracing::info!(retrying = verification.retry.len(), "executor verified ready; accepting batches");
                         }
-                        Err(error) if pool.fatal_token().is_cancelled() => {
-                            tracing::error!(%error, "executor verification hit a fatal database failure; stopping pipeline");
-                            cancel.cancel();
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(error = %format!("{error:#}"), "executor not ready; still verifying");
-                        }
+                        Err(error) if error.is_fatal() => return Err(error),
+                        Err(error) => tracing::warn!(%error, "executor not ready; still verifying"),
                     }
                     continue;
                 }
-                opt = exec_rx.recv(), if !verification.active => match opt {
-                    Some(b) => b,
-                    None => break,  // channel closed → upstream is gone
+                batch = exec_rx.recv(), if !verification.active => match batch {
+                    Some(batch) => batch,
+                    None => return Ok(()), // channel closed → upstream is gone
                 },
             };
-
             if batch.filled_notes.is_empty() {
                 continue;
             }
             match split_batch(&mut batch) {
                 Ok(transactions) => transactions,
                 Err(error) => {
-                    // A malformed batch fails the same way on every retry, so
-                    // its orders go straight back; the executor itself is fine.
+                    // A malformed batch fails the same way on every retry.
                     tracing::error!(%error, "cannot split execution batch safely; returning orders");
-                    let orders = batch.book_orders();
-                    match give_back(&pool, &book_tx, orders).await {
-                        Ok(BatchSubmission::Paused { reason, give_back }) => {
-                            verification.pause(batch, give_back, std::iter::empty());
-                            verify_tick.reset();
-                            tracing::warn!(%reason, "executor entering verification mode");
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::error!(%error, "returning orders hit a fatal database failure; stopping pipeline");
-                            cancel.cancel();
-                            return;
-                        }
-                    }
+                    verification.returning.extend(batch.book_orders());
+                    give_back(
+                        miden_adapter,
+                        pool,
+                        book_tx,
+                        &mut verification,
+                        &mut verify_tick,
+                    )
+                    .await?;
                     continue;
                 }
             }
@@ -793,55 +748,74 @@ pub async fn run_executor(
                 // Unsubmitted groups remain Active in the DB for boot recovery.
                 break;
             }
-            let result = execute_batch(
-                &client,
-                &miden_adapter,
+            let notes = batch.filled_notes.len();
+            match execute_batch(
+                client,
+                miden_adapter,
                 solver_id,
-                &pool,
+                pool,
                 &batch,
-                &book_tx,
-                &cancel,
+                book_tx,
+                cancel,
             )
-            .await;
-
-            match result {
-                Ok(BatchSubmission::Accepted(settlement)) => {
-                    tracing::info!(
-                        notes = batch.filled_notes.len(),
-                        "batch accepted for settlement"
-                    );
-                    record_settlement(&batch, &mut stats, &stats_tx);
+            .await?
+            {
+                BatchSubmission::Accepted(settlement) => {
+                    tracing::info!(notes, "batch accepted for settlement");
+                    record_settlement(&batch, &mut stats, stats_tx);
                     pending.insert(settlement.id(), settlement);
                 }
-                Ok(BatchSubmission::Uncertain(settlement)) => {
-                    tracing::warn!(
-                        notes = batch.filled_notes.len(),
-                        "batch submission outcome uncertain"
-                    );
+                BatchSubmission::Uncertain(settlement) => {
+                    tracing::warn!(notes, "batch submission outcome uncertain");
                     pending.insert(settlement.id(), settlement);
                 }
-                Ok(BatchSubmission::Returned) => {}
-                Ok(BatchSubmission::Paused { reason, give_back }) => {
-                    verification.pause(batch, give_back, transactions.by_ref());
+                BatchSubmission::Released => {}
+                BatchSubmission::GiveBack(orders) => {
+                    verification.returning.extend(orders);
+                    if !give_back(
+                        miden_adapter,
+                        pool,
+                        book_tx,
+                        &mut verification,
+                        &mut verify_tick,
+                    )
+                    .await?
+                    {
+                        verification.pause(transactions.by_ref());
+                        break;
+                    }
+                }
+                BatchSubmission::Paused(reason) => {
+                    tracing::warn!(%reason, "executor entering verification mode");
+                    verification.pause(std::iter::once(batch).chain(transactions.by_ref()));
                     verify_tick.reset();
-                    tracing::warn!(
-                        %reason,
-                        retrying = verification.retry.len(),
-                        returning = verification.returning.len(),
-                        "executor entering verification mode"
-                    );
                     break;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch recovery failed; stopping pipeline");
-                    cancel.cancel();
-                    return;
                 }
             }
         }
     }
+}
 
-    tracing::info!("executor shutting down");
+/// Return `verification.returning` to the matcher now. `Ok(false)`: the
+/// return did not commit; the orders stay owed and the executor enters
+/// verification mode, which retries the return.
+async fn give_back(
+    miden_adapter: &Arc<Mutex<dyn MidenClient>>,
+    pool: &DbPool,
+    book_tx: &mpsc::Sender<BookUpdate>,
+    verification: &mut Verification,
+    verify_tick: &mut tokio::time::Interval,
+) -> ExecResult<bool> {
+    match release_held(miden_adapter, pool, book_tx, &mut verification.returning).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_fatal() => Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "orders could not be returned; executor entering verification mode");
+            verification.pause(std::iter::empty());
+            verify_tick.reset();
+            Ok(false)
+        }
+    }
 }
 
 /// The executor client syncs independently. Once its local transaction record
@@ -870,7 +844,7 @@ async fn reconcile_settlements(
         .await
         {
             Ok(resolved) => resolved,
-            Err(ExecutorError::Db(error)) if error.is_fatal() => return Err(error.into()),
+            Err(error) if error.is_fatal() => return Err(error),
             // One failed lifecycle write leaves this settlement exactly as
             // durable state describes it; try again on the next tick.
             Err(error) => {
@@ -1253,7 +1227,7 @@ async fn execute_batch(
             // A batch that cannot be prepared fails the same way on retry,
             // so its orders go straight back to the matcher.
             tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch preparation failed; returning its orders");
-            return give_back(pool, book_tx, batch.book_orders()).await;
+            return Ok(BatchSubmission::GiveBack(batch.book_orders()));
         }
     };
 
@@ -1262,10 +1236,7 @@ async fn execute_batch(
     if let Err(e) =
         check_fee_headroom(client, miden_adapter, solver_id, FeePreflight::Lenient).await
     {
-        return Ok(BatchSubmission::Paused {
-            reason: e,
-            give_back: None,
-        });
+        return Ok(BatchSubmission::Paused(e));
     }
 
     match submit_with_rpc_backoff(client, solver_id, &components, pool, cancel).await {
@@ -1282,8 +1253,8 @@ async fn execute_batch(
             // Failure for THIS batch composition; nothing was reserved or
             // submitted. Re-feed immediately: the DB filter returns only the
             // parents still Active, so one consumed during proving drops out.
-            tracing::error!(error = %msg, "tx build failed; re-feeding active orders");
-            give_back(pool, book_tx, batch.book_orders()).await
+            tracing::error!(error = %msg, "tx build failed; returning its orders");
+            Ok(BatchSubmission::GiveBack(batch.book_orders()))
         }
         SubmitOutcome::Critical(error) => Err(error.into()),
         SubmitOutcome::Cancelled => {
@@ -1292,104 +1263,64 @@ async fn execute_batch(
             );
             Err(ExecutorError::Cancelled)
         }
-        SubmitOutcome::TxError(e, mut settlement) => {
-            if let Some(settlement) = settlement.as_mut() {
-                let attempt_id = settlement.id_bytes().to_vec();
-                if let Err(error) = pool
-                    .write(move |conn| {
-                        db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_id)
-                    })
-                    .await
-                {
-                    if error.is_fatal() {
-                        return Err(error.into());
-                    }
-                    // The durable row keeps its pre-rejection status; the
-                    // discard transaction below accepts any unconfirmed status.
-                    tracing::warn!(%error, "rejected settlement status write failed; continuing");
+        // Failed before reservation (execution or proving): nothing was
+        // submitted, so the orders simply go back; `release_held` drops any
+        // whose note got consumed meanwhile.
+        SubmitOutcome::TxError(e, None) => {
+            tracing::error!(error = %e, "settlement transaction failed before submission; returning its orders");
+            Ok(BatchSubmission::GiveBack(batch.book_orders()))
+        }
+        SubmitOutcome::TxError(e, Some(mut settlement)) => {
+            let attempt_id = settlement.id_bytes().to_vec();
+            if let Err(error) = pool
+                .write(move |conn| db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_id))
+                .await
+            {
+                if error.is_fatal() {
+                    return Err(error.into());
                 }
-                settlement.mark_rejected();
+                // The durable row keeps its pre-rejection status; the
+                // discard transaction below accepts any unconfirmed status.
+                tracing::warn!(%error, "rejected settlement status write failed; continuing");
             }
+            settlement.mark_rejected();
             let input_notes = components.notes();
             let note_ids: Vec<_> = input_notes.iter().map(|note| note.id()).collect();
             tracing::error!(error = %e, ?note_ids, "settlement transaction failed; classifying input nullifiers");
 
-            let (consumed, active_orders) = match classify_input_notes(
-                miden_adapter,
-                batch,
-                &input_notes,
-            )
-            .await
+            // On any non-fatal failure below the rejection is durable and the
+            // parents stay reserved; reconciliation retries the release.
+            let consumed = match miden_adapter
+                .lock()
+                .await
+                .check_consumed_notes(&input_notes)
+                .await
             {
-                Ok(classification) => classification,
+                Ok(consumed) => consumed,
                 Err(error) => {
-                    if let Some(settlement) = settlement {
-                        // The rejection is already durable. Reconciliation
-                        // will retry this nullifier lookup without stopping
-                        // unrelated settlement work.
-                        tracing::warn!(%error, "input classification RPC failed; settlement remains reserved");
-                        return Ok(BatchSubmission::Uncertain(settlement));
-                    }
-
-                    // Nothing was submitted or reserved, but which input is
-                    // consumed is unknown until the RPC answers again.
-                    return Ok(BatchSubmission::Paused {
-                        reason: error.into(),
-                        give_back: None,
-                    });
+                    tracing::warn!(%error, "input classification RPC failed; settlement remains reserved");
+                    return Ok(BatchSubmission::Uncertain(settlement));
                 }
             };
             let consumed_count = consumed.len();
-            let active_count = active_orders.len();
-            let rejected_tx_id = settlement
-                .as_ref()
-                .map(|settlement| settlement.attempt.tx_id.clone());
-
-            // DB updates first, then re-feed the actives. Idempotent against
-            // a concurrent ingest update (status guard in mark_orders_onchain_nullified).
+            let tx_id = settlement.attempt.tx_id.clone();
             let released = pool
                 .write_book(book_tx, move |conn| {
-                    if let Some(tx_id) = rejected_tx_id {
-                        // Release parents and delete the attempt in one transaction.
-                        db::postgres_db::finish_discarded_settlement_tx(conn, &tx_id, &consumed)
-                    } else {
-                        // Execution/proving failed before durable reservation.
-                        let consumed_bytes: Vec<_> =
-                            consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
-                        db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
-                        let mut update =
-                            db::postgres_db::active_book_update_tx(conn, active_orders)?;
-                        update.removed.extend(consumed);
-                        Ok(update)
-                    }
+                    // Release parents and delete the attempt in one transaction.
+                    db::postgres_db::finish_discarded_settlement_tx(conn, &tx_id, &consumed)
                 })
                 .await;
-            if let Err(error) = released {
-                if error.is_fatal() {
-                    return Err(error.into());
+            match released {
+                Ok(()) => {
+                    tracing::error!(error = ?e, consumed_count, "non-RPC submit failure classified");
+                    Ok(BatchSubmission::Released)
                 }
-                return Ok(match settlement {
-                    // Parents stay reserved; reconciliation retries the release.
-                    Some(settlement) => {
-                        tracing::warn!(%error, "discard write failed; settlement left for reconciliation");
-                        BatchSubmission::Uncertain(settlement)
-                    }
-                    // Nothing was reserved, so the orders are still Active.
-                    // The nullifier check is repeated when they are returned.
-                    None => BatchSubmission::Paused {
-                        reason: error.into(),
-                        give_back: Some(batch.book_orders()),
-                    },
-                });
+                Err(error) if error.is_fatal() => Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(%error, "discard write failed; settlement left for reconciliation");
+                    Ok(BatchSubmission::Uncertain(settlement))
+                }
             }
-
-            tracing::error!(
-                error = ?e,
-                consumed_count,
-                refed_count = active_count,
-                "non-RPC submit failure classified"
-            );
-            Ok(BatchSubmission::Returned)
         }
     }
 }
@@ -1583,45 +1514,39 @@ pub(crate) fn spawn_executor_thread(
 )> {
     use anyhow::Context;
     let (exec_ready_tx, exec_ready_rx) = oneshot::channel::<anyhow::Result<()>>();
-    let exec_factory = factory;
-    let exec_db = db_pool;
-    let exec_cancel = cancel;
-    let exec_refeed_tx = refeed_tx;
-    let exec_stats_tx = stats_tx;
-    let exec_sync_interval = sync_interval;
     let executor_thread = thread::Builder::new()
         .name("executor-client".into())
         .spawn(move || {
             crate::start::run_on_local_runtime("executor-client", async move {
-                let client = match exec_factory.build_executor().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = exec_ready_tx.send(Err(e.context("build_executor")));
+                let setup = async {
+                    let client = factory.build_executor().await.context("build_executor")?;
+                    let rpc = factory.rpc().context("build executor rpc")?;
+                    let shared: Arc<Mutex<Client<FilesystemKeyStore>>> =
+                        Arc::new(Mutex::new(client));
+                    let adapter: Arc<Mutex<dyn MidenClient>> =
+                        Arc::new(Mutex::new(MidenClientAdapter {
+                            client: shared.clone(),
+                            rpc,
+                        }));
+                    // Miden 0.16 seals transaction inputs against synced chain
+                    // headers, so an unsynced client can't submit. Sync once
+                    // before accepting batches; the periodic sync task below
+                    // sleeps before its first tick.
+                    adapter
+                        .lock()
+                        .await
+                        .sync_state()
+                        .await
+                        .context("initial executor sync")?;
+                    anyhow::Ok((shared, adapter))
+                };
+                let (executor_shared, executor_adapter) = match setup.await {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        let _ = exec_ready_tx.send(Err(error));
                         return;
                     }
                 };
-                let exec_rpc = match exec_factory.rpc() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = exec_ready_tx.send(Err(e.context("build executor rpc")));
-                        return;
-                    }
-                };
-                let executor_shared: Arc<Mutex<Client<FilesystemKeyStore>>> =
-                    Arc::new(Mutex::new(client));
-                let executor_adapter: Arc<Mutex<dyn MidenClient>> =
-                    Arc::new(Mutex::new(MidenClientAdapter {
-                        client: executor_shared.clone(),
-                        rpc: exec_rpc,
-                    }));
-
-                // Miden 0.16 seals transaction inputs against synced chain headers, so
-                // an unsynced client can't submit. Sync once before accepting batches;
-                // the periodic sync task below sleeps before its first tick.
-                if let Err(e) = executor_adapter.lock().await.sync_state().await {
-                    let _ = exec_ready_tx.send(Err(anyhow::Error::from(e).context("initial executor sync")));
-                    return;
-                }
                 match executor_adapter.lock().await.fee_parameters().await {
                     Ok(Some((faucet, base_fee))) => {
                         tracing::info!(fee_faucet = %faucet, base_fee, "chain fee parameters");
@@ -1632,16 +1557,16 @@ pub(crate) fn spawn_executor_thread(
 
                 let run_client = executor_shared.clone();
                 let run_adapter = executor_adapter.clone();
-                let run_cancel = exec_cancel.clone();
+                let run_cancel = cancel.clone();
                 let mut executor_handle = tokio::task::spawn_local(async move {
                     run_executor(
                         run_client,
                         run_adapter,
                         solver_id,
-                        exec_db,
+                        db_pool,
                         exec_rx,
-                        exec_refeed_tx,
-                        exec_stats_tx,
+                        refeed_tx,
+                        stats_tx,
                         run_cancel,
                     )
                     .await;
@@ -1649,7 +1574,7 @@ pub(crate) fn spawn_executor_thread(
 
                 let sync_adapter = executor_adapter.clone();
                 let sync_client = executor_shared.clone();
-                let sync_cancel = exec_cancel.clone();
+                let sync_cancel = cancel.clone();
                 let mut executor_sync_handle = tokio::task::spawn_local(async move {
                     // Claim funds sent while the solver was down (a new account's first
                     // claim also deploys it), then again after every successful sync.
@@ -1659,7 +1584,7 @@ pub(crate) fn spawn_executor_thread(
                     loop {
                         tokio::select! {
                             _ = sync_cancel.cancelled() => break,
-                            _ = tokio::time::sleep(exec_sync_interval) => {
+                            _ = tokio::time::sleep(sync_interval) => {
                                 if let Err(e) = sync_adapter.lock().await.sync_state().await {
                                     tracing::warn!(error = %e, "executor-client tagless sync failed; will retry next tick");
                                     continue;
@@ -1678,14 +1603,14 @@ pub(crate) fn spawn_executor_thread(
                 // immediately (the `exec_rx`-drop → matcher path only fires on
                 // the *next* batch send, and never if only the sync task dies).
                 tokio::select! {
-                    _ = exec_cancel.cancelled() => {}
+                    _ = cancel.cancelled() => {}
                     _ = &mut executor_handle => {
                         tracing::error!("executor task exited unexpectedly; triggering shutdown");
-                        exec_cancel.cancel();
+                        cancel.cancel();
                     }
                     _ = &mut executor_sync_handle => {
                         tracing::error!("executor-sync task exited unexpectedly; triggering shutdown");
-                        exec_cancel.cancel();
+                        cancel.cancel();
                     }
                 }
                 // Drain inside the runtime so the executor `Client` Arc refs
@@ -1888,8 +1813,8 @@ mod claim_tests {
             let components = BatchComponents::prepare(&tx, solver_id).unwrap();
             assert!(components.inputs.len() <= miden_protocol::MAX_INPUT_NOTES_PER_TX);
             assert!(
-                components.expected_output_recipients.len() + 1
-                    <= miden_protocol::MAX_OUTPUT_NOTES_PER_TX
+                components.expected_output_recipients.len()
+                    < miden_protocol::MAX_OUTPUT_NOTES_PER_TX
             );
         }
     }
@@ -2223,7 +2148,7 @@ mod recovery_tests {
         assert!(verification.take_retries().is_empty());
 
         // Pausing on transaction 1 holds it and the rest of its tick.
-        verification.pause(tagged(1), None, [tagged(2), tagged(3)].into_iter());
+        verification.pause([tagged(1), tagged(2), tagged(3)]);
         assert!(verification.active);
         assert!(
             verification.take_retries().is_empty(),
@@ -2236,36 +2161,12 @@ mod recovery_tests {
             verification.take_retries().is_empty(),
             "retried exactly once"
         );
-    }
 
-    #[test]
-    fn verification_gives_orders_back_instead_of_retrying_when_asked() -> Result<()> {
-        let order = BookOrder {
-            priority_seq: 1,
-            arrival_unix: 1,
-            note: Arc::new(parent_note()?),
-        };
-        let mut verification = Verification::default();
-        verification.pause(tagged(1), Some(vec![order]), [tagged(2)].into_iter());
-        assert_eq!(verification.returning.len(), 1);
+        // An unreturned give-back pauses without retrying anything.
+        verification.pause(std::iter::empty());
+        assert!(verification.active);
         verification.resume();
-        assert_eq!(
-            tags(&verification.take_retries()),
-            vec![2],
-            "a given-back transaction is not retried"
-        );
-
-        verification.pause(tagged(3), Some(Vec::new()), std::iter::empty());
-        assert!(
-            verification.active,
-            "an unreturned batch pauses the executor"
-        );
-        verification.resume();
-        assert!(
-            verification.take_retries().is_empty(),
-            "a given-back batch is never retried"
-        );
-        Ok(())
+        assert!(verification.take_retries().is_empty());
     }
 
     #[test]
@@ -2301,7 +2202,7 @@ mod recovery_tests {
             let rows: Vec<_> = notes
                 .iter()
                 .map(|note| NewOrderRow::ingested(note, 1))
-                .collect::<DbResult<_>>()?;
+                .collect::<crate::db::DbResult<_>>()?;
             pool.write(move |conn| {
                 db::postgres_db::insert_orders_batch_tx(conn, &rows, 1)?;
                 Ok(())

@@ -31,6 +31,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::sync::mpsc;
 
+use crate::db::postgres_pool::{LatencySnapshot, LATENCY_BUCKET_US};
 use crate::db::DbPool;
 use crate::types::{BookUpdate, ExecutionBatch};
 
@@ -97,16 +98,18 @@ async fn health() -> (StatusCode, &'static str) {
     (StatusCode::OK, "ok")
 }
 
-fn append_latency_buckets(body: &mut String, metric: &str, buckets: &[u64; 9]) {
+fn append_latency(body: &mut String, metric: &str, latency: &LatencySnapshot) {
     use std::fmt::Write;
 
-    const BOUNDS: [&str; 9] = [
-        "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "1", "+Inf",
-    ];
-    for (bound, count) in BOUNDS.into_iter().zip(buckets) {
+    let bounds = LATENCY_BUCKET_US
+        .iter()
+        .map(|us| (*us as f64 / 1_000_000.0).to_string())
+        .chain(["+Inf".to_string()]);
+    for (bound, count) in bounds.zip(latency.buckets) {
         let _ = writeln!(body, "{metric}_bucket{{le=\"{bound}\"}} {count}");
     }
-    let _ = writeln!(body, "{metric}_count {}", buckets[8]);
+    let _ = writeln!(body, "{metric}_sum {}", latency.sum_us as f64 / 1_000_000.0);
+    let _ = writeln!(body, "{metric}_count {}", latency.buckets[8]);
 }
 
 async fn metrics(
@@ -118,12 +121,8 @@ async fn metrics(
     let mut body = format!(
         "solver_db_read_total {}\n\
          solver_db_read_errors_total {}\n\
-         solver_db_read_pool_wait_seconds_sum {}\n\
-         solver_db_read_duration_seconds_sum {}\n\
          solver_db_write_total {}\n\
          solver_db_write_errors_total {}\n\
-         solver_db_writer_wait_seconds_sum {}\n\
-         solver_db_write_duration_seconds_sum {}\n\
          solver_db_lock_timeouts_total {}\n\
          solver_db_statement_timeouts_total {}\n\
          solver_db_deadlocks_total {}\n\
@@ -131,19 +130,14 @@ async fn metrics(
          solver_db_read_connections {}\n\
          solver_db_read_idle_connections {}\n\
          solver_db_writer_busy {}\n\
-         solver_db_ownership_lost {}\n\
          solver_db_fatal_shutdown_requested {}\n\
          solver_matcher_book_channel_remaining {}\n\
          solver_matcher_executor_channel_remaining {}\n\
          solver_matcher_executor_full_skipped_ticks_total {}\n",
         pool.read_total,
         pool.read_errors,
-        pool.read_wait_us as f64 / 1_000_000.0,
-        pool.read_duration_us as f64 / 1_000_000.0,
         pool.write_total,
         pool.write_errors,
-        pool.writer_wait_us as f64 / 1_000_000.0,
-        pool.write_duration_us as f64 / 1_000_000.0,
         pool.lock_timeouts,
         pool.statement_timeouts,
         pool.deadlocks,
@@ -151,32 +145,19 @@ async fn metrics(
         pool.read_connections,
         pool.read_idle_connections,
         u8::from(pool.writer_busy),
-        u8::from(pool.ownership_lost),
         u8::from(pool.fatal_shutdown_requested),
         book_capacity,
         exec_capacity,
         crate::matcher::skipped_executor_full_ticks(),
     );
-    append_latency_buckets(
-        &mut body,
-        "solver_db_read_pool_wait_seconds",
-        &pool.read_wait_buckets,
-    );
-    append_latency_buckets(
-        &mut body,
-        "solver_db_read_duration_seconds",
-        &pool.read_duration_buckets,
-    );
-    append_latency_buckets(
-        &mut body,
-        "solver_db_writer_wait_seconds",
-        &pool.writer_wait_buckets,
-    );
-    append_latency_buckets(
-        &mut body,
-        "solver_db_write_duration_seconds",
-        &pool.write_duration_buckets,
-    );
+    for (metric, latency) in [
+        ("solver_db_read_pool_wait_seconds", &pool.read_wait),
+        ("solver_db_read_duration_seconds", &pool.read_duration),
+        ("solver_db_writer_wait_seconds", &pool.writer_wait),
+        ("solver_db_write_duration_seconds", &pool.write_duration),
+    ] {
+        append_latency(&mut body, metric, latency);
+    }
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 

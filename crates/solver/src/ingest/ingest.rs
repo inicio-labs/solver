@@ -195,8 +195,10 @@ pub async fn run_ingest(
                     let now = i64::try_from(crate::types::now_unix()).unwrap_or(i64::MAX);
                     last_sync_unix_seconds.store(now, Ordering::Relaxed);
                 }
+                // A fatal writer or a closed matcher channel never recovers.
                 Err(error)
-                    if !pool.fatal_token().is_cancelled()
+                    if !error.is_fatal()
+                        && !matches!(error, DbError::MatcherStopped)
                         && failures + 1 < INGEST_PERSIST_ATTEMPTS =>
                 {
                     tracing::warn!(%error, attempt = failures + 1, "persisting ingest update failed; retrying next tick");
@@ -326,12 +328,7 @@ impl SyncResult {
                 continue;
             }
             let arrival_unix = crate::types::now_unix();
-            // Parsed as a valid PSWAP order just above.
-            order_rows.push(NewOrderRow {
-                note_id: note.id().to_bytes().to_vec(),
-                raw_data: note.to_bytes(),
-                arrival_unix: i64::try_from(arrival_unix)?,
-            });
+            order_rows.push(NewOrderRow::parsed(note, arrival_unix)?);
             book_orders.push(BookOrder {
                 priority_seq: 0,
                 arrival_unix,
@@ -581,51 +578,36 @@ pub(crate) fn spawn_ingest_thread(
 )> {
     use anyhow::Context;
     let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<anyhow::Result<()>>();
-    let ingest_factory = factory;
-    let ingest_db = db_pool;
-    let ingest_cancel = cancel;
-    let ingest_book_tx = book_tx;
-    let ingest_subscribe_rx = subscribe_rx;
-    let ingest_last_sync: Arc<AtomicI64> = last_sync;
     let ingest_thread = thread::Builder::new()
         .name("ingest-client".into())
         .spawn(move || {
             crate::start::run_on_local_runtime("ingest-client", async move {
-                let client = match ingest_factory.build_ingest().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = ingest_ready_tx.send(Err(e.context("build_ingest")));
-                        return;
-                    }
+                let setup = async {
+                    let client = factory.build_ingest().await.context("build_ingest")?;
+                    let rpc = factory.rpc().context("build ingest rpc")?;
+                    let adapter: Arc<Mutex<dyn MidenClient>> =
+                        Arc::new(Mutex::new(MidenClientAdapter {
+                            client: Arc::new(Mutex::new(client)),
+                            rpc,
+                        }));
+                    crate::pipeline::spawn_ingest_tasks(
+                        adapter,
+                        db_pool,
+                        book_tx,
+                        subscribe_rx,
+                        ingest_interval,
+                        cancel.clone(),
+                        last_sync,
+                        solver_id,
+                        clearing_bootstrap,
+                    )
+                    .await
+                    .context("spawn_ingest_tasks")
                 };
-                let rpc = match ingest_factory.rpc() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = ingest_ready_tx.send(Err(e.context("build ingest rpc")));
-                        return;
-                    }
-                };
-                let adapter: Arc<Mutex<dyn MidenClient>> =
-                    Arc::new(Mutex::new(MidenClientAdapter {
-                        client: Arc::new(Mutex::new(client)),
-                        rpc,
-                    }));
-                let mut h = match crate::pipeline::spawn_ingest_tasks(
-                    adapter,
-                    ingest_db,
-                    ingest_book_tx,
-                    ingest_subscribe_rx,
-                    ingest_interval,
-                    ingest_cancel.clone(),
-                    ingest_last_sync,
-                    solver_id,
-                    clearing_bootstrap,
-                )
-                .await
-                {
+                let mut h = match setup.await {
                     Ok(h) => h,
-                    Err(e) => {
-                        let _ = ingest_ready_tx.send(Err(e.context("spawn_ingest_tasks")));
+                    Err(error) => {
+                        let _ = ingest_ready_tx.send(Err(error));
                         return;
                     }
                 };
@@ -634,16 +616,16 @@ pub(crate) fn spawn_ingest_thread(
                 // coordination loop has no other signal — `book_tx` keeps
                 // other live senders, so its `book_rx` never closes and the
                 // matcher would silently run a stale book. Propagate a global
-                // shutdown (`ingest_cancel` is a clone of the root token).
+                // shutdown (`cancel` is a clone of the root token).
                 tokio::select! {
-                    _ = ingest_cancel.cancelled() => {}
+                    _ = cancel.cancelled() => {}
                     _ = &mut h.ingest_handle => {
                         tracing::error!("ingest task exited unexpectedly; triggering shutdown");
-                        ingest_cancel.cancel();
+                        cancel.cancel();
                     }
                     _ = &mut h.subscribe_handle => {
                         tracing::error!("subscribe-relay task exited unexpectedly; triggering shutdown");
-                        ingest_cancel.cancel();
+                        cancel.cancel();
                     }
                 }
                 // Drain inside the runtime: abort + await both tasks so their

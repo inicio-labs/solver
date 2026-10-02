@@ -36,6 +36,10 @@ pub enum DbError {
     },
     #[error("PostgreSQL worker stopped")]
     WorkerStopped(#[from] tokio::task::JoinError),
+    #[error("PostgreSQL writer worker panicked")]
+    WriterPanicked(#[source] tokio::task::JoinError),
+    #[error("PostgreSQL write did not finish within {0:?}; its outcome is unknown")]
+    WriteDeadline(Duration),
     #[error("matcher stopped: book update receiver closed")]
     MatcherStopped,
 
@@ -128,7 +132,8 @@ impl DbError {
                 | Self::OwnerEpochMoved { .. }
                 | Self::ReconnectTimedOut { .. }
                 | Self::CommitOutcomeUnknown { .. }
-                | Self::WorkerStopped(_)
-        ) || matches!(self, Self::Deadline { operation, .. } if *operation == "write")
+                | Self::WriterPanicked(_)
+                | Self::WriteDeadline(_)
+        )
     }
 }

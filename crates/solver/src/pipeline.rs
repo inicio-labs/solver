@@ -23,8 +23,9 @@ use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 /// batches, consumed-note notifications), used by `create_channels`.
 const PIPELINE_CHANNEL_BUF: usize = 5000;
 /// At most one batch waits for the executor. When it stops receiving
-/// (verification mode) the matcher's `try_reserve` fails on the next tick,
-/// so orders stay live in its book instead of queueing at stale prices.
+/// (verification mode) the matcher sees no free capacity on the next tick and
+/// skips it, so orders stay live in its book instead of queueing at stale
+/// prices.
 const EXEC_CHANNEL_BUF: usize = 1;
 /// Admin → subscribe-relay buffer. Low-traffic (infrequent operator actions).
 const SUBSCRIBE_CHANNEL_BUF: usize = 100;
@@ -130,11 +131,10 @@ async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, 
         .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &lookup_key))
         .await
     {
-        Ok(row) => match row {
-            Some(row) if row.decimals.is_some() => return, // already have it
-            Some(_) => {}                                  // registered, still missing → fetch
-            None => return,                                // not registered → nothing to annotate
-        },
+        // Registered but still missing metadata: fetch it below.
+        Ok(Some(row)) if row.decimals.is_none() => {}
+        // Already annotated, or not registered: nothing to do.
+        Ok(_) => return,
         Err(e) => {
             tracing::warn!(%token, error = %e, "ensure_token_metadata: db read failed");
             return;

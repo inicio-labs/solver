@@ -230,13 +230,14 @@ fn quote_from_row(
     }
     .ok_or(ApiError::NoPrice)?;
 
+    let decimals = row.token_decimals();
     Ok(PriceResponse {
         faucet_id: account_id.to_hex(),
         ticker: row.ticker,
         vs_currency: state.vs_currency.clone(),
         price: format_price(usd, precision),
         precision: precision_label(precision),
-        decimals: row.decimals.map(|d| d as u8),
+        decimals,
         as_of,
         stale,
         source: "coingecko".to_string(),
@@ -340,7 +341,7 @@ async fn token_rows(
     let keys: Vec<_> = tokens.iter().map(Serializable::to_bytes).collect();
     let mut rows = state
         .pool
-        .read(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
+        .read_public(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(tokens
@@ -392,8 +393,8 @@ async fn get_swap_eta(
     let rows = token_rows(&state, vec![a, b]).await?;
     let row_a = rows.get(&a).ok_or(ApiError::UnknownFaucet)?;
     let row_b = rows.get(&b).ok_or(ApiError::UnknownFaucet)?;
-    let d_a = row_a.decimals.map(|d| d as u8);
-    let d_b = row_b.decimals.map(|d| d as u8);
+    let d_a = row_a.token_decimals();
+    let d_b = row_b.token_decimals();
 
     // Book check — the incoming order (offer A, request B) crosses against the
     // OPPOSITE pair (offer B, request A).

@@ -19,7 +19,7 @@ use super::postgres_models::{
 use super::postgres_schema::{
     orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
 };
-use crate::types::{BookOrder, BookUpdate, OrderId, OrderStatus, SettlementError, TokenId};
+use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
 
 /// Rows per multi-row INSERT. The widest row (a remainder order) binds four
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
@@ -88,13 +88,6 @@ pub fn existing_note_ids_tx(
         .collect())
 }
 
-pub fn get_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<OrderRow>> {
-    Ok(orders::table
-        .filter(orders::status.eq(OrderStatus::Active.as_str()))
-        .select(OrderRow::as_select())
-        .load(conn)?)
-}
-
 pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
     let rows: Vec<OrderRow> = orders::table
         .filter(orders::status.eq(OrderStatus::Active.as_str()))
@@ -140,8 +133,11 @@ pub fn active_book_update_tx(
     })
 }
 
-/// Retire externally consumed orders. A parent reserved by an unresolved
-/// settlement is left for the executor, which decides from our transaction.
+/// Retire orders whose notes are consumed on chain. A consumed note is spent
+/// whoever consumed it, so a parent reserved by an unresolved settlement is
+/// retired too: confirmation still marks it Executed if our transaction was
+/// the consumer, and a discarded settlement only releases parents that are
+/// still Settling, so a consumed parent can never return to the book.
 pub fn mark_orders_onchain_nullified_tx(
     conn: &mut PgConnection,
     note_ids: &[Vec<u8>],
@@ -152,39 +148,13 @@ pub fn mark_orders_onchain_nullified_tx(
     let mut sorted = note_ids.to_vec();
     sorted.sort();
     sorted.dedup();
-    let locked: Vec<Vec<u8>> = orders::table
-        .filter(orders::note_id.eq_any(&sorted))
-        .order(orders::note_id.asc())
-        .for_update()
-        .select(orders::note_id)
-        .load(conn)?;
-    if locked.is_empty() {
-        return Ok(0);
-    }
-    // Every settlement_inputs row belongs to an unresolved attempt.
-    let reserved: HashSet<Vec<u8>> = settlement_inputs::table
-        .filter(settlement_inputs::parent_note_id.eq_any(&locked))
-        .select(settlement_inputs::parent_note_id)
-        .load::<Vec<u8>>(conn)?
-        .into_iter()
-        .collect();
-    let external: Vec<_> = locked
-        .into_iter()
-        .filter(|id| !reserved.contains(id))
-        .collect();
-    if external.is_empty() {
-        return Ok(0);
-    }
-    Ok(diesel::update(
-        orders::table
-            .filter(orders::note_id.eq_any(external))
-            .filter(
-                orders::status
-                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-            ),
+    Ok(
+        diesel::update(orders::table.filter(orders::note_id.eq_any(sorted)).filter(
+            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+        ))
+        .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
+        .execute(conn)?,
     )
-    .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
-    .execute(conn)?)
 }
 
 /// Reserve all parents after proof, before submission. A missing or consumed
@@ -197,21 +167,13 @@ pub fn prepare_settlement_tx(
     if inputs.is_empty() {
         return Err(SettlementError::NoInputs.into());
     }
-    if attempt.settlement_status()? != SettlementStatus::Prepared {
-        return Err(SettlementError::NotPrepared.into());
-    }
+    // The executor builds `attempt` and `inputs` from one executed transaction
+    // (`SettlementAttemptRow::prepared`, `BatchComponents::settlement_inputs`),
+    // so their IDs and child fields agree by construction.
     let mut parent_ids: Vec<_> = inputs
         .iter()
         .map(|input| input.parent_note_id.clone())
         .collect();
-    for input in inputs {
-        if input.tx_id != attempt.tx_id {
-            return Err(SettlementError::InputTransactionMismatch.into());
-        }
-        if input.child_note_id.is_some() != input.child_note_data.is_some() {
-            return Err(SettlementError::IncompleteChild.into());
-        }
-    }
     parent_ids.sort();
     parent_ids.dedup();
     if parent_ids.len() != inputs.len() {
@@ -241,15 +203,12 @@ pub fn prepare_settlement_tx(
         .collect();
     // The only validation of a child: confirmation and ingest rely on it.
     for input in inputs {
-        if let (Some(child_id), Some(raw_child)) = (&input.child_note_id, &input.child_note_data) {
+        if let Some(raw_child) = &input.child_note_data {
             let child = Note::read_from(&mut SliceReader::new(raw_child))?;
-            if child.id().to_bytes().as_slice() != child_id {
-                return Err(SettlementError::ChildIdMismatch.into());
-            }
             let parent = parents
                 .get(input.parent_note_id.as_slice())
                 .ok_or(SettlementError::MissingInputOrder)?;
-            NewRemainderOrderRow::from_parent(parent, &child)?;
+            validate_remainder(parent, &child)?;
         }
     }
     let changed = diesel::update(
@@ -390,6 +349,20 @@ fn lock_attempt(conn: &mut PgConnection, tx_id: &[u8]) -> DbResult<bool> {
         .first::<Vec<u8>>(conn)
         .optional()?
         .is_some())
+}
+
+/// A remainder must be a valid PSWAP order of its parent's creator, and the
+/// parent must hold a FIFO slot for it to inherit.
+fn validate_remainder(parent: &OrderRow, child: &Note) -> DbResult<()> {
+    let child_terms = Order::from_note(child)?;
+    let parent_terms = Order::from_note(&parent.note()?)?;
+    if child_terms.creator_id != parent_terms.creator_id {
+        return Err(SettlementError::InvalidRemainder.into());
+    }
+    if parent.priority_seq <= 0 {
+        return Err(DbError::Corrupt("parent order lacks a FIFO priority"));
+    }
+    Ok(())
 }
 
 /// A remainder inherits its parent's FIFO slot and arrival time. Its ID
@@ -642,10 +615,10 @@ pub fn get_registered_tokens_tx(conn: &mut PgConnection) -> DbResult<Vec<Registe
 
 pub fn get_registered_token_tx(
     conn: &mut PgConnection,
-    token_id: &[u8],
+    token: TokenId,
 ) -> DbResult<Option<RegisteredTokenRow>> {
     Ok(registered_tokens::table
-        .find(token_id)
+        .find(token.to_bytes())
         .select(RegisteredTokenRow::as_select())
         .first(conn)
         .optional()?)
@@ -724,9 +697,19 @@ pub fn unregister_token_tx(conn: &mut PgConnection, token: TokenId) -> DbResult<
 pub fn load_token_symbols_tx(conn: &mut PgConnection) -> DbResult<HashMap<TokenId, String>> {
     let mut result = HashMap::new();
     for row in get_registered_tokens_tx(conn)? {
-        if let Some(symbol) = row.external_symbol {
-            let token = TokenId::read_from(&mut SliceReader::new(&row.token_id))?;
-            result.insert(token, symbol);
+        if let Some(symbol) = &row.external_symbol {
+            result.insert(row.token()?, symbol.clone());
+        }
+    }
+    Ok(result)
+}
+
+/// On-chain decimals of every registered token that has them.
+pub fn load_token_decimals_tx(conn: &mut PgConnection) -> DbResult<HashMap<TokenId, u8>> {
+    let mut result = HashMap::new();
+    for row in get_registered_tokens_tx(conn)? {
+        if let Some(decimals) = row.token_decimals() {
+            result.insert(row.token()?, decimals);
         }
     }
     Ok(result)
@@ -735,7 +718,7 @@ pub fn load_token_symbols_tx(conn: &mut PgConnection) -> DbResult<HashMap<TokenI
 pub fn load_registered_tokens_tx(conn: &mut PgConnection) -> DbResult<Vec<TokenId>> {
     get_registered_tokens_tx(conn)?
         .into_iter()
-        .map(|row| Ok(TokenId::read_from(&mut SliceReader::new(&row.token_id))?))
+        .map(|row| row.token())
         .collect()
 }
 
@@ -753,6 +736,7 @@ pub fn seed_tokens_from_config_tx(
 mod tests {
     use super::*;
     use crate::db::postgres_migrations;
+    use crate::db::postgres_test::TestSchema;
     use anyhow::Result;
     use diesel::connection::SimpleConnection;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
@@ -764,39 +748,8 @@ mod tests {
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
-    use std::sync::atomic::{AtomicU64, Ordering};
+
     use std::sync::{Arc, Barrier};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
-
-    struct SchemaFixture {
-        conn: PgConnection,
-        name: String,
-    }
-
-    impl SchemaFixture {
-        fn new() -> Result<Self> {
-            let url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
-            let mut conn = postgres_migrations::connect(&url)?;
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let sequence = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
-            let name = format!("solver_data_{}_{}_{}", std::process::id(), nonce, sequence);
-            conn.batch_execute(&format!("CREATE SCHEMA {name}; SET search_path TO {name}"))?;
-            postgres_migrations::migrate(&mut conn)?;
-            Ok(Self { conn, name })
-        }
-    }
-
-    impl Drop for SchemaFixture {
-        fn drop(&mut self) {
-            let _ = self.conn.batch_execute("ROLLBACK");
-            let _ = self.conn.batch_execute(&format!(
-                "SET search_path TO public; DROP SCHEMA {} CASCADE",
-                self.name
-            ));
-        }
-    }
 
     fn order_note(serial_number: Word) -> Result<Note> {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE.try_into()?;
@@ -821,7 +774,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn bulk_511_parent_transition_is_atomic_and_idempotent() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let mut order_rows = Vec::with_capacity(511);
         let mut inputs = Vec::with_capacity(511);
@@ -915,7 +868,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn two_connections_confirm_once() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let note = order_note(Word::default())?;
         let id = note.id().to_bytes();
         let order_row = NewOrderRow::ingested(&note, 10)?;
@@ -971,7 +924,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn two_connections_cannot_reserve_the_same_parent() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let note = order_note(Word::default())?;
         let order_row = NewOrderRow::ingested(&note, 10)?;
         fixture.conn.transaction::<_, DbError, _>(|conn| {
@@ -1030,7 +983,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn confirmation_and_discard_never_split_a_transition() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let note = order_note(Word::default())?;
         let order_row = NewOrderRow::ingested(&note, 10)?;
         fixture.conn.transaction::<_, DbError, _>(|conn| {
@@ -1099,7 +1052,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn nullifier_observation_and_prepare_serialize() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let note = order_note(Word::default())?;
         let parent_id = note.id().to_bytes();
         let order_row = NewOrderRow::ingested(&note, 10)?;
@@ -1157,20 +1110,18 @@ mod tests {
             .find(note.id().to_bytes())
             .select(orders::status)
             .first(&mut fixture.conn)?;
-        if prepared {
-            assert_eq!((attempts, changed), (1, 0));
-            assert_eq!(status, OrderStatus::Settling.as_str());
-        } else {
-            assert_eq!((attempts, changed), (0, 1));
-            assert_eq!(status, OrderStatus::OnchainNullified.as_str());
-        }
+        // Whichever commits first, the consumed note ends retired: reserved
+        // or not, a spent parent never stays live.
+        assert_eq!(attempts, i64::from(prepared));
+        assert_eq!(changed, 1);
+        assert_eq!(status, OrderStatus::OnchainNullified.as_str());
         Ok(())
     }
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn recovery_rejects_attempt_without_inputs() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         diesel::insert_into(settlement_attempts::table)
             .values(SettlementAttemptRow {
                 tx_id: vec![21],
@@ -1193,7 +1144,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn invalid_ingest_and_child_rows_roll_back() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let note = order_note(Word::default())?;
         // Only a valid PSWAP note becomes an order row.
@@ -1244,7 +1195,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn missing_sync_cursor_rolls_back_the_entire_ingest_batch() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         diesel::delete(sync_state::table.find(1_i16)).execute(conn)?;
         let note = order_note(Word::default())?;
@@ -1260,7 +1211,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn token_registry_bulk_lookup_and_validation() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let first: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into()?;
         let second: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into()?;
@@ -1290,7 +1241,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn ingest_batch_beyond_the_bind_parameter_limit_is_chunked() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         // Three binds per row: 22,000 rows need 66,000 parameters, more than
         // the 65,535 PostgreSQL accepts in one statement.

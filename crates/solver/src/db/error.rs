@@ -25,8 +25,6 @@ pub enum DbError {
     ReadPool(#[from] diesel::r2d2::PoolError),
     #[error("PostgreSQL read pool stayed busy for {0:?}")]
     ReadPoolBusy(Duration),
-    #[error("PostgreSQL read pool is closed")]
-    ReadPoolClosed,
     #[error("PostgreSQL read_pool_size must be at least one")]
     InvalidReadPoolSize,
     #[error("PostgreSQL {operation} did not finish within {deadline:?}")]
@@ -53,8 +51,6 @@ pub enum DbError {
     AlreadyOwned,
     #[error("PostgreSQL writer is no longer safe; restart the whole solver")]
     WriterUnsafe,
-    #[error("PostgreSQL writer stayed busy for {0:?}; restart the whole solver")]
-    WriterBusy(Duration),
     #[error("PostgreSQL writer lost its ownership lock")]
     OwnershipLost,
     #[error("another solver holds the ownership lock after the writer session was lost")]
@@ -64,12 +60,6 @@ pub enum DbError {
          (owner epoch {ours} -> {current})"
     )]
     OwnerEpochMoved { ours: i64, current: i64 },
-    #[error("PostgreSQL writer did not reconnect within {window:?}")]
-    ReconnectTimedOut {
-        window: Duration,
-        #[source]
-        last: Box<DbError>,
-    },
     #[error("cannot determine whether transaction {xid} committed (status {status:?})")]
     CommitOutcomeUnknown { xid: String, status: Option<String> },
     #[error("PostgreSQL writer session was lost before commit; reconnected, nothing was written")]
@@ -116,17 +106,31 @@ pub enum DbError {
 }
 
 impl DbError {
+    /// A connection, pool or timeout failure that a later retry can clear,
+    /// as opposed to bad stored data or a broken invariant.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_)
+                | Self::Query(_)
+                | Self::ReadPool(_)
+                | Self::ReadPoolBusy(_)
+                | Self::Deadline { .. }
+                | Self::WorkerStopped(_)
+                | Self::LostBeforeCommit(_)
+                | Self::CommitDidNotApply(_)
+        )
+    }
+
     /// Whether this error means the solver must stop: it can no longer prove
     /// it is the only writer, or a write's outcome is unknown.
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
             Self::WriterUnsafe
-                | Self::WriterBusy(_)
                 | Self::OwnershipLost
                 | Self::LockTakenAfterDisconnect
                 | Self::OwnerEpochMoved { .. }
-                | Self::ReconnectTimedOut { .. }
                 | Self::CommitOutcomeUnknown { .. }
                 | Self::WriterPanicked(_)
                 | Self::WriteDeadline(_)

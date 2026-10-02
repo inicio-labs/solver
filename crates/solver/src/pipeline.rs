@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use miden_protocol::crypto::utils::{Deserializable, Serializable};
+use miden_protocol::crypto::utils::Serializable;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -36,7 +36,6 @@ pub struct PipelineConfig {
     /// be shared with `HttpPriceClient` (which hydrates the symbol cache from
     /// it at boot).
     pub db_pool: db::DbPool,
-    pub ingest_interval: Duration,
     pub price_interval: Duration,
     pub match_interval: Duration,
     /// Tokens to register at boot, each with an optional CoinGecko-style
@@ -53,11 +52,6 @@ pub struct PipelineConfig {
     /// on Ctrl-C (or any external shutdown event). Each pipeline task watches
     /// this token via `tokio::select!` and exits cleanly between iterations.
     pub cancel: CancellationToken,
-    /// Shared `last successful sync` timestamp (unix seconds), bumped by the
-    /// ingest task after every successful `sync_state`. Wired through to the
-    /// observability `/readyz` endpoint via `obs::ObsState`. Passing the same
-    /// `Arc` to both sides makes readiness reflect real ingest progress.
-    pub last_sync_unix_seconds: Arc<AtomicI64>,
 }
 
 impl PipelineConfig {
@@ -74,11 +68,9 @@ impl PipelineConfig {
         admin_token: Option<String>,
         token_map: SharedTokenMap,
         cancel: CancellationToken,
-        last_sync_unix_seconds: Arc<AtomicI64>,
     ) -> Self {
         Self {
             db_pool,
-            ingest_interval: Duration::from_millis(engine.fetch_interval_ms),
             price_interval: Duration::from_millis(engine.price_interval_ms),
             match_interval: Duration::from_millis(engine.pulse_interval_ms),
             initial_tokens,
@@ -86,7 +78,6 @@ impl PipelineConfig {
             admin_token,
             token_map,
             cancel,
-            last_sync_unix_seconds,
         }
     }
 }
@@ -122,13 +113,10 @@ pub async fn subscribe_all_pairs(
 /// registration touching this token (or a restart) retries. Must run on the
 /// ingest thread — the only place the `!Send` Miden client lives.
 async fn ensure_token_metadata(client: &mut dyn MidenClient, pool: &db::DbPool, token: TokenId) {
-    let key = token.to_bytes();
-
     // Already cached? Check first so we never re-hit the RPC for a known token
     // (the admin path replays a token across every pair it forms).
-    let lookup_key = key.clone();
     match pool
-        .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &lookup_key))
+        .read(move |conn| db::postgres_db::get_registered_token_tx(conn, token))
         .await
     {
         // Registered but still missing metadata: fetch it below.
@@ -356,11 +344,6 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
 }
 
 /// Handles for the `!Send` client-bound tasks spawned on the ingest thread.
-pub struct IngestHandles {
-    pub ingest_handle: JoinHandle<()>,
-    pub subscribe_handle: JoinHandle<()>,
-}
-
 /// Spawn the `!Send` client-bound tasks (subscribe-relay + ingest) on the
 /// INGEST thread's LocalSet. Subscribes all configured pairs first (uses the
 /// ingest adapter), then spawns the relay + ingest loops. Must be called from
@@ -373,10 +356,10 @@ pub async fn spawn_ingest_tasks(
     mut subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
     cancel: CancellationToken,
-    last_sync_unix_seconds: Arc<AtomicI64>,
+    last_sync_unix_seconds: Arc<AtomicU64>,
     solver_id: miden_protocol::account::AccountId,
     clearing_bootstrap: oneshot::Sender<matcher::ClearingBootstrap>,
-) -> Result<IngestHandles> {
+) -> Result<crate::start::ClientTasks> {
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
 
@@ -427,10 +410,10 @@ pub async fn spawn_ingest_tasks(
         .await;
     });
 
-    Ok(IngestHandles {
-        ingest_handle,
-        subscribe_handle,
-    })
+    Ok(vec![
+        ("ingest", ingest_handle),
+        ("subscribe-relay", subscribe_handle),
+    ])
 }
 
 /// This is the clearer’s only database hydration. Fail closed if the chain
@@ -442,32 +425,18 @@ async fn reconcile_clearing_book(
     let (mut orders, decimals) = pool
         .read(|conn| {
             let orders = db::postgres_db::load_active_orders_tx(conn)?;
-            let mut decimals = HashMap::new();
-            for token in db::postgres_db::get_registered_tokens_tx(conn)? {
-                if let Some(value) = token.decimals {
-                    decimals.insert(
-                        TokenId::read_from_bytes(&token.token_id)?,
-                        u8::try_from(value)?,
-                    );
-                }
-            }
+            let decimals = db::postgres_db::load_token_decimals_tx(conn)?;
             Ok((orders, decimals))
         })
         .await?;
-    let mut consumed = std::collections::HashSet::new();
-    // Bound each RPC request; notes were decoded once at the DB boundary.
-    for chunk in orders.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
-        let notes = chunk
-            .iter()
-            .map(|order| order.note.as_ref().clone())
-            .collect::<Vec<_>>();
-        consumed.extend(
-            client
-                .check_consumed_notes(&notes)
-                .await
-                .context("reconcile clearing notes against chain")?,
-        );
-    }
+    let notes: Vec<_> = orders
+        .iter()
+        .map(|order| order.note.as_ref().clone())
+        .collect();
+    let consumed = client
+        .check_consumed_notes(&notes)
+        .await
+        .context("reconcile clearing notes against chain")?;
     if !consumed.is_empty() {
         let ids: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
         pool.write(move |conn| {
@@ -853,10 +822,8 @@ mod tests {
         .unwrap();
 
         // Freshly seeded rows carry no metadata yet.
-        let key_a = token_a.to_bytes();
-        let lookup_key = key_a.clone();
         let row = pool
-            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &lookup_key))
+            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, token_a))
             .await
             .unwrap()
             .unwrap();
@@ -868,7 +835,7 @@ mod tests {
         subscribe_all_pairs(&pool, &mut mock_client).await.unwrap();
 
         let row = pool
-            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, &key_a))
+            .read(move |conn| db::postgres_db::get_registered_token_tx(conn, token_a))
             .await
             .unwrap()
             .unwrap();

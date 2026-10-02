@@ -12,7 +12,7 @@ use miden_protocol::note::{Note, NoteId};
 use miden_protocol::transaction::TransactionId;
 use miden_standards::note::PswapNote;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -22,15 +22,13 @@ use tokio_util::sync::CancellationToken;
 use super::error::{ChainError, ChainResult, IngestError};
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_models::NewOrderRow;
-use crate::db::{self, DbError, DbPool, DbResult};
+use crate::db::{self, DbPool, DbResult};
 use crate::types::Order as PipelineOrder;
 use crate::types::{BookOrder, BookUpdate, TokenId};
 
 /// Notes per startup-recovery write transaction. Keeps each transaction well
 /// inside the writer's statement timeout however much history the client has.
 const RECOVERY_BATCH_NOTES: usize = 1_000;
-/// Consecutive failed persists of one sync result before ingest gives up.
-const INGEST_PERSIST_ATTEMPTS: u32 = 5;
 
 /// Result of a sync_state call — newly received notes plus IDs of notes
 /// whose nullifier was just observed on-chain. The matcher uses the
@@ -64,10 +62,9 @@ pub trait MidenClient {
     /// a crash interrupted persistence into the solver database.
     async fn stored_notes(&mut self) -> ChainResult<Vec<Note>>;
 
-    /// Given a slice of notes the solver currently believes are matchable,
-    /// return the subset whose nullifiers are already on-chain. Used by the
-    /// executor after a non-RPC submit error to identify which input notes
-    /// are zombies vs. which are still legitimately active.
+    /// The subset of `notes` whose nullifiers are already on chain, i.e. that
+    /// someone consumed. Used wherever orders return to the book or a
+    /// rejected settlement is released, and by startup recovery.
     async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>>;
 
     /// Whether the node has committed transaction `tx_id` of `account_id` in
@@ -90,6 +87,9 @@ pub trait MidenClient {
         faucet_id: TokenId,
     ) -> ChainResult<Option<(u8, String)>>;
 
+    /// The node's latest block number.
+    async fn chain_tip(&mut self) -> ChainResult<BlockNumber>;
+
     /// The chain tip's fee parameters `(fee faucet, verification base fee)`, or
     /// `None` when this client can't report them — mocks, which skip the
     /// executor's fee pre-flight.
@@ -110,13 +110,15 @@ pub async fn run_ingest(
     book_tx: mpsc::Sender<BookUpdate>,
     interval: Duration,
     cancel: CancellationToken,
-    last_sync_unix_seconds: Arc<AtomicI64>,
+    last_sync_unix_seconds: Arc<AtomicU64>,
     solver_id: AccountId,
 ) {
     // Sync advances the client's durable cursor before the database sees the
     // result, so a failed persist keeps that result and retries it before the
-    // next sync; the write is idempotent. Only a fatal writer or persistent
-    // failure stops the pipeline, where boot replays the client's stored notes.
+    // next sync, for as long as the failure is transient; the write is
+    // idempotent and the retry costs no RPC. `/readyz` reports the stalled
+    // sync meanwhile. Only a fatal writer, a closed matcher channel, or a
+    // failure that would repeat stops the pipeline.
     let mut unpersisted: Option<(SyncResult, u32)> = None;
     loop {
         let sync = match unpersisted.take() {
@@ -144,15 +146,9 @@ pub async fn run_ingest(
                 .await
             {
                 Ok(()) => {
-                    let now = i64::try_from(crate::types::now_unix()).unwrap_or(i64::MAX);
-                    last_sync_unix_seconds.store(now, Ordering::Relaxed);
+                    last_sync_unix_seconds.store(crate::types::now_unix(), Ordering::Relaxed);
                 }
-                // A fatal writer or a closed matcher channel never recovers.
-                Err(error)
-                    if !error.is_fatal()
-                        && !matches!(error, DbError::MatcherStopped)
-                        && failures + 1 < INGEST_PERSIST_ATTEMPTS =>
-                {
+                Err(error) if error.is_transient() && !error.is_fatal() => {
                     tracing::warn!(%error, attempt = failures + 1, "persisting ingest update failed; retrying next tick");
                     unpersisted = Some((retry, failures + 1));
                 }
@@ -192,9 +188,7 @@ impl SyncResult {
         let sync = client.sync_state().await?;
         let stored = client.stored_notes().await?;
         let mut consumed_notes = sync.consumed_notes;
-        for note_chunk in stored.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
-            consumed_notes.extend(client.check_consumed_notes(note_chunk).await?);
-        }
+        consumed_notes.extend(client.check_consumed_notes(&stored).await?);
 
         let stored_ids: Vec<_> = stored
             .iter()
@@ -306,42 +300,21 @@ impl SyncResult {
     }
 }
 
-/// Adapter that wraps the real `miden_client::Client` behind our `MidenClient`
-/// trait abstraction. The same trait is implemented by `MockMidenClient` for
-/// tests; this adapter makes the typed Client interchangeable in production.
+/// The real `miden_client::Client` behind the `MidenClient` trait
+/// (`MockMidenClient` implements it for tests). Ingest and the executor each
+/// own one adapter over their own client, on their own thread; the executor
+/// also keeps the typed client for building and submitting transactions.
 ///
-/// Locking strategy: we hold `Arc<Mutex<Client>>` so the executor (which needs
-/// the typed Client for `submit_new_transaction`) and ingest/admin (which go
-/// through this adapter) can both share the same underlying instance without
-/// fighting over ownership.
+/// Note discovery: PSWAPs come from `new_public_notes` ∪ `new_private_notes`
+/// of each sync — notes the client's tag screener saw for the first time.
+/// The ingest client is keyless and tracks no account, so the solver's own
+/// public remainders are re-discovered here like any other PSWAP. The
+/// executor client subscribes no tags; its sync only keeps the chain tip and
+/// the solver account fresh.
 ///
-/// Note discovery (post the keyless-ingest / keystore-executor split):
-/// PSWAPs come from a single `SyncSummary` source —
-///   * `new_public_notes` ∪ `new_private_notes` — notes the screener
-///     inserted into the input-notes table on this sync (tag-discovered,
-///     not previously tracked).
-///
-/// The **ingest client is keyless and tracks no accounts**, so it has no
-/// `output_notes` table and its `committed_notes` never carries the
-/// solver's own notes. Solver-produced **remainder PSWAPs** (from partial
-/// fills) are `Public` and tag-matched, so the ingest client re-discovers
-/// them here via `new_public_notes` on the sync after the executor's
-/// settle commits — exactly like any externally-created PSWAP. (The old
-/// single-client model needed a second `committed_notes` pass because the
-/// solver client owned the account and its remainder surfaced as its own
-/// committed output note; that pass is dead post-split and was removed.)
-/// The **executor client** subscribes no tags, so its `sync_state`
-/// discovers nothing — it runs only to keep the chain tip / solver
-/// account fresh; its returned notes are discarded by the sync task.
-///
-/// Dedup: the adapter is intentionally stateless. `new_public_notes` /
-/// `new_private_notes` are edge-triggered (a note appears on exactly one
-/// sync — the one whose block range covers its inclusion block — and
-/// never again, since ranges advance and are non-overlapping). Any
-/// residual double-emit is absorbed durably downstream: `ingest_once`
-/// forwards an order to the matcher only when `insert_notes_batch`
-/// reports it as newly inserted (the `orders` primary key is the dedup
-/// authority, which also survives restarts).
+/// The adapter is stateless. A note appears in one sync only, and any repeat
+/// is absorbed by the `orders` primary key: ingest forwards an order to the
+/// matcher only when its insert actually added the row.
 pub(crate) struct MidenClientAdapter {
     pub(crate) client: Arc<Mutex<Client<FilesystemKeyStore>>>,
     /// Standalone RPC handle for the same node, used by
@@ -351,6 +324,43 @@ pub(crate) struct MidenClientAdapter {
     /// that test helper previously forced the production build to enable
     /// miden-client's `testing` feature.
     pub(crate) rpc: Arc<dyn NodeRpcClient>,
+}
+
+impl MidenClientAdapter {
+    /// The consumed notes among one RPC-sized chunk.
+    async fn consumed_chunk(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>> {
+        // Map nullifier → NoteId so we can recover the IDs from the RPC response.
+        let mut nullifier_to_id = HashMap::new();
+        let mut nullifiers = BTreeSet::new();
+        for note in notes {
+            let nullifier = note.nullifier();
+            nullifier_to_id.insert(nullifier, note.id());
+            nullifiers.insert(nullifier);
+        }
+
+        // GENESIS is intentional, not a placeholder: this is an "ever
+        // consumed?" existence check, so it must scan the full nullifier
+        // history. (The node serves this from its nullifier set; the
+        // `from` block only bounds the *response* range, not correctness.)
+        // Uses the dedicated `self.rpc` handle — NOT `client.test_rpc_api()`
+        // — so production no longer depends on miden-client's `testing`
+        // feature. No `client` lock is taken: this query goes straight to
+        // the node, independent of `Client` state.
+        let heights = self
+            .rpc
+            .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
+            .await?;
+
+        let mut consumed = HashSet::new();
+        for (nullifier, maybe_height) in heights {
+            if maybe_height.is_some() {
+                if let Some(id) = nullifier_to_id.get(&nullifier) {
+                    consumed.insert(*id);
+                }
+            }
+        }
+        Ok(consumed)
+    }
 }
 
 #[async_trait(?Send)]
@@ -443,39 +453,10 @@ impl MidenClient for MidenClientAdapter {
     }
 
     async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>> {
-        if notes.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        // Map nullifier → NoteId so we can recover the IDs from the RPC response.
-        let mut nullifier_to_id = HashMap::new();
-        let mut nullifiers = BTreeSet::new();
-        for note in notes {
-            let nullifier = note.nullifier();
-            nullifier_to_id.insert(nullifier, note.id());
-            nullifiers.insert(nullifier);
-        }
-
-        // GENESIS is intentional, not a placeholder: this is an "ever
-        // consumed?" existence check, so it must scan the full nullifier
-        // history. (The node serves this from its nullifier set; the
-        // `from` block only bounds the *response* range, not correctness.)
-        // Uses the dedicated `self.rpc` handle — NOT `client.test_rpc_api()`
-        // — so production no longer depends on miden-client's `testing`
-        // feature. No `client` lock is taken: this query goes straight to
-        // the node, independent of `Client` state.
-        let heights = self
-            .rpc
-            .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
-            .await?;
-
         let mut consumed = HashSet::new();
-        for (nullifier, maybe_height) in heights {
-            if maybe_height.is_some() {
-                if let Some(id) = nullifier_to_id.get(&nullifier) {
-                    consumed.insert(*id);
-                }
-            }
+        // Bound each RPC request, so callers can pass any number of notes.
+        for chunk in notes.chunks(miden_protocol::MAX_INPUT_NOTES_PER_TX) {
+            consumed.extend(self.consumed_chunk(chunk).await?);
         }
         Ok(consumed)
     }
@@ -487,6 +468,11 @@ impl MidenClient for MidenClientAdapter {
         let client = self.client.lock().await;
         let meta = client.fetch_remote_token_metadata(faucet_id).await?;
         Ok(meta.map(|m| (m.decimals, m.symbol)))
+    }
+
+    async fn chain_tip(&mut self) -> ChainResult<BlockNumber> {
+        let (header, _) = self.rpc.get_block_header_by_number(None, false).await?;
+        Ok(header.block_num())
     }
 
     async fn fee_parameters(&mut self) -> ChainResult<Option<(TokenId, u32)>> {
@@ -521,96 +507,40 @@ pub(crate) fn spawn_ingest_thread(
     book_tx: mpsc::Sender<BookUpdate>,
     subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
     ingest_interval: Duration,
-    last_sync: Arc<AtomicI64>,
+    last_sync: Arc<AtomicU64>,
     solver_id: AccountId,
     clearing_bootstrap: oneshot::Sender<crate::matcher::ClearingBootstrap>,
-) -> anyhow::Result<(
-    thread::JoinHandle<()>,
-    oneshot::Receiver<anyhow::Result<()>>,
-)> {
+) -> anyhow::Result<(thread::JoinHandle<()>, crate::start::ClientReady)> {
     use anyhow::Context;
-    let (ingest_ready_tx, ingest_ready_rx) = oneshot::channel::<anyhow::Result<()>>();
-    let ingest_thread = thread::Builder::new()
-        .name("ingest-client".into())
-        .spawn(move || {
-            crate::start::run_on_local_runtime("ingest-client", async move {
-                let setup = async {
-                    let client = factory.build_ingest().await.context("build_ingest")?;
-                    let rpc = factory.rpc().context("build ingest rpc")?;
-                    let adapter: Arc<Mutex<dyn MidenClient>> =
-                        Arc::new(Mutex::new(MidenClientAdapter {
-                            client: Arc::new(Mutex::new(client)),
-                            rpc,
-                        }));
-                    crate::pipeline::spawn_ingest_tasks(
-                        adapter,
-                        db_pool,
-                        book_tx,
-                        subscribe_rx,
-                        ingest_interval,
-                        cancel.clone(),
-                        last_sync,
-                        solver_id,
-                        clearing_bootstrap,
-                    )
-                    .await
-                    .context("spawn_ingest_tasks")
-                };
-                let mut h = match setup.await {
-                    Ok(h) => h,
-                    Err(error) => {
-                        let _ = ingest_ready_tx.send(Err(error));
-                        return;
-                    }
-                };
-                let _ = ingest_ready_tx.send(Ok(()));
-                // If a task exits *unexpectedly* (not via cancel) the main
-                // coordination loop has no other signal — `book_tx` keeps
-                // other live senders, so its `book_rx` never closes and the
-                // matcher would silently run a stale book. Propagate a global
-                // shutdown (`cancel` is a clone of the root token).
-                tokio::select! {
-                    _ = cancel.cancelled() => {}
-                    _ = &mut h.ingest_handle => {
-                        tracing::error!("ingest task exited unexpectedly; triggering shutdown");
-                        cancel.cancel();
-                    }
-                    _ = &mut h.subscribe_handle => {
-                        tracing::error!("subscribe-relay task exited unexpectedly; triggering shutdown");
-                        cancel.cancel();
-                    }
-                }
-                // Drain inside the runtime: abort + await both tasks so their
-                // `Client` Arc refs are dropped *here* (runtime still entered).
-                // Otherwise `LocalSet::drop` after `block_on` returns would
-                // force-drop the `!Send` Client with no runtime context, whose
-                // Drop then panics ("panic in a destructor during cleanup").
-                //
-                // The `is_finished()` guard is load-bearing: if the `select!`
-                // above ended via a `&mut h.*_handle` arm, that handle was
-                // already polled to completion there. A `JoinHandle` is a
-                // one-shot future — awaiting it again panics with "JoinHandle
-                // polled after completion". So only `.await` the handles the
-                // `select!` did NOT already drive to completion; `abort()` on a
-                // finished task is a harmless no-op.
-                h.ingest_handle.abort();
-                h.subscribe_handle.abort();
-                if !h.ingest_handle.is_finished() {
-                    let _ = h.ingest_handle.await;
-                }
-                if !h.subscribe_handle.is_finished() {
-                    let _ = h.subscribe_handle.await;
-                }
-            });
-        })
-        .context("spawn ingest thread")?;
-    Ok((ingest_thread, ingest_ready_rx))
+    let task_cancel = cancel.clone();
+    crate::start::spawn_client_thread("ingest-client", cancel, move || async move {
+        let client = factory.build_ingest().await.context("build_ingest")?;
+        let rpc = factory.rpc().context("build ingest rpc")?;
+        let adapter: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(MidenClientAdapter {
+            client: Arc::new(Mutex::new(client)),
+            rpc,
+        }));
+        crate::pipeline::spawn_ingest_tasks(
+            adapter,
+            db_pool,
+            book_tx,
+            subscribe_rx,
+            ingest_interval,
+            task_cancel,
+            last_sync,
+            solver_id,
+            clearing_bootstrap,
+        )
+        .await
+        .context("spawn_ingest_tasks")
+    })
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::db::postgres_test::TestDb;
+    use crate::db::postgres_test::{TestDb, TestSchema};
+    use crate::db::DbError;
     use crate::types::OrderStatus;
     use anyhow::Result;
     use diesel::connection::SimpleConnection;
@@ -623,41 +553,13 @@ pub mod tests {
     };
     use miden_protocol::{asset::AssetAmount, Word};
     use miden_standards::note::PswapNoteStorage;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct PostgresFixture {
-        conn: PgConnection,
-        name: String,
-    }
-
-    impl PostgresFixture {
-        fn new() -> Result<Self> {
-            let url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
-            let mut conn = db::postgres_migrations::connect(&url)?;
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let name = format!("solver_ingest_{}_{}", std::process::id(), nonce);
-            conn.batch_execute(&format!("CREATE SCHEMA {name}; SET search_path TO {name}"))?;
-            db::postgres_migrations::migrate(&mut conn)?;
-            Ok(Self { conn, name })
-        }
-    }
-
-    impl Drop for PostgresFixture {
-        fn drop(&mut self) {
-            let _ = self.conn.batch_execute("ROLLBACK");
-            let _ = self.conn.batch_execute(&format!(
-                "SET search_path TO public; DROP SCHEMA {} CASCADE",
-                self.name
-            ));
-        }
-    }
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn postgres_ingest_never_confirms_and_consumed_remainder_stays_retired() -> Result<()> {
         use db::postgres_schema::orders;
 
-        let mut pg_fixture = PostgresFixture::new()?;
+        let mut pg_fixture = TestSchema::migrated()?;
         let conn = &mut pg_fixture.conn;
         let (parent, child, solver) = fixture();
         let first = conn.transaction::<_, DbError, _>(|conn| {
@@ -721,14 +623,15 @@ pub mod tests {
         })?;
         // Ingest cannot tell our remainder from an identical one created by
         // another filler. It stores the remainder with the parent's FIFO slot
-        // (retired here, since it was consumed in the same sync) but leaves
-        // the settlement unconfirmed and the reserved parent Settling.
+        // (retired here, since it was consumed in the same sync) and leaves
+        // the settlement unconfirmed. The consumed parent is retired even
+        // though it is reserved, so a later discard cannot reactivate it.
         assert!(update.active.is_empty());
         let parent_status: String = orders::table
             .find(parent.id().to_bytes().to_vec())
             .select(orders::status)
             .first(conn)?;
-        assert_eq!(parent_status, OrderStatus::Settling.as_str());
+        assert_eq!(parent_status, OrderStatus::OnchainNullified.as_str());
         let ingested_child: (String, i64) = orders::table
             .find(child.id().to_bytes().to_vec())
             .select((orders::status, orders::priority_seq))
@@ -845,7 +748,7 @@ pub mod tests {
             .await
             .unwrap();
         let first = pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -853,7 +756,7 @@ pub mod tests {
             .await
             .unwrap();
         let second = pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
@@ -863,7 +766,7 @@ pub mod tests {
             .await
             .unwrap();
         assert!(pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -885,11 +788,11 @@ pub mod tests {
         // The remainder is live on chain whoever created it: it is ingested
         // with its parent's FIFO slot, but our settlement stays unconfirmed.
         let live = pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].note_id, child.id().to_bytes());
+        assert_eq!(live[0].id(), child.id());
         assert_eq!(live[0].priority_seq, 1);
         assert_eq!(
             pool.read(db::postgres_db::load_unresolved_attempts_tx)
@@ -910,11 +813,11 @@ pub mod tests {
         assert!(update.active.is_empty());
         assert!(update.removed.contains(&parent.id()));
         let live = pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].note_id, child.id().to_bytes());
+        assert_eq!(live[0].id(), child.id());
         assert_eq!(live[0].priority_seq, 1);
     }
 
@@ -938,7 +841,7 @@ pub mod tests {
         assert!(update.active.is_empty());
         assert!(update.removed.contains(&child_id));
         assert!(pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -969,7 +872,7 @@ pub mod tests {
             1
         );
         assert!(pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -1044,6 +947,12 @@ pub mod tests {
 
     #[async_trait(?Send)]
     impl MidenClient for MockMidenClient {
+        async fn chain_tip(&mut self) -> ChainResult<BlockNumber> {
+            Ok(BlockNumber::from(
+                u32::try_from(self.block).unwrap_or(u32::MAX),
+            ))
+        }
+
         async fn stored_notes(&mut self) -> ChainResult<Vec<Note>> {
             Ok(self.stored.clone())
         }
@@ -1112,7 +1021,7 @@ pub mod tests {
         let client: Arc<Mutex<dyn MidenClient>> = Arc::new(Mutex::new(mock));
         let (book_tx, _book_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
-        let last_sync = Arc::new(AtomicI64::new(0));
+        let last_sync = Arc::new(AtomicU64::new(0));
 
         let ingest = run_ingest(
             client,
@@ -1200,12 +1109,12 @@ pub mod tests {
         })
         .await
         .unwrap();
-        let before: HashMap<Vec<u8>, i64> = pool
-            .read(db::postgres_db::get_active_orders_tx)
+        let before: HashMap<NoteId, u64> = pool
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| (row.note_id, row.priority_seq))
+            .map(|order| (order.id(), order.priority_seq))
             .collect();
         assert_eq!(before.len(), RECOVERY_BATCH_NOTES);
 
@@ -1233,7 +1142,7 @@ pub mod tests {
             0
         );
         assert_eq!(
-            pool.read(db::postgres_db::get_active_orders_tx)
+            pool.read(db::postgres_db::load_active_orders_tx)
                 .await
                 .unwrap()
                 .len(),
@@ -1257,12 +1166,12 @@ pub mod tests {
             50
         );
         let after = pool
-            .read(db::postgres_db::get_active_orders_tx)
+            .read(db::postgres_db::load_active_orders_tx)
             .await
             .unwrap();
         assert_eq!(after.len(), 2_500);
         for row in after {
-            if let Some(&priority) = before.get(&row.note_id) {
+            if let Some(&priority) = before.get(&row.id()) {
                 assert_eq!(row.priority_seq, priority, "replay kept the FIFO slot");
             }
         }
@@ -1292,7 +1201,7 @@ pub mod tests {
 
         let (book_tx, mut book_rx) = mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let last_sync = Arc::new(AtomicI64::new(0));
+        let last_sync = Arc::new(AtomicU64::new(0));
         let ingest = run_ingest(
             client,
             pool.clone(),

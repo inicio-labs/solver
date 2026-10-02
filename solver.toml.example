@@ -64,7 +64,7 @@ admin_port = 3001
 # warning is logged if it is set.
 # debug_mode = false
 # Observability HTTP server port (binds 127.0.0.1 only). Exposes
-# `/health` (liveness), `/readyz` (schema, writer ownership, sync freshness),
+# `/health` (liveness), `/readyz` (database reachable, writer ownership, sync freshness),
 # and `/metrics` (Prometheus text counters and gauges). No auth.
 # Defaults to 9090.
 # obs_port = 9090

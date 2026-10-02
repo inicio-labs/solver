@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use diesel::prelude::*;
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
-use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
+use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::{Note, NoteType};
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -21,7 +21,7 @@ use miden_standards::note::{PswapNote, PswapNoteStorage};
 use solver::db::postgres_models::NewOrderRow;
 use solver::db::postgres_schema::orders;
 use solver::db::{postgres_db, postgres_migrations, DbError, DbPool};
-use solver::types::{BookUpdate, OrderId};
+use solver::types::BookUpdate;
 use tokio::sync::mpsc;
 
 use common::PgSchema;
@@ -59,14 +59,15 @@ async fn crash_worker() -> Result<()> {
     let (book_tx, _book_rx) = mpsc::channel(1);
     book_tx.send(BookUpdate::default()).await?;
     pool.write_book(&book_tx, move |conn| {
-        let parent = postgres_db::get_active_orders_tx(conn)?
+        // Active orders load in FIFO order.
+        let parent = postgres_db::load_active_orders_tx(conn)?
             .into_iter()
-            .min_by_key(|order| order.priority_seq)
+            .next()
             .ok_or(DbError::Corrupt("crash fixture has no active parent"))?;
-        diesel::update(orders::table.find(&parent.note_id))
+        let id = parent.id();
+        diesel::update(orders::table.find(id.to_bytes()))
             .set(orders::status.eq("onchain_nullified"))
             .execute(conn)?;
-        let id = OrderId::read_from(&mut SliceReader::new(&parent.note_id))?;
         Ok(BookUpdate {
             removed: vec![id],
             active: Vec::new(),

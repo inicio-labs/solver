@@ -33,8 +33,10 @@ active-active mode in V1.
    and run `solver-bin check-db` (it checks the writer connection only). Set
    `SOLVER_READ_DATABASE_URL` to the reader URL for the runtime; startup
    verifies that both URLs resolve the same database and schema. Use `sslmode=verify-full`, a trusted root CA,
-   `connect_timeout=5`, and supported libpq TCP keepalive settings in remote
-   URLs. Store credentials in a secret manager or protected environment file;
+   `connect_timeout=5`, and libpq TCP keepalives in remote URLs, for example
+   `keepalives_idle=5&keepalives_interval=2&keepalives_count=3&tcp_user_timeout=15000`,
+   so a dead connection fails within about 15 seconds and takes the in-place
+   reconnect path below rather than the 30-second write deadline. Store credentials in a secret manager or protected environment file;
    never put them in `solver.toml` or a command log.
 4. Keep `executor_store_path` and `ingest_store_path` as distinct SQLite files.
    Start one solver. A second process pointed at the same application schema
@@ -70,9 +72,11 @@ every schema change is a stop-then-start deploy:
 3. Start the new binary.
 
 To roll back after step 2, revert the migration with the new binary before
-starting the old one, for example `diesel migration revert` against the
-migration-role URL from the solver crate directory; the old binary refuses to
-start while the newer migration is applied. Every migration after the baseline
+starting the old one: `solver-bin revert-db` (migration role, same
+`SOLVER_MIGRATION_DATABASE_URL`); the old binary refuses to start while the
+newer migration is applied. `migrate-db` and `revert-db` take the solver's
+ownership lock first, so they refuse to run while a solver is up, and no solver
+starts until they finish. `revert-db` refuses to revert the baseline. Every migration after the baseline
 must ship a `down.sql` that undoes it without data loss. The baseline's own
 `down.sql` drops every application table and is only appropriate before the
 first production order.
@@ -81,28 +85,42 @@ first production order.
 
 The solver holds one PostgreSQL advisory lock on its writer session. If that
 session is lost (database restart or failover, network cut, terminated
-backend), the solver reconnects in place for up to 30 seconds while holding
-its internal writer lock, re-takes the advisory lock, and checks the
+backend), the solver reconnects in place, retrying with backoff (up to 5
+seconds apart) until the database answers. It holds its internal writer lock
+meanwhile, so other writes wait instead of failing; the matcher keeps its book
+and reads keep working. It then re-takes the advisory lock and checks the
 `sync_state.owner_epoch` it claimed at startup. A write lost before `COMMIT`
 returns an ordinary error; a write lost during `COMMIT` is resolved with
 `pg_xact_status` and returns its real outcome. If the previous backend still
 holds the lock after a network cut, the solver terminates that backend.
 
 The solver stops only when it cannot safely continue: another solver holds
-the lock or advanced the owner epoch while it was disconnected, the writer
-does not come back within the reconnect window, the live session no longer
-holds its lock, a database worker panics, or a write is still running after
-the 30-second client deadline. Every other database error is returned to the
+the lock or advanced the owner epoch while it was disconnected, the outcome
+of a commit lost in flight cannot be determined, the live session no longer
+holds its lock, a writer worker panics, or a write is still running after the
+30-second client deadline. Every other database error is returned to the
 caller and handled in place:
 
 - A failed read (including the public price API and `/readyz`) returns an
-  error to that caller; the read pool reconnects on the next checkout.
+  error to that caller; the read pool reconnects on the next checkout. The
+  public price API may use at most `read_pool_size - 1` read connections, so
+  wallet traffic cannot starve ingest, the executor, or `/readyz`. If the
+  executor cannot load its pending settlements at startup (pool busy,
+  database briefly unreachable), it retries every second instead of stopping.
 - A lock or statement timeout rolls back that one transaction on a healthy
   session; the caller re-feeds or retries.
-- Ingest keeps a sync result whose write failed and retries it on the next
-  tick, up to five times, before stopping the pipeline.
+- Ingest keeps a sync result whose write failed and retries it on every
+  tick for as long as the failure is transient (no extra RPC); `/readyz`
+  reports the stalled sync meanwhile.
 - A settlement whose lifecycle write failed is retried on the next
   reconciliation tick.
+
+A transaction that fails the same way every time it is built (a bad note, an
+insolvent batch, an execution or proving error) is retried one pair group at
+a time, so the healthy pairs settle at once. A group that still fails on its
+own is held back from the matcher for 30 seconds, doubling on each repeat
+failure up to 30 minutes, and released once the hold is over. Watch for
+`pair group keeps failing; holding its orders`.
 
 When the executor cannot settle — no fee headroom, the node RPC or the
 database writer unavailable — it enters **verification mode**: it stops
@@ -117,7 +135,21 @@ in its book, so nothing is re-matched at a stale price. Watch for
 node, the fee balance, or PostgreSQL needs attention, not the solver.
 
 The solver sets `idle_session_timeout = 0` on its own sessions, so a server or
-role default that closes idle clients does not end the writer session.
+role default that closes idle clients does not end the writer session. It also
+sets server-side TCP keepalives on them (`tcp_keepalives_idle = 10`,
+`tcp_keepalives_interval = 5`, `tcp_keepalives_count = 3`, and on Linux
+servers `tcp_user_timeout = 25s`). If the solver's host or network vanishes,
+the server ends the orphaned writer backend within about 25 seconds and
+releases the ownership lock, so a restarted solver can start instead of
+failing with "another solver already owns" until the operating system's
+default keepalive (about two hours) notices. A pooler or proxy between the
+solver and PostgreSQL must forward the disconnect for this to work; otherwise
+end the stale backend by hand with `pg_terminate_backend` on the pid holding
+the advisory lock in `pg_locks`. It also
+sets `lc_messages = 'C'` so metrics can tell lock, statement and deadlock
+timeouts apart. That needs a superuser or, on PostgreSQL 15+, `GRANT SET ON
+PARAMETER lc_messages TO <writer>, <reader>`; without it the solver runs
+normally, logs one warning, and counts those timeouts as `database` errors.
 
 When the solver does stop, restart the whole solver; restarting only a Rust
 task does not rebuild the matcher. The restart reconciles durable notes and

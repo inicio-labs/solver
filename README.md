@@ -320,7 +320,7 @@ crossing orders between them automatically.
 ## Observability
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
-- `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if the PostgreSQL schema, original writer ownership, and recent sync are healthy; otherwise 503.
+- `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if a PostgreSQL read answers, the writer still holds its ownership lock, and the last sync is recent; otherwise 503. The schema is verified once at startup.
 - `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure.
 
 ---

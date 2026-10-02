@@ -60,6 +60,10 @@ fn schema_mismatch(expected: &BTreeSet<String>, applied: &BTreeSet<String>) -> O
 /// ordinary solver startup. A database already ahead of this binary is
 /// refused rather than migrated.
 pub fn migrate(conn: &mut PgConnection) -> DbResult<Vec<String>> {
+    super::postgres_pool::with_ownership_lock(conn, migrate_locked)
+}
+
+fn migrate_locked(conn: &mut PgConnection) -> DbResult<Vec<String>> {
     let history =
         diesel::sql_query("SELECT to_regclass('__diesel_schema_migrations')::text AS name")
             .get_result::<HistoryTable>(conn)?;
@@ -86,6 +90,25 @@ pub fn migrate(conn: &mut PgConnection) -> DbResult<Vec<String>> {
     Ok(applied)
 }
 
+/// Roll back the newest applied migration with its `down.sql`, so an older
+/// solver binary can start again. Refuses to revert the baseline, whose
+/// `down.sql` drops every application table.
+pub fn revert_last(conn: &mut PgConnection) -> DbResult<String> {
+    super::postgres_pool::with_ownership_lock(conn, |conn| {
+        let applied = applied_versions(conn)?;
+        let baseline = expected_versions()?.into_iter().next();
+        if applied.len() <= 1 && applied.iter().next() == baseline.as_ref() {
+            return Err(DbError::Migration(
+                "refusing to revert the baseline migration: it drops every application table"
+                    .into(),
+            ));
+        }
+        conn.revert_last_migration(MIGRATIONS)
+            .map(|version| version.to_string())
+            .map_err(|error| DbError::Migration(error.to_string()))
+    })
+}
+
 /// Check, without DDL, that the applied migration history equals the set
 /// compiled into this binary. Each migration creates its own tables, so an
 /// exact history match also means the schema this binary expects is present.
@@ -103,41 +126,10 @@ pub fn connect(database_url: &str) -> DbResult<PgConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Context, Result};
+    use crate::db::postgres_test::TestSchema;
+    use anyhow::Result;
     use diesel::connection::SimpleConnection;
     use diesel::sql_types::BigInt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
-
-    struct SchemaFixture {
-        conn: PgConnection,
-        name: String,
-    }
-
-    impl SchemaFixture {
-        fn new() -> Result<Self> {
-            let url = std::env::var("SOLVER_TEST_DATABASE_URL")
-                .context("set SOLVER_TEST_DATABASE_URL for PostgreSQL tests")?;
-            let mut conn = connect(&url)?;
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let sequence = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
-            let name = format!("solver_pg_{}_{}_{}", std::process::id(), nonce, sequence);
-            conn.batch_execute(&format!("CREATE SCHEMA {name}; SET search_path TO {name}"))?;
-            Ok(Self { conn, name })
-        }
-    }
-
-    impl Drop for SchemaFixture {
-        fn drop(&mut self) {
-            let _ = self.conn.batch_execute("ROLLBACK");
-            let _ = self.conn.batch_execute(&format!(
-                "SET search_path TO public; DROP SCHEMA {} CASCADE",
-                self.name
-            ));
-        }
-    }
 
     #[derive(QueryableByName)]
     struct PriorityRow {
@@ -160,7 +152,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn migration_history_matches_exactly_without_startup_ddl() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::new()?;
         let conn = &mut fixture.conn;
 
         assert!(
@@ -200,7 +192,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn baseline_constraints_and_priority_inheritance() -> Result<()> {
-        let mut fixture = SchemaFixture::new()?;
+        let mut fixture = TestSchema::new()?;
         let conn = &mut fixture.conn;
         migrate(conn)?;
         conn.batch_execute("BEGIN")?;

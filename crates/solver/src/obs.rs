@@ -1,6 +1,6 @@
 //! Observability HTTP server: liveness, readiness, and local solver metrics.
 //!
-//! Both endpoints are unauthenticated by design — supervisors and monitoring
+//! All endpoints are unauthenticated by design — supervisors and monitoring
 //! scrapers shouldn't need a bearer token. The server binds on `127.0.0.1`
 //! only and runs on a separate port (`obs_port`) from the admin server so
 //! operators can firewall them independently.
@@ -12,7 +12,8 @@
 //!   to serve HTTP. If this fails the supervisor should restart the process.
 //!
 //! * `GET /readyz` — returns `200 OK` only when both:
-//!     1. PostgreSQL schema and the original writer ownership session are healthy.
+//!     1. A PostgreSQL read answers and the writer session still holds its
+//!        ownership lock (the schema is verified once, at startup).
 //!     2. The time since the last successful `sync_state` is below the
 //!        configured freshness threshold.
 //!   Otherwise returns `503 Service Unavailable` with a short text body
@@ -20,9 +21,8 @@
 //!   probes to stop routing traffic during transient degradation WITHOUT
 //!   restarting the process.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::db::postgres_pool::{LatencySnapshot, LATENCY_BUCKET_US};
 use crate::db::DbPool;
-use crate::types::{BookUpdate, ExecutionBatch};
+use crate::types::{now_unix, BookUpdate, ExecutionBatch};
 
 /// Shared observability state.
 ///
@@ -43,34 +43,30 @@ use crate::types::{BookUpdate, ExecutionBatch};
 #[derive(Clone)]
 pub struct ObsState {
     pub db_pool: DbPool,
-    pub last_sync_unix_seconds: Arc<AtomicI64>,
+    pub last_sync_unix_seconds: Arc<AtomicU64>,
     pub readiness_freshness_secs: u64,
-    book_tx: Option<mpsc::Sender<BookUpdate>>,
-    exec_tx: Option<mpsc::Sender<ExecutionBatch>>,
+    /// Read only for their remaining capacity in `/metrics`.
+    book_tx: mpsc::Sender<BookUpdate>,
+    exec_tx: mpsc::Sender<ExecutionBatch>,
 }
 
 impl ObsState {
-    pub fn new(db_pool: DbPool, readiness_freshness_secs: u64) -> Self {
-        Self {
-            db_pool,
-            last_sync_unix_seconds: Arc::new(AtomicI64::new(unix_now())),
-            readiness_freshness_secs,
-            book_tx: None,
-            exec_tx: None,
-        }
-    }
-
-    pub fn with_channels(
-        mut self,
+    pub fn new(
+        db_pool: DbPool,
+        readiness_freshness_secs: u64,
         book_tx: mpsc::Sender<BookUpdate>,
         exec_tx: mpsc::Sender<ExecutionBatch>,
     ) -> Self {
-        self.book_tx = Some(book_tx);
-        self.exec_tx = Some(exec_tx);
-        self
+        Self {
+            db_pool,
+            last_sync_unix_seconds: Arc::new(AtomicU64::new(now_unix())),
+            readiness_freshness_secs,
+            book_tx,
+            exec_tx,
+        }
     }
 
-    /// Build the observability router (`/health` + `/readyz`).
+    /// Build the observability router (`/health`, `/readyz`, `/metrics`).
     pub fn router(self) -> Router {
         Router::new()
             .route("/health", get(health))
@@ -80,18 +76,10 @@ impl ObsState {
     }
 
     /// Handle for the ingest task to record successful syncs. Cheap clone —
-    /// just bumps the Arc<AtomicI64> rather than passing the whole state.
-    pub fn last_sync_handle(&self) -> Arc<AtomicI64> {
+    /// just bumps the Arc<AtomicU64> rather than passing the whole state.
+    pub fn last_sync_handle(&self) -> Arc<AtomicU64> {
         self.last_sync_unix_seconds.clone()
     }
-}
-
-/// Current Unix time in seconds, saturating to i64 (good until year 292277026596).
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 async fn health() -> (StatusCode, &'static str) {
@@ -116,8 +104,8 @@ async fn metrics(
     State(state): State<ObsState>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
     let pool = state.db_pool.telemetry_snapshot();
-    let book_capacity = state.book_tx.as_ref().map_or(0, mpsc::Sender::capacity);
-    let exec_capacity = state.exec_tx.as_ref().map_or(0, mpsc::Sender::capacity);
+    let book_capacity = state.book_tx.capacity();
+    let exec_capacity = state.exec_tx.capacity();
     let mut body = format!(
         "solver_db_read_total {}\n\
          solver_db_read_errors_total {}\n\
@@ -162,7 +150,7 @@ async fn metrics(
 }
 
 async fn readyz(State(state): State<ObsState>) -> (StatusCode, String) {
-    // 1. Verify the exact PostgreSQL schema and the original writer lock.
+    // 1. A read answers and the writer session still holds its lock.
     if let Err(e) = state.db_pool.readiness_check().await {
         tracing::warn!(error = %e, "readyz: DB unreachable");
         return (
@@ -173,9 +161,8 @@ async fn readyz(State(state): State<ObsState>) -> (StatusCode, String) {
 
     // 2. Last sync recent enough?
     let last = state.last_sync_unix_seconds.load(Ordering::Relaxed);
-    let now = unix_now();
-    let age = now.saturating_sub(last);
-    if age > state.readiness_freshness_secs as i64 {
+    let age = now_unix().saturating_sub(last);
+    if age > state.readiness_freshness_secs {
         tracing::warn!(
             age_secs = age,
             threshold_secs = state.readiness_freshness_secs,
@@ -199,11 +186,17 @@ mod tests {
     use crate::db::postgres_test::TestDb;
     use axum_test::TestServer;
 
+    fn test_state(db: &TestDb) -> ObsState {
+        let (book_tx, _) = tokio::sync::mpsc::channel(1);
+        let (exec_tx, _) = tokio::sync::mpsc::channel(1);
+        ObsState::new(db.pool.clone(), 60, book_tx, exec_tx)
+    }
+
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn health_returns_200() {
         let db = TestDb::new().await.unwrap();
-        let state = ObsState::new(db.pool.clone(), 60);
+        let state = test_state(&db);
         let server = TestServer::new(state.router());
         let res = server.get("/health").await;
         res.assert_status_ok();
@@ -214,7 +207,7 @@ mod tests {
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn readyz_returns_200_when_fresh() {
         let db = TestDb::new().await.unwrap();
-        let state = ObsState::new(db.pool.clone(), 60);
+        let state = test_state(&db);
         // Constructor initialises last_sync to "now", so first /readyz must pass.
         let server = TestServer::new(state.router());
         let res = server.get("/readyz").await;
@@ -225,11 +218,11 @@ mod tests {
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn readyz_returns_503_when_sync_stale() {
         let db = TestDb::new().await.unwrap();
-        let state = ObsState::new(db.pool.clone(), 60);
+        let state = test_state(&db);
         // Force last_sync into the distant past so the freshness check fails.
         state
             .last_sync_unix_seconds
-            .store(unix_now() - 3600, Ordering::Relaxed);
+            .store(now_unix() - 3600, Ordering::Relaxed);
         let server = TestServer::new(state.router());
         let res = server.get("/readyz").await;
         res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
@@ -240,17 +233,17 @@ mod tests {
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn readyz_updates_when_handle_writes() {
         let db = TestDb::new().await.unwrap();
-        let state = ObsState::new(db.pool.clone(), 60);
+        let state = test_state(&db);
         let handle = state.last_sync_handle();
         // Stale first, then refreshed via the handle the ingest task would hold.
         state
             .last_sync_unix_seconds
-            .store(unix_now() - 3600, Ordering::Relaxed);
+            .store(now_unix() - 3600, Ordering::Relaxed);
         let server = TestServer::new(state.clone().router());
         let stale = server.get("/readyz").await;
         stale.assert_status(StatusCode::SERVICE_UNAVAILABLE);
 
-        handle.store(unix_now(), Ordering::Relaxed);
+        handle.store(now_unix(), Ordering::Relaxed);
         let fresh = server.get("/readyz").await;
         fresh.assert_status_ok();
     }
@@ -261,7 +254,7 @@ mod tests {
         let db = TestDb::new().await.unwrap();
         let (book_tx, _book_rx) = tokio::sync::mpsc::channel(3);
         let (exec_tx, _exec_rx) = tokio::sync::mpsc::channel(2);
-        let state = ObsState::new(db.pool.clone(), 60).with_channels(book_tx, exec_tx);
+        let state = ObsState::new(db.pool.clone(), 60, book_tx, exec_tx);
         db.pool.read(|_| Ok(())).await.unwrap();
         let server = TestServer::new(state.router());
         let response = server.get("/metrics").await;

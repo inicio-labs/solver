@@ -19,22 +19,14 @@ pub type Amount = u64;
 pub enum SettlementError {
     #[error("settlement has no inputs")]
     NoInputs,
-    #[error("new settlement is not in the prepared state")]
-    NotPrepared,
     #[error("settlement lists the same parent order twice")]
     DuplicateParent,
     #[error("settlement input order is missing")]
     MissingInputOrder,
-    #[error("settlement child ID and note data must both be present or both absent")]
-    IncompleteChild,
     #[error("settlement child is not a valid remainder of its parent")]
     InvalidRemainder,
-    #[error("settlement input belongs to a different transaction")]
-    InputTransactionMismatch,
     #[error("settlement input order is not active")]
     InputOrderNotActive,
-    #[error("settlement child ID does not match its note")]
-    ChildIdMismatch,
     #[error("expected payback {0} is absent from the executed outputs")]
     MissingPayback(NoteId),
     #[error("expected remainder {0} is absent from the executed outputs")]
@@ -86,9 +78,8 @@ pub fn now_unix() -> UnixSecs {
 /// previous solver attempt whose DB bookkeeping we lost). No further
 /// processing — the matcher's hydration query already filters
 /// `status = 'active'`, so terminal rows are excluded automatically.
-/// Stored as its snake_case name; `strum` derives both directions (`as_str`
-/// and `str::parse`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
+/// Stored as its snake_case name (`as_str`, derived by `strum`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum OrderStatus {
     Active,

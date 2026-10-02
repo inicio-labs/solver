@@ -78,6 +78,11 @@ fn cli() -> clap::Command {
                 .about("Apply PostgreSQL schema migrations using SOLVER_MIGRATION_DATABASE_URL"),
         )
         .subcommand(
+            clap::Command::new("revert-db").about(
+                "Roll back the newest PostgreSQL migration using SOLVER_MIGRATION_DATABASE_URL",
+            ),
+        )
+        .subcommand(
             clap::Command::new("check-db")
                 .about("Check PostgreSQL schema compatibility using SOLVER_DATABASE_URL"),
         )
@@ -156,6 +161,14 @@ fn main() -> anyhow::Result<()> {
                 "PostgreSQL schema ready ({} new migration(s))",
                 applied.len()
             );
+            return Ok(());
+        }
+        Some("revert-db") => {
+            let url = env::var("SOLVER_MIGRATION_DATABASE_URL")
+                .context("set SOLVER_MIGRATION_DATABASE_URL for revert-db")?;
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            let reverted = solver::db::postgres_migrations::revert_last(&mut conn)?;
+            println!("PostgreSQL migration {reverted} reverted");
             return Ok(());
         }
         Some("check-db") => {

@@ -21,7 +21,7 @@ use crate::types::TokenId;
 /// We send via a channel rather than holding a `MidenClient` directly because
 /// the production `Client<FilesystemKeyStore>` is `!Send`, which conflicts
 /// with axum's requirement that handler state be `Send + Sync`. The subscribe
-/// task lives in the same `LocalSet` and owns the client; we just give it a
+/// task runs on the ingest thread, which owns the client; admin only holds a
 /// `Sender` (which is always `Send + Sync`).
 pub type SubscribeSender = mpsc::Sender<(TokenId, TokenId)>;
 
@@ -31,8 +31,7 @@ pub struct AdminState {
     /// Channel to the subscribe task. Admin sends one message per direction
     /// when a new token is registered; the subscribe task processes them in
     /// order. Failures only log — admin call still succeeds since the DB row
-    /// is the source of truth (the matcher will see the new token on its
-    /// next hydration).
+    /// is the source of truth, and a restart subscribes every registered pair.
     subscribe_tx: SubscribeSender,
     /// In-memory faucet-id → external-symbol cache, shared with `HttpPriceClient`.
     /// Mutated atomically alongside DB writes so the price client always sees
@@ -128,15 +127,20 @@ impl AdminState {
         let Some(existing) = existing else {
             return Ok(false);
         };
-        // Send failures only log: the database row is the source of truth and
-        // a restart re-subscribes every registered pair.
-        for other in existing.into_iter().filter(|other| *other != token) {
-            for pair in [(token, other), (other, token)] {
-                if let Err(error) = self.subscribe_tx.send(pair).await {
-                    tracing::warn!(%error, "admin: subscribe channel send failed");
+        // Its own task, so a caller that disconnects after the commit cannot
+        // skip the subscriptions (a retry would only answer "already
+        // registered"). Send failures only log: the database row is the
+        // source of truth and a restart re-subscribes every registered pair.
+        let subscribe_tx = self.subscribe_tx.clone();
+        tokio::spawn(async move {
+            for other in existing.into_iter().filter(|other| *other != token) {
+                for pair in [(token, other), (other, token)] {
+                    if let Err(error) = subscribe_tx.send(pair).await {
+                        tracing::warn!(%error, "admin: subscribe channel send failed");
+                    }
                 }
             }
-        }
+        });
         Ok(true)
     }
 }

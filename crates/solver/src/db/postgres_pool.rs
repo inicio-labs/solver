@@ -5,7 +5,7 @@
 //! Tokio mutex serializes individual transactions. Read concurrency is bounded
 //! before a blocking worker is spawned.
 
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::error::{DbError, DbResult};
@@ -36,10 +36,14 @@ pub const LATENCY_BUCKET_US: [u64; 8] = [
 // network reply. A timed-out blocking operation keeps its permit while the
 // coordinated solver shuts down for a supervised restart.
 const DEFAULT_OPERATION_DEADLINE: Duration = Duration::from_secs(30);
-/// How long a lost writer session may take to come back before the solver
-/// gives up and stops. Covers a database restart or failover.
-const DEFAULT_RECONNECT_WINDOW: Duration = Duration::from_secs(30);
-
+/// How long a read waits for a free read slot before reporting the pool busy.
+const READ_SLOT_WAIT: Duration = Duration::from_secs(5);
+/// How long a new read connection may take to open.
+const READ_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on the `/readyz` writer-ownership probe.
+const READINESS_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// Longest pause between writer reconnect attempts.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// A cumulative latency histogram (Prometheus style).
 #[derive(Default)]
 struct Latency {
@@ -194,23 +198,40 @@ impl PoolTelemetry {
     }
 }
 
+/// A server backend, identified by pid and start time: a pid alone can be
+/// reused by another session after the database restarts.
+#[derive(QueryableByName, Clone, Debug, PartialEq, Eq)]
+struct Backend {
+    #[diesel(sql_type = Integer)]
+    pid: i32,
+    #[diesel(sql_type = Nullable<Text>)]
+    started: Option<String>,
+}
+
 #[derive(QueryableByName)]
 struct LockResult {
     #[diesel(sql_type = Bool)]
     acquired: bool,
     #[diesel(sql_type = Integer)]
     backend_pid: i32,
+    #[diesel(sql_type = Nullable<Text>)]
+    backend_start: Option<String>,
 }
 
-/// Try the session advisory lock. `Some(backend pid)` when this session now
+/// Try the session advisory lock. `Some(this backend)` when this session now
 /// holds it; a granted session-level lock needs no further check.
-fn try_lock(conn: &mut PgConnection, lock_key: i64) -> diesel::QueryResult<Option<i32>> {
+fn try_lock(conn: &mut PgConnection, lock_key: i64) -> diesel::QueryResult<Option<Backend>> {
     let lock = diesel::sql_query(
-        "SELECT pg_try_advisory_lock($1) AS acquired, pg_backend_pid() AS backend_pid",
+        "SELECT pg_try_advisory_lock($1) AS acquired, pg_backend_pid() AS backend_pid,
+                (SELECT backend_start::text FROM pg_stat_activity
+                 WHERE pid = pg_backend_pid()) AS backend_start",
     )
     .bind::<BigInt, _>(lock_key)
     .get_result::<LockResult>(conn)?;
-    Ok(lock.acquired.then_some(lock.backend_pid))
+    Ok(lock.acquired.then_some(Backend {
+        pid: lock.backend_pid,
+        started: lock.backend_start,
+    }))
 }
 
 /// `pg_locks` shows a bigint advisory key as two 32-bit halves.
@@ -261,6 +282,34 @@ fn schema_lock_key(schema: &str) -> i64 {
 }
 
 #[derive(QueryableByName)]
+struct CurrentSchema {
+    #[diesel(sql_type = Nullable<Text>)]
+    schema: Option<String>,
+}
+
+/// Run schema maintenance while holding the solver's ownership lock for the
+/// schema this session migrates, so it cannot change tables under a running
+/// solver and no solver can start until it finishes.
+pub(crate) fn with_ownership_lock<T>(
+    conn: &mut PgConnection,
+    maintenance: impl FnOnce(&mut PgConnection) -> DbResult<T>,
+) -> DbResult<T> {
+    let schema = diesel::sql_query("SELECT current_schema()::text AS schema")
+        .get_result::<CurrentSchema>(conn)?
+        .schema
+        .unwrap_or_else(|| "public".into());
+    let lock_key = schema_lock_key(&schema);
+    if try_lock(conn, lock_key)?.is_none() {
+        return Err(DbError::AlreadyOwned);
+    }
+    let result = maintenance(conn);
+    diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<BigInt, _>(lock_key)
+        .execute(conn)?;
+    result
+}
+
+#[derive(QueryableByName)]
 struct SettingResult {
     #[diesel(sql_type = Text)]
     value: String,
@@ -294,12 +343,6 @@ fn writer_health(conn: &mut PgConnection, lock_key: i64) -> diesel::QueryResult<
 struct OptionalText {
     #[diesel(sql_type = Nullable<Text>)]
     value: Option<String>,
-}
-
-#[derive(QueryableByName)]
-struct OptionalPid {
-    #[diesel(sql_type = Nullable<Integer>)]
-    pid: Option<i32>,
 }
 
 #[derive(QueryableByName)]
@@ -402,30 +445,31 @@ impl<E: Into<DbError>> From<E> for Reconnect {
 /// advisory lock, and confirm the ownership epoch is still ours.
 fn reconnect_once(
     config: &WriterConfig,
-    previous_pid: i32,
-) -> Result<(PgConnection, i32), Reconnect> {
+    previous: &Backend,
+) -> Result<(PgConnection, Backend), Reconnect> {
     let lock_key = config.lock_key;
     let mut conn = postgres_migrations::connect(&config.url)?;
     configure_session(&mut conn, &config.application_name)?;
-    let Some(backend_pid) = try_lock(&mut conn, lock_key)? else {
+    let Some(backend) = try_lock(&mut conn, lock_key)? else {
         // After a network cut our previous backend can outlive the client
-        // and keep the lock until it notices; that one is safe to end.
+        // and keep the lock until it notices; that one is safe to end. It is
+        // matched by pid and start time, never by a reused pid alone.
         let holder = diesel::sql_query(
-            "SELECT pid FROM pg_locks
-             WHERE locktype = 'advisory' AND granted
-               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-               AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1
+            "SELECT l.pid, a.backend_start::text AS started
+             FROM pg_locks AS l LEFT JOIN pg_stat_activity AS a ON a.pid = l.pid
+             WHERE l.locktype = 'advisory' AND l.granted
+               AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+               AND l.classid::bigint = $1 AND l.objid::bigint = $2 AND l.objsubid = 1
              LIMIT 1",
         )
         .bind::<BigInt, _>(lock_key_parts(lock_key).0)
         .bind::<BigInt, _>(lock_key_parts(lock_key).1)
-        .get_result::<OptionalPid>(&mut conn)
-        .optional()?
-        .and_then(|row| row.pid);
+        .get_result::<Backend>(&mut conn)
+        .optional()?;
         return Err(match holder {
-            Some(pid) if pid == previous_pid => {
+            Some(holder) if holder == *previous && holder.started.is_some() => {
                 diesel::sql_query("SELECT pg_terminate_backend($1)")
-                    .bind::<Integer, _>(pid)
+                    .bind::<Integer, _>(holder.pid)
                     .execute(&mut conn)?;
                 Reconnect::Retry(DbError::OwnershipLost)
             }
@@ -443,7 +487,7 @@ fn reconnect_once(
             current,
         }));
     }
-    Ok((conn, backend_pid))
+    Ok((conn, backend))
 }
 
 /// Whether the transaction a lost session was committing took effect. Only
@@ -465,42 +509,38 @@ fn transaction_committed(conn: &mut PgConnection, xid: &str) -> Result<bool, Rec
 }
 
 /// Replace the lost writer session in place and, if a commit was in flight,
-/// learn its outcome. Retries transient failures until `window` runs out.
+/// learn its outcome. Retries until the database answers: a restart or
+/// failover pauses writes instead of stopping the solver. Only a condition
+/// that makes continuing unsafe (another owner, unknown commit outcome)
+/// returns an error.
 fn recover_writer(
-    conn: &mut PgConnection,
+    writer: &mut Writer,
     config: &WriterConfig,
-    previous_pid: i32,
     xid: Option<&str>,
-    window: Duration,
-) -> DbResult<(i32, Option<bool>)> {
-    let deadline = Instant::now() + window;
+) -> DbResult<Option<bool>> {
     let mut backoff = Duration::from_millis(100);
-    loop {
-        let attempt = reconnect_once(config, previous_pid).and_then(|(mut fresh, pid)| {
+    for tries in 1_u64.. {
+        let attempt = reconnect_once(config, &writer.backend).and_then(|(mut fresh, backend)| {
             let committed = xid
                 .map(|xid| transaction_committed(&mut fresh, xid))
                 .transpose()?;
-            Ok((fresh, pid, committed))
+            Ok((fresh, backend, committed))
         });
         match attempt {
-            Ok((fresh, pid, committed)) => {
-                *conn = fresh;
-                return Ok((pid, committed));
+            Ok((fresh, backend, committed)) => {
+                writer.conn = fresh;
+                writer.backend = backend;
+                return Ok(committed);
             }
             Err(Reconnect::Stop(error)) => return Err(error),
-            Err(Reconnect::Retry(error)) if Instant::now() + backoff < deadline => {
-                tracing::warn!(%error, "PostgreSQL writer reconnect attempt failed; retrying");
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(2));
-            }
             Err(Reconnect::Retry(error)) => {
-                return Err(DbError::ReconnectTimedOut {
-                    window,
-                    last: Box::new(error),
-                })
+                tracing::warn!(%error, tries, "PostgreSQL writer reconnect failed; writes wait, retrying");
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
             }
         }
     }
+    unreachable!("the reconnect loop only exits by returning")
 }
 
 /// What a lost writer session needs to come back as the same owner.
@@ -516,12 +556,40 @@ struct WriterConfig {
 fn configure_session(conn: &mut PgConnection, application_name: &str) -> diesel::QueryResult<()> {
     conn.batch_execute(
         "SET default_transaction_isolation = 'read committed';
-         SET lc_messages = 'C';
          SET statement_timeout = '10s';
          SET lock_timeout = '2s';
          SET idle_in_transaction_session_timeout = '10s';
          SET idle_session_timeout = 0",
     )?;
+    // Server-side TCP keepalives on our own sessions: once a client vanishes
+    // (network cut, crash, killed host), the server ends its backend within
+    // about 25 s, releasing the writer's ownership lock, so a restarted solver
+    // can start instead of finding the lock held by a session nobody owns.
+    // `idle_session_timeout = 0` keeps a live idle writer; these end only a
+    // dead one. Ordinary roles may set them; unsupported platforms only warn.
+    // `tcp_user_timeout` (Linux servers) also covers a backend blocked
+    // sending to a dead client, where keepalive probes do not run.
+    for setting in [
+        "SET tcp_keepalives_idle = 10; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3",
+        "SET tcp_user_timeout = 25000",
+    ] {
+        if let Err(error) = conn.batch_execute(setting) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(%error, setting, "cannot set server TCP keepalives; a dead writer session may hold the ownership lock until the server's own keepalive ends it")
+            });
+        }
+    }
+    // English messages let `ErrorClass` tell lock, statement and deadlock
+    // timeouts apart in metrics. Only a superuser, or a role granted
+    // `SET ON PARAMETER lc_messages` (PostgreSQL 15+), may set it; without
+    // that grant the solver runs normally and counts them as `database`.
+    if let Err(error) = conn.batch_execute("SET lc_messages = 'C'") {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(%error, "cannot set lc_messages; timeout metrics will be unclassified")
+        });
+    }
     let setting = diesel::sql_query("SELECT set_config('application_name', $1, false) AS value")
         .bind::<Text, _>(application_name)
         .get_result::<SettingResult>(conn)?;
@@ -544,20 +612,26 @@ impl r2d2::CustomizeConnection<PgConnection, r2d2::Error> for ReadCustomizer {
     }
 }
 
+/// The single writer session and its backend pid. Both change together, only
+/// on reconnect, and only under the writer mutex.
+struct Writer {
+    conn: PgConnection,
+    backend: Backend,
+}
+
 #[derive(Clone)]
 pub struct PgPool {
-    writer: Arc<Mutex<PgConnection>>,
+    writer: Arc<Mutex<Writer>>,
     writer_config: Arc<WriterConfig>,
-    /// Backend of the current writer session; changes only on reconnect,
-    /// always while the writer mutex is held.
-    writer_backend_pid: Arc<AtomicI32>,
     /// Cancelled once the writer is unsafe; requests a whole-solver stop.
     fatal_db: CancellationToken,
     operation_deadline: Duration,
-    reconnect_window: Duration,
     publish_order: Arc<Mutex<()>>,
     readers: r2d2::Pool<ConnectionManager<PgConnection>>,
     read_slots: Arc<Semaphore>,
+    /// Caps public API reads below `read_slots`, so wallet traffic always
+    /// leaves at least one read connection for the solver pipeline.
+    public_slots: Arc<Semaphore>,
     telemetry: Arc<PoolTelemetry>,
 }
 
@@ -574,20 +648,20 @@ impl PgPool {
         if read_pool_size == 0 {
             return Err(DbError::InvalidReadPoolSize);
         }
-        let (writer, writer_backend_pid, readers, writer_config) =
+        let (writer, writer_backend, readers, writer_config) =
             blocking("startup", DEFAULT_OPERATION_DEADLINE, move || {
                 let mut writer = postgres_migrations::connect(&writer_url)?;
                 configure_session(&mut writer, &application_name)?;
                 postgres_migrations::verify(&mut writer)?;
                 let writer_identity = database_identity(&mut writer)?;
                 let lock_key = schema_lock_key(&writer_identity.schema_name);
-                let writer_backend_pid =
+                let writer_backend =
                     try_lock(&mut writer, lock_key)?.ok_or(DbError::AlreadyOwned)?;
                 let owner_epoch = claim_owner_epoch(&mut writer)?;
 
                 let readers = r2d2::Pool::builder()
                     .max_size(read_pool_size)
-                    .connection_timeout(Duration::from_secs(5))
+                    .connection_timeout(READ_CONNECT_TIMEOUT)
                     .test_on_check_out(true)
                     .connection_customizer(Box::new(ReadCustomizer {
                         application_name: format!("{application_name}/read"),
@@ -610,20 +684,22 @@ impl PgPool {
                     lock_key,
                     owner_epoch,
                 };
-                Ok((writer, writer_backend_pid, readers, writer_config))
+                Ok((writer, writer_backend, readers, writer_config))
             })
             .await?;
 
         Ok(Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(Writer {
+                conn: writer,
+                backend: writer_backend,
+            })),
             writer_config: Arc::new(writer_config),
-            writer_backend_pid: Arc::new(AtomicI32::new(writer_backend_pid)),
             fatal_db: CancellationToken::new(),
             operation_deadline: DEFAULT_OPERATION_DEADLINE,
-            reconnect_window: DEFAULT_RECONNECT_WINDOW,
             publish_order: Arc::new(Mutex::new(())),
             readers,
             read_slots: Arc::new(Semaphore::new(read_pool_size as usize)),
+            public_slots: Arc::new(Semaphore::new((read_pool_size as usize - 1).max(1))),
             telemetry: Arc::new(PoolTelemetry::default()),
         })
     }
@@ -656,6 +732,30 @@ impl PgPool {
         self.fatal_db.clone()
     }
 
+    /// A read for the public price API. It waits for a public slot first, so
+    /// a traffic burst queues here instead of taking every read connection
+    /// from ingest, the executor and `/readyz`.
+    pub async fn read_public<T, F>(&self, operation: F) -> DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
+    {
+        let _slot = self.read_slot(&self.public_slots).await?;
+        self.read(operation).await
+    }
+
+    /// A slot from `slots`, or `ReadPoolBusy` after `READ_SLOT_WAIT`. The
+    /// semaphores are never closed, so running out of time is the only error.
+    async fn read_slot(&self, slots: &Arc<Semaphore>) -> DbResult<OwnedSemaphorePermit> {
+        match tokio::time::timeout(READ_SLOT_WAIT, slots.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => {
+                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
+                Err(DbError::ReadPoolBusy(READ_SLOT_WAIT))
+            }
+        }
+    }
+
     /// Reads never request a solver shutdown. The read pool holds no
     /// ownership state, so a failed read is reported to its caller and the
     /// pool reconnects on the next checkout. Only the writer can be fatal.
@@ -670,23 +770,9 @@ impl PgPool {
         let operation_name = std::any::type_name::<F>();
         self.telemetry.read_total.fetch_add(1, Ordering::Relaxed);
         let waiting_since = Instant::now();
-        let permit = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.read_slots.clone().acquire_owned(),
-        )
-        .await;
+        let permit = self.read_slot(&self.read_slots).await;
         self.telemetry.read_wait.record(waiting_since);
-        let permit = match permit {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(DbError::ReadPoolClosed);
-            }
-            Err(_) => {
-                self.telemetry.read_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(DbError::ReadPoolBusy(Duration::from_secs(5)));
-            }
-        };
+        let permit = permit?;
         let readers = self.readers.clone();
         let started = Instant::now();
         // The blocking worker keeps its permit until libpq returns, so a lost
@@ -720,25 +806,31 @@ impl PgPool {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
             return Err(DbError::WriterUnsafe);
         }
+        // No timeout of its own: the holder is a write bounded by the
+        // operation deadline, or a reconnect that waits for the database to
+        // come back. Either stops the solver itself if it cannot finish safely.
         let waiting_since = Instant::now();
-        let writer =
-            tokio::time::timeout(Duration::from_secs(30), self.writer.clone().lock_owned()).await;
+        let writer = tokio::select! {
+            writer = self.writer.clone().lock_owned() => Some(writer),
+            _ = self.fatal_db.cancelled() => None,
+        };
         self.telemetry.writer_wait.record(waiting_since);
-        let Ok(mut writer) = writer else {
+        let Some(mut writer) = writer else {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(self.stop(DbError::WriterBusy(Duration::from_secs(30))));
+            return Err(DbError::WriterUnsafe);
         };
         if self.writer_unsafe() {
             self.telemetry.write_errors.fetch_add(1, Ordering::Relaxed);
             return Err(DbError::WriterUnsafe);
         }
-        let expected_pid = self.writer_backend_pid.load(Ordering::Acquire);
+        let expected_pid = writer.backend.pid;
         let lock_key = self.writer_config.lock_key;
         let started = Instant::now();
         let attempt = tokio::time::timeout(
             self.operation_deadline,
             tokio::task::spawn_blocking(move || {
-                let outcome = run_write_transaction(&mut writer, operation, lock_key, expected_pid);
+                let outcome =
+                    run_write_transaction(&mut writer.conn, operation, lock_key, expected_pid);
                 (writer, outcome)
             }),
         )
@@ -751,11 +843,11 @@ impl PgPool {
                     Err(self.stop(DbError::OwnershipLost))
                 }
                 Ok(Ok((writer, Err(WriteFailure::LostBeforeCommit(error))))) => self
-                    .recover(writer, expected_pid, None)
+                    .recover(writer, None)
                     .await
                     .and(Err(DbError::LostBeforeCommit(Box::new(error)))),
                 Ok(Ok((writer, Err(WriteFailure::LostAtCommit { error, value, xid })))) => {
-                    match self.recover(writer, expected_pid, xid).await? {
+                    match self.recover(writer, xid).await? {
                         // A transaction that wrote nothing has no ID and no effect;
                         // its result was computed from a consistent snapshot.
                         Some(true) | None => Ok(value),
@@ -817,24 +909,15 @@ impl PgPool {
     /// transaction `xid` committed. Any failure here stops the solver.
     async fn recover(
         &self,
-        mut writer: tokio::sync::OwnedMutexGuard<PgConnection>,
-        previous_pid: i32,
+        mut writer: tokio::sync::OwnedMutexGuard<Writer>,
         xid: Option<String>,
     ) -> DbResult<Option<bool>> {
+        let previous_pid = writer.backend.pid;
         tracing::warn!(previous_pid, "PostgreSQL writer session lost; reconnecting");
         let config = self.writer_config.clone();
-        let window = self.reconnect_window;
-        let backend_pid = self.writer_backend_pid.clone();
         let recovered = tokio::task::spawn_blocking(move || {
-            let recovered =
-                recover_writer(&mut writer, &config, previous_pid, xid.as_deref(), window);
-            // Publish the new backend before releasing the writer mutex: a
-            // queued write must never pair the new session with the old pid.
-            if let Ok((pid, _)) = &recovered {
-                backend_pid.store(*pid, Ordering::Release);
-            }
-            drop(writer);
-            recovered
+            recover_writer(&mut writer, &config, xid.as_deref())
+                .map(|committed| (writer.backend.pid, committed))
         })
         .await;
         match recovered {
@@ -851,7 +934,7 @@ impl PgPool {
                 Ok(committed)
             }
             Ok(Err(error)) => Err(self.stop(error)),
-            Err(panicked) => Err(self.stop(DbError::WorkerStopped(panicked))),
+            Err(panicked) => Err(self.stop(DbError::WriterPanicked(panicked))),
         }
     }
 
@@ -899,12 +982,12 @@ impl PgPool {
         let Ok(mut writer) = self.writer.clone().try_lock_owned() else {
             return Ok(());
         };
-        let expected_pid = self.writer_backend_pid.load(Ordering::Acquire);
+        let expected_pid = writer.backend.pid;
         let lock_key = self.writer_config.lock_key;
         // A dead session is replaced by the next write; only a live session
         // without the lock is fatal here.
-        let health = blocking("readiness probe", Duration::from_secs(5), move || {
-            Ok(writer_health(&mut writer, lock_key)?)
+        let health = blocking("readiness probe", READINESS_PROBE_DEADLINE, move || {
+            Ok(writer_health(&mut writer.conn, lock_key)?)
         })
         .await?;
         if health.backend_pid != expected_pid || !health.owns_advisory_lock {
@@ -919,47 +1002,78 @@ mod tests {
     use super::*;
     use crate::db::postgres_migrations;
     use crate::db::postgres_schema::sync_state;
+    use crate::db::postgres_test::TestSchema;
     use anyhow::{bail, Context, Result};
     use miden_protocol::crypto::utils::{Deserializable, SliceReader};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
-    static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
-
-    struct PoolFixture {
-        admin: PgConnection,
-        name: String,
-        url: String,
+    #[derive(QueryableByName)]
+    struct Keepalives {
+        #[diesel(sql_type = Text)]
+        idle: String,
+        #[diesel(sql_type = Text)]
+        interval: String,
+        #[diesel(sql_type = Text)]
+        count: String,
+        #[diesel(sql_type = Text)]
+        user_timeout: String,
     }
 
-    impl PoolFixture {
-        fn new() -> Result<Self> {
-            let base_url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
-            let mut admin = postgres_migrations::connect(&base_url)?;
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let sequence = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
-            let name = format!("solver_pool_{}_{}_{}", std::process::id(), nonce, sequence);
-            admin.batch_execute(&format!("CREATE SCHEMA {name}"))?;
-            let separator = if base_url.contains('?') { '&' } else { '?' };
-            let url = format!("{base_url}{separator}options=-csearch_path%3D{name}");
-            let fixture = Self { admin, name, url };
-            let mut schema_conn = postgres_migrations::connect(&fixture.url)?;
-            postgres_migrations::migrate(&mut schema_conn)?;
-            Ok(fixture)
-        }
+    /// A dead client's writer session must not hold the ownership lock for
+    /// hours: the server probes our sessions and ends a vanished one quickly.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn solver_sessions_let_the_server_detect_a_dead_client() -> Result<()> {
+        let schema = TestSchema::migrated()?;
+        let pool = PgPool::open(
+            schema.url.clone(),
+            schema.url.clone(),
+            1,
+            "solver/test".into(),
+        )
+        .await?;
+        let settings = pool
+            .write(|conn| {
+                Ok(diesel::sql_query(
+                    "SELECT current_setting('tcp_keepalives_idle') AS idle,
+                            current_setting('tcp_keepalives_interval') AS interval,
+                            current_setting('tcp_keepalives_count') AS count,
+                            current_setting('tcp_user_timeout') AS user_timeout",
+                )
+                .get_result::<Keepalives>(conn)?)
+            })
+            .await?;
+        // The test database is reached over TCP; a Unix socket reads as 0.
+        assert_eq!(settings.idle, "10");
+        assert_eq!(settings.interval, "5");
+        assert_eq!(settings.count, "3");
+        // Linux servers apply it; servers without TCP_USER_TIMEOUT keep 0.
+        assert!(matches!(settings.user_timeout.as_str(), "25s" | "0"));
+        Ok(())
     }
 
-    impl Drop for PoolFixture {
-        fn drop(&mut self) {
-            let _ = self
-                .admin
-                .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.name));
-        }
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    fn migrations_refuse_to_run_while_a_solver_owns_the_schema() -> Result<()> {
+        let mut schema = TestSchema::migrated()?;
+        let mut solver = postgres_migrations::connect(&schema.url)?;
+        let lock_key = schema_lock_key(&schema.name);
+        assert!(try_lock(&mut solver, lock_key)?.is_some());
+        assert!(matches!(
+            postgres_migrations::migrate(&mut schema.conn),
+            Err(DbError::AlreadyOwned)
+        ));
+        drop(solver);
+        postgres_migrations::migrate(&mut schema.conn)?;
+        // Maintenance releases the lock, so a solver can start afterwards.
+        assert!(try_lock(&mut postgres_migrations::connect(&schema.url)?, lock_key)?.is_some());
+        Ok(())
     }
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn ownership_and_post_commit_publication() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let url = fixture.url.clone();
 
         let pool = PgPool::open(url.clone(), url.clone(), 2, "solver/test".into()).await?;
@@ -968,7 +1082,7 @@ mod tests {
             Ok(_) => bail!("a second solver acquired the application ownership lock"),
             Err(error) => assert!(matches!(error, DbError::AlreadyOwned), "{error:?}"),
         }
-        let other_schema = PoolFixture::new()?;
+        let other_schema = TestSchema::migrated()?;
         let independent = PgPool::open(
             other_schema.url.clone(),
             other_schema.url.clone(),
@@ -1055,7 +1169,8 @@ mod tests {
         let lock_key = pool.writer_config.lock_key;
         pool.write(move |conn| {
             let unlocked = diesel::sql_query(
-                "SELECT pg_advisory_unlock($1) AS acquired, pg_backend_pid() AS backend_pid",
+                "SELECT pg_advisory_unlock($1) AS acquired, pg_backend_pid() AS backend_pid,
+                        NULL::text AS backend_start",
             )
             .bind::<BigInt, _>(lock_key)
             .get_result::<LockResult>(conn)?;
@@ -1075,7 +1190,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn book_updates_arrive_in_commit_order() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let url = fixture.url.clone();
         let pool = PgPool::open(url.clone(), url, 1, "solver/publish-order".into()).await?;
         let first_id = crate::types::OrderId::read_from(&mut SliceReader::new(&[1_u8; 32]))?;
@@ -1144,7 +1259,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn closed_matcher_after_commit_leaves_state_for_restart() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let url = fixture.url.clone();
         let pool = PgPool::open(url.clone(), url.clone(), 1, "solver/first".into()).await?;
         let (sender, receiver) = mpsc::channel(1);
@@ -1181,8 +1296,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn reader_must_target_the_writer_database_and_schema() -> Result<()> {
-        let writer = PoolFixture::new()?;
-        let reader = PoolFixture::new()?;
+        let writer = TestSchema::migrated()?;
+        let reader = TestSchema::migrated()?;
         let error = match PgPool::open(
             writer.url.clone(),
             reader.url.clone(),
@@ -1204,7 +1319,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn exhausted_read_pool_returns_a_bounded_error() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1234,7 +1349,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn lost_write_reply_fails_closed_but_committed_state_is_recoverable() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let mut pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1277,7 +1392,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn lost_read_reply_is_not_fatal() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let mut pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1313,7 +1428,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn readiness_does_not_wait_for_a_busy_writer() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1342,7 +1457,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn row_lock_timeout_is_not_fatal() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1383,7 +1498,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn statement_timeout_is_not_fatal() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1443,7 +1558,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn lost_idle_writer_reconnects_and_keeps_running() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1451,7 +1566,7 @@ mod tests {
             "solver/idle-writer".into(),
         )
         .await?;
-        let first_pid = pool.writer_backend_pid.load(Ordering::Acquire);
+        let first_pid = pool.writer.lock().await.backend.pid;
         terminate(&mut fixture.admin, first_pid)?;
 
         // Nothing was in flight: the write that finds the dead session reports
@@ -1459,7 +1574,7 @@ mod tests {
         let error = pool.write(|_| Ok(())).await.unwrap_err();
         assert!(matches!(error, DbError::LostBeforeCommit(_)), "{error:?}");
         assert!(!pool.fatal_token().is_cancelled());
-        assert_ne!(pool.writer_backend_pid.load(Ordering::Acquire), first_pid);
+        assert_ne!(pool.writer.lock().await.backend.pid, first_pid);
         pool.write(|conn| {
             diesel::update(sync_state::table.find(1_i16))
                 .set(sync_state::last_fetched_block.eq(3_i64))
@@ -1476,7 +1591,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn writer_lost_mid_transaction_writes_nothing_and_recovers() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1484,7 +1599,7 @@ mod tests {
             "solver/mid-transaction".into(),
         )
         .await?;
-        let pid = pool.writer_backend_pid.load(Ordering::Acquire);
+        let pid = pool.writer.lock().await.backend.pid;
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let blocked_pool = pool.clone();
         let blocked = tokio::spawn(async move {
@@ -1515,7 +1630,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn writer_lost_during_commit_reports_the_real_outcome() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1563,7 +1678,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     fn commit_outcome_is_read_back_by_transaction_id() -> Result<()> {
-        let fixture = PoolFixture::new()?;
+        let fixture = TestSchema::migrated()?;
         let mut conn = postgres_migrations::connect(&fixture.url)?;
         let mut xid_of = |finish: &str| -> Result<String> {
             conn.batch_execute(
@@ -1591,7 +1706,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn another_owner_after_disconnect_stops_the_solver() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1599,10 +1714,7 @@ mod tests {
             "solver/lock-taken".into(),
         )
         .await?;
-        terminate(
-            &mut fixture.admin,
-            pool.writer_backend_pid.load(Ordering::Acquire),
-        )?;
+        terminate(&mut fixture.admin, pool.writer.lock().await.backend.pid)?;
         let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS value")
             .bind::<BigInt, _>(pool.writer_config.lock_key)
             .get_result::<Flag>(&mut fixture.admin)?
@@ -1625,7 +1737,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
     async fn a_new_owner_epoch_after_disconnect_stops_the_solver() -> Result<()> {
-        let mut fixture = PoolFixture::new()?;
+        let mut fixture = TestSchema::migrated()?;
         let pool = PgPool::open(
             fixture.url.clone(),
             fixture.url.clone(),
@@ -1633,10 +1745,7 @@ mod tests {
             "solver/epoch-moved".into(),
         )
         .await?;
-        terminate(
-            &mut fixture.admin,
-            pool.writer_backend_pid.load(Ordering::Acquire),
-        )?;
+        terminate(&mut fixture.admin, pool.writer.lock().await.backend.pid)?;
         // Another solver started, did work, and exited while we were away.
         fixture.admin.batch_execute(&format!(
             "UPDATE {}.sync_state SET owner_epoch = owner_epoch + 1",

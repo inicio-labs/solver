@@ -13,7 +13,7 @@ use miden_protocol::note::Note;
 
 use super::error::{DbError, DbResult};
 use super::postgres_schema::{orders, registered_tokens, settlement_attempts, settlement_inputs};
-use crate::types::{BookOrder, Order, OrderId, SettlementError};
+use crate::types::{BookOrder, Order, OrderId, TokenId};
 
 /// An unresolved settlement, stored as its snake_case name. Confirmed and
 /// released attempts are deleted.
@@ -107,26 +107,6 @@ impl NewOrderRow {
     }
 }
 
-impl NewRemainderOrderRow {
-    /// Rejects a child that is not a valid PSWAP order of the same creator.
-    pub fn from_parent(parent: &OrderRow, child: &Note) -> DbResult<Self> {
-        let child_terms = Order::from_note(child)?;
-        let parent_terms = Order::from_note(&parent.note()?)?;
-        if child_terms.creator_id != parent_terms.creator_id {
-            return Err(SettlementError::InvalidRemainder.into());
-        }
-        if parent.priority_seq <= 0 {
-            return Err(DbError::Corrupt("parent order lacks a FIFO priority"));
-        }
-        Ok(Self {
-            note_id: child.id().to_bytes().to_vec(),
-            raw_data: child.to_bytes(),
-            arrival_unix: parent.arrival_unix,
-            priority_seq: parent.priority_seq,
-        })
-    }
-}
-
 #[derive(Queryable, Selectable, Insertable, Debug, Clone)]
 #[diesel(table_name = settlement_attempts)]
 pub struct SettlementAttemptRow {
@@ -167,6 +147,18 @@ pub struct RegisteredTokenRow {
     pub external_symbol: Option<String>,
     pub decimals: Option<i32>,
     pub ticker: Option<String>,
+}
+
+impl RegisteredTokenRow {
+    pub fn token(&self) -> DbResult<TokenId> {
+        Ok(TokenId::read_from(&mut SliceReader::new(&self.token_id))?)
+    }
+
+    /// On-chain decimals, once fetched. The column's CHECK keeps them in u8.
+    pub fn token_decimals(&self) -> Option<u8> {
+        self.decimals
+            .and_then(|decimals| u8::try_from(decimals).ok())
+    }
 }
 
 #[cfg(test)]

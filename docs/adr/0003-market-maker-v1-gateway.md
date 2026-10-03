@@ -241,7 +241,7 @@ Maker traffic must not slow public ingest or settlement, and a cancel must never
 
 **Handlers** run concurrently and do only CPU work: authenticate, decode, and validate the note once into domain types. They pass the validated command to the intake writer over bounded channels, with a separate small channel for cancels, and await its reply. A full channel returns UNAVAILABLE ("durable acceptance unavailable") instead of hanging.
 
-**Intake writer (group commit).** One task owns the intake session. Each round it takes every waiting cancel first, then up to N submits or whatever arrived within a short window (illustrative: 500 commands or 2 ms), and writes them in one transaction using statements that cannot fail per command (`INSERT … ON CONFLICT DO NOTHING RETURNING`), so one bad command never aborts the batch. It classifies each outcome from the returned rows (Accepted, retry of a stored result, idempotency conflict, note already registered), commits once, replies to every handler, then sends the committed cutoffs, stops and attributions on the maker control lane (see *Cancellation rule*). Atomicity remains per command: if the transaction itself fails, none of its commands was acknowledged and each is retryable by request ID. One fsync per batch gives high throughput on one session; per-command latency is the window plus one commit.
+**Intake writer (group commit).** One task owns the intake session. Each round it takes every waiting cancel first, then up to N waiting submits (default 500), and writes them in one transaction using statements that cannot fail per command (`INSERT … ON CONFLICT DO NOTHING RETURNING`), so one bad command never aborts the batch. It classifies each outcome from the returned rows (Accepted, retry of a stored result, idempotency conflict, note already registered), commits once, sends the committed cutoffs, stops and attributions on the maker control lane (see *Cancellation rule*), then replies to every handler, so a maker that sees Applied knows its cutoff is already queued at the matcher. Atomicity remains per command: if the transaction itself fails, none of its commands was acknowledged and each is retryable by request ID. Commands that arrive while a round commits form the next round, so batching adds no fixed wait: one fsync per batch gives high throughput on one session, and per-command latency is at most the running round plus one commit.
 
 A separate session is safe because maker commands only append facts (commands, notes, lineage attributions, cutoffs) and never move orders or settlements; execution authority stays with the core writer. The pool opens the intake session only after it owns the database and closes it when the pool's fatal token fires. Cancel and reservation serialize through the maker control row lock, which works across sessions. Submits and cancels add no work to the core writer.
 
@@ -427,9 +427,9 @@ One stream writer reads committed events in order. Delivery may repeat; applying
 
 #### Reconnect and heartbeat
 
-Replay means sending the maker the ordered events it missed. For example, if it can recover through event 19, reconnect with `after_event_sequence = 19`; the solver sends retained events 20 onward and then continues live delivery. ReplayComplete names a fixed catch-up watermark.
+Replay means sending the maker the ordered events it missed. For example, if it can recover through event 19, reconnect with `after_seq = 19`; the solver sends retained events 20 onward and then continues live delivery. ReplayComplete names a fixed catch-up watermark. While idle, the stream sends a keep-alive carrying its cursor; each keep-alive re-checks the API key, so revoking a key ends its open streams within one interval (default 10 s). Replay paces itself to the subscriber through a bounded buffer; a subscriber that takes nothing for a whole keep-alive interval is disconnected with RESOURCE_EXHAUSTED and resumes from its cursor.
 
-Heartbeat carries `received_through_event_sequence`. It reports the maker's progress for lag monitoring; it does not authorize deleting events (V1 deletes none).
+The unary Heartbeat carries `received_through_seq` and returns the server time and the maker's latest event sequence. It reports the maker's progress for lag monitoring; it does not authorize deleting events (V1 deletes none).
 
 If event 20 is missing and 21 arrives, the MM pauses applying later feed events and requests replay after 19. A malformed event needs visible repair/version handling, not silent skipping or an infinite reconnect loop. The solver does not cancel orders merely because replay stalled. Unary cancellations remain available; the recommended maker workflow completes catch-up before new quoting.
 
@@ -517,7 +517,7 @@ These are proposed reviewable changes, not six independent production releases. 
 
 Before implementation of the corresponding feature, agree:
 
-- Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
+- Intake round size and queue capacities (configurable, defaults 500, 4096 and 1024), and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
 - When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
 - Supported network/script versions, sync freshness bound, deployment failure coverage and workload targets.

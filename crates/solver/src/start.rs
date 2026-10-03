@@ -41,7 +41,7 @@ async fn join_client_threads(
     ingest: std::thread::JoinHandle<()>,
     executor: std::thread::JoinHandle<()>,
     price_api: std::thread::JoinHandle<()>,
-    router: Option<std::thread::JoinHandle<()>>,
+    optional: Vec<(&'static str, std::thread::JoinHandle<()>)>,
 ) -> Result<()> {
     let joined = tokio::task::spawn_blocking(move || {
         let mut failed = false;
@@ -49,15 +49,12 @@ async fn join_client_threads(
             ("ingest", ingest),
             ("executor", executor),
             ("price-api", price_api),
-        ] {
+        ]
+        .into_iter()
+        .chain(optional)
+        {
             if let Err(error) = handle.join() {
                 tracing::error!(thread = name, ?error, "solver worker panicked");
-                failed = true;
-            }
-        }
-        if let Some(router) = router {
-            if let Err(error) = router.join() {
-                tracing::error!(thread = "router", ?error, "solver worker panicked");
                 failed = true;
             }
         }
@@ -459,9 +456,13 @@ pub async fn start(
                 // (same cancel + join path as a startup-gate failure) so nothing is
                 // left running after `start` returns.
                 cancel.cancel();
-                if let Err(join_error) =
-                    join_client_threads(ingest_thread, executor_thread, price_api_thread, None)
-                        .await
+                if let Err(join_error) = join_client_threads(
+                    ingest_thread,
+                    executor_thread,
+                    price_api_thread,
+                    Vec::new(),
+                )
+                .await
                 {
                     tracing::error!(%join_error, "solver workers did not stop cleanly");
                 }
@@ -470,6 +471,48 @@ pub async fn start(
         }
     } else {
         (None, None)
+    };
+    let mut optional_threads: Vec<_> = router_thread.map(|t| ("router", t)).into_iter().collect();
+
+    // 13d. MAKER GATEWAY THREAD (ADR 0003): gRPC maker commands and the maker
+    //      intake writer on their own OS thread, runtime and database session,
+    //      so maker traffic cannot slow ingest or settlement. Only spawned when
+    //      enabled; committed cancels reach the matcher on the maker lane.
+    let gateway_ready_rx = if config.engine.maker_gateway_enabled {
+        let gateway_cfg = crate::gateway::GatewayConfig {
+            bind: config.engine.maker_gateway_bind.clone(),
+            port: config.engine.maker_gateway_port,
+            round_submits: config.engine.maker_intake_round_submits,
+            submit_queue: config.engine.maker_intake_submit_queue,
+            cancel_queue: config.engine.maker_intake_cancel_queue,
+        };
+        match crate::gateway::spawn_gateway_thread(
+            gateway_cfg,
+            db_pool.clone(),
+            channels.maker_fact_tx,
+            cancel.clone(),
+        ) {
+            Ok((thread, ready_rx)) => {
+                optional_threads.push(("maker-gateway", thread));
+                Some(ready_rx)
+            }
+            Err(e) => {
+                cancel.cancel();
+                if let Err(join_error) = join_client_threads(
+                    ingest_thread,
+                    executor_thread,
+                    price_api_thread,
+                    optional_threads,
+                )
+                .await
+                {
+                    tracing::error!(%join_error, "solver workers did not stop cleanly");
+                }
+                return Err(e).context("maker gateway startup failed");
+            }
+        }
+    } else {
+        None
     };
 
     // 14. Startup gate: both client threads must report ready (client built +
@@ -482,6 +525,9 @@ pub async fn start(
         if let Some(rx) = router_ready_rx {
             ready(rx, "router").await?;
         }
+        if let Some(rx) = gateway_ready_rx {
+            ready(rx, "maker-gateway").await?;
+        }
         Ok(())
       } => result,
       _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during startup")),
@@ -493,7 +539,7 @@ pub async fn start(
             ingest_thread,
             executor_thread,
             price_api_thread,
-            router_thread,
+            optional_threads,
         )
         .await
         {
@@ -533,7 +579,7 @@ pub async fn start(
         ingest_thread,
         executor_thread,
         price_api_thread,
-        router_thread,
+        optional_threads,
     )
     .await?;
     if !shutdown_requested.is_cancelled() {

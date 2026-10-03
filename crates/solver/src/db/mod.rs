@@ -12,4 +12,4 @@ pub mod postgres_schema;
 pub mod postgres_test;
 
 pub use error::{DbError, DbResult};
-pub use postgres_pool::PgPool as DbPool;
+pub use postgres_pool::{IntakeSession, PgPool as DbPool};

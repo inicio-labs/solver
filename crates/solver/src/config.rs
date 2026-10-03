@@ -15,6 +15,8 @@ enum ConfigError {
     EmptyPriceCurrency,
     #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
     InvalidClearingFee { fee: u32, maximum: u32 },
+    #[error("engine.{0} must be at least 1")]
+    ZeroMakerIntakeLimit(&'static str),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +198,28 @@ pub struct EngineConfig {
     /// reactivates (ms). Set above realistic consume latency. Default 30000.
     #[serde(default = "default_router_inflight_ttl_ms")]
     pub router_inflight_ttl_ms: u64,
+    // ── Market-maker gRPC gateway (ADR 0003) ──────────────────────────────────
+    /// Enable the maker gateway. Default `false`. It serves plaintext HTTP/2:
+    /// terminate TLS at a proxy or load balancer in front of it.
+    #[serde(default)]
+    pub maker_gateway_enabled: bool,
+    /// Gateway bind address. Default `"127.0.0.1"` (behind the TLS proxy).
+    #[serde(default = "default_maker_gateway_bind")]
+    pub maker_gateway_bind: String,
+    /// Gateway port. Default 8095.
+    #[serde(default = "default_maker_gateway_port")]
+    pub maker_gateway_port: u16,
+    /// Most submits written in one intake transaction; every waiting cancel
+    /// is written too. Default 500.
+    #[serde(default = "default_maker_intake_round_submits")]
+    pub maker_intake_round_submits: usize,
+    /// Submits waiting for the intake before new ones get UNAVAILABLE.
+    /// Default 4096.
+    #[serde(default = "default_maker_intake_submit_queue")]
+    pub maker_intake_submit_queue: usize,
+    /// Cancels waiting for the intake, in their own queue. Default 1024.
+    #[serde(default = "default_maker_intake_cancel_queue")]
+    pub maker_intake_cancel_queue: usize,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -291,6 +315,21 @@ fn default_router_quote_ttl_ms() -> u64 {
 fn default_router_inflight_ttl_ms() -> u64 {
     30_000
 }
+fn default_maker_gateway_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_maker_gateway_port() -> u16 {
+    8095
+}
+fn default_maker_intake_round_submits() -> usize {
+    500
+}
+fn default_maker_intake_submit_queue() -> usize {
+    4096
+}
+fn default_maker_intake_cancel_queue() -> usize {
+    1024
+}
 
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
@@ -318,6 +357,24 @@ impl SolverConfig {
                 fee: self.engine.clearing_fee_ppm,
                 maximum: crate::clearing::PPM_DENOMINATOR,
             });
+        }
+        for (name, value) in [
+            (
+                "maker_intake_round_submits",
+                self.engine.maker_intake_round_submits,
+            ),
+            (
+                "maker_intake_submit_queue",
+                self.engine.maker_intake_submit_queue,
+            ),
+            (
+                "maker_intake_cancel_queue",
+                self.engine.maker_intake_cancel_queue,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::ZeroMakerIntakeLimit(name));
+            }
         }
         Ok(())
     }

@@ -229,6 +229,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     router_max_msg_bytes: 16384,
                     router_quote_ttl_ms: 20_000,
                     router_inflight_ttl_ms: 30_000,
+                    maker_gateway_enabled: false,
+                    maker_gateway_bind: "127.0.0.1".into(),
+                    maker_gateway_port: 0,
+                    maker_intake_round_submits: 500,
+                    maker_intake_submit_queue: 4096,
+                    maker_intake_cancel_queue: 1024,
                 },
             };
 

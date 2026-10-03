@@ -619,6 +619,54 @@ struct Writer {
     backend: Backend,
 }
 
+/// The maker intake's session: group-commit transactions of maker commands
+/// beside the core writer, never through it. Maker commands only append facts
+/// (commands, lineage claims, cutoffs, stops) and never move orders or
+/// settlements, so it needs no ownership lock. Cancels and reservations still
+/// serialize through the maker control row, which works across sessions.
+pub struct IntakeSession {
+    url: String,
+    application_name: String,
+    conn: Option<PgConnection>,
+    fatal_db: CancellationToken,
+    deadline: Duration,
+}
+
+impl IntakeSession {
+    /// Run `work` as one transaction on a blocking worker, connecting first
+    /// if needed. Refuses once the pool is fatal. After any error the session
+    /// is replaced on the next call; a failure during COMMIT leaves the
+    /// outcome unknown, which a retry by request ID resolves.
+    pub async fn transaction<T, F>(&mut self, work: F) -> DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
+    {
+        if self.fatal_db.is_cancelled() {
+            return Err(DbError::WriterUnsafe);
+        }
+        let conn = self.conn.take();
+        let (url, application_name) = (self.url.clone(), self.application_name.clone());
+        let (conn, result) = blocking("intake", self.deadline, move || {
+            let mut conn = match conn {
+                Some(conn) => conn,
+                None => {
+                    let mut conn = postgres_migrations::connect(&url)?;
+                    configure_session(&mut conn, &application_name)?;
+                    conn
+                }
+            };
+            let result = conn.transaction(work);
+            Ok((conn, result))
+        })
+        .await?;
+        if result.is_ok() {
+            self.conn = Some(conn);
+        }
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct PgPool {
     writer: Arc<Mutex<Writer>>,
@@ -730,6 +778,18 @@ impl PgPool {
     /// A database failure requiring coordinated shutdown and startup hydration.
     pub fn fatal_token(&self) -> CancellationToken {
         self.fatal_db.clone()
+    }
+
+    /// The maker intake's own session (ADR 0003). It connects on first use,
+    /// with the writer's URL and session settings but not its ownership lock.
+    pub fn intake_session(&self) -> IntakeSession {
+        IntakeSession {
+            url: self.writer_config.url.clone(),
+            application_name: format!("{}/intake", self.writer_config.application_name),
+            conn: None,
+            fatal_db: self.fatal_db.clone(),
+            deadline: self.operation_deadline,
+        }
     }
 
     /// A read for the public price API. It waits for a public slot first, so

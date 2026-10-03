@@ -238,6 +238,25 @@ fn claim_command(
     }))
 }
 
+/// The stored reply of `request_id`, for a maker whose reply was lost.
+pub fn stored_result_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    request_id: &str,
+) -> DbResult<Option<CommandResult>> {
+    let stored: Option<String> = maker_commands::table
+        .find((maker_id, request_id))
+        .select(maker_commands::result)
+        .first(conn)
+        .optional()?;
+    stored
+        .map(|result| {
+            serde_json::from_str(&result)
+                .map_err(|_| DbError::Corrupt("stored command result is unreadable"))
+        })
+        .transpose()
+}
+
 fn seq_column(seq: u64) -> DbResult<i64> {
     Ok(i64::try_from(seq)?)
 }

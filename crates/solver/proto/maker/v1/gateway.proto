@@ -1,0 +1,101 @@
+// Market-maker gateway (ADR 0003, docs/adr/0003-market-maker-v1-gateway.md).
+//
+// Every call carries the maker's API key as `authorization: Bearer <key>`
+// metadata. TLS terminates at a proxy in front of the solver.
+syntax = "proto3";
+
+package solver.maker.v1;
+
+service MakerGateway {
+  // Durably accept a PSWAP note, private or public. Accepted does not mean
+  // Live: the note becomes Live once it is verified on chain.
+  rpc SubmitOrder(SubmitOrderRequest) returns (CommandReply);
+  // Stop every order of this maker in the scope whose submit sequence is
+  // below this command's sequence, including submits that arrive later.
+  // Orders already reserved by a settlement may still fill; the reply counts
+  // them.
+  rpc CancelAll(CancelAllRequest) returns (CommandReply);
+  // Stop one order by its lineage ID, even before its submit arrives.
+  rpc CancelOrder(CancelOrderRequest) returns (CommandReply);
+  // The stored reply of an earlier command, after a lost response.
+  rpc GetCommand(GetCommandRequest) returns (CommandReply);
+}
+
+message CommandHeader {
+  // Identifies one logical command: retrying the same ID, sequence and
+  // contents returns the stored reply. 1 to 128 bytes.
+  string request_id = 1;
+  // Maker-assigned, unique per maker across every command kind; 1 to 2^63-1.
+  uint64 seq = 2;
+}
+
+message SubmitOrderRequest {
+  CommandHeader header = 1;
+  // The PSWAP note in miden's canonical `Note` serialization.
+  bytes note = 2;
+}
+
+enum OrderType {
+  // Every order type.
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_PSWAP = 1;
+}
+
+// Both directions of a pair; faucet IDs in either order.
+message Market {
+  bytes faucet_a = 1;
+  bytes faucet_b = 2;
+}
+
+// Orders offering one faucet's asset for another's.
+message Direction {
+  bytes offered_faucet = 1;
+  bytes requested_faucet = 2;
+}
+
+// Filters combine as an intersection; none set stops every order. A market
+// and a direction of different pairs are rejected, never broadened.
+message CancelAllRequest {
+  CommandHeader header = 1;
+  OrderType order_type = 2;
+  Market market = 3;
+  Direction direction = 4;
+}
+
+message CancelOrderRequest {
+  CommandHeader header = 1;
+  // Creator account ID (15 bytes) followed by the root note's serial number:
+  // four big-endian u64 elements, the last minus the note's depth.
+  bytes lineage_id = 2;
+}
+
+message GetCommandRequest {
+  string request_id = 1;
+}
+
+message CommandReply {
+  // The stored reply of an earlier identical command.
+  bool replayed = 1;
+  oneof result {
+    Accepted accepted = 2;
+    AlreadyRegistered already_registered = 3;
+    Applied applied = 4;
+    Stopped stopped = 5;
+  }
+}
+
+message Accepted {}
+
+// Another submit already claimed this note's lineage.
+message AlreadyRegistered {}
+
+message Applied {
+  // The effective barrier: the highest cancel sequence in this scope.
+  uint64 cutoff = 1;
+  // Orders already reserved by a settlement, which may still fill.
+  uint64 settling = 2;
+}
+
+message Stopped {
+  uint64 settling = 1;
+}

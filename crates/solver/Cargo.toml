@@ -41,6 +41,15 @@ ruint = "1.18"
 range-set-blaze = "0.7"
 thiserror = "2"
 strum = { version = "0.28", features = ["derive"] }
+# Maker gateway gRPC (ADR 0003): the versions miden-client already brings in.
+tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+# Pure-Rust Protobuf compiler: neither developers nor CI need a system protoc.
+protox = "0.9"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 miden-crypto.workspace = true
@@ -63,5 +72,7 @@ tokio-tungstenite = "0.29"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Adversarial property-based fuzzing of the matching math (pentest).
 proptest = "1"
+# gRPC client for the maker gateway tests.
+tonic = { version = "0.14", default-features = false, features = ["channel"] }
 # test-util is dev-only; enables tokio::time::pause/advance + start_paused on #[tokio::test].
 tokio = { version = "1.40", features = ["test-util"] }

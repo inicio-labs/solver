@@ -324,7 +324,7 @@ pub fn append_event_tx(
     maker_id: MakerId,
     kind: EventKind,
     lineage_id: Option<&[u8]>,
-    payload: &str,
+    payload: &[u8],
 ) -> DbResult<u64> {
     let next: i64 = diesel::update(makers::table.find(maker_id))
         .set(makers::next_event_seq.eq(makers::next_event_seq + 1))
@@ -759,7 +759,7 @@ mod tests {
         let (alpha, beta) = (maker(conn, "alpha")?, maker(conn, "beta")?);
         let append = |conn: &mut PgConnection, maker_id| {
             conn.transaction::<_, DbError, _>(|conn| {
-                append_event_tx(conn, maker_id, EventKind::OrderStatus, None, "{}")
+                append_event_tx(conn, maker_id, EventKind::OrderStatus, None, b"")
             })
         };
         assert_eq!(append(conn, alpha)?, 1);
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(append(conn, beta)?, 1);
         // A rolled-back append gives its number back.
         let rolled_back = conn.transaction::<(), DbError, _>(|conn| {
-            append_event_tx(conn, alpha, EventKind::SettlementPending, None, "{}")?;
+            append_event_tx(conn, alpha, EventKind::SettlementPending, None, b"")?;
             Err(DbError::Corrupt("roll back"))
         });
         assert!(rolled_back.is_err());

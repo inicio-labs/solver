@@ -112,7 +112,7 @@ diesel::table! {
         event_seq -> BigInt,
         kind -> Text,
         lineage_id -> Nullable<Binary>,
-        payload -> Text,
+        payload -> Binary,
     }
 }
 

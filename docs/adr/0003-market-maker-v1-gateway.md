@@ -144,16 +144,7 @@ SettlementPending reports identify batch, settlement transaction, order/input ve
 
 #### Lineage uniqueness
 
-Within one order the lineage ID is always the same, because it is computed from fields the PSWAP script carries forward (creator, serial elements 0–2, and `s3 − depth`). Across different orders it is unique unless the same creator reuses an entire serial number: `PswapNote::builder()` takes the serial from the caller, and the protocol does not generate or check it. A random serial makes a collision practically impossible. The pinned SDK's own lineage tracker is stricter still, keying a wallet's orders by `order_id` (serial element 1) alone, so a maker that works with the SDK satisfies this rule.
-
-Enforcement:
-
-- Store the lineage ID as exact bytes (creator plus four serial elements), not a hash, so equality is exact.
-- `maker_lineages.lineage_id` is the primary key: a second order with the same lineage is rejected as already registered, never merged.
-- Reject an all-zero root serial at intake; it is the common copy-paste mistake.
-- Different creators never collide, because the creator is part of the ID.
-
-A public note's creator and serial are visible on chain, and V1 has no creator proof, so any maker could submit someone else's public note, claim its lineage and then cancel it, stopping this solver from trading a legitimate public order. Private notes are not exposed to this, because only their holder knows their contents. Proposed: a public note can be claimed only for a creator account registered to that maker (an allowlist, not a cryptographic proof).
+V1 assumes lineage IDs are unique: makers create notes with random serial numbers, which the SDK's own lineage tracking already requires. The primary key on `maker_lineages.lineage_id` still rejects a second claim of the same lineage as already registered. Handling deliberate or accidental collisions, including who may claim a public note, is deferred.
 
 #### Activation flow
 
@@ -393,12 +384,11 @@ Before implementation of the corresponding feature, agree:
 - Whether makers accept the minimal event feed above: OrderStatus, SettlementPending and SettlementResolved (no cancel event).
 - Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
-- Targeted cancel identity: proposed as the PSWAP lineage ID (creator and root serial).
-- Public-note claims: allow them only for creator accounts registered to the claiming maker (see *Lineage uniqueness*). Bulk filters are maker-wide with optional order type, market and direction.
+- Targeted cancel identity: proposed as the PSWAP lineage ID (creator and root serial). Bulk filters are maker-wide with optional order type, market and direction.
 - When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
 - Supported network/script versions, sync freshness bound, deployment failure coverage and workload targets.
 
-Expiry/clock details, dead-man behavior, sequence-allocator failure recovery and rollback detection after a restore remain deferred. Existing clearing/allocation and the agreed late-cancel/remainder rules are unchanged.
+Expiry/clock details, dead-man behavior, sequence-allocator failure recovery, rollback detection after a restore, and lineage-collision handling (including who may claim a public note) remain deferred. Existing clearing/allocation and the agreed late-cancel/remainder rules are unchanged.
 
 ## Evidence and limits
 

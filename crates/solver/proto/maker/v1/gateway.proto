@@ -19,6 +19,14 @@ service MakerGateway {
   rpc CancelOrder(CancelOrderRequest) returns (CommandReply);
   // The stored reply of an earlier command, after a lost response.
   rpc GetCommand(GetCommandRequest) returns (CommandReply);
+  // This maker's events after `after_seq`, a ReplayComplete once caught up,
+  // then each new event once it commits, with periodic keep-alives carrying
+  // the cursor. After any disconnect, reconnect with the last `seq` you
+  // processed: no event is ever lost or reordered.
+  rpc StreamEvents(StreamEventsRequest) returns (stream StreamMessage);
+  // Report how far you have processed the feed; returns the server time and
+  // your latest event sequence, so you can see your lag.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
 }
 
 message CommandHeader {
@@ -98,4 +106,90 @@ message Applied {
 
 message Stopped {
   uint64 settling = 1;
+}
+
+message StreamEventsRequest {
+  // Replay from the event after this one; 0 replays the whole feed.
+  uint64 after_seq = 1;
+}
+
+message StreamMessage {
+  oneof message {
+    MakerEvent event = 1;
+    KeepAlive keep_alive = 2;
+    ReplayComplete replay_complete = 3;
+  }
+}
+
+// Sent once per stream: every event through `through_seq` has been sent;
+// later events are live.
+message ReplayComplete {
+  uint64 through_seq = 1;
+}
+
+message KeepAlive {
+  // The `seq` of the last event sent on this stream (or `after_seq`).
+  uint64 cursor = 1;
+  int64 server_time_unix_ms = 2;
+}
+
+message HeartbeatRequest {
+  // The last event `seq` you have processed.
+  uint64 received_through_seq = 1;
+}
+
+message HeartbeatReply {
+  int64 server_time_unix_ms = 1;
+  // Your newest event's `seq` (0 before your first event).
+  uint64 latest_seq = 2;
+}
+
+// One event of the maker's feed. Sequences are contiguous per maker and
+// define the order; timestamps do not.
+message MakerEvent {
+  uint64 seq = 1;
+  string event_id = 2;
+  int64 created_at_unix_ms = 3;
+  // The order lineage the event concerns, when it concerns one.
+  bytes lineage_id = 4;
+  EventBody body = 5;
+}
+
+// The V1 feed is frozen at these three events (ADR 0003).
+message EventBody {
+  oneof kind {
+    OrderStatus order_status = 1;
+    SettlementPending settlement_pending = 2;
+    SettlementResolved settlement_resolved = 3;
+  }
+}
+
+enum OrderState {
+  ORDER_STATE_UNSPECIFIED = 0;
+  // Verified on chain and eligible for matching.
+  ORDER_STATE_LIVE = 1;
+  // Rejected after an earlier Accepted reply.
+  ORDER_STATE_REJECTED = 2;
+  // Its note was verified spent elsewhere.
+  ORDER_STATE_UNAVAILABLE = 3;
+}
+
+message OrderStatus {
+  bytes note_id = 1;
+  // 0 for the submitted note, one more per partial fill.
+  uint32 depth = 2;
+  OrderState state = 3;
+  string reason = 4;
+}
+
+// A settlement transaction is durable and may be broadcast. Fill details
+// arrive with the executor's reporting.
+message SettlementPending {
+  bytes tx_id = 1;
+}
+
+// A settlement transaction was verified committed or definitively voided.
+message SettlementResolved {
+  bytes tx_id = 1;
+  bool committed = 2;
 }

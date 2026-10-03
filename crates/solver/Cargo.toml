@@ -45,6 +45,7 @@ strum = { version = "0.28", features = ["derive"] }
 tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
 tonic-prost = "0.14"
 prost = "0.14"
+tokio-stream = { version = "0.1", default-features = false }
 
 [build-dependencies]
 # Pure-Rust Protobuf compiler: neither developers nor CI need a system protoc.

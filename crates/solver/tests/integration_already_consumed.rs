@@ -235,6 +235,8 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     maker_intake_round_submits: 500,
                     maker_intake_submit_queue: 4096,
                     maker_intake_cancel_queue: 1024,
+                    maker_stream_buffer: 256,
+                    maker_stream_heartbeat_ms: 10_000,
                 },
             };
 

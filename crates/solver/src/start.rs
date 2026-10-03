@@ -485,11 +485,19 @@ pub async fn start(
             round_submits: config.engine.maker_intake_round_submits,
             submit_queue: config.engine.maker_intake_submit_queue,
             cancel_queue: config.engine.maker_intake_cancel_queue,
+            stream: crate::gateway::StreamConfig {
+                buffer: config.engine.maker_stream_buffer,
+                heartbeat: Duration::from_millis(config.engine.maker_stream_heartbeat_ms),
+            },
         };
+        // Producers of maker events (activation, settlement reporting) notify
+        // it after their commits.
+        let maker_events = crate::gateway::EventWake::default();
         match crate::gateway::spawn_gateway_thread(
             gateway_cfg,
             db_pool.clone(),
             channels.maker_fact_tx,
+            maker_events,
             cancel.clone(),
         ) {
             Ok((thread, ready_rx)) => {

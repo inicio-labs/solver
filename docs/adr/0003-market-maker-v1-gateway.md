@@ -427,9 +427,9 @@ One stream writer reads committed events in order. Delivery may repeat; applying
 
 #### Reconnect and heartbeat
 
-Replay means sending the maker the ordered events it missed. For example, if it can recover through event 19, reconnect with `after_event_sequence = 19`; the solver sends retained events 20 onward and then continues live delivery. ReplayComplete names a fixed catch-up watermark.
+Replay means sending the maker the ordered events it missed. For example, if it can recover through event 19, reconnect with `after_seq = 19`; the solver sends retained events 20 onward and then continues live delivery. ReplayComplete names a fixed catch-up watermark. While idle, the stream sends a keep-alive carrying its cursor; each keep-alive re-checks the API key, so revoking a key ends its open streams within one interval (default 10 s). Replay paces itself to the subscriber through a bounded buffer; a subscriber that takes nothing for a whole keep-alive interval is disconnected with RESOURCE_EXHAUSTED and resumes from its cursor.
 
-Heartbeat carries `received_through_event_sequence`. It reports the maker's progress for lag monitoring; it does not authorize deleting events (V1 deletes none).
+The unary Heartbeat carries `received_through_seq` and returns the server time and the maker's latest event sequence. It reports the maker's progress for lag monitoring; it does not authorize deleting events (V1 deletes none).
 
 If event 20 is missing and 21 arrives, the MM pauses applying later feed events and requests replay after 19. A malformed event needs visible repair/version handling, not silent skipping or an infinite reconnect loop. The solver does not cancel orders merely because replay stalled. Unary cancellations remain available; the recommended maker workflow completes catch-up before new quoting.
 

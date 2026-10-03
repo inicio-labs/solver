@@ -10,7 +10,7 @@
 use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use diesel::sql_types::BigInt;
+use diesel::sql_types::{BigInt, Text};
 use miden_protocol::crypto::utils::Serializable;
 
 use super::error::{DbError, DbResult};
@@ -255,6 +255,60 @@ pub fn stored_result_tx(
                 .map_err(|_| DbError::Corrupt("stored command result is unreadable"))
         })
         .transpose()
+}
+
+/// `maker_id`'s newest event sequence (0 before its first event).
+pub fn latest_event_seq_tx(conn: &mut PgConnection, maker_id: MakerId) -> DbResult<u64> {
+    let next: Option<i64> = makers::table
+        .find(maker_id)
+        .select(makers::next_event_seq)
+        .first(conn)
+        .optional()?;
+    Ok(u64::try_from(next.unwrap_or(1) - 1)?)
+}
+
+/// A stored maker event, as the stream sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub seq: u64,
+    pub event_id: String,
+    pub created_at_unix_ms: i64,
+    pub lineage_id: Option<Vec<u8>>,
+    pub payload: Vec<u8>,
+}
+
+/// Up to `limit` of `maker_id`'s events after `after_seq`, in order.
+pub fn read_events_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    after_seq: u64,
+    limit: i64,
+) -> DbResult<Vec<StoredEvent>> {
+    let after_seq = i64::try_from(after_seq).unwrap_or(i64::MAX);
+    maker_events::table
+        .filter(maker_events::maker_id.eq(maker_id))
+        .filter(maker_events::event_seq.gt(after_seq))
+        .order(maker_events::event_seq.asc())
+        .limit(limit)
+        .select((
+            maker_events::event_seq,
+            sql::<Text>("event_id::text"),
+            sql::<BigInt>("(extract(epoch FROM created_at) * 1000)::bigint"),
+            maker_events::lineage_id,
+            maker_events::payload,
+        ))
+        .load::<(i64, String, i64, Option<Vec<u8>>, Vec<u8>)>(conn)?
+        .into_iter()
+        .map(|(seq, event_id, created_at_unix_ms, lineage_id, payload)| {
+            Ok(StoredEvent {
+                seq: u64::try_from(seq)?,
+                event_id,
+                created_at_unix_ms,
+                lineage_id,
+                payload,
+            })
+        })
+        .collect()
 }
 
 fn seq_column(seq: u64) -> DbResult<i64> {

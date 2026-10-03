@@ -220,6 +220,15 @@ pub struct EngineConfig {
     /// Cancels waiting for the intake, in their own queue. Default 1024.
     #[serde(default = "default_maker_intake_cancel_queue")]
     pub maker_intake_cancel_queue: usize,
+    /// Event-stream buffer per subscriber. Replay waits for room; a
+    /// subscriber that takes nothing for a whole heartbeat interval is
+    /// disconnected and resumes from its cursor. Default 256.
+    #[serde(default = "default_maker_stream_buffer")]
+    pub maker_stream_buffer: usize,
+    /// Event-stream heartbeat (ms), which also re-checks the API key, so a
+    /// revoked key ends open streams within it. Default 10000.
+    #[serde(default = "default_maker_stream_heartbeat_ms")]
+    pub maker_stream_heartbeat_ms: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -330,6 +339,12 @@ fn default_maker_intake_submit_queue() -> usize {
 fn default_maker_intake_cancel_queue() -> usize {
     1024
 }
+fn default_maker_stream_buffer() -> usize {
+    256
+}
+fn default_maker_stream_heartbeat_ms() -> u64 {
+    10_000
+}
 
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
@@ -370,6 +385,11 @@ impl SolverConfig {
             (
                 "maker_intake_cancel_queue",
                 self.engine.maker_intake_cancel_queue,
+            ),
+            ("maker_stream_buffer", self.engine.maker_stream_buffer),
+            (
+                "maker_stream_heartbeat_ms",
+                usize::try_from(self.engine.maker_stream_heartbeat_ms).unwrap_or(usize::MAX),
             ),
         ] {
             if value == 0 {

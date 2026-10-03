@@ -5315,6 +5315,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
  "toml 0.8.23",

@@ -11,11 +11,13 @@ use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
 use super::error::IntakeError;
+use super::events::{feed, unix_ms, EventWake, StreamConfig, Subscriber};
 use super::intake::{intake_queues, run_intake, Intake};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
@@ -38,26 +40,45 @@ pub struct GatewayConfig {
     pub round_submits: usize,
     pub submit_queue: usize,
     pub cancel_queue: usize,
+    pub stream: StreamConfig,
 }
 
 #[derive(Clone)]
 pub struct MakerGatewayService {
     pool: DbPool,
     intake: Intake,
+    events: EventWake,
+    stream: StreamConfig,
+    /// Ends every event stream at shutdown, so the server can stop.
+    cancel: CancellationToken,
 }
 
 impl MakerGatewayService {
-    pub fn new(pool: DbPool, intake: Intake) -> Self {
-        Self { pool, intake }
+    pub fn new(
+        pool: DbPool,
+        intake: Intake,
+        events: EventWake,
+        stream: StreamConfig,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            pool,
+            intake,
+            events,
+            stream,
+            cancel,
+        }
     }
 
     pub fn into_server(self) -> MakerGatewayServer<Self> {
         MakerGatewayServer::new(self).max_decoding_message_size(MAX_REQUEST_BYTES)
     }
 
-    /// The maker whose unrevoked API key the request carries. Checked on every
-    /// call, so a revoked key stops working at once.
-    async fn authenticate<T>(&self, request: &Request<T>) -> Result<MakerId, Status> {
+    /// The maker whose unrevoked API key the request carries, and the key's
+    /// hash. Checked on every call, so a revoked key stops working at once.
+    /// Gateway reads use the public read budget, which always leaves a read
+    /// connection to the solver pipeline.
+    async fn authenticate<T>(&self, request: &Request<T>) -> Result<(MakerId, Vec<u8>), Status> {
         let key = request
             .metadata()
             .get("authorization")
@@ -65,11 +86,14 @@ impl MakerGatewayService {
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or_else(|| Status::unauthenticated("missing API key"))?;
         let key_hash = api_key_hash(key);
-        self.pool
-            .read(move |conn| maker_db::authenticate_tx(conn, &key_hash))
+        let lookup = key_hash.clone();
+        let maker_id = self
+            .pool
+            .read_public(move |conn| maker_db::authenticate_tx(conn, &lookup))
             .await
             .map_err(|_| Status::unavailable("cannot check the API key now; retry"))?
-            .ok_or_else(|| Status::unauthenticated("unknown or revoked API key"))
+            .ok_or_else(|| Status::unauthenticated("unknown or revoked API key"))?;
+        Ok((maker_id, key_hash))
     }
 
     async fn execute(
@@ -90,11 +114,35 @@ impl MakerGatewayService {
 
 #[tonic::async_trait]
 impl MakerGateway for MakerGatewayService {
+    type StreamEventsStream = ReceiverStream<Result<proto::StreamMessage, Status>>;
+
+    async fn stream_events(
+        &self,
+        request: Request<proto::StreamEventsRequest>,
+    ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        let (maker_id, key_hash) = self.authenticate(&request).await?;
+        let subscriber = Subscriber {
+            maker_id,
+            key_hash,
+            cursor: request.into_inner().after_seq,
+        };
+        let (tx, rx) = mpsc::channel(self.stream.buffer.max(2));
+        tokio::spawn(feed(
+            self.pool.clone(),
+            self.events.clone(),
+            self.stream,
+            subscriber,
+            tx,
+            self.cancel.clone(),
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn submit_order(
         &self,
         request: Request<proto::SubmitOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let maker_id = self.authenticate(&request).await?;
+        let (maker_id, _) = self.authenticate(&request).await?;
         let request = request.into_inner();
         let header = header(maker_id, request.header)?;
         let note = Note::read_from_bytes(&request.note)
@@ -111,7 +159,7 @@ impl MakerGateway for MakerGatewayService {
         &self,
         request: Request<proto::CancelAllRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let maker_id = self.authenticate(&request).await?;
+        let (maker_id, _) = self.authenticate(&request).await?;
         let request = request.into_inner();
         let header = header(maker_id, request.header.clone())?;
         let scope = scope(&request)?;
@@ -123,7 +171,7 @@ impl MakerGateway for MakerGatewayService {
         &self,
         request: Request<proto::CancelOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let maker_id = self.authenticate(&request).await?;
+        let (maker_id, _) = self.authenticate(&request).await?;
         let request = request.into_inner();
         let header = header(maker_id, request.header)?;
         if request.lineage_id.len() != LINEAGE_ID_LEN {
@@ -136,15 +184,38 @@ impl MakerGateway for MakerGatewayService {
             .await
     }
 
+    async fn heartbeat(
+        &self,
+        request: Request<proto::HeartbeatRequest>,
+    ) -> Result<Response<proto::HeartbeatReply>, Status> {
+        let (maker_id, _) = self.authenticate(&request).await?;
+        let latest_seq = self
+            .pool
+            .read_public(move |conn| maker_db::latest_event_seq_tx(conn, maker_id))
+            .await
+            .map_err(|_| Status::unavailable("cannot read the event feed now; retry"))?;
+        let received = request.into_inner().received_through_seq;
+        tracing::debug!(
+            maker_id,
+            received,
+            lag = latest_seq.saturating_sub(received),
+            "maker heartbeat"
+        );
+        Ok(Response::new(proto::HeartbeatReply {
+            server_time_unix_ms: unix_ms(),
+            latest_seq,
+        }))
+    }
+
     async fn get_command(
         &self,
         request: Request<proto::GetCommandRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let maker_id = self.authenticate(&request).await?;
+        let (maker_id, _) = self.authenticate(&request).await?;
         let request_id = request.into_inner().request_id;
         let stored = self
             .pool
-            .read(move |conn| maker_db::stored_result_tx(conn, maker_id, &request_id))
+            .read_public(move |conn| maker_db::stored_result_tx(conn, maker_id, &request_id))
             .await
             .map_err(|_| Status::unavailable("cannot read command status now; retry"))?;
         match stored {
@@ -250,6 +321,7 @@ pub fn spawn_gateway_thread(
     cfg: GatewayConfig,
     pool: DbPool,
     facts: mpsc::UnboundedSender<MakerFact>,
+    events: EventWake,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -292,8 +364,10 @@ pub fn spawn_gateway_thread(
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "maker gateway listening");
                 let shutdown = cancel.clone();
+                let service =
+                    MakerGatewayService::new(pool, intake, events, cfg.stream, cancel.clone());
                 let served = tonic::transport::Server::builder()
-                    .add_service(MakerGatewayService::new(pool, intake).into_server())
+                    .add_service(service.into_server())
                     .serve_with_incoming_shutdown(TcpIncoming::from(listener), async move {
                         shutdown.cancelled().await
                     })
@@ -328,19 +402,29 @@ mod tests {
         facts: mpsc::UnboundedReceiver<MakerFact>,
         key: String,
         key_id: i64,
+        maker_id: MakerId,
+        events: EventWake,
         db: TestDb,
         stop: CancellationToken,
     }
+
+    const TEST_STREAM: StreamConfig = StreamConfig {
+        buffer: 16,
+        heartbeat: std::time::Duration::from_millis(100),
+    };
 
     async fn gateway() -> Gateway {
         let db = TestDb::new().await.unwrap();
         let key = crate::maker::new_api_key();
         let hash = api_key_hash(&key);
-        let key_id = db
+        let (maker_id, key_id) = db
             .pool
             .write(move |conn| {
                 let maker_id = maker_db::create_maker_tx(conn, "alpha")?.unwrap();
-                Ok(maker_db::issue_api_key_tx(conn, maker_id, &hash)?.unwrap())
+                Ok((
+                    maker_id,
+                    maker_db::issue_api_key_tx(conn, maker_id, &hash)?.unwrap(),
+                ))
             })
             .await
             .unwrap();
@@ -356,7 +440,15 @@ mod tests {
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let service = MakerGatewayService::new(db.pool.clone(), intake).into_server();
+        let events = EventWake::default();
+        let service = MakerGatewayService::new(
+            db.pool.clone(),
+            intake,
+            events.clone(),
+            TEST_STREAM,
+            stop.clone(),
+        )
+        .into_server();
         let shutdown = stop.clone();
         tokio::spawn(
             tonic::transport::Server::builder()
@@ -375,6 +467,8 @@ mod tests {
             facts,
             key,
             key_id,
+            maker_id,
+            events,
             db,
             stop,
         }
@@ -439,6 +533,7 @@ mod tests {
             key_id,
             db,
             stop,
+            ..
         } = gateway().await;
         let order = pswap_note(1);
 
@@ -654,10 +749,16 @@ mod tests {
             round_submits: 10,
             submit_queue: 4,
             cancel_queue: 4,
+            stream: TEST_STREAM,
         };
-        let (thread, ready) =
-            spawn_gateway_thread(cfg(0), db.pool.clone(), facts_tx.clone(), cancel.clone())
-                .unwrap();
+        let (thread, ready) = spawn_gateway_thread(
+            cfg(0),
+            db.pool.clone(),
+            facts_tx.clone(),
+            EventWake::default(),
+            cancel.clone(),
+        )
+        .unwrap();
         ready.await.unwrap().unwrap();
         cancel.cancel();
         tokio::task::spawn_blocking(move || thread.join().unwrap())
@@ -671,6 +772,7 @@ mod tests {
             cfg(port),
             db.pool.clone(),
             facts_tx,
+            EventWake::default(),
             CancellationToken::new(),
         )
         .unwrap();
@@ -678,5 +780,98 @@ mod tests {
         tokio::task::spawn_blocking(move || thread.join().unwrap())
             .await
             .unwrap();
+    }
+
+    async fn next(
+        stream: &mut tonic::Streaming<proto::StreamMessage>,
+    ) -> (Option<proto::MakerEvent>, Option<proto::KeepAlive>) {
+        match stream.message().await.unwrap().unwrap().message.unwrap() {
+            proto::stream_message::Message::Event(event) => (Some(event), None),
+            proto::stream_message::Message::KeepAlive(beat) => (None, Some(beat)),
+            proto::stream_message::Message::ReplayComplete(complete) => {
+                panic!("unexpected ReplayComplete {complete:?}")
+            }
+        }
+    }
+
+    fn order_status(note_id: u8) -> proto::EventBody {
+        proto::EventBody {
+            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
+                note_id: vec![note_id],
+                depth: 0,
+                state: proto::OrderState::Live.into(),
+                reason: String::new(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_event_stream_replays_then_follows_with_heartbeats() {
+        let Gateway {
+            mut client,
+            key,
+            maker_id,
+            events,
+            db,
+            stop,
+            ..
+        } = gateway().await;
+        let append = |count: u8| {
+            db.pool.write(move |conn| {
+                for note in 0..count {
+                    super::super::append_event_tx(conn, maker_id, Some(&[7]), &order_status(note))?;
+                }
+                Ok(())
+            })
+        };
+        append(3).await.unwrap();
+
+        let mut stream = client
+            .stream_events(signed(&key, proto::StreamEventsRequest { after_seq: 1 }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Replay after the cursor, in order, with typed bodies.
+        for seq in [2, 3] {
+            let event = next(&mut stream).await.0.unwrap();
+            assert_eq!(event.seq, seq);
+            assert_eq!(event.lineage_id, vec![7]);
+            assert_eq!(event.body, Some(order_status(seq as u8 - 1)));
+            assert!(!event.event_id.is_empty() && event.created_at_unix_ms > 0);
+        }
+        match stream.message().await.unwrap().unwrap().message.unwrap() {
+            proto::stream_message::Message::ReplayComplete(complete) => {
+                assert_eq!(complete.through_seq, 3)
+            }
+            other => panic!("expected ReplayComplete, got {other:?}"),
+        }
+        // A new event arrives once its commit wakes the stream.
+        append(1).await.unwrap();
+        events.notify();
+        assert_eq!(next(&mut stream).await.0.unwrap().seq, 4);
+        // The heartbeat carries the cursor.
+        let beat = loop {
+            if let (_, Some(beat)) = next(&mut stream).await {
+                break beat;
+            }
+        };
+        assert_eq!(beat.cursor, 4);
+        assert!(beat.server_time_unix_ms > 0);
+
+        // The maker reports its progress and sees how far behind it is.
+        let reply = client
+            .heartbeat(signed(
+                &key,
+                proto::HeartbeatRequest {
+                    received_through_seq: 2,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.latest_seq, 4);
+        assert!(reply.server_time_unix_ms > 0);
+        stop.cancel();
     }
 }

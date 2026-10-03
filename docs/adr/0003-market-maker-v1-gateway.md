@@ -3,7 +3,7 @@
 - **Status:** Proposed design. Product constraints identified as agreed below; open protocol and operating choices remain before implementation.
 - **Date:** 2026-10-02
 - **Revised:** 2026-10-02 — cancellation by cutoff and the `live_orders` view; maker intake and activation in parallel with ingest and settlement. Builds on PR #34.
-- **Revised:** 2026-10-03 — lineage-keyed maker metadata; public notes accepted through the gateway; RFQ router skips maker orders; makers rebuild payback/remainder notes from fill details; no cancel stream event; event TTL.
+- **Revised:** 2026-10-03 — lineage-keyed maker metadata; public notes accepted through the gateway; RFQ router skips maker orders; makers rebuild payback/remainder notes from fill details; no cancel stream event; events kept and timestamped (expiry later); restore detection deferred.
 - **Deciders:** Vaibhav Jindal for maker-facing requirements; solver implementation review pending.
 - **Related:** [ADR 0001](0001-external-liquidity-routing.md) for public external routing, [ADR 0002](0002-filler-sdk.md) for the filler interface.
 
@@ -290,7 +290,7 @@ One stream writer reads committed events in order. Delivery may repeat; applying
 
 Replay means sending the maker the ordered events it missed. For example, if it can recover through event 19, reconnect with `after_event_sequence = 19`; the solver sends retained events 20 onward and then continues live delivery. ReplayComplete names a fixed catch-up watermark.
 
-Heartbeat carries `received_through_event_sequence`. It reports the maker's progress for lag monitoring; it does not authorize deleting events, which expire by TTL (below).
+Heartbeat carries `received_through_event_sequence`. It reports the maker's progress for lag monitoring; it does not authorize deleting events (V1 deletes none).
 
 If event 20 is missing and 21 arrives, the MM pauses applying later feed events and requests replay after 19. A malformed event needs visible repair/version handling, not silent skipping or an infinite reconnect loop. The solver does not cancel orders merely because replay stalled. Unary cancellations remain available; the recommended maker workflow completes catch-up before new quoting.
 
@@ -300,9 +300,7 @@ Use a simple read-only `GetMakerState` operation over existing PostgreSQL record
 
 Normal reconnect uses the maker's durably saved event cursor and replay, plus its stored command results. `GetMakerState` is a current view for checking what the solver believes, not a gapless historical snapshot or a new replay cursor. Pages may observe concurrent changes; the API must not claim they form one atomic past view. Independent maker command writers coordinate their cancellations or refresh this read. A current view does not replace settlement history; that is a separate paginated read over canonical records (below).
 
-Events expire after a published TTL (illustrative: 30 days, configurable). PostgreSQL has no built-in row TTL; a small background task deletes expired events in bounded batches on the intake session, so it never occupies the core writer. pg_cron, or daily partitions dropped by a retention job, are later options if volume requires them.
-
-Expiry is safe because the event table is only the feed. Canonical order, fill, settlement and accounting history (including the fill details makers rebuild notes from), submitted notes, cutoffs, lineage attributions and command results are kept independently and never expire with events, so pruning cannot turn an old retry into a fresh order. A maker reconnecting with a cursor older than the oldest retained event gets REPLAY_CURSOR_EXPIRED; it recovers from `GetMakerState` plus the settlement-history read, then resumes the stream from the current sequence.
+V1 deletes no events, so any cursor can be replayed. Every event row carries its creation timestamp (`created_at`), so a time-based expiry can be added later without touching existing rows. The event table is only the feed: canonical order, fill, settlement and accounting history (including the fill details makers rebuild notes from), submitted notes, cutoffs, lineage attributions and command results live in their own tables. A later expiry would therefore only need REPLAY_CURSOR_EXPIRED plus recovery from `GetMakerState` and the settlement-history read.
 
 ### Performance, durability and cost
 
@@ -316,7 +314,7 @@ Use fsync and synchronous commits for ordinary restart durability with intact st
 
 Enforce one active execution authority across restarts/deployments. Loss of database or execution authority stops new signing/submission; already-broadcast transactions remain subject to reconciliation. Critical worker failure triggers coordinated recovery.
 
-Backups/PITR do not substitute for synchronous replication. Restoring an old backup must not silently revive cancelled orders or reuse old event progress: detect rollback and require an explicit recovery epoch/reconciliation before readiness. Test business DB, Miden client state and note recovery together.
+Backups do not substitute for synchronous replication. Archive the WAL continuously (PITR), so a restore replays PostgreSQL's journal to just before the failure instead of rolling back to the last backup. Detecting a restore that still lost acknowledged data is deferred; candidate checks are a maker cursor ahead of our event sequence, and solver transactions on chain that the database does not know. Test business DB, Miden client state and note recovery together.
 
 The main costs remain application compute, database/storage/backups and any replication, node/prover services, egress and settlement fees. This is a small component count, not a claim of zero cost or guaranteed latency.
 
@@ -329,7 +327,6 @@ The implementation should make these boundaries visible in ordinary domain funct
 3. **Activate:** after the maker-note watcher verifies the exact note committed and unspent, one core-writer commit inserts the order (Active, or Stopped below a cutoff) with its OrderStatus event and publishes the book update in commit order. This assumes the recommended durable-eligibility meaning of Live.
 4. **Reserve and prepare:** after proving and before any possible broadcast, one core-writer commit checks every input against `live_orders` under the makers' control locks, reserves each exact input note/version, and records enough final transaction and input linkage to reconcile the outcome, together with SettlementPending. Cancellation serializes on the same lock. If this commit fails, nothing was broadcast and the candidate is recalculated.
 5. **Finalize:** after authenticated chain verification, one commit applies each committed transaction's actual fills, remainder orders, the fill details makers rebuild notes from, lineage, earned surplus/fees, settlement cost and SettlementResolved event. A definitive void has its own resolved outcome without realized order revenue. A transaction that might still land remains Pending. Remainders and released inputs below a cutoff are written Stopped.
-6. **Event expiry:** a background task on the intake session deletes events older than the TTL in bounded batches. It never removes command results, cutoffs, lineage attributions, submitted notes, or order, settlement and accounting history.
 
 Each event insert shares the business transaction that produced it. A PostgreSQL notification or in-process channel only wakes a reader; it is not an additional durability layer. Submit and cancel commit on the intake session; activation, reserve-and-prepare and finalize commit on the core writer. Each adds ordinary commit latency. Chain commitment and sync add separate latency before Live and final settlement. No exact millisecond promise is made without measuring the selected deployment.
 
@@ -344,7 +341,7 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 - **Importing maker notes into the ingest client.** Ingest would turn them into ordinary orders without maker attribution, cutoffs or routing class, and every import would contend for the ingest client. The watcher's batched node RPC avoids both.
 - **A stream event per cancel.** It repeats the unary reply for a single-process maker; a maker with several processes on one identity polls `GetMakerState` instead.
 - **Copying maker metadata onto each remainder row.** Keying it by the PSWAP lineage gives the same inheritance with no copy, and makes a public note found by ingest first and the gateway second (or the reverse) a maker order without a conversion step or a race.
-- **Cursor-acknowledged event cleanup.** Per-session cleanup authority and retention floors add protocol state; a published TTL over a feed backed by canonical history recovers more simply.
+- **Event cleanup in V1.** Cursor-acknowledged cleanup adds per-session authority and retention floors; a TTL needs a recovery path for expired cursors. V1 keeps every event, timestamped, and adds expiry only when volume requires it.
 - **Atomic replace or multi-command batch.** V1 uses one command per request; cancelling one order and submitting a new note are separate outcomes. This avoids a premature atomic-readiness contract for a replacement note.
 - **Full recovery-grade snapshot.** Ordinary replay covers missed solver events; a small GetMakerState read shows current solver state. A gapless historical snapshot across unbounded, concurrently changing pages would require a stronger protocol and is not part of this V1 design.
 - **A stream event for every acknowledgement and worker stage.** Accepted and Applied already have stored command results. Push solver-discovered order and transaction transitions; retain routine import/sync/proving attempts in internal diagnostics.
@@ -358,7 +355,7 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 - A public maker note may be inserted by public ingest or by the watcher; whichever does, the lineage's maker metadata applies to it and its remainders.
 - Order rows below a cutoff keep `status = 'active'` until their note is reclaimed. Liveness must always be read through `live_orders`; reading the status column alone is a bug.
 - The current-state read is an ordinary paginated PostgreSQL query. Its pages may see concurrent changes and must not masquerade as one atomic historical snapshot. It does not recreate deleted fill history.
-- A maker offline longer than the event TTL loses the replayable feed for that interval and recovers from current state and settlement history; its cancels remain visible as cutoffs and command results.
+- V1 keeps every event, so any cursor can be replayed; storage grows with event volume until an expiry is added.
 - PostgreSQL fsync/synchronous commit protects acknowledged records against ordinary process restart with intact storage. Primary storage loss without acknowledged-data loss requires an appropriate synchronous replica and controlled failover; backup alone is insufficient.
 - Submitted NoteFiles demand maker-scoped authorization, restricted logging and protected storage/backups. The RFQ router never receives a maker order.
 - This ADR does not change clearing-price or allocation policy and does not introduce a maker fee schedule. It records actual earned value and cost only when the corresponding transaction is verified committed.
@@ -368,7 +365,7 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 Correctness comes from these tested rules, not the choice of gRPC or macros. Each implementation PR contains its own relevant tests.
 
 1. **Protocol and PostgreSQL foundation.** Freeze the contract and durable transaction boundaries. Test retry conflicts, duplicate notes, same-note resubmission after cancel, cross-maker isolation, rollback, interrupted commit/notification, and a group-commit batch in which one command conflicts. Test concurrent event writers for committed ordering and rollback gaps.
-2. **Authenticated gateway and recovery.** Add unary operations, event streaming, heartbeat and the maker-filtered current-state read. Test key rotation/revocation including open streams, disconnect after send, duplicate replay, missing/malformed events, cancellation cutoffs and reserved exposure in the read, replay across the TTL boundary returning REPLAY_CURSOR_EXPIRED, recovery from state and settlement history, and expiry batches never touching canonical history. Do not present independently read pages as one atomic snapshot.
+2. **Authenticated gateway and recovery.** Add unary operations, event streaming, heartbeat and the maker-filtered current-state read. Test key rotation/revocation including open streams, disconnect after send, duplicate replay, missing/malformed events, cancellation cutoffs and reserved exposure in the read, and replay from any earlier cursor. Do not present independently read pages as one atomic snapshot.
 3. **Private note activation.** Add validation and the maker-note watcher (batched note-ID check, incremental tag and nullifier sync, one activation commit per block). Test wrong script/network, malformed creator without account-control proof, tag collisions, both arrival orders, spent-before-activation, cancel-before-commit, interrupted cache update, stale sync, that public ingest never activates a private maker note, that a public maker note ends as a maker order whether ingest or the gateway sees it first, a second submit of an attributed lineage, and the RFQ router skipping maker orders.
 4. **Cancellation and matcher reservation.** Add scoped monotone cutoffs and whole-note reservations. Test cancel/reservation races, cancel 100 then 80, delayed submit 90, empty scope then delayed submit, market/direction isolation, targeted scope, inherited remainder sequence, no cancel stream event, lost cancel reply recovered by retry/status, cutoff visible in the current-state read and crash after cancel ACK. Also test the cutoff reaching the matcher before and after an activation's book update, reservation failing for a candidate handed over before the cutoff, inputs of a voided settlement staying Stopped, a cancel never updating order rows, unchanged cancel latency with 100,000 live orders, and a submit flood not delaying cancels or ingest commits.
 5. **Executor recovery and reporting.** Add journal/reconciliation, transaction-specific Pending/Resolved reports, fill details and accounting only after verified settlement. Test chain-success-before-DB-write crash, timeout after node acceptance, definitive failure, external consumption while proving/submitting, two partial-fill candidates using one input, all late-cancel outcomes, repeated partial fills, rounding/accounting, the maker rebuilding payback and remainder notes from reported fill details, and maker reclaim with the solver offline.
@@ -384,10 +381,10 @@ Before implementation of the corresponding feature, agree:
 - Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
 - Targeted cancel identity: proposed as the PSWAP lineage ID (creator, `order_id`). Bulk filters are maker-wide with optional order type, market and direction.
-- The event TTL value. Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
+- When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
 - Supported network/script versions, sync freshness bound, deployment failure coverage and workload targets.
 
-Expiry/clock details, dead-man behavior and sequence-allocator failure recovery remain deferred. Existing clearing/allocation and the agreed late-cancel/remainder rules are unchanged.
+Expiry/clock details, dead-man behavior, sequence-allocator failure recovery and rollback detection after a restore remain deferred. Existing clearing/allocation and the agreed late-cancel/remainder rules are unchanged.
 
 ## Evidence and limits
 

@@ -156,7 +156,7 @@ V1 assumes lineage IDs are unique: makers create notes with random serial number
 3. Persist the accepted command and payload on the intake session (group commit), then acknowledge. The note is not imported into the ingest client, so public ingest never sees a private maker note. Public ingest may also discover a public maker note; both paths insert the same order row idempotently, and the lineage's maker metadata applies whichever inserts it.
 4. MM submits note creation independently. Support both note-data-before-chain and chain-before-note-data arrival.
 5. The maker-note watcher, woken per new block with polling as the fallback, checks new intake by note ID and pending intake incrementally by PSWAP tag, and verifies the exact note as committed (inclusion proof) and unspent (nullifier sync) through node RPC.
-6. In one core-writer commit, recheck the cutoff under the maker control lock and any enabled expiry, then insert the order — Active, or Stopped below a cutoff — with its OrderStatus event and book update, before matching can use it.
+6. In one core-writer commit, insert the order and check it against `live_orders` (and any enabled expiry) in the same transaction — Active, or Stopped below a cutoff — with its OrderStatus event and book update, before matching can use it.
 
 Recommended simple meaning of Live: **durably eligible after chain verification**. Update the book after commit and recover missed cache updates from durable state. If Live must promise actual installation in the matcher, retain a matcher acknowledgement instead. This wording remains a decision to close before implementation.
 
@@ -194,7 +194,7 @@ Columns are illustrative; an order-type filter joins the same way once more than
 
 A cancel is one short commit on the intake session (see *Intake and activation in parallel*): raise the cutoff under the maker control row lock, and store the Applied result with the exposure already reserved as of that commit. Its cost does not depend on how many orders it stops. After the commit the cutoff goes to the matcher on the maker control lane (below), and the matcher drops that maker's matching entries from its in-memory book at once.
 
-The cutoff is checked only where a row is about to become live, inside writes that already happen:
+The cutoff is checked only where a row is about to become live, inside writes that already happen. All of them publish through `write_book`, which passes every order the transaction activates through `live_orders` before commit: live orders go to the matcher with their maker tag, excluded maker orders are stored Stopped. This check needs no maker lock: a cancel that commits just after it only leaves the status column lagging, which the view already covers.
 
 | Write that already happens | Below a cutoff |
 |---|---|
@@ -210,7 +210,7 @@ Cutoffs only rise, and stops and lineage attributions are only added, so their o
 - **Read first.** The matcher's select prefers the control lane over `book_tx` and the timer, and each tick drains the control lane before it applies queued book updates and clears. A cutoff that reached the matcher before a tick is therefore applied before that tick matches anything.
 - **Unbounded, the one exception to bounded channels.** A full bounded lane would block the intake writer, and the next cancels with it. Each message is one already-committed command and is cheap to apply, and the matcher reads the lane first, so it only holds what arrives during one matching pass. A gauge reports its length.
 
-The matcher keeps all three facts (hydrated at startup), tags existing and later entries of an attributed lineage as maker orders (for in-memory cutoffs and RFQ exclusion), drops entries when a cutoff or stop arrives, and ignores any later Active update below one. These messages therefore need no commit-order lock. A lost message (a crash between commit and send) only makes the drop late: restart hydrates the facts, and reservation checks `live_orders` regardless.
+Book entries built from the database already carry their maker tag. The matcher keeps every cutoff (few per maker, hydrated at startup), tags existing entries of an attributed lineage as maker orders (for in-memory cutoffs and RFQ exclusion), drops entries when a cutoff or stop arrives, and ignores any later Active update below a cutoff. It keeps a stop or attribution for a minute after it arrives, far longer than any earlier-committed book update can lag behind it, so memory stays bounded. These messages therefore need no commit-order lock. A lost message (a crash between commit and send) only makes the drop late: restart hydrates the facts, and reservation checks `live_orders` regardless.
 
 A valid empty scope still installs its barrier for later arrivals. Counts, if returned, describe the as-of view of the cancel commit.
 
@@ -218,7 +218,7 @@ Bulk cancellation may filter by order type, market and direction; provided filte
 
 #### Where cancel meets matching
 
-Reservation happens once, in the executor, after proving and before any possible broadcast: PR #34's `prepare_settlement_tx` commit. That transaction locks the input order rows, then the control rows of the makers that own them (shared, in maker-ID order; read from the locked rows rather than from the candidate, because an attribution can arrive after the matcher picked it), checks every input against `live_orders`, then reserves the whole exact input notes and stores the transaction record. A cancel raises its cutoff under the same row with an exclusive lock, so the two serialize:
+Reservation happens once, in the executor, after proving and before any possible broadcast: PR #34's `prepare_settlement_tx` commit. That transaction locks the input order rows, then the control rows of the makers that own them (in maker-ID order; read from the locked rows rather than from the candidate, because an attribution can arrive after the matcher picked it), checks every input against `live_orders`, then reserves the whole exact input notes and stores the transaction record. A cancel raises its cutoff under the same row lock, so the two serialize. Both take `FOR NO KEY UPDATE`: reservations come only from the single core writer, so a shared mode would gain nothing, and foreign-key checks (`KEY SHARE`) never wait on it:
 
 - Cancel wins: the reservation fails, nothing is broadcast, and the inputs return to the matcher through the same view, so the stopped ones stay out. The proof is wasted, which is acceptable.
 - Reservation wins: the cancel reply lists that settlement as in-flight exposure; whatever it leaves behind comes back Stopped.
@@ -251,13 +251,13 @@ A separate session is safe because maker commands only append facts (commands, n
 2. Still-pending intake: incremental `sync_notes` from the last checked block over the PSWAP tags of pending notes catches later commitments without re-querying every pending ID each block.
 3. Candidates: verify the exact note ID and its inclusion proof, and that the note is unspent.
 4. Live maker orders: incremental `sync_nullifiers` over their nullifier prefixes finds notes the maker reclaimed or traded elsewhere.
-5. One `write_book` per block for everything found: activations (Active, or Stopped below a cutoff, checked under the maker control lock), spent orders marked OnchainNullified, their OrderStatus events and the book update.
+5. One `write_book` per block for everything found: activations (Active, or Stopped below a cutoff, checked through `live_orders` in the same transaction), spent orders marked OnchainNullified, their OrderStatus events and the book update.
 
 Maker notes are never imported into the ingest client, so public ingest is unchanged and no private note reaches the book without the gateway's checks. The executor already consumes notes unauthenticated from our stored copy, so settling a private note needs no client import. If the watcher's last verified block falls behind the chain tip by more than the freshness bound, it pauses activation; cancels continue.
 
 **Event delivery** also runs on the gateway thread: per-stream readers, woken in-process after any commit that inserts that maker's events, read through a capped read budget (like PR #34's public-read cap) so streams cannot starve pipeline reads. Only core-writer commits insert maker events, so each maker's contiguous event sequence comes from one per-maker counter row written by one session.
 
-Lock order, which rules out deadlocks between the two sessions: order rows (by note ID), then maker control rows (by maker ID), then the per-maker event counter. A cancel takes only its maker's control row; reservation takes its input rows first, then their makers' control rows; activation inserts new rows and takes its makers' control rows.
+Lock order, which rules out deadlocks between the two sessions: order rows (by note ID), then maker control rows (by maker ID). The per-maker event counter lives on the control row, so appending an event takes the same lock last. A cancel takes only its maker's control row; reservation takes its input rows first, then their makers' control rows; activation and settlement write order rows first and lock control rows only to append events.
 
 ### Data model
 

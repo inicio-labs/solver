@@ -13,7 +13,7 @@ Market makers create private PSWAP notes and submit them to Miden themselves. Th
 
 The chain and the solver answer different questions. Miden client synchronization can verify that a note is committed or spent. It cannot reveal our private order intake, book eligibility, maker-scoped cancel cutoffs, local reservation or ambiguous settlement submission. Conversely, our off-chain cancellation does not revoke an on-chain note or reverse a transaction that may already have been broadcast. The API and its recovery contract must state exactly which of these facts each response means.
 
-The inspected solver baseline stores business records in SQLite/Diesel, maintains an in-memory matching book, and submits settlements through an executor. [PR #34](https://github.com/inicio-labs/solver/pull/34) replaces SQLite with PostgreSQL: a single ownership-locked writer session, `write_book` (book updates published to the matcher in commit order), a settlement journal written before any broadcast, confirmation only by our transaction ID, and remainders that inherit their parent's FIFO slot. This ADR builds the maker gateway on that store; it does not claim the gateway itself has been implemented. The existing public external-liquidity router remains a separate path. Private maker orders require explicit routing classification.
+The inspected solver baseline stores business records in SQLite/Diesel, maintains an in-memory matching book, and submits settlements through an executor. [PR #34](https://github.com/inicio-labs/solver/pull/34) (merged) replaced SQLite with PostgreSQL: a single ownership-locked writer session, `write_book` (book updates published to the matcher in commit order), a settlement journal written before any broadcast, confirmation only by our transaction ID, and remainders that inherit their parent's FIFO slot. This ADR builds the maker gateway on that store; it does not claim the gateway itself has been implemented. The existing public external-liquidity router remains a separate path. Private maker orders require explicit routing classification.
 
 The design favors a small number of components and readable Rust. The difficult work is not the transport itself; it is deciding when a request is durable, when an on-chain note may enter the book, which side wins a cancellation race, and how to recover a transaction that might have reached Miden.
 
@@ -96,6 +96,8 @@ Pin mutually compatible library versions against the exact Miden dependencies us
 
 An API key is a high-entropy bearer credential carried in gRPC authorization metadata over TLS. Store a verifier, support rotation/revocation, and derive a stable `maker_id` from the validated credential.
 
+Onboarding in V1 is an operator action: the existing bearer-token admin API creates a maker, issues its API key (shown once; only its hash is stored) and revokes keys. Maker self-service rotation comes later.
+
 Authorize every command, current-state read, lookup and event stream against that maker. Enforce revocation on already-open streams too. Revoking access does not implicitly cancel accepted orders.
 
 The note's creator account determines its on-chain payment/reclaim behavior. It need not equal the API submitter, and V1 requires no creator-account control proof or allowlist. Possession of another party's private note data can still enable arranging a fill: protect note data, storage and backups, and keep payloads out of diagnostics and notification channels.
@@ -108,7 +110,7 @@ Maker attribution is the routing classification: the RFQ router checks whether a
 
 #### Commands and retries
 
-State-changing operations are SubmitOrder and cancellation. One bulk CancelAll command covers every order of the authenticated maker or applies optional order-type, market and direction filters. The earlier cancel-by-order/note requirement remains a targeted CancelOrder command; its exact identity encoding still needs agreement. A bulk type/market filter is not cancel-one. Each request contains only one command.
+State-changing operations are SubmitOrder and cancellation. One bulk CancelAll command covers every order of the authenticated maker or applies optional order-type, market and direction filters. The earlier cancel-by-order/note requirement remains a targeted CancelOrder command, which names the order by its lineage ID. A bulk type/market filter is not cancel-one. Each request contains only one command.
 
 Each command carries a request ID and maker-assigned sequence:
 
@@ -205,7 +207,7 @@ Cutoffs only rise and lineage attributions are only added, so their order relati
 
 A valid empty scope still installs its barrier for later arrivals. Counts, if returned, describe the as-of view of the cancel commit.
 
-Bulk cancellation may filter by order type, market and direction; provided filters combine as an intersection. Market filters use network-specific asset IDs. BTC → ETH and ETH → BTC are different directions; cancelling both requires an explicit market-wide scope. Order type is separate from pair/direction. V1 accepts only PSWAP, so a PSWAP-only filter does not narrow the current order set unless combined with a market filter. Invalid or ambiguous filters must never broaden cancellation. For targeted cancellation, use a stable root order/note identity, including before a delayed submit arrives; exact encoding remains open.
+Bulk cancellation may filter by order type, market and direction; provided filters combine as an intersection. Market filters use network-specific asset IDs. BTC → ETH and ETH → BTC are different directions; cancelling both requires an explicit market-wide scope. Order type is separate from pair/direction. V1 accepts only PSWAP, so a PSWAP-only filter does not narrow the current order set unless combined with a market filter. Invalid or ambiguous filters must never broaden cancellation. Targeted cancellation (CancelOrder) names the order by its lineage ID (creator plus root serial). The maker knows it before submitting, so it also stops a submit that arrives later.
 
 #### Where cancel meets matching
 
@@ -510,7 +512,6 @@ Before implementation of the corresponding feature, agree:
 - Whether makers accept the minimal event feed above: OrderStatus, SettlementPending and SettlementResolved (no cancel event).
 - Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
-- Targeted cancel identity: proposed as the PSWAP lineage ID (creator and root serial). Bulk filters are maker-wide with optional order type, market and direction.
 - When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
 - Supported network/script versions, sync freshness bound, deployment failure coverage and workload targets.
 

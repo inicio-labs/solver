@@ -84,6 +84,7 @@ CREATE TABLE maker_stops (
 );
 
 -- The maker event feed. V1 deletes no events; `created_at` allows expiry later.
+-- `payload` is the encoded protobuf event body the stream sends.
 CREATE TABLE maker_events (
     maker_id BIGINT NOT NULL REFERENCES makers (maker_id),
     event_seq BIGINT NOT NULL CHECK (event_seq > 0),
@@ -91,7 +92,7 @@ CREATE TABLE maker_events (
     kind TEXT NOT NULL
         CHECK (kind IN ('order_status', 'settlement_pending', 'settlement_resolved')),
     lineage_id BYTEA,
-    payload TEXT NOT NULL,
+    payload BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (maker_id, event_seq)
 );

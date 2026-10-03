@@ -12,6 +12,7 @@ use diesel::prelude::*;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
+use super::maker_db::{self, SettlementPhase};
 use super::postgres_models::{
     maker_tag, LiveOrderRow, NewOrderRow, NewRemainderOrderRow, OrderKeyColumns, OrderRow,
     RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
@@ -22,6 +23,8 @@ use super::postgres_schema::{
 };
 use crate::maker::MakerTag;
 use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
+use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
 
 /// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
@@ -310,6 +313,16 @@ pub fn prepare_settlement_tx(
     diesel::insert_into(settlement_inputs::table)
         .values(inputs)
         .execute(conn)?;
+    let journal = inputs
+        .iter()
+        .map(|input| {
+            let parent = parents
+                .get(input.parent_note_id.as_slice())
+                .ok_or(SettlementError::MissingInputOrder)?;
+            Ok((input.clone(), (*parent).clone()))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+    maker_db::report_settlement_tx(conn, &attempt.tx_id, &journal, SettlementPhase::Pending)?;
     tracing::info!(
         tx_id = %hex::encode(&attempt.tx_id),
         parents = changed,
@@ -509,6 +522,11 @@ pub fn finish_discarded_settlement_tx(
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
     }
+    let journal: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
+        .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
+        .filter(settlement_inputs::tx_id.eq(tx_id))
+        .select((SettlementInputRow::as_select(), OrderRow::as_select()))
+        .load(conn)?;
     let rows: Vec<OrderRow> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
         .filter(settlement_inputs::tx_id.eq(tx_id))
@@ -546,6 +564,7 @@ pub fn finish_discarded_settlement_tx(
                 .execute(conn)?;
         }
     }
+    maker_db::report_settlement_tx(conn, tx_id, &journal, SettlementPhase::Voided)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     tracing::info!(
         tx_id = %hex::encode(tx_id),
@@ -569,6 +588,8 @@ pub fn confirm_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
+    commit_block: BlockNumber,
+    consumer: AccountId,
 ) -> DbResult<BookUpdate> {
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
@@ -580,6 +601,7 @@ pub fn confirm_settlement_tx(
         .for_update()
         .select((SettlementInputRow::as_select(), OrderRow::as_select()))
         .load(conn)?;
+    let journal = rows.clone();
 
     let mut removed = Vec::with_capacity(rows.len());
     let mut children = Vec::new();
@@ -632,6 +654,11 @@ pub fn confirm_settlement_tx(
     )
     .set(orders::status.eq(OrderStatus::Executed.as_str()))
     .execute(conn)?;
+    let committed = SettlementPhase::Committed {
+        block: commit_block,
+        consumer,
+    };
+    maker_db::report_settlement_tx(conn, tx_id, &journal, committed)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     let active: Vec<BookOrder> = children
         .into_iter()
@@ -823,6 +850,14 @@ pub fn seed_tokens_from_config_tx(
     Ok(())
 }
 
+/// The account a test settlement is consumed by.
+#[cfg(test)]
+pub(crate) fn test_consumer() -> AccountId {
+    miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+        .try_into()
+        .expect("valid test account ID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +916,7 @@ mod tests {
                 parent_note_id: id,
                 child_note_id: Some(child.id().to_bytes()),
                 child_note_data: Some(child.to_bytes()),
+                fill_amount: None,
             });
         }
         let inserted = conn
@@ -928,7 +964,13 @@ mod tests {
         assert_eq!((attempts, mappings), (1, 511));
 
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
+            confirm_settlement_tx(
+                conn,
+                &attempt.tx_id,
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+            )
         })?;
         assert_eq!(update.removed.len(), 511);
         assert_eq!(update.active.len(), 511);
@@ -945,7 +987,13 @@ mod tests {
             );
         }
         let duplicate = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
+            confirm_settlement_tx(
+                conn,
+                &attempt.tx_id,
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+            )
         })?;
         assert!(duplicate.is_empty());
         let executed: i64 = orders::table
@@ -977,6 +1025,7 @@ mod tests {
                     parent_note_id: id.clone(),
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 }],
             )
         })?;
@@ -993,7 +1042,13 @@ mod tests {
                 conn.batch_execute(&format!("SET search_path TO {schema}"))?;
                 barrier.wait();
                 let update = conn.transaction::<_, DbError, _>(|conn| {
-                    confirm_settlement_tx(conn, &[7], &HashSet::new())
+                    confirm_settlement_tx(
+                        conn,
+                        &[7],
+                        &HashSet::new(),
+                        BlockNumber::GENESIS,
+                        test_consumer(),
+                    )
                 })?;
                 Ok(update.removed.len())
             }));
@@ -1044,6 +1099,7 @@ mod tests {
                     parent_note_id: parent_id,
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 };
                 barrier.wait();
                 match conn.transaction::<_, DbError, _>(|conn| {
@@ -1091,6 +1147,7 @@ mod tests {
                     parent_note_id: note.id().to_bytes(),
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 }],
             )
         })?;
@@ -1105,7 +1162,13 @@ mod tests {
             conn.batch_execute(&format!("SET search_path TO {confirm_schema}"))?;
             confirm_barrier.wait();
             conn.transaction::<_, DbError, _>(|conn| {
-                confirm_settlement_tx(conn, &[41], &HashSet::new())
+                confirm_settlement_tx(
+                    conn,
+                    &[41],
+                    &HashSet::new(),
+                    BlockNumber::GENESIS,
+                    test_consumer(),
+                )
             })
             .map_err(Into::into)
         });
@@ -1175,6 +1238,7 @@ mod tests {
                         parent_note_id: prepare_parent,
                         child_note_id: None,
                         child_note_data: None,
+                        fill_amount: None,
                     }],
                 )
             }) {
@@ -1265,6 +1329,7 @@ mod tests {
             parent_note_id: note.id().to_bytes(),
             child_note_id: Some(vec![10]),
             child_note_data: Some(vec![11]),
+            fill_amount: None,
         };
         assert!(conn
             .transaction::<_, DbError, _>(|conn| {

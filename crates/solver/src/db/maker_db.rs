@@ -11,13 +11,16 @@ use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
+use miden_standards::note::PswapNote;
 
 use super::error::{DbError, DbResult};
-use super::postgres_models::{NewOrderRow, OrderRow};
+use super::postgres_models::{NewOrderRow, OrderRow, SettlementInputRow};
 use super::postgres_schema::{
     api_keys, live_orders, maker_commands, maker_cutoffs, maker_events, maker_lineages,
     maker_stops, makers, orders,
@@ -599,6 +602,210 @@ pub fn order_notes_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult
         .collect()
 }
 
+/// Where a settlement stands when it is reported to makers.
+#[derive(Debug, Clone, Copy)]
+pub enum SettlementPhase {
+    /// Reserved and recorded; it may be broadcast.
+    Pending,
+    /// Our transaction is verified committed in `block`, consumed by
+    /// `consumer` (the solver account).
+    Committed {
+        block: BlockNumber,
+        consumer: AccountId,
+    },
+    /// It can never commit; nothing was filled.
+    Voided,
+}
+
+/// What the maker needs to rebuild its payback and remainder notes for one
+/// consumed input. The executor always fills with
+/// `PswapNote::execute(solver, None, Some(fill))`, so the parent note, the
+/// fill amount and the stored remainder determine every value exactly.
+fn input_fill(
+    parent: &Note,
+    fill_amount: u64,
+    remainder: Option<&Note>,
+    lineage_id: &[u8],
+) -> DbResult<proto::InputFill> {
+    let pswap = PswapNote::try_from(parent).map_err(crate::types::OrderError::from)?;
+    let offered = pswap.offered_asset().amount().as_u64();
+    let (remaining_offered, remaining_requested) = match remainder {
+        Some(note) => {
+            let rest = PswapNote::try_from(note).map_err(crate::types::OrderError::from)?;
+            (
+                rest.offered_asset().amount().as_u64(),
+                rest.storage().min_requested_amount(),
+            )
+        }
+        None => (0, 0),
+    };
+    Ok(proto::InputFill {
+        note_id: parent.id().to_bytes().to_vec(),
+        lineage_id: lineage_id.to_vec(),
+        depth: pswap.parent_depth() + 1,
+        payback_amount: fill_amount,
+        offered_paid: offered
+            .checked_sub(remaining_offered)
+            .ok_or(DbError::Corrupt("remainder offers more than its parent"))?,
+        remaining_offered,
+        remaining_requested,
+        remainder_note_id: remainder.map_or_else(Vec::new, |note| note.id().to_bytes().to_vec()),
+    })
+}
+
+/// Where an order stands after a resolved settlement: `subject` is the
+/// remainder when there is one, else the input itself.
+fn resulting_status(
+    subject: &[u8],
+    live: &HashSet<Vec<u8>>,
+    statuses: &HashMap<Vec<u8>, String>,
+) -> proto::ResultingStatus {
+    if live.contains(subject) {
+        proto::ResultingStatus::Live
+    } else if statuses.get(subject).map(String::as_str)
+        == Some(OrderStatus::OnchainNullified.as_str())
+    {
+        proto::ResultingStatus::Spent
+    } else {
+        proto::ResultingStatus::Stopped
+    }
+}
+
+/// Report a settlement to each maker whose orders are among its inputs, one
+/// event per maker, in the transaction that made the change: SettlementPending
+/// when it is reserved, SettlementResolved when it commits or is voided.
+/// `inputs` pairs each journal row with its parent order. Inputs of public
+/// orders, and of attempts prepared before fills were recorded, are not
+/// reported.
+pub fn report_settlement_tx(
+    conn: &mut PgConnection,
+    tx_id: &[u8],
+    inputs: &[(SettlementInputRow, OrderRow)],
+    phase: SettlementPhase,
+) -> DbResult<()> {
+    let parent_ids: Vec<&Vec<u8>> = inputs
+        .iter()
+        .map(|(input, _)| &input.parent_note_id)
+        .collect();
+    let owners: HashMap<Vec<u8>, (MakerId, Vec<u8>)> = orders::table
+        .inner_join(
+            maker_lineages::table.on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+        )
+        .filter(orders::note_id.eq_any(&parent_ids))
+        .select((
+            orders::note_id,
+            maker_lineages::maker_id,
+            maker_lineages::lineage_id,
+        ))
+        .load::<(Vec<u8>, i64, Vec<u8>)>(conn)?
+        .into_iter()
+        .map(|(note_id, maker_id, lineage_id)| (note_id, (maker_id, lineage_id)))
+        .collect();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    // A resolved input's order now lives on in its remainder, if any.
+    let subjects: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|(input, _)| {
+            input
+                .child_note_id
+                .clone()
+                .unwrap_or_else(|| input.parent_note_id.clone())
+        })
+        .collect();
+    let live: HashSet<Vec<u8>> = live_orders::table
+        .filter(live_orders::note_id.eq_any(&subjects))
+        .select(live_orders::note_id)
+        .load::<Vec<u8>>(conn)?
+        .into_iter()
+        .collect();
+    let statuses: HashMap<Vec<u8>, String> = orders::table
+        .filter(orders::note_id.eq_any(&subjects))
+        .select((orders::note_id, orders::status))
+        .load::<(Vec<u8>, String)>(conn)?
+        .into_iter()
+        .collect();
+
+    let mut reports: BTreeMap<MakerId, (Vec<proto::InputFill>, Vec<proto::InputResult>)> =
+        BTreeMap::new();
+    for ((input, parent), subject) in inputs.iter().zip(&subjects) {
+        let Some((maker_id, lineage_id)) = owners.get(&input.parent_note_id) else {
+            continue;
+        };
+        let remainder = input
+            .child_note_data
+            .as_deref()
+            .map(Note::read_from_bytes)
+            .transpose()?;
+        let fill = input
+            .fill_amount
+            .map(|amount| {
+                input_fill(
+                    &parent.note()?,
+                    u64::try_from(amount)?,
+                    remainder.as_ref(),
+                    lineage_id,
+                )
+            })
+            .transpose()?;
+        let (fills, results) = reports.entry(*maker_id).or_default();
+        let status = match phase {
+            SettlementPhase::Pending => {
+                fills.extend(fill);
+                continue;
+            }
+            SettlementPhase::Committed { .. } => {
+                fills.extend(fill);
+                if input.child_note_id.is_some() {
+                    resulting_status(subject, &live, &statuses)
+                } else {
+                    proto::ResultingStatus::Filled
+                }
+            }
+            SettlementPhase::Voided => resulting_status(subject, &live, &statuses),
+        };
+        results.push(proto::InputResult {
+            note_id: input.parent_note_id.clone(),
+            lineage_id: lineage_id.clone(),
+            status: status.into(),
+        });
+    }
+
+    for (maker_id, (fills, results)) in reports {
+        let kind = match phase {
+            SettlementPhase::Pending if fills.is_empty() => continue,
+            SettlementPhase::Pending => {
+                proto::event_body::Kind::SettlementPending(proto::SettlementPending {
+                    tx_id: tx_id.to_vec(),
+                    fills,
+                })
+            }
+            SettlementPhase::Committed { block, consumer } => {
+                proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
+                    tx_id: tx_id.to_vec(),
+                    committed: true,
+                    commit_block: block.as_u32(),
+                    consumer_account_id: consumer.to_bytes(),
+                    fills,
+                    results,
+                })
+            }
+            SettlementPhase::Voided => {
+                proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
+                    tx_id: tx_id.to_vec(),
+                    committed: false,
+                    results,
+                    ..Default::default()
+                })
+            }
+        };
+        let body = proto::EventBody { kind: Some(kind) };
+        gateway::append_event_tx(conn, maker_id, None, &body)?;
+    }
+    Ok(())
+}
+
 /// The three V1 events (frozen; ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -642,8 +849,9 @@ pub fn append_event_tx(
 mod tests {
     use super::*;
     use crate::db::postgres_db::{
-        backfill_order_keys_tx, insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx,
-        prepare_settlement_tx,
+        backfill_order_keys_tx, confirm_settlement_tx, finish_discarded_settlement_tx,
+        insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
+        test_consumer,
     };
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
@@ -663,6 +871,7 @@ mod tests {
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteAttachment, PswapNoteStorage};
+    use prost::Message as _;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
@@ -1104,6 +1313,7 @@ mod tests {
                 parent_note_id: parent.id().to_bytes().to_vec(),
                 child_note_id: None,
                 child_note_data: None,
+                fill_amount: None,
             }],
         )
     }
@@ -1277,6 +1487,244 @@ mod tests {
         Ok(())
     }
 
+    /// A journal row filling `parent` with `amount` exactly as the executor
+    /// does, and the payback and remainder notes the transaction creates.
+    fn fill(tx: u8, parent: &Note, amount: u64) -> (SettlementInputRow, Note, Option<Note>) {
+        let pswap = PswapNote::try_from(parent).unwrap();
+        let requested = pswap.storage().requested_faucet_id();
+        let (payback, remainder) = pswap
+            .execute(
+                test_consumer(),
+                None,
+                Some(FungibleAsset::new(requested, amount).unwrap()),
+            )
+            .unwrap();
+        let remainder = remainder.map(Note::from);
+        let row = SettlementInputRow {
+            tx_id: vec![tx],
+            parent_note_id: parent.id().to_bytes().to_vec(),
+            child_note_id: remainder.as_ref().map(|note| note.id().to_bytes().to_vec()),
+            child_note_data: remainder.as_ref().map(Serializable::to_bytes),
+            fill_amount: Some(i64::try_from(amount).unwrap()),
+        };
+        (row, payback, remainder)
+    }
+
+    fn prepare(conn: &mut PgConnection, tx: u8, inputs: &[SettlementInputRow]) -> Result<()> {
+        let attempt = SettlementAttemptRow {
+            tx_id: vec![tx],
+            tx_result: vec![tx],
+            status: "prepared".into(),
+        };
+        conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, inputs))?;
+        Ok(())
+    }
+
+    fn settlement_events(
+        conn: &mut PgConnection,
+        maker_id: MakerId,
+    ) -> Result<Vec<proto::event_body::Kind>> {
+        Ok(read_events_tx(conn, maker_id, 0, 100)?
+            .into_iter()
+            .map(|event| {
+                proto::EventBody::decode(event.payload.as_slice())
+                    .unwrap()
+                    .kind
+                    .unwrap()
+            })
+            .collect())
+    }
+
+    fn resolved(kind: &proto::event_body::Kind) -> &proto::SettlementResolved {
+        match kind {
+            proto::event_body::Kind::SettlementResolved(resolved) => resolved,
+            other => panic!("expected SettlementResolved, got {other:?}"),
+        }
+    }
+
+    /// The maker's side: rebuild both output notes from its ORIGINAL note and
+    /// the reported fill, with the pinned SDK.
+    fn rebuild(original: &Note, fill: &proto::InputFill, consumer: &[u8]) -> (Note, Option<Note>) {
+        let original = PswapNote::try_from(original).unwrap();
+        let consumer = AccountId::read_from_bytes(consumer).unwrap();
+        let attachment = |amount| {
+            PswapNoteAttachment::new(
+                AssetAmount::new(amount).unwrap(),
+                original.order_id(),
+                fill.depth,
+            )
+        };
+        let payback = original
+            .payback_note(consumer, &attachment(fill.payback_amount))
+            .unwrap();
+        let remainder = (!fill.remainder_note_id.is_empty()).then(|| {
+            original
+                .remainder_note(
+                    consumer,
+                    &attachment(fill.offered_paid),
+                    AssetAmount::new(fill.remaining_offered).unwrap(),
+                    AssetAmount::new(fill.remaining_requested).unwrap(),
+                )
+                .unwrap()
+        });
+        (payback, remainder)
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_maker_rebuilds_its_notes_from_reported_fills_across_rounds() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let (alpha, beta) = (maker(conn, "alpha")?, maker(conn, "beta")?);
+        let (quote, other, public) = (note(1), note(2), note(3));
+        run(conn, alpha, "s1", 1, submit(&quote))?;
+        run(conn, beta, "s1", 1, submit(&other))?;
+        ingest(conn, &[&quote, &other, &public])?;
+
+        // Round 1: a partial fill of alpha's quote, beside beta's and a public order.
+        let (row, payback, remainder) = fill(1, &quote, 40);
+        let (beta_row, ..) = fill(1, &other, 100);
+        let (public_row, ..) = fill(1, &public, 100);
+        prepare(conn, 1, &[row, beta_row, public_row])?;
+        let pending = settlement_events(conn, alpha)?;
+        let proto::event_body::Kind::SettlementPending(pending) = &pending[0] else {
+            panic!("expected SettlementPending");
+        };
+        assert_eq!(pending.fills.len(), 1, "only alpha's own input");
+        assert_eq!(pending.fills[0].payback_amount, 40);
+
+        let block = BlockNumber::from(42_u32);
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(conn, &[1], &HashSet::new(), block, test_consumer())
+        })?;
+        let events = settlement_events(conn, alpha)?;
+        let report = resolved(&events[1]);
+        assert!(report.committed);
+        assert_eq!(report.commit_block, 42);
+        assert_eq!(report.fills, pending.fills, "the fill is what was intended");
+        assert_eq!(
+            report.results[0].status(),
+            proto::ResultingStatus::Live,
+            "the remainder is live"
+        );
+        let (rebuilt_payback, rebuilt_remainder) =
+            rebuild(&quote, &report.fills[0], &report.consumer_account_id);
+        assert_eq!(rebuilt_payback.id(), payback.id());
+        let remainder = remainder.unwrap();
+        assert_eq!(rebuilt_remainder.unwrap().id(), remainder.id());
+        // Beta hears about its own full fill only.
+        let beta_events = settlement_events(conn, beta)?;
+        assert_eq!(resolved(&beta_events[1]).fills.len(), 1);
+        assert_eq!(
+            resolved(&beta_events[1]).results[0].status(),
+            proto::ResultingStatus::Filled
+        );
+
+        // Round 2 fills the remainder; the maker still rebuilds from its original note.
+        let (row, payback, second) = fill(2, &remainder, 20);
+        prepare(conn, 2, &[row])?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(conn, &[2], &HashSet::new(), block, test_consumer())
+        })?;
+        let events = settlement_events(conn, alpha)?;
+        let report = resolved(events.last().unwrap());
+        assert_eq!(report.fills[0].depth, 2);
+        let (rebuilt_payback, rebuilt_remainder) =
+            rebuild(&quote, &report.fills[0], &report.consumer_account_id);
+        assert_eq!(rebuilt_payback.id(), payback.id());
+        assert_eq!(rebuilt_remainder.unwrap().id(), second.unwrap().id());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_late_fill_after_a_cancel_reports_its_remainder_stopped() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let quote = note(1);
+        run(conn, alpha, "s1", 1, submit(&quote))?;
+        ingest(conn, &[&quote])?;
+        let (row, ..) = fill(1, &quote, 40);
+        prepare(conn, 1, &[row])?;
+        // The cancel lands while the settlement is in flight.
+        assert_eq!(
+            run(conn, alpha, "c2", 2, cancel_all(CutoffScope::all()))?.0,
+            CommandReply::Committed(CommandResult::Applied {
+                cutoff: 2,
+                settling: 1
+            })
+        );
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(
+                conn,
+                &[1],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+            )
+        })?;
+        let events = settlement_events(conn, alpha)?;
+        let report = resolved(events.last().unwrap());
+        assert!(report.committed);
+        assert_eq!(report.fills.len(), 1, "the fill is reported");
+        assert_eq!(report.results[0].status(), proto::ResultingStatus::Stopped);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_voided_settlement_reports_where_each_input_stands() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let (returned, spent, stopped) = (note(1), note(2), note(3));
+        for (seq, order) in [(1, &returned), (2, &spent), (3, &stopped)] {
+            run(conn, alpha, &format!("s{seq}"), seq, submit(order))?;
+        }
+        ingest(conn, &[&returned, &spent, &stopped])?;
+        let rows: Vec<_> = [&returned, &spent, &stopped]
+            .into_iter()
+            .map(|order| fill(1, order, 100).0)
+            .collect();
+        prepare(conn, 1, &rows)?;
+        let lineage_id = OrderKeys::from_note(&stopped)?.lineage_id;
+        run(
+            conn,
+            alpha,
+            "x4",
+            4,
+            MakerCommand::CancelOrder { lineage_id },
+        )?;
+
+        let consumed = HashSet::from([spent.id()]);
+        conn.transaction::<_, DbError, _>(|conn| {
+            finish_discarded_settlement_tx(conn, &[1], &consumed)
+        })?;
+        let events = settlement_events(conn, alpha)?;
+        let report = resolved(events.last().unwrap());
+        assert!(!report.committed);
+        assert!(report.fills.is_empty(), "nothing was filled");
+        let statuses: HashMap<Vec<u8>, proto::ResultingStatus> = report
+            .results
+            .iter()
+            .map(|result| (result.note_id.clone(), result.status()))
+            .collect();
+        assert_eq!(
+            statuses[&returned.id().to_bytes().to_vec()],
+            proto::ResultingStatus::Live
+        );
+        assert_eq!(
+            statuses[&spent.id().to_bytes().to_vec()],
+            proto::ResultingStatus::Spent
+        );
+        assert_eq!(
+            statuses[&stopped.id().to_bytes().to_vec()],
+            proto::ResultingStatus::Stopped
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn reverting_after_maker_activity_is_refused() -> Result<()> {
@@ -1284,9 +1732,12 @@ mod tests {
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
         run(conn, alpha, "s1", 1, submit(&note(1)))?;
+        // The settlement-fills column goes first; the maker tables refuse.
+        postgres_migrations::revert_last(conn)?;
         assert!(postgres_migrations::revert_last(conn).is_err());
 
         let mut empty = TestSchema::migrated()?;
+        postgres_migrations::revert_last(&mut empty.conn)?;
         postgres_migrations::revert_last(&mut empty.conn)?;
         postgres_migrations::migrate(&mut empty.conn)?;
         Ok(())

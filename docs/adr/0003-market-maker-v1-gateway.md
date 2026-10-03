@@ -152,7 +152,7 @@ V1 assumes lineage IDs are unique: makers create notes with random serial number
 #### Activation flow
 
 1. MM creates its PSWAP note (private, or public) and submits ExpectedNote plus its sync hint.
-2. Validate the approved pinned script, network, creator field, asset IDs, integer amounts and full note identity. A PSWAP tag alone is not identity or proof.
+2. Validate the approved pinned script, network, creator field, asset IDs, integer amounts and full note identity. A PSWAP tag alone is not identity or proof. A note for a pair this solver does not clear is rejected, since nothing would ever match it.
 3. Persist the accepted command and payload on the intake session (group commit), then acknowledge. The note is not imported into the ingest client, so public ingest never sees a private maker note. Public ingest may also discover a public maker note; both paths insert the same order row idempotently, and the lineage's maker metadata applies whichever inserts it.
 4. MM submits note creation independently. Support both note-data-before-chain and chain-before-note-data arrival.
 5. The maker-note watcher, woken per new block with polling as the fallback, checks new intake by note ID and pending intake incrementally by PSWAP tag, and verifies the exact note as committed (inclusion proof) and unspent (nullifier sync) through node RPC.
@@ -245,17 +245,19 @@ Maker traffic must not slow public ingest or settlement, and a cancel must never
 
 A separate session is safe because maker commands only append facts (commands, notes, lineage attributions, cutoffs) and never move orders or settlements; execution authority stays with the core writer. The pool opens the intake session only after it owns the database and closes it when the pool's fatal token fires. Cancel and reservation serialize through the maker control row lock, which works across sessions. Submits and cancels add no work to the core writer.
 
-**Maker-note watcher.** One task, woken per new block with polling as the fallback, using its own `Send` node RPC handle:
+**Maker-note watcher.** One task on the gateway thread, polling the chain tip (`maker_watch_interval_ms`, default 1 s), using its own `Send` node RPC handle:
 
 1. New intake: one batched `get_notes_by_id` (up to the node's `note_ids_limit` per call) catches notes committed before their data arrived.
 2. Still-pending intake: incremental `sync_notes` from the last checked block over the PSWAP tags of pending notes catches later commitments without re-querying every pending ID each block.
-3. Candidates: verify the exact note ID and its inclusion proof, and that the note is unspent.
-4. Live maker orders: incremental `sync_nullifiers` over their nullifier prefixes finds notes the maker reclaimed or traded elsewhere.
-5. One `write_book` per block for everything found: activations (Active, or Stopped below a cutoff, checked through `live_orders` in the same transaction), spent orders marked OnchainNullified, their OrderStatus events and the book update.
+3. Candidates: the committed note must carry the submitted note's ID and metadata, and be unspent. Otherwise the submission is rejected (OrderStatus Rejected, or Unavailable when already spent). V1 trusts the solver's own node for inclusion, as ingest and the executor already do; checking inclusion proofs against block headers is deferred.
+4. Live maker orders: incremental `sync_nullifiers` over their nullifier prefixes finds notes the maker reclaimed or traded elsewhere; an order it starts watching is checked over its whole history once.
+5. One `write_book` per round for everything found: activations (Active, or Stopped below a cutoff, checked through `live_orders` in the same transaction), spent orders marked OnchainNullified, their OrderStatus events and the book update. A round that fails changes nothing and is repeated whole; the watcher's memory (scan cursor, IDs already looked up, watched orders) is rebuilt after a restart.
 
-Maker notes are never imported into the ingest client, so public ingest is unchanged and no private note reaches the book without the gateway's checks. The executor already consumes notes unauthenticated from our stored copy, so settling a private note needs no client import. If the watcher's last verified block falls behind the chain tip by more than the freshness bound, it pauses activation; cancels continue.
+Every path that retires consumed orders (watcher, ingest, executor release, startup reconciliation) reports Unavailable for the live maker orders among them in the same transaction, so the event does not depend on which path saw the spend first. An order reserved by our own settlement is not live, so its consumption is not reported as a spend elsewhere.
 
-**Event delivery** also runs on the gateway thread: per-stream readers, woken in-process after any commit that inserts that maker's events, read through a capped read budget (like PR #34's public-read cap) so streams cannot starve pipeline reads. Only core-writer commits insert maker events, so each maker's contiguous event sequence comes from one per-maker counter row written by one session.
+Maker notes are never imported into the ingest client, so public ingest is unchanged and no private note reaches the book without the gateway's checks. The executor already consumes notes unauthenticated from our stored copy, so settling a private note needs no client import. Pausing activation when the watcher falls behind the chain tip by more than a freshness bound is deferred; a failing watcher simply activates nothing, while cancels continue.
+
+**Event delivery** also runs on the gateway thread: per-stream readers, woken in-process after any core-writer commit that inserted maker events, read through a capped read budget (like PR #34's public-read cap) so streams cannot starve pipeline reads. Only core-writer commits insert maker events, so each maker's contiguous event sequence comes from one per-maker counter row written by one session.
 
 Lock order, which rules out deadlocks between the two sessions: order rows (by note ID), then maker control rows (by maker ID). The per-maker event counter lives on the control row, so appending an event takes the same lock last. A cancel takes only its maker's control row; reservation takes its input rows first, then their makers' control rows; activation and settlement write order rows first and lock control rows only to append events.
 

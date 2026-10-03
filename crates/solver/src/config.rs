@@ -229,6 +229,10 @@ pub struct EngineConfig {
     /// revoked key ends open streams within it. Default 10000.
     #[serde(default = "default_maker_stream_heartbeat_ms")]
     pub maker_stream_heartbeat_ms: u64,
+    /// How often the maker-note watcher checks for new blocks (ms). Default
+    /// 1000.
+    #[serde(default = "default_maker_watch_interval_ms")]
+    pub maker_watch_interval_ms: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -345,6 +349,9 @@ fn default_maker_stream_buffer() -> usize {
 fn default_maker_stream_heartbeat_ms() -> u64 {
     10_000
 }
+fn default_maker_watch_interval_ms() -> u64 {
+    1_000
+}
 
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
@@ -390,6 +397,10 @@ impl SolverConfig {
             (
                 "maker_stream_heartbeat_ms",
                 usize::try_from(self.engine.maker_stream_heartbeat_ms).unwrap_or(usize::MAX),
+            ),
+            (
+                "maker_watch_interval_ms",
+                usize::try_from(self.engine.maker_watch_interval_ms).unwrap_or(usize::MAX),
             ),
         ] {
             if value == 0 {

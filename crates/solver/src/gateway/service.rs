@@ -3,10 +3,13 @@
 //! Handlers only authenticate, decode and validate; the intake writer makes
 //! every command durable. Note payloads and API keys are never logged.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use miden_client::rpc::NodeRpcClient;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
@@ -17,16 +20,18 @@ use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
 use super::error::IntakeError;
-use super::events::{feed, unix_ms, EventWake, StreamConfig, Subscriber};
+use super::events::{feed, unix_ms, StreamConfig, Subscriber};
 use super::intake::{intake_queues, run_intake, Intake};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
+use super::watcher::{run_watcher, RpcChain, Watcher};
 use crate::db::{maker_db, DbPool};
+use crate::maker::EventWake;
 use crate::maker::{
     api_key_hash, market_key, CommandHeader, CommandReply, CommandResult, CutoffScope,
     MakerCommand, MakerFact, MakerId,
 };
-use crate::types::TokenId;
+use crate::types::{BookUpdate, TokenId};
 
 /// Largest accepted request. A PSWAP note is a few kilobytes.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -37,6 +42,11 @@ const LINEAGE_ID_LEN: usize = AccountId::SERIALIZED_SIZE + 32;
 pub struct GatewayConfig {
     pub bind: String,
     pub port: u16,
+    /// Market keys of the pairs this solver clears; submits for any other
+    /// pair are rejected, since nothing would ever match them.
+    pub markets: HashSet<Vec<u8>>,
+    /// How often the maker-note watcher looks for new blocks.
+    pub watch_interval: std::time::Duration,
     pub round_submits: usize,
     pub submit_queue: usize,
     pub cancel_queue: usize,
@@ -47,6 +57,7 @@ pub struct GatewayConfig {
 pub struct MakerGatewayService {
     pool: DbPool,
     intake: Intake,
+    markets: Arc<HashSet<Vec<u8>>>,
     events: EventWake,
     stream: StreamConfig,
     /// Ends every event stream at shutdown, so the server can stop.
@@ -57,6 +68,7 @@ impl MakerGatewayService {
     pub fn new(
         pool: DbPool,
         intake: Intake,
+        markets: HashSet<Vec<u8>>,
         events: EventWake,
         stream: StreamConfig,
         cancel: CancellationToken,
@@ -64,6 +76,7 @@ impl MakerGatewayService {
         Self {
             pool,
             intake,
+            markets: Arc::new(markets),
             events,
             stream,
             cancel,
@@ -152,6 +165,13 @@ impl MakerGateway for MakerGatewayService {
         let command = MakerCommand::submit(note).map_err(|error| {
             Status::invalid_argument(format!("note is not a valid PSWAP order: {error}"))
         })?;
+        if let MakerCommand::Submit { keys, .. } = &command {
+            if !self.markets.contains(&keys.market) {
+                return Err(Status::invalid_argument(
+                    "this solver does not trade that pair",
+                ));
+            }
+        }
         self.execute(header, command).await
     }
 
@@ -317,11 +337,14 @@ fn intake_status(error: &IntakeError) -> Status {
 /// Run the gateway on its own OS thread and multi-thread runtime, like the
 /// price API, so maker traffic cannot starve ingest or settlement. The intake
 /// writer runs there too, on its own database session.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_gateway_thread(
     cfg: GatewayConfig,
     pool: DbPool,
     facts: mpsc::UnboundedSender<MakerFact>,
     events: EventWake,
+    rpc: Arc<dyn NodeRpcClient>,
+    book_tx: mpsc::Sender<BookUpdate>,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -361,11 +384,22 @@ pub fn spawn_gateway_thread(
                     cfg.round_submits,
                     cancel.clone(),
                 ));
+                let watcher = tokio::spawn(run_watcher(
+                    Watcher::new(pool.clone(), RpcChain::new(rpc), book_tx),
+                    cfg.watch_interval,
+                    cancel.clone(),
+                ));
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "maker gateway listening");
                 let shutdown = cancel.clone();
-                let service =
-                    MakerGatewayService::new(pool, intake, events, cfg.stream, cancel.clone());
+                let service = MakerGatewayService::new(
+                    pool,
+                    intake,
+                    cfg.markets,
+                    events,
+                    cfg.stream,
+                    cancel.clone(),
+                );
                 let served = tonic::transport::Server::builder()
                     .add_service(service.into_server())
                     .serve_with_incoming_shutdown(TcpIncoming::from(listener), async move {
@@ -378,6 +412,7 @@ pub fn spawn_gateway_thread(
                 // An unexpected gateway exit needs coordinated recovery.
                 cancel.cancel();
                 let _ = writer.await;
+                let _ = watcher.await;
             });
         })?;
     Ok((handle, ready_rx))
@@ -441,9 +476,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let events = EventWake::default();
+        let [x, y, _] = ids();
+        let markets = [x, y].map(|id| AccountId::read_from_bytes(&id).unwrap());
         let service = MakerGatewayService::new(
             db.pool.clone(),
             intake,
+            HashSet::from([market_key(markets[0], markets[1])]),
             events.clone(),
             TEST_STREAM,
             stop.clone(),
@@ -578,6 +616,39 @@ mod tests {
         );
 
         // Malformed input is rejected before it reaches the intake.
+        let unknown_pair = {
+            use miden_protocol::asset::{AssetAmount, FungibleAsset};
+            use miden_standards::note::{PswapNote, PswapNoteStorage};
+            let creator = AccountId::try_from(
+                miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+            )
+            .unwrap();
+            let [x, _, z] = ids().map(|id| AccountId::read_from_bytes(&id).unwrap());
+            Note::from(
+                PswapNote::builder()
+                    .sender(creator)
+                    .storage(
+                        PswapNoteStorage::builder()
+                            .min_requested_asset(FungibleAsset::new(z, 10).unwrap())
+                            .min_fill_step(AssetAmount::new(1).unwrap())
+                            .creator_account_id(creator)
+                            .build(),
+                    )
+                    .serial_number(miden_protocol::Word::from([9_u32, 9, 9, 9]))
+                    .note_type(miden_protocol::note::NoteType::Private)
+                    .offered_asset(FungibleAsset::new(x, 10).unwrap())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            code(
+                client
+                    .submit_order(signed(&key, submit("s8", 8, &unknown_pair)))
+                    .await
+            ),
+            Code::InvalidArgument
+        );
         let mut garbage = submit("s9", 9, &order);
         garbage.note.push(0);
         assert_eq!(
@@ -746,16 +817,27 @@ mod tests {
         let cfg = |port| GatewayConfig {
             bind: "127.0.0.1".into(),
             port,
+            watch_interval: std::time::Duration::from_millis(50),
+            markets: HashSet::new(),
             round_submits: 10,
             submit_queue: 4,
             cancel_queue: 4,
             stream: TEST_STREAM,
         };
+        // No node answers here: watcher rounds fail and are retried.
+        let rpc = || -> Arc<dyn NodeRpcClient> {
+            let endpoint =
+                miden_client::rpc::Endpoint::new("http".into(), "127.0.0.1".into(), Some(1));
+            Arc::new(miden_client::rpc::GrpcClient::new(&endpoint, 100))
+        };
+        let (book_tx, _book_rx) = mpsc::channel(1);
         let (thread, ready) = spawn_gateway_thread(
             cfg(0),
             db.pool.clone(),
             facts_tx.clone(),
             EventWake::default(),
+            rpc(),
+            book_tx.clone(),
             cancel.clone(),
         )
         .unwrap();
@@ -773,6 +855,8 @@ mod tests {
             db.pool.clone(),
             facts_tx,
             EventWake::default(),
+            rpc(),
+            book_tx,
             CancellationToken::new(),
         )
         .unwrap();

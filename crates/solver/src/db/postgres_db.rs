@@ -210,6 +210,7 @@ pub fn mark_orders_onchain_nullified_tx(
     let mut sorted = note_ids.to_vec();
     sorted.sort();
     sorted.dedup();
+    super::maker_db::report_spent_tx(conn, &sorted)?;
     Ok(
         diesel::update(orders::table.filter(orders::note_id.eq_any(sorted)).filter(
             orders::status.eq_any([

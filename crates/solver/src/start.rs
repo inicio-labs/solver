@@ -288,6 +288,10 @@ pub async fn start(
             config.engine.router_inflight_ttl_ms,
         )
     });
+    let maker_markets = pairs
+        .iter()
+        .map(|&(x, y)| crate::maker::market_key(x, y))
+        .collect();
     let clearing = ClearingRuntime {
         bootstrap: bootstrap_rx,
         routing,
@@ -482,6 +486,8 @@ pub async fn start(
         let gateway_cfg = crate::gateway::GatewayConfig {
             bind: config.engine.maker_gateway_bind.clone(),
             port: config.engine.maker_gateway_port,
+            watch_interval: Duration::from_millis(config.engine.maker_watch_interval_ms),
+            markets: maker_markets,
             round_submits: config.engine.maker_intake_round_submits,
             submit_queue: config.engine.maker_intake_submit_queue,
             cancel_queue: config.engine.maker_intake_cancel_queue,
@@ -490,16 +496,21 @@ pub async fn start(
                 heartbeat: Duration::from_millis(config.engine.maker_stream_heartbeat_ms),
             },
         };
-        // Producers of maker events (activation, settlement reporting) notify
-        // it after their commits.
-        let maker_events = crate::gateway::EventWake::default();
-        match crate::gateway::spawn_gateway_thread(
-            gateway_cfg,
-            db_pool.clone(),
-            channels.maker_fact_tx,
-            maker_events,
-            cancel.clone(),
-        ) {
+        // The core writer notifies it after every commit that appended maker
+        // events.
+        let maker_events = crate::gateway::EventWake::global().clone();
+        let spawned = factory.rpc().and_then(|rpc| {
+            crate::gateway::spawn_gateway_thread(
+                gateway_cfg,
+                db_pool.clone(),
+                channels.maker_fact_tx,
+                maker_events,
+                rpc,
+                channels.book_tx.clone(),
+                cancel.clone(),
+            )
+        });
+        match spawned {
             Ok((thread, ready_rx)) => {
                 optional_threads.push(("maker-gateway", thread));
                 Some(ready_rx)

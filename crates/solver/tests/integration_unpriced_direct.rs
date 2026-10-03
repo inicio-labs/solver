@@ -196,6 +196,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                     maker_intake_cancel_queue: 1024,
                     maker_stream_buffer: 256,
                     maker_stream_heartbeat_ms: 10_000,
+                    maker_watch_interval_ms: 1_000,
                 },
             };
 

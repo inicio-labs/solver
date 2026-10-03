@@ -921,6 +921,10 @@ impl PgPool {
             }
         }
         .await;
+        if result.is_ok() {
+            // Maker events committed: wake their streams.
+            crate::maker::EventWake::notify_if_appended();
+        }
         self.finish(Access::Write, started, operation_name, result)
     }
 

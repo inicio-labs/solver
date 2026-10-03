@@ -57,7 +57,7 @@ These are responsibilities within one solver deployment, not new microservices:
 1. **API boundary:** authenticate, validate request shape, call a domain operation and map its result to gRPC. Stream committed events separately.
 2. **Order operations:** submit, cancel, activate and reserve candidates for execution. Each operation owns its business rule and database transaction.
 3. **Chain workers:** the existing ingest task keeps discovering public notes; a new maker-note watcher verifies private maker notes through node RPC (see *Intake and activation in parallel*); the matcher selects candidates; the executor reserves, submits and reconciles settlements.
-4. **Store:** focused queries and transactions using the solver's database stack. Event reading and cleanup are small background tasks.
+4. **Store:** focused queries and transactions using the solver's database stack. Event reading is a small background task.
 
 Reuse the existing module layout. Add a file when it has a clear responsibility; do not create a framework, service bus or generic repository abstraction for this gateway.
 
@@ -79,9 +79,9 @@ A channel or PostgreSQL notification only wakes a worker. The worker reads durab
 
 Use libraries to remove protocol and storage boilerplate while keeping financial transitions visible in ordinary code.
 
-- **[Tonic](https://docs.rs/tonic/latest/tonic/) and [Prost](https://docs.rs/prost/latest/prost/):** define the protocol once in Protobuf; generate message types and clients/services with compatible [tonic-prost-build](https://docs.rs/tonic-prost-build/latest/tonic_prost_build/) tooling. Do not hand-maintain duplicate wire models.
+- **[Tonic](https://docs.rs/tonic/latest/tonic/) and [Prost](https://docs.rs/prost/latest/prost/):** define the protocol once in Protobuf; generate message types and clients/services with compatible [tonic-prost-build](https://docs.rs/tonic-prost-build/latest/tonic_prost_build/) tooling. Do not hand-maintain duplicate wire models. `miden-client` already brings tonic 0.14, prost 0.14, tonic-prost-build and protox (a pure-Rust Protobuf compiler) into the dependency tree, matching our axum 0.8 and hyper 1; use the same versions and compile the `.proto` with protox so neither developers nor CI need a system `protoc`.
 - **[Tower](https://docs.rs/tower/latest/tower/):** reuse Tonic-compatible middleware where useful for bounded concurrency and authentication. For awaited credential checks, a shared async handler helper is sufficient initially; introduce a custom layer only if it reduces repetition. Tonic's [interceptor](https://docs.rs/tonic/latest/tonic/service/trait.Interceptor.html) is synchronous.
-- **Existing Tokio:** use bounded channels and existing shutdown/task facilities. One shared sync task avoids a sync operation per order.
+- **Existing Tokio:** use bounded channels and existing shutdown/task facilities. One maker-note watcher batches node checks instead of a sync operation per order.
 - **Existing Diesel:** use its PostgreSQL backend, [row derives](https://docs.diesel.rs/master/diesel/prelude/index.html), schema macros and migration tooling. Reuse PR #34's `PgPool`, which runs blocking Diesel on worker threads behind async `read`, `write` and `write_book`; do not add diesel-async or SQLx alongside it.
 - **Error and serialization derives:** use `#[derive(thiserror::Error)]` for distinct domain failures, one `error.rs` per module as PR #34 does; keep `anyhow` only at startup and thread-spawn boundaries. Use existing Serde derives where configuration or JSON actually needs them, not automatically on every Protobuf type.
 - **Existing tests and diagnostics:** use `#[tokio::test]`, existing `proptest!` and focused fixtures for the failure rules below. Use existing tracing with explicit safe fields.
@@ -96,7 +96,7 @@ Pin mutually compatible library versions against the exact Miden dependencies us
 
 An API key is a high-entropy bearer credential carried in gRPC authorization metadata over TLS. Store a verifier, support rotation/revocation, and derive a stable `maker_id` from the validated credential.
 
-Authorize every command, current-state read, lookup, event stream and private-note download against that maker. Enforce revocation on already-open streams too. Revoking access does not implicitly cancel accepted orders.
+Authorize every command, current-state read, lookup and event stream against that maker. Enforce revocation on already-open streams too. Revoking access does not implicitly cancel accepted orders.
 
 The note's creator account determines its on-chain payment/reclaim behavior. It need not equal the API submitter, and V1 requires no creator-account control proof or allowlist. Possession of another party's private note data can still enable arranging a fill: protect note data, storage and backups, and keep payloads out of diagnostics and notification channels.
 
@@ -118,11 +118,11 @@ Each command carries a request ID and maker-assigned sequence:
 - A new request ID or higher sequence cannot silently duplicate or revive the same cancelled note. Preserve network-qualified note/root identity independently of result cleanup.
 - A lineage is attributed once. A later submit of any note in an attributed lineage, by the same or another maker, returns already registered (or the stored result for an exact retry).
 
-Submit returns Accepted after its validated command and private note data commit. Accepted does not mean Live. This retained intake is enough for retry/recovery; no mandatory separate AwaitingCommitment event or initial order row is required.
+Submit returns Accepted after its validated command and note data commit. Accepted does not mean Live. This retained intake is enough for retry/recovery; no mandatory separate AwaitingCommitment event or initial order row is required.
 
 Cancel returns Applied after its cutoff and command result commit together. The response identifies scope/cutoff and explains that already reserved exposure may still settle. It provides bounded exposure details or a reference to a consistent paginated view, not an unbounded order list. Retrying the same request ID or querying command status returns the stored result if the response was lost.
 
-Reads include a paginated current-state view, order/command status, settlement history and private-note retrieval. Heartbeats carry the recoverable event cursor. Server-time support accompanies any later agreed expiry contract.
+Reads include a paginated current-state view, order/command status and settlement history. Heartbeats carry the recoverable event cursor. Server-time support accompanies any later agreed expiry contract.
 
 Each command is independent: a successful cancellation remains applied if a subsequent submission fails. Database atomicity applies within each command, not across the two requests.
 
@@ -250,6 +250,132 @@ Maker notes are never imported into the ingest client, so public ingest is uncha
 
 Lock order, which rules out deadlocks between the two sessions: order rows (by note ID), then maker control rows (by maker ID), then the per-maker event counter. A cancel takes only its maker's control row; reservation takes its input rows first, then their makers' control rows; activation inserts new rows and takes its makers' control rows.
 
+### Data model
+
+PR #34's tables stay. The gateway adds four columns to `orders`, two settlement-history tables, and its own tables. Column lists are illustrative; the migration fixes exact types.
+
+Core tables (PR #34 plus additions):
+
+```mermaid
+erDiagram
+  orders {
+    bytea note_id PK
+    bytea raw_data "full note"
+    bigint arrival_unix
+    text status "plus stopped (new)"
+    bigint priority_seq "FIFO, kept by remainders"
+    bytea lineage_id "new: creator + root serial"
+    int depth "new: 0 root, 1 first remainder, ..."
+    bytea market "new"
+    bytea direction "new"
+  }
+  settlement_attempts {
+    bytea tx_id PK
+    bytea tx_result "journal before broadcast"
+    text status "prepared, uncertain, rejected"
+  }
+  settlement_inputs {
+    bytea tx_id PK, FK
+    bytea parent_note_id PK, FK
+    bytea child_note_id "remainder"
+    bytea child_note_data
+  }
+  settled_transactions {
+    bytea tx_id PK "new"
+    bigint commit_block
+    bigint fee_cost
+    text surplus
+    timestamptz created_at
+  }
+  settled_fills {
+    bytea tx_id PK, FK "new"
+    bytea note_id PK, FK
+    bytea lineage_id
+    bigint payback_amount
+    int depth
+    bigint remaining_offered
+    bigint remaining_requested
+  }
+  settlement_attempts ||--|{ settlement_inputs : reserves
+  orders ||--o{ settlement_inputs : "is parent"
+  settled_transactions ||--|{ settled_fills : contains
+  orders ||--o{ settled_fills : "was filled"
+```
+
+`sync_state` and `registered_tokens` are unchanged. `lineage_id` and `depth` are computed from the note by whichever path inserts the row. `settled_fills` holds what a maker needs to rebuild its payback and remainder notes; unlike `settlement_attempts`, the history tables are never deleted.
+
+Gateway tables:
+
+```mermaid
+erDiagram
+  makers {
+    bigint maker_id PK
+    text name
+    bigint next_event_seq "event counter"
+    timestamptz created_at
+  }
+  api_keys {
+    bigint key_id PK
+    bigint maker_id FK
+    bytea key_hash "never the key itself"
+    timestamptz revoked_at
+    timestamptz created_at
+  }
+  maker_commands {
+    bigint maker_id PK, FK
+    text request_id PK
+    bigint seq UK "unique per maker"
+    text kind "submit or cancel"
+    bytea payload "includes note data"
+    text result "stored reply"
+    timestamptz created_at
+  }
+  maker_lineages {
+    bytea lineage_id PK
+    bigint maker_id FK
+    bigint root_seq
+    bytea root_note_id
+    text state "pending, live, rejected"
+    timestamptz created_at
+  }
+  maker_cutoffs {
+    bigint maker_id PK, FK
+    bytea market PK "empty means all"
+    bytea direction PK "empty means both"
+    bigint cutoff "only rises"
+    timestamptz updated_at
+  }
+  maker_stops {
+    bigint maker_id PK, FK
+    bytea lineage_id PK "targeted cancel"
+    timestamptz created_at
+  }
+  maker_events {
+    bigint maker_id PK, FK
+    bigint event_seq PK
+    uuid event_id UK
+    text kind
+    bytea payload
+    timestamptz created_at
+  }
+  makers ||--o{ api_keys : has
+  makers ||--o{ maker_commands : sends
+  makers ||--o{ maker_lineages : owns
+  makers ||--o{ maker_cutoffs : "cancel barriers"
+  makers ||--o{ maker_stops : "targeted cancels"
+  makers ||--o{ maker_events : "event feed"
+```
+
+`maker_lineages` links to `orders` only through `lineage_id`, joined by `live_orders`; no foreign key, because either row may be written first.
+
+| Step | Connection | Tables written |
+|---|---|---|
+| Maker submits a note | intake | `maker_commands`, `maker_lineages` (`pending`) |
+| Maker cancels | intake | `maker_commands`, `maker_cutoffs`; a targeted cancel writes `maker_stops` |
+| Watcher finds the note on chain | core writer | `orders`, `maker_lineages` (`live`), `maker_events` |
+| Executor reserves a batch | core writer | `settlement_attempts`, `settlement_inputs` |
+| Settlement confirmed | core writer | `settled_transactions`, `settled_fills`, remainder row in `orders`, `maker_events` |
+
 ### Settlement and remainder recovery
 
 Keep this inside the existing executor/sync/startup paths. It is required so the gateway can report trustworthy outcomes and the fill details makers rebuild their notes from; it is not a second settlement service.
@@ -282,7 +408,7 @@ Record exact asset amounts and identifiers, order/maker attribution where establ
 
 Store each order's actual input/payment/remainder flows and each batch's reconciled asset residuals after verified commitment. Record settlement cost for the committed transaction; attribute it to a particular note only if that attribution is unambiguous or an allocation rule is agreed. If per-order surplus allocation is undefined, retain unallocated batch revenue linked to its orders; do not invent a split or imply a new maker charge. Voided fills realize no trading revenue or note-attributed settlement cost.
 
-The inspected executor pays settlement fees from the solver account and captures residual assets as surplus. Confirm this against the implementation branch; V1 adds recording, not a new fee policy.
+PR #34's executor pays settlement fees from the solver account and keeps residual assets as surplus; V1 adds recording, not a new fee policy.
 
 ### Event delivery and recovery
 
@@ -312,7 +438,7 @@ Keep the matching book in memory and perform the final authoritative check when 
 
 Use bounded stream buffers. Disconnect a slow event consumer and let it replay from its recoverable cursor. Preserve cancellation capacity under load: cancels have their own channel, are written first in every intake round, and commit on a session separate from the core writer. Return a clear failure when durable acceptance is unavailable. These are resource protections, not business order quotas.
 
-PostgreSQL transactions and WAL remove the need for a separate queue/WAL service, but still cost storage and commit latency. Start with indexed tables and batched cleanup. Measure peak command load, event volume, sync delay, admission latency and recovery lag before quoting capacity or a monthly cost.
+PostgreSQL transactions and WAL remove the need for a separate queue/WAL service, but still cost storage and commit latency. Start with indexed tables. Measure peak command load, event volume, sync delay, admission latency and recovery lag before quoting capacity or a monthly cost.
 
 Use fsync and synchronous commits for ordinary restart durability with intact storage. If the promise also covers loss of primary storage without losing acknowledged cancellations, use synchronous durable replication and fail over only to a sufficiently caught-up copy. Do not silently weaken that promise when a required copy is unavailable.
 
@@ -371,7 +497,7 @@ Correctness comes from these tested rules, not the choice of gRPC or macros. Eac
 1. **Protocol and PostgreSQL foundation.** Freeze the contract and durable transaction boundaries. Test retry conflicts, duplicate notes, same-note resubmission after cancel, cross-maker isolation, rollback, interrupted commit/notification, and a group-commit batch in which one command conflicts. Test concurrent event writers for committed ordering and rollback gaps.
 2. **Authenticated gateway and recovery.** Add unary operations, event streaming, heartbeat and the maker-filtered current-state read. Test key rotation/revocation including open streams, disconnect after send, duplicate replay, missing/malformed events, cancellation cutoffs and reserved exposure in the read, and replay from any earlier cursor. Do not present independently read pages as one atomic snapshot.
 3. **Private note activation.** Add validation and the maker-note watcher (batched note-ID check, incremental tag and nullifier sync, one activation commit per block). Test wrong script/network, malformed creator without account-control proof, tag collisions, both arrival orders, spent-before-activation, cancel-before-commit, interrupted cache update, stale sync, that public ingest never activates a private maker note, that a public maker note ends as a maker order whether ingest or the gateway sees it first, a second submit of an attributed lineage, and the RFQ router skipping maker orders.
-4. **Cancellation and matcher reservation.** Add scoped monotone cutoffs and whole-note reservations. Test cancel/reservation races, cancel 100 then 80, delayed submit 90, empty scope then delayed submit, market/direction isolation, targeted scope, inherited remainder sequence, no cancel stream event, lost cancel reply recovered by retry/status, cutoff visible in the current-state read and crash after cancel ACK. Also test the cutoff reaching the matcher before and after an activation's book update, reservation failing for a candidate handed over before the cutoff, inputs of a voided settlement staying Stopped, a cancel never updating order rows, unchanged cancel latency with 100,000 live orders, and a submit flood not delaying cancels or ingest commits.
+4. **Cancellation and reservation.** Add scoped monotone cutoffs and whole-note reservations. Test cancel/reservation races, cancel 100 then 80, delayed submit 90, empty scope then delayed submit, market/direction isolation, targeted scope, inherited remainder sequence, no cancel stream event, lost cancel reply recovered by retry/status, cutoff visible in the current-state read and crash after cancel ACK. Also test the cutoff reaching the matcher before and after an activation's book update, reservation failing for a candidate handed over before the cutoff, inputs of a voided settlement staying Stopped, a cancel never updating order rows, unchanged cancel latency with 100,000 live orders, and a submit flood not delaying cancels or ingest commits.
 5. **Executor recovery and reporting.** Add journal/reconciliation, transaction-specific Pending/Resolved reports, fill details and accounting only after verified settlement. Test chain-success-before-DB-write crash, timeout after node acceptance, definitive failure, external consumption while proving/submitting, two partial-fill candidates using one input, all late-cancel outcomes, repeated partial fills, rounding/accounting, the maker rebuilding payback and remainder notes from reported fill details, and maker reclaim with the solver offline.
 6. **Release rehearsal.** Exercise the complete pipeline under peak load, slow clients, database failure, restore and stale execution authority. Verify privacy and recovery procedures; measure latency. Enable production maker fills only after the complete path passes.
 

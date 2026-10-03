@@ -2,6 +2,7 @@
 //! remain SQLite and are not part of this module.
 
 pub mod error;
+pub mod maker_db;
 pub mod postgres_db;
 pub mod postgres_migrations;
 pub mod postgres_models;

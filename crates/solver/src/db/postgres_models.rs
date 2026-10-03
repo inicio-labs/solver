@@ -13,7 +13,7 @@ use miden_protocol::note::Note;
 
 use super::error::{DbError, DbResult};
 use super::postgres_schema::{orders, registered_tokens, settlement_attempts, settlement_inputs};
-use crate::types::{BookOrder, Order, OrderId, TokenId};
+use crate::types::{BookOrder, Order, OrderId, OrderKeys, TokenId};
 
 /// An unresolved settlement, stored as its snake_case name. Confirmed and
 /// released attempts are deleted.
@@ -70,6 +70,28 @@ impl OrderRow {
     }
 }
 
+/// The order keys every insert stores, computed from the note.
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = orders)]
+pub struct OrderKeyColumns {
+    pub lineage_id: Vec<u8>,
+    pub depth: i64,
+    pub market: Vec<u8>,
+    pub direction: Vec<u8>,
+}
+
+impl OrderKeyColumns {
+    pub fn of(note: &Note) -> DbResult<Self> {
+        let keys = OrderKeys::from_note(note)?;
+        Ok(Self {
+            lineage_id: keys.lineage_id,
+            depth: keys.depth.into(),
+            market: keys.market,
+            direction: keys.direction,
+        })
+    }
+}
+
 /// A fresh external order. PostgreSQL's identity column is never supplied.
 #[derive(Insertable, Debug, Clone)]
 #[diesel(table_name = orders)]
@@ -77,6 +99,8 @@ pub struct NewOrderRow {
     pub note_id: Vec<u8>,
     pub raw_data: Vec<u8>,
     pub arrival_unix: i64,
+    #[diesel(embed)]
+    pub keys: OrderKeyColumns,
 }
 
 /// A settlement child inherits the exact FIFO slot and arrival time of its
@@ -88,6 +112,8 @@ pub struct NewRemainderOrderRow {
     pub raw_data: Vec<u8>,
     pub arrival_unix: i64,
     pub priority_seq: i64,
+    #[diesel(embed)]
+    pub keys: OrderKeyColumns,
 }
 
 impl NewOrderRow {
@@ -103,6 +129,7 @@ impl NewOrderRow {
             note_id: note.id().to_bytes().to_vec(),
             raw_data: note.to_bytes(),
             arrival_unix: i64::try_from(arrival_unix)?,
+            keys: OrderKeyColumns::of(note)?,
         })
     }
 }

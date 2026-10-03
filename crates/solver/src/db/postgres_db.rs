@@ -13,15 +13,15 @@ use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
 use super::postgres_models::{
-    NewOrderRow, NewRemainderOrderRow, OrderRow, RegisteredTokenRow, SettlementAttemptRow,
-    SettlementInputRow, SettlementStatus,
+    NewOrderRow, NewRemainderOrderRow, OrderKeyColumns, OrderRow, RegisteredTokenRow,
+    SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
     orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
 };
 use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
 
-/// Rows per multi-row INSERT. The widest row (a remainder order) binds four
+/// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
 const INSERT_CHUNK_ROWS: usize = 1_000;
 
@@ -378,6 +378,7 @@ fn remainder_of(
         raw_data,
         arrival_unix: parent.arrival_unix,
         priority_seq: parent.priority_seq,
+        keys: OrderKeyColumns::of(&note)?,
     };
     let order = BookOrder {
         priority_seq: u64::try_from(parent.priority_seq)?,
@@ -1243,22 +1244,28 @@ mod tests {
     fn ingest_batch_beyond_the_bind_parameter_limit_is_chunked() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
-        // Three binds per row: 22,000 rows need 66,000 parameters, more than
+        // Seven binds per row: 10,000 rows need 70,000 parameters, more than
         // the 65,535 PostgreSQL accepts in one statement.
-        let rows: Vec<NewOrderRow> = (0..22_000_u32)
+        let rows: Vec<NewOrderRow> = (0..10_000_u32)
             .map(|index| NewOrderRow {
                 note_id: index.to_be_bytes().to_vec(),
                 raw_data: vec![1],
                 arrival_unix: 1,
+                keys: OrderKeyColumns {
+                    lineage_id: index.to_be_bytes().to_vec(),
+                    depth: 0,
+                    market: vec![1],
+                    direction: vec![1],
+                },
             })
             .collect();
         let inserted =
             conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &rows, 5))?;
-        assert_eq!(inserted.len(), 22_000);
+        assert_eq!(inserted.len(), 10_000);
         let priorities: HashSet<u64> = inserted.values().copied().collect();
         assert_eq!(
             priorities.len(),
-            22_000,
+            10_000,
             "every order gets its own FIFO slot"
         );
         assert_eq!(get_last_fetched_block_tx(conn)?, 5);

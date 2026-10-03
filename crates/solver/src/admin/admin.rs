@@ -4,13 +4,14 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use diesel::PgConnection;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::db::{self, DbPool};
+use crate::db::{self, DbPool, DbResult};
 use crate::price::SharedTokenMap;
 use crate::types::TokenId;
 
@@ -20,7 +21,7 @@ use crate::types::TokenId;
 /// We send via a channel rather than holding a `MidenClient` directly because
 /// the production `Client<FilesystemKeyStore>` is `!Send`, which conflicts
 /// with axum's requirement that handler state be `Send + Sync`. The subscribe
-/// task lives in the same `LocalSet` and owns the client; we just give it a
+/// task runs on the ingest thread, which owns the client; admin only holds a
 /// `Sender` (which is always `Send + Sync`).
 pub type SubscribeSender = mpsc::Sender<(TokenId, TokenId)>;
 
@@ -30,22 +31,24 @@ pub struct AdminState {
     /// Channel to the subscribe task. Admin sends one message per direction
     /// when a new token is registered; the subscribe task processes them in
     /// order. Failures only log — admin call still succeeds since the DB row
-    /// is the source of truth (the matcher will see the new token on its
-    /// next hydration).
+    /// is the source of truth, and a restart subscribes every registered pair.
     subscribe_tx: SubscribeSender,
     /// In-memory faucet-id → external-symbol cache, shared with `HttpPriceClient`.
     /// Mutated atomically alongside DB writes so the price client always sees
     /// the latest mapping without a DB read per fetch.
     token_map: SharedTokenMap,
+    /// One token mutation (database write + cache update) at a time.
+    write_order: Arc<Mutex<()>>,
 }
 
 impl AdminState {
-    pub fn new(
-        pool: DbPool,
-        subscribe_tx: SubscribeSender,
-        token_map: SharedTokenMap,
-    ) -> Self {
-        Self { pool, subscribe_tx, token_map }
+    pub fn new(pool: DbPool, subscribe_tx: SubscribeSender, token_map: SharedTokenMap) -> Self {
+        Self {
+            pool,
+            subscribe_tx,
+            token_map,
+            write_order: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Build the admin router.
@@ -67,59 +70,90 @@ impl AdminState {
             .with_state(self)
     }
 
-    pub fn load_tokens_from_db(&self) -> anyhow::Result<Vec<TokenId>> {
-        db::load_registered_tokens(&self.pool)
+    pub async fn load_tokens_from_db(&self) -> DbResult<Vec<TokenId>> {
+        self.pool
+            .read(db::postgres_db::load_registered_tokens_tx)
+            .await
     }
 
-    /// Update the in-memory symbol cache. Lock held briefly, no awaits.
-    fn set_cache(&self, token: TokenId, symbol: Option<String>) {
-        let mut map = crate::price::write_token_map(&self.token_map);
-        match symbol {
-            Some(s) => {
-                map.insert(token, s);
-            }
-            None => {
-                map.remove(&token);
-            }
-        }
-    }
-
-    async fn register_token(
+    /// Run one token mutation and keep the in-memory symbol cache equal to
+    /// the database. `operation` returns `(changed, value)`; when `changed`,
+    /// the cache entry for `token` becomes `symbol` (`None` removes it).
+    ///
+    /// Mutations run one at a time, each with its cache update, so the cache
+    /// changes in commit order. They run in their own task: an HTTP caller
+    /// that disconnects mid-request cannot leave a committed row without its
+    /// cache update.
+    async fn write_token<T, F>(
         &self,
-        new_token: TokenId,
-        external_symbol: Option<String>,
-    ) -> anyhow::Result<bool> {
-        let mut token_bytes = Vec::new();
-        new_token.write_into(&mut token_bytes);
-
-        let mut conn = self.pool.write_conn()?;
-        let inserted = db::register_token(&mut conn, &token_bytes, external_symbol.as_deref())?;
-
-        if inserted {
-            // Reflect the new mapping in the in-memory cache (if any).
-            if external_symbol.is_some() {
-                self.set_cache(new_token, external_symbol.clone());
+        token: TokenId,
+        symbol: Option<String>,
+        operation: F,
+    ) -> DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<(bool, T)> + Send + 'static,
+    {
+        let order = self.write_order.clone().lock_owned().await;
+        let (pool, token_map) = (self.pool.clone(), self.token_map.clone());
+        tokio::spawn(async move {
+            let _order = order;
+            let (changed, value) = pool.write(operation).await?;
+            if changed {
+                let mut map = crate::price::write_token_map(&token_map);
+                match symbol {
+                    Some(symbol) => map.insert(token, symbol),
+                    None => map.remove(&token),
+                };
             }
+            Ok(value)
+        })
+        .await?
+    }
 
-            // Tell the subscribe task to subscribe both directions of every
-            // existing pair involving the new token. Channel send failures
-            // are logged but don't fail the admin call — the DB row is the
-            // source of truth and a restart will reconcile.
-            let existing = self.load_tokens_from_db()?;
-            for token in &existing {
-                if *token != new_token {
-                    if let Err(e) = self.subscribe_tx.send((new_token, *token)).await {
-                        tracing::warn!(error = %e, "admin: subscribe channel send failed");
-                    }
-                    if let Err(e) = self.subscribe_tx.send((*token, new_token)).await {
-                        tracing::warn!(error = %e, "admin: subscribe channel send failed");
+    /// Register `token`; `true` when it is new. A new token is subscribed
+    /// against every registered token, in both directions.
+    async fn register_token(&self, token: TokenId, symbol: Option<String>) -> DbResult<bool> {
+        let db_symbol = symbol.clone();
+        let existing = self
+            .write_token(token, symbol, move |conn| {
+                if !db::postgres_db::register_token_tx(conn, token, db_symbol.as_deref())? {
+                    return Ok((false, None));
+                }
+                let existing = db::postgres_db::load_registered_tokens_tx(conn)?;
+                Ok((true, Some(existing)))
+            })
+            .await?;
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        // Its own task, so a caller that disconnects after the commit cannot
+        // skip the subscriptions (a retry would only answer "already
+        // registered"). Send failures only log: the database row is the
+        // source of truth and a restart re-subscribes every registered pair.
+        let subscribe_tx = self.subscribe_tx.clone();
+        tokio::spawn(async move {
+            for other in existing.into_iter().filter(|other| *other != token) {
+                for pair in [(token, other), (other, token)] {
+                    if let Err(error) = subscribe_tx.send(pair).await {
+                        tracing::warn!(%error, "admin: subscribe channel send failed");
                     }
                 }
             }
-        }
-
-        Ok(inserted)
+        });
+        Ok(true)
     }
+}
+
+/// Parse a hex token ID; only its canonical serialization is accepted.
+fn parse_token(hex_id: &str) -> Result<TokenId, StatusCode> {
+    let bytes = hex::decode(hex_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token =
+        TokenId::read_from(&mut SliceReader::new(&bytes)).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if token.to_bytes() != bytes {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(token)
 }
 
 // ── Auth Middleware ─────────────────────────────────────────────────────────
@@ -135,9 +169,7 @@ async fn require_bearer_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
     match provided {
-        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => {
-            Ok(next.run(req).await)
-        }
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -149,6 +181,7 @@ async fn list_tokens(
 ) -> Result<Json<Vec<TokenResponse>>, StatusCode> {
     let tokens = state
         .load_tokens_from_db()
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let response = tokens
@@ -169,15 +202,11 @@ async fn add_token(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<(StatusCode, &'static str), StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
+    let token = parse_token(&req.token_id)?;
     let inserted = state
         .register_token(token, req.external_symbol)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     if inserted {
         Ok((StatusCode::CREATED, "registered"))
     } else {
@@ -189,47 +218,42 @@ async fn update_token_symbol_handler(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let mut conn = state
-        .pool
-        .write_conn()
+    let token = parse_token(&req.token_id)?;
+    let symbol = req.external_symbol;
+    let db_symbol = symbol.clone();
+    let updated = state
+        .write_token(token, symbol, move |conn| {
+            let updated =
+                db::postgres_db::update_token_symbol_tx(conn, token, db_symbol.as_deref())?;
+            Ok((updated, updated))
+        })
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let updated = db::update_token_symbol(&mut conn, &bytes, req.external_symbol.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if !updated {
-        return Ok(StatusCode::NOT_FOUND);
-    }
-    state.set_cache(token, req.external_symbol);
-    Ok(StatusCode::OK)
+    Ok(if updated {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    })
 }
 
 async fn remove_token(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<TokenRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let bytes = hex::decode(&req.token_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token = TokenId::read_from(&mut SliceReader::new(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let mut conn = state
-        .pool
-        .write_conn()
+    let token = parse_token(&req.token_id)?;
+    let deleted = state
+        .write_token(token, None, move |conn| {
+            let deleted = db::postgres_db::unregister_token_tx(conn, token)?;
+            Ok((deleted, deleted))
+        })
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deleted = db::unregister_token(&mut conn, &bytes)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if deleted {
-        state.set_cache(token, None);
-        Ok(StatusCode::OK)
+    Ok(if deleted {
+        StatusCode::OK
     } else {
-        Ok(StatusCode::NOT_FOUND)
-    }
+        StatusCode::NOT_FOUND
+    })
 }
-
 
 #[derive(Deserialize)]
 pub struct TokenRequest {
@@ -247,15 +271,15 @@ pub struct TokenResponse {
 mod tests {
     use super::*;
     use axum_test::TestServer;
+    use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
     };
-    use miden_protocol::account::AccountId;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
-    use crate::db;
+    use crate::db::postgres_test::TestDb;
 
     fn test_token_a() -> TokenId {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()
@@ -265,51 +289,49 @@ mod tests {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
     }
 
-    fn unique_db_url() -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("file:admintest{}?mode=memory&cache=shared", n)
-    }
-
     const TEST_TOKEN: &str = "test-admin-token";
 
-    fn make_state_with_map() -> (Arc<AdminState>, SharedTokenMap) {
-        let pool = db::init_db(&unique_db_url(), 1).unwrap();
+    async fn make_state_with_map() -> (Arc<AdminState>, SharedTokenMap, TestDb) {
+        let test_db = TestDb::new().await.unwrap();
         // Tests don't exercise the subscribe path; create a channel whose
         // receiver is dropped immediately. Sends will fail but admin handlers
         // log and continue.
         let (subscribe_tx, _) = mpsc::channel::<(TokenId, TokenId)>(8);
         let token_map: SharedTokenMap = Arc::new(RwLock::new(HashMap::new()));
-        let state = Arc::new(AdminState::new(pool, subscribe_tx, token_map.clone()));
-        (state, token_map)
+        let state = Arc::new(AdminState::new(
+            test_db.pool.clone(),
+            subscribe_tx,
+            token_map.clone(),
+        ));
+        (state, token_map, test_db)
     }
 
-    pub fn make_state() -> Arc<AdminState> {
-        make_state_with_map().0
+    async fn make_state() -> (Arc<AdminState>, TestDb) {
+        let (state, _, db) = make_state_with_map().await;
+        (state, db)
     }
 
-    fn test_server() -> TestServer {
-        let state = make_state();
+    async fn test_server() -> (TestServer, TestDb) {
+        let (state, db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
             AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-admin-token"),
         );
-        server
+        (server, db)
     }
 
     /// Returns (server, cache) so tests can inspect the in-memory cache.
-    fn test_server_with_cache() -> (TestServer, SharedTokenMap) {
-        let (state, cache) = make_state_with_map();
+    async fn test_server_with_cache() -> (TestServer, SharedTokenMap, TestDb) {
+        let (state, cache, db) = make_state_with_map().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
             AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-admin-token"),
         );
-        (server, cache)
+        (server, cache, db)
     }
 
     fn token_hex(token: TokenId) -> String {
@@ -319,8 +341,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_created_first_time() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -330,8 +353,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_ok_on_duplicate() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.post("/admin/tokens").json(&body).await;
@@ -340,8 +364,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_bad_request_for_invalid_hex() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": "not_hex!" }))
@@ -350,8 +375,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_ok_when_found() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.delete("/admin/tokens").json(&body).await;
@@ -359,8 +385,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_not_found_when_missing() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         let res = server
             .delete("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -369,8 +396,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_without_bearer_token_return_unauthorized() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let server = TestServer::new(state.router(Some(token)));
         let res = server.get("/admin/tokens").await;
@@ -378,8 +406,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_with_wrong_token_return_unauthorized() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
@@ -391,16 +420,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn router_with_no_admin_token_returns_404() {
-        let state = make_state();
+        let (state, _db) = make_state().await;
         let server = TestServer::new(state.router(None));
         let res = server.get("/admin/tokens").await;
         res.assert_status(StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn list_tokens_returns_all_registered() {
-        let server = test_server();
+        let (server, _db) = test_server().await;
         server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -422,8 +453,9 @@ mod tests {
     // ── New: symbol-cache tests ────────────────────────────────────────────
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_with_symbol_persists_to_cache() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({
@@ -433,12 +465,16 @@ mod tests {
             .await;
         res.assert_status(StatusCode::CREATED);
         let map = cache.read().unwrap();
-        assert_eq!(map.get(&test_token_a()).map(String::as_str), Some("usd-coin"));
+        assert_eq!(
+            map.get(&test_token_a()).map(String::as_str),
+            Some("usd-coin")
+        );
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn patch_token_symbol_updates_cache_and_db() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         // Register without a symbol.
         server
             .post("/admin/tokens")
@@ -454,12 +490,16 @@ mod tests {
             .await;
         res.assert_status(StatusCode::OK);
         let map = cache.read().unwrap();
-        assert_eq!(map.get(&test_token_a()).map(String::as_str), Some("ethereum"));
+        assert_eq!(
+            map.get(&test_token_a()).map(String::as_str),
+            Some("ethereum")
+        );
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn patch_token_symbol_returns_404_for_unknown() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let res = server
             .patch("/admin/tokens")
             .json(&json!({
@@ -472,8 +512,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn delete_token_clears_cache_entry() {
-        let (server, cache) = test_server_with_cache();
+        let (server, cache, _db) = test_server_with_cache().await;
         let body = json!({
             "token_id": token_hex(test_token_a()),
             "external_symbol": "usd-coin"
@@ -487,5 +528,41 @@ mod tests {
             .await;
         res.assert_status(StatusCode::OK);
         assert!(!cache.read().unwrap().contains_key(&test_token_a()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn token_writes_update_the_cache_in_commit_order_despite_caller_abort() {
+        let (state, map, _db) = make_state_with_map().await;
+        let token = test_token_a();
+        assert!(state.register_token(token, None).await.unwrap());
+
+        // The first caller disconnects after its write started; its cache
+        // update must still land, and before the second write's.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .write_token(token, Some("first".into()), move |conn| {
+                    let _ = started_tx.send(());
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    db::postgres_db::update_token_symbol_tx(conn, token, Some("first"))?;
+                    Ok((true, ()))
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        state
+            .write_token(token, Some("second".into()), move |conn| {
+                db::postgres_db::update_token_symbol_tx(conn, token, Some("second"))?;
+                Ok((true, ()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            map.read().unwrap().get(&token).map(String::as_str),
+            Some("second")
+        );
     }
 }

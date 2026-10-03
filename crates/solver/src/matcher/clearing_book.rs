@@ -27,29 +27,35 @@ pub(crate) struct ClearingBook {
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
-    pub(super) fn apply(&mut self, update: BookUpdate) -> Result<(), ClearingError> {
+    pub(super) fn apply(&mut self, update: BookUpdate) {
         for id in update.removed {
             self.remove(id);
         }
-        for order in update.active {
-            self.insert(&order)?;
+        for order in &update.active {
+            self.insert_or_skip(order);
         }
-        Ok(())
     }
 
     /// Apply the updates queued at the start of the tick. New arrivals wait for
     /// the next receive, so a busy producer cannot postpone matching forever.
-    pub(super) fn apply_pending(
-        &mut self,
-        updates: &mut mpsc::Receiver<BookUpdate>,
-    ) -> Result<(), ClearingError> {
+    pub(super) fn apply_pending(&mut self, updates: &mut mpsc::Receiver<BookUpdate>) {
         for _ in 0..updates.len() {
             let Ok(update) = updates.try_recv() else {
                 break;
             };
-            self.apply(update)?;
+            self.apply(update);
         }
-        Ok(())
+    }
+
+    /// Index `order`, or leave it out of the live book if it cannot be
+    /// indexed: a malformed note, or a stale parent whose remainder already
+    /// holds its FIFO slot. One bad order must not stop matching for every
+    /// other one; it stays Active in the database and returns on next boot.
+    pub(super) fn insert_or_skip(&mut self, order: &BookOrder) {
+        if let Err(error) = self.insert(order) {
+            self.remove(order.id());
+            tracing::warn!(note_id = %order.id(), %error, "order left out of the live book");
+        }
     }
 
     fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
@@ -225,8 +231,11 @@ impl ClearingBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clearing::ReferencePrice;
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
+    use crate::matcher::MatcherError;
+    use crate::price::PriceData;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -406,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn worker_routes_an_unmatched_note_without_legacy_matcher() {
+    async fn worker_routes_only_after_executor_capacity_returns() {
         let mut rng = RandomCoin::new(Word::default());
         let order = fixture(false, 10, 18, 1, &mut rng);
         let pair = Order::from_book_order(&order).unwrap().index_key().0;
@@ -432,7 +441,13 @@ mod tests {
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -442,12 +457,99 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        let handover = tokio::time::timeout(Duration::from_secs(1), route_rx.recv())
+        // The first tick cannot clear, so it must not bypass internal
+        // matching by routing an order to an external DEX either.
+        snapshot_rx.changed().await.unwrap();
+        assert!(route_rx.try_recv().is_err());
+        assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let handover = tokio::time::timeout(Duration::from_secs(2), route_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(handover.items[0].note_id, order.id());
         assert!(exec_rx.try_recv().is_err());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_executor_queue_does_not_route_an_internal_cross_to_a_dex() {
+        let mut rng = RandomCoin::new(Word::default());
+        let seller = fixture(false, 11, 18, 1, &mut rng);
+        let buyer = fixture(true, 22, 10, 2, &mut rng);
+        let pair = Order::from_book_order(&seller).unwrap().index_key().0;
+        let (routing, mut route_rx) = routing_fixture(&seller);
+        let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                decimals: [(pair.0, 0), (pair.1, 0)].into_iter().collect(),
+            })
+            .is_ok());
+        let observed_at = now_millis();
+        let mut prices = crate::price::PreciseSnapshot::new();
+        for (token, price) in [(pair.0, "2"), (pair.1, "1")] {
+            prices.insert(
+                token,
+                PriceData {
+                    usd: price.parse().unwrap(),
+                    exact_reference: Some(ReferencePrice::from_decimal(price).unwrap()),
+                    source_updated_at_unix_ms: Some(observed_at),
+                    observed_at_unix_ms: observed_at,
+                },
+            );
+        }
+        let (_, prices_rx) = watch::channel(prices);
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices: prices_rx,
+            pairs: vec![pair],
+            config: ClearingConfig::default(),
+            max_price_age_ms: 1_000,
+            max_source_age_ms: 1_000,
+            max_source_skew_ms: 0,
+            routing: Some(routing),
+        };
+        let (_book_tx, book_rx) = mpsc::channel(1);
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        exec_tx
+            .try_send(ExecutionBatch {
+                filled_notes: Vec::new(),
+                group_ends: Vec::new(),
+            })
+            .unwrap();
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_matcher(
+            book_rx,
+            exec_tx,
+            Duration::from_secs(1),
+            snapshot_tx,
+            runtime,
+            cancel.clone(),
+        ));
+
+        snapshot_rx.changed().await.unwrap();
+        assert!(route_rx.try_recv().is_err());
+        assert_eq!(
+            snapshot_rx.borrow().len(),
+            2,
+            "orders stay live on a skipped tick"
+        );
+        assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let execution = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.filled_notes.len(), 2);
+        assert!(
+            route_rx.try_recv().is_err(),
+            "internal matches must not route"
+        );
         cancel.cancel();
         task.await.unwrap().unwrap();
     }
@@ -601,8 +703,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: vec![parent.id()],
             active: vec![child.clone()],
-        })
-        .unwrap();
+        });
         assert_eq!(admit(&book, false, 100)[0].order().id(), child.id());
     }
 
@@ -639,7 +740,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("book update channel closed"));
+        assert!(matches!(error, MatcherError::IngestStopped), "{error:?}");
     }
 
     #[test]
@@ -693,8 +794,8 @@ mod tests {
         .await
         .expect("invalid config must not wait for bootstrap");
         assert!(matches!(
-            result.unwrap_err().downcast_ref::<ClearingError>(),
-            Some(ClearingError::InvalidConfig)
+            result,
+            Err(MatcherError::Config(ClearingError::InvalidConfig))
         ));
     }
 
@@ -819,5 +920,28 @@ mod tests {
             .expect("matcher must stop even when the executor queue is full")
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn apply_skips_an_order_whose_fifo_slot_is_taken_and_keeps_matching() {
+        let mut rng = RandomCoin::new(Word::default());
+        // Same pair, price and priority: a remainder holds the slot a stale
+        // parent activation would also claim.
+        let holder = fixture(false, 11, 18, 5, &mut rng);
+        let stale = fixture(false, 11, 18, 5, &mut rng);
+        let other = fixture(true, 22, 10, 6, &mut rng);
+        assert_ne!(holder.id(), stale.id());
+
+        let mut book = ClearingBook::default();
+        book.apply(BookUpdate {
+            removed: Vec::new(),
+            active: vec![holder.clone(), stale.clone(), other.clone()],
+        });
+
+        assert!(book.orders.contains_key(&holder.id()));
+        assert!(book.orders.contains_key(&other.id()));
+        assert!(!book.orders.contains_key(&stale.id()));
+        let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
+        assert_eq!(indexed, 2, "the slot still belongs to the holder");
     }
 }

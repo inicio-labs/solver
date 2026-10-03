@@ -32,42 +32,48 @@ use miden_protocol::account::AccountType;
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::utils::Serializable;
 use miden_testing::MockChain;
-use solver::config::{
-    AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig,
-};
+use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, vault_balance, MockClientFactory};
+use common::{build_test_client, temp_paths, vault_balance, MockClientFactory, PgSchema};
 
-/// Read an order's status straight from the solver's SQLite DB (fresh
-/// read-only connection; WAL allows concurrent reads while the solver writes).
+/// Read an order's status using a fresh PostgreSQL connection.
 /// `None` = no row yet (not ingested) or DB not ready.
-fn order_status(db_path: &str, note_key: &[u8]) -> Option<String> {
-    use solver::db::schema::orders;
-    let mut conn = SqliteConnection::establish(db_path).ok()?;
-    orders::table
-        .filter(orders::note_id.eq(note_key))
-        .select(orders::status)
-        .first::<String>(&mut conn)
-        .optional()
-        .ok()
-        .flatten()
+async fn order_status(db_url: &str, note_key: &[u8]) -> Option<String> {
+    let url = db_url.to_owned();
+    let key = note_key.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use solver::db::postgres_schema::orders;
+        let mut conn = solver::db::postgres_migrations::connect(&url).ok()?;
+        orders::table
+            .filter(orders::note_id.eq(key))
+            .select(orders::status)
+            .first::<String>(&mut conn)
+            .optional()
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let pg = PgSchema::new().await?;
             // 1. Shared mock chain.
             let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
 
             // 2. USER client: USDC/ETH faucets, `alice` (PSWAP creator) and
             //    `dave` (external consumer — NOT the solver).
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
-            let mut user_client =
-                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?);
+            let mut user_client = TestClient::new(
+                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?,
+            );
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -75,29 +81,41 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
-            let (usdc, _) =
-                user_client.insert_account(AccountSetup::faucet(mode).auth_scheme(scheme)).await?;
-            let (eth, _) =
-                user_client.insert_account(AccountSetup::faucet(mode).auth_scheme(scheme)).await?;
-            let (alice, _) =
-                user_client.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
-            let (dave, _) =
-                user_client.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
+            let (usdc, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (eth, _) = user_client
+                .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
+                .await?;
+            let (alice, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
+            let (dave, _) = user_client
+                .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                .await?;
             let usdc_id = usdc.id();
             let eth_id = eth.id();
             let dave_id = dave.id();
-            println!("[test] alice={} dave={}", alice.id().to_hex(), dave_id.to_hex());
+            println!(
+                "[test] alice={} dave={}",
+                alice.id().to_hex(),
+                dave_id.to_hex()
+            );
             rpc.prove_block();
             user_client.sync_state().await?;
 
             // 3. Fund alice with USDC (to offer) and dave with ETH (to fill).
-            user_client.mint_and_consume(alice.id(), usdc_id, NoteType::Public).await?;
+            user_client
+                .mint_and_consume(alice.id(), usdc_id, NoteType::Public)
+                .await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("sync after alice mint: {e}"))?;
-            user_client.mint_and_consume(dave_id, eth_id, NoteType::Public).await?;
+            user_client
+                .mint_and_consume(dave_id, eth_id, NoteType::Public)
+                .await?;
             rpc.prove_block();
             user_client
                 .sync_state()
@@ -128,17 +146,20 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             // 5. Provision the solver account (throwaway client persists it).
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = TestClient::new(build_test_client(
-                    rpc.clone(),
-                    solver_keystore_path.clone(),
-                    solver_store_path.clone(),
-                )
-                .await?);
+                let mut sc = TestClient::new(
+                    build_test_client(
+                        rpc.clone(),
+                        solver_keystore_path.clone(),
+                        solver_store_path.clone(),
+                    )
+                    .await?,
+                );
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
-                let (acct, _) =
-                    sc.insert_account(AccountSetup::wallet(mode).auth_scheme(scheme)).await?;
+                let (acct, _) = sc
+                    .insert_account(AccountSetup::wallet(mode).auth_scheme(scheme))
+                    .await?;
                 acct.id()
             };
 
@@ -156,14 +177,16 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    the tag and discovers alice's PSWAP), triangular DISABLED and
             //    no reciprocal order → the solver tracks it but can never
             //    match/settle it. No race.
-            let solver_db = solver_temp.path().join("solver.sqlite3");
-            let solver_db_path = solver_db.to_string_lossy().into_owned();
+            let solver_db_path = pg.url.clone();
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
+                rpc: RpcConfig {
+                    endpoint: "http://unused".into(),
+                    timeout_ms: 1_000,
+                    prover_endpoint: None,
+                },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    app_db_path: solver_db_path.clone(),
                     executor_store_path: executor_store_path.clone(),
                     ingest_store_path: ingest_store_path.clone(),
                     read_pool_size: 2,
@@ -186,6 +209,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    verify_interval_ms: 5_000,
                     price_api_base_url: None,
                     price_query_port: 8080,
                     price_query_bind: "127.0.0.1".to_string(),
@@ -233,7 +257,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                 if solver_handle.is_finished() {
                     break;
                 }
-                if order_status(&solver_db_path, &note_key).as_deref() == Some("active") {
+                if order_status(&solver_db_path, &note_key).await.as_deref() == Some("active") {
                     tracked = true;
                     break;
                 }
@@ -245,7 +269,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    1 ETH in, 100 USDC out). Solver is NOT involved.
             let consumed_ok = if tracked {
                 let consume_request = TransactionRequestBuilder::new()
-                    .build_pswap_consume(&pswap_note, dave_id, AssetAmount::new(1).expect("valid amount"), AssetAmount::ZERO)
+                    .build_pswap_consume(
+                        &pswap_note,
+                        dave_id,
+                        AssetAmount::new(1).expect("valid amount"),
+                        AssetAmount::ZERO,
+                    )
                     .map_err(|e| anyhow::anyhow!("dave build_pswap_consume: {e}"))?;
                 Box::pin(user_client.submit_new_transaction(dave_id, consume_request))
                     .await
@@ -258,13 +287,13 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
 
             // 9. Phase 3: drive the chain until the solver's ingest syncs past
             //    the consumption and retires the order as terminal.
-            let mut final_status = order_status(&solver_db_path, &note_key);
+            let mut final_status = order_status(&solver_db_path, &note_key).await;
             if consumed_ok {
                 for _ in 0..600 {
                     if solver_handle.is_finished() {
                         break;
                     }
-                    final_status = order_status(&solver_db_path, &note_key);
+                    final_status = order_status(&solver_db_path, &note_key).await;
                     if final_status.as_deref() == Some("onchain_nullified") {
                         break;
                     }
@@ -318,8 +347,8 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
 
             // 11. Clean shutdown — bounded join, no orphan threads.
             cancel.cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
-                .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle).await;
             drop(user_temp);
             drop(solver_temp);
             verdict

@@ -53,7 +53,7 @@ Before direct-clearing hydration, ingestion syncs and replays included PSWAP not
 - `ingest`: recognize a linked remainder before ordinary note insertion, and observe on-chain parent nullifiers.
 - `matcher`: mark dispatched parents Inactive; apply complete outcome events immediately, matching only on the timer.
 
-The fresh `schema.sql` defines the new tables and priority index. It is not an in-place migration for a pre-existing solver database; deploying over one requires a separate migration or fresh database, consistent with the new-service rollout decision.
+This was the original SQLite design note. The application database now uses the PostgreSQL baseline in `crates/solver/migrations_postgres`; the obsolete SQLite `schema.sql` and migrations were removed. This document is historical, not an operator migration procedure.
 
 ## Verification
 

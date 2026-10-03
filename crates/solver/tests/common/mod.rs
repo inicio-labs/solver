@@ -10,10 +10,13 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use diesel::connection::SimpleConnection;
+use diesel::prelude::*;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::rpc::encryption::TransactionEncryptionKey;
@@ -26,6 +29,73 @@ use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::dsa::eddsa_25519_sha512::KeyExchangeKey;
 use miden_testing::MockChain;
 use tempfile::TempDir;
+
+static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
+
+/// One fresh PostgreSQL application schema for a full solver integration test.
+/// Each integration file has one solver test, so its process-local URL settings
+/// cannot race another test in the same process.
+pub struct PgSchema {
+    pub url: String,
+    base_url: String,
+    name: String,
+    prior_writer: Option<String>,
+    prior_reader: Option<String>,
+}
+
+impl PgSchema {
+    pub async fn new() -> Result<Self> {
+        let base_url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
+        let setup_url = base_url.clone();
+        let (name, url) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let sequence = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
+            let name = format!("solver_it_{}_{}_{}", std::process::id(), nonce, sequence);
+            let mut admin = solver::db::postgres_migrations::connect(&setup_url)?;
+            admin.batch_execute(&format!("CREATE SCHEMA {name}"))?;
+            let separator = if setup_url.contains('?') { '&' } else { '?' };
+            let url = format!("{setup_url}{separator}options=-csearch_path%3D{name}");
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            solver::db::postgres_migrations::migrate(&mut conn)?;
+            Ok((name, url))
+        })
+        .await??;
+        let prior_writer = std::env::var("SOLVER_DATABASE_URL").ok();
+        let prior_reader = std::env::var("SOLVER_READ_DATABASE_URL").ok();
+        std::env::set_var("SOLVER_DATABASE_URL", &url);
+        std::env::set_var("SOLVER_READ_DATABASE_URL", &url);
+        Ok(Self {
+            url,
+            base_url,
+            name,
+            prior_writer,
+            prior_reader,
+        })
+    }
+}
+
+impl Drop for PgSchema {
+    fn drop(&mut self) {
+        match &self.prior_writer {
+            Some(value) => std::env::set_var("SOLVER_DATABASE_URL", value),
+            None => std::env::remove_var("SOLVER_DATABASE_URL"),
+        }
+        match &self.prior_reader {
+            Some(value) => std::env::set_var("SOLVER_READ_DATABASE_URL", value),
+            None => std::env::remove_var("SOLVER_READ_DATABASE_URL"),
+        }
+        let base = self.base_url.clone();
+        let name = self.name.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(mut admin) = solver::db::postgres_migrations::connect(&base) {
+                let _ = admin.batch_execute(&format!("DROP SCHEMA {name} CASCADE"));
+            }
+        })
+        .join();
+    }
+}
 
 /// Build a `Client<FilesystemKeyStore>` backed by `MockRpcApi` + a tempdir-scoped
 /// SQLite store + keystore. Each test gets a fresh tempdir so they don't share
@@ -57,7 +127,10 @@ pub async fn build_test_client(
 /// validator attestation). Seed an unattested key instead: the mock never unseals,
 /// so any key bound to this chain's genesis works.
 async fn seed_encryption_key(client: &mut Client<FilesystemKeyStore>) -> Result<()> {
-    client.ensure_genesis_in_place().await.map_err(|e| anyhow!("genesis: {e}"))?;
+    client
+        .ensure_genesis_in_place()
+        .await
+        .map_err(|e| anyhow!("genesis: {e}"))?;
     let (genesis, _) = client
         .get_block_header_by_num(BlockNumber::GENESIS)
         .await
@@ -163,7 +236,9 @@ impl solver::ClientFactory for FailingExecutorFactory {
     }
 
     async fn build_executor(&self) -> Result<Client<FilesystemKeyStore>> {
-        Err(anyhow!("injected executor build failure (startup-failure test)"))
+        Err(anyhow!(
+            "injected executor build failure (startup-failure test)"
+        ))
     }
 
     fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
@@ -172,36 +247,42 @@ impl solver::ClientFactory for FailingExecutorFactory {
     }
 }
 
-/// Real-time analogue of [`wait_for`] for the L2 threaded model. The solver's
-/// ingest/executor threads run on their own real-time runtimes (the test's
-/// `start_paused` virtual clock cannot reach them), so we poll on wall-clock
-/// time instead of driving virtual time. Each iteration: check the predicate,
-/// then `prove_block()` to commit any pending submitted txs, then sleep
-/// `poll`. Bails after `max_iterations`.
-pub async fn wait_for_realtime<F>(
-    rpc: &MockRpcApi,
-    max_iterations: u32,
-    poll: Duration,
-    mut check: F,
+/// Wait for the executor to finish proving and submit a settlement before the
+/// test advances the mock chain. Proving empty blocks while the executor works
+/// can pass the transaction's expiry height before it is submitted.
+pub async fn wait_for_submitted_settlement<F>(
+    db_url: &str,
+    max_wait: Duration,
+    solver_stopped: F,
 ) -> Result<()>
 where
-    F: FnMut(&MockChain) -> bool,
+    F: Fn() -> bool,
 {
-    for _ in 0..max_iterations {
-        {
-            if check(&rpc.mock_chain.read()) {
-                return Ok(());
-            }
+    let started = std::time::Instant::now();
+    loop {
+        if solver_stopped() {
+            return Err(anyhow!("solver stopped before submitting the settlement"));
         }
-        rpc.prove_block();
-        tokio::time::sleep(poll).await;
+        let url = db_url.to_owned();
+        let submitted = tokio::task::spawn_blocking(move || -> Result<bool> {
+            use solver::db::postgres_schema::settlement_attempts;
+
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            // A prepared attempt is written only after proving, immediately
+            // before submission; it cannot be confirmed (and deleted) until
+            // the test advances the mock chain.
+            let count: i64 = settlement_attempts::table.count().get_result(&mut conn)?;
+            Ok(count > 0)
+        })
+        .await??;
+        if submitted {
+            return Ok(());
+        }
+        if started.elapsed() >= max_wait {
+            return Err(anyhow!("settlement was not submitted within {max_wait:?}"));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    if check(&rpc.mock_chain.read()) {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "wait_for_realtime timed out after {max_iterations} iterations"
-    ))
 }
 
 /// Poll for a chain-state predicate, deterministically driving virtual time
@@ -228,7 +309,9 @@ where
         }
         rpc.prove_block();
     }
-    Err(anyhow!("wait_for timed out after {max_iterations} iterations"))
+    Err(anyhow!(
+        "wait_for timed out after {max_iterations} iterations"
+    ))
 }
 
 /// Sum of fungible-asset balances of `faucet` held in `account_id`'s vault,

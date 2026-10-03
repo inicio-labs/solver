@@ -21,25 +21,29 @@ use miden_testing::MockChain;
 use solver::config::{EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, FailingExecutorFactory};
+use common::{build_test_client, temp_paths, FailingExecutorFactory, PgSchema};
 
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let _pg = PgSchema::new().await?;
             let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
 
             // Minimal solver account just to satisfy the config / start
             // signature (executor build fails before it's ever used).
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut sc = TestClient::new(build_test_client(
-                    rpc.clone(),
-                    solver_keystore_path.clone(),
-                    solver_store_path.clone(),
-                )
-                .await?);
+                let mut sc = TestClient::new(
+                    build_test_client(
+                        rpc.clone(),
+                        solver_keystore_path.clone(),
+                        solver_store_path.clone(),
+                    )
+                    .await?,
+                );
                 sc.ensure_genesis_in_place()
                     .await
                     .map_err(|e| anyhow::anyhow!("solver genesis: {e}"))?;
@@ -57,13 +61,15 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                 ingest_store: solver_temp.path().join("ingest_store.sqlite3"),
             });
 
-            let solver_db = solver_temp.path().join("solver.sqlite3");
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
+                rpc: RpcConfig {
+                    endpoint: "http://unused".into(),
+                    timeout_ms: 1_000,
+                    prover_endpoint: None,
+                },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    app_db_path: solver_db.to_string_lossy().into_owned(),
                     executor_store_path: solver_temp
                         .path()
                         .join("executor_store.sqlite3")
@@ -88,6 +94,7 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    verify_interval_ms: 5_000,
                     price_api_base_url: None,
                     price_query_port: 8080,
                     price_query_bind: "127.0.0.1".to_string(),

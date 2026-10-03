@@ -1,10 +1,14 @@
-//! DB module. The `models`/`schema` submodules and the core DB
-//! implementation ([`db`]) live in sibling files; this file only wires the
-//! submodules and re-exports the public surface so callers keep using
-//! `crate::db::{...}`.
+//! PostgreSQL application database. The two upstream Miden client stores
+//! remain SQLite and are not part of this module.
 
-pub mod models;
-pub mod schema;
+pub mod error;
+pub mod postgres_db;
+pub mod postgres_migrations;
+pub mod postgres_models;
+pub mod postgres_pool;
+pub mod postgres_schema;
+#[cfg(test)]
+pub mod postgres_test;
 
-mod db;
-pub use db::*;
+pub use error::{DbError, DbResult};
+pub use postgres_pool::PgPool as DbPool;

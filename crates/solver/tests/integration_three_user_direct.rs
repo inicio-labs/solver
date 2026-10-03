@@ -19,7 +19,8 @@ mod common;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use diesel::prelude::*;
 use miden_client::auth::AuthSchemeId;
 use miden_client::note::NoteType;
 use miden_client::testing::common::{AccountSetup, TestClient};
@@ -28,32 +29,90 @@ use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder}
 use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
-use solver::config::{
-    AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig,
-};
+use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
 use common::{
-    build_test_client, temp_paths, vault_balance, wait_for_realtime, MockClientFactory,
+    build_test_client, temp_paths, vault_balance, wait_for_submitted_settlement, MockClientFactory,
+    PgSchema,
 };
 
+#[derive(QueryableByName)]
+struct ActiveWriterCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+async fn wait_for_restarted_writer(db_url: &str, application_name: &str) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        let url = db_url.to_owned();
+        let name = application_name.to_owned();
+        let count = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            let row: ActiveWriterCount = diesel::sql_query(
+                "SELECT count(*)::bigint AS count FROM pg_stat_activity WHERE application_name = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .get_result(&mut conn)?;
+            Ok(row.count)
+        })
+        .await??;
+        if count == 1 {
+            return Ok(());
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            anyhow::bail!("restarted solver did not acquire its PostgreSQL writer session");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_confirmed_attempt(db_url: &str) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        let url = db_url.to_owned();
+        let confirmed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            use solver::db::postgres_schema::{orders, settlement_attempts};
+
+            // Confirmation retires the parents and deletes the attempt.
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            let unresolved: i64 = settlement_attempts::table.count().get_result(&mut conn)?;
+            let executed: i64 = orders::table
+                .filter(orders::status.eq("executed"))
+                .count()
+                .get_result(&mut conn)?;
+            Ok(unresolved == 0 && executed > 0)
+        })
+        .await??;
+        if confirmed {
+            return Ok(());
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            anyhow::bail!("restarted solver did not confirm the submitted settlement");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 // L2: the solver's ingest/executor clients run on their own OS-thread runtimes,
-// so the test's virtual clock can't drive them — this test runs on real time
-// and polls observable chain state (`wait_for_realtime`) instead of stepping
-// `tokio::time::advance`.
+// so the test uses real-time polling. Advance the mock chain only after the
+// executor submits, or empty blocks can expire a transaction during proving.
 #[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn three_user_direct_matching() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let pg = PgSchema::new().await?;
             // 1. Empty MockChain wrapped in MockRpcApi, shared by both Clients.
             let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
 
             // 2. USER Client: owns alice/bob/charlie + USDC/ETH faucets.
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
-            let mut user_client =
-                TestClient::new(build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path)
-                    .await?);
+            let mut user_client = TestClient::new(
+                build_test_client(rpc.clone(), user_keystore_path.clone(), user_store_path).await?,
+            );
             user_client
                 .ensure_genesis_in_place()
                 .await
@@ -86,23 +145,32 @@ async fn three_user_direct_matching() -> Result<()> {
                 charlie.id().to_hex(),
             );
 
+            rpc.prove_block();
+            user_client.sync_state().await?;
+
             // 3. Fund users via mint+consume → prove → sync. Each round commits
             //    one block; sync_state pulls the new state into the user Client.
-            user_client.mint_and_consume(alice.id(), usdc.id(), NoteType::Public).await?;
+            user_client
+                .mint_and_consume(alice.id(), usdc.id(), NoteType::Public)
+                .await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("user sync after alice mint: {e}"))?;
 
-            user_client.mint_and_consume(bob.id(), eth.id(), NoteType::Public).await?;
+            user_client
+                .mint_and_consume(bob.id(), eth.id(), NoteType::Public)
+                .await?;
             rpc.prove_block();
             user_client
                 .sync_state()
                 .await
                 .map_err(|e| anyhow::anyhow!("user sync after bob mint: {e}"))?;
 
-            user_client.mint_and_consume(charlie.id(), usdc.id(), NoteType::Public).await?;
+            user_client
+                .mint_and_consume(charlie.id(), usdc.id(), NoteType::Public)
+                .await?;
             rpc.prove_block();
             user_client
                 .sync_state()
@@ -195,12 +263,14 @@ async fn three_user_direct_matching() -> Result<()> {
             //    and the solver process reloads it on start.
             let (solver_temp, solver_keystore_path, solver_store_path) = temp_paths()?;
             let solver_id = {
-                let mut solver_client = TestClient::new(build_test_client(
-                    rpc.clone(),
-                    solver_keystore_path.clone(),
-                    solver_store_path.clone(),
-                )
-                .await?);
+                let mut solver_client = TestClient::new(
+                    build_test_client(
+                        rpc.clone(),
+                        solver_keystore_path.clone(),
+                        solver_store_path.clone(),
+                    )
+                    .await?,
+                );
                 solver_client
                     .ensure_genesis_in_place()
                     .await
@@ -226,8 +296,7 @@ async fn three_user_direct_matching() -> Result<()> {
                 keystore: solver_keystore_path.clone(),
             });
 
-            // 6. SolverConfig pointing at a per-test SQLite path.
-            let solver_db = solver_temp.path().join("solver.sqlite3");
+            // 6. SolverConfig; the application database is the isolated PostgreSQL schema.
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
@@ -237,7 +306,6 @@ async fn three_user_direct_matching() -> Result<()> {
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    app_db_path: solver_db.to_string_lossy().into_owned(),
                     executor_store_path,
                     ingest_store_path,
                     read_pool_size: 2,
@@ -260,6 +328,7 @@ async fn three_user_direct_matching() -> Result<()> {
                     debug_mode: false,
                     obs_port: 0,
                     readiness_freshness_secs: 60,
+                    verify_interval_ms: 5_000,
                     price_api_base_url: None,
                     price_query_port: 8080,
                     price_query_bind: "127.0.0.1".to_string(),
@@ -291,6 +360,9 @@ async fn three_user_direct_matching() -> Result<()> {
             // Both faucets have the same decimals, so the reference ratio is 100.
             let price_map: std::collections::HashMap<_, u64> =
                 [(usdc.id(), 100), (eth.id(), 10_000)].into_iter().collect();
+            let restart_factory = factory.clone();
+            let restart_config = config.clone();
+            let restart_price_map = price_map.clone();
             let mut solver_handle = tokio::task::spawn_local(async move {
                 solver::start(
                     factory,
@@ -320,15 +392,61 @@ async fn three_user_direct_matching() -> Result<()> {
             let eth_id = eth.id();
             let usdc_id = usdc.id();
             let initial_committed_count = rpc.mock_chain.read().committed_notes().len();
-            let wait_result = wait_for_realtime(
-                &rpc,
-                2000,
-                std::time::Duration::from_millis(100),
-                |chain| {
-                    vault_balance(chain, solver_id, usdc_id) >= 20
-                        && chain.committed_notes().len() >= initial_committed_count + 2
-                },
-            )
+            let wait_result: Result<()> = async {
+                wait_for_submitted_settlement(&pg.url, std::time::Duration::from_secs(900), || {
+                    solver_handle.is_finished()
+                })
+                .await?;
+
+                // Restart after submission but before the mock chain confirms
+                // the transaction. The new solver must reconcile the durable
+                // submitted attempt using the same PostgreSQL and client stores.
+                cancel.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
+                    .await
+                    .context("first solver did not stop after submission")???;
+                let restart_cancel = CancellationToken::new();
+                let restart_task_cancel = restart_cancel.clone();
+                let mut restarted = tokio::task::spawn_local(async move {
+                    solver::start(
+                        restart_factory,
+                        move |_sm, _key| {
+                            Ok(
+                                Box::new(solver::price::MockPriceClient::new(restart_price_map))
+                                    as Box<dyn solver::price::PriceClient + Send + Sync>,
+                            )
+                        },
+                        solver_id,
+                        restart_config,
+                        restart_task_cancel,
+                    )
+                    .await
+                });
+                let resumed: Result<()> = async {
+                    wait_for_restarted_writer(&pg.url, &format!("solver/{}", solver_id.to_hex()))
+                        .await?;
+                    if restarted.is_finished() {
+                        anyhow::bail!("restarted solver exited before chain confirmation");
+                    }
+                    rpc.prove_block();
+                    let chain = rpc.mock_chain.read();
+                    if vault_balance(&chain, solver_id, usdc_id) < 20
+                        || chain.committed_notes().len() < initial_committed_count + 2
+                    {
+                        anyhow::bail!("submitted settlement did not credit surplus and paybacks");
+                    }
+                    drop(chain);
+                    wait_for_confirmed_attempt(&pg.url).await?;
+                    Ok(())
+                }
+                .await;
+                restart_cancel.cancel();
+                let stopped =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), &mut restarted).await;
+                resumed?;
+                stopped.context("restarted solver did not stop cleanly")???;
+                Ok(())
+            }
             .await;
 
             // Compute the verdict WITHOUT `?`/`assert!` so the cleanup below
@@ -348,7 +466,9 @@ async fn three_user_direct_matching() -> Result<()> {
                 // (the two payback P2IDs).
                 let grown = chain_ro.committed_notes().len() - initial_committed_count;
                 if grown < 2 {
-                    anyhow::bail!("expected ≥2 new committed notes (alice+bob paybacks), got {grown}");
+                    anyhow::bail!(
+                        "expected ≥2 new committed notes (alice+bob paybacks), got {grown}"
+                    );
                 }
                 Ok(())
             })();
@@ -371,8 +491,11 @@ async fn three_user_direct_matching() -> Result<()> {
             // Always clean up: cancel + bounded join so no OS thread leaks
             // across test cases, regardless of pass/fail.
             cancel.cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
-                .await;
+            if !solver_handle.is_finished() {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), &mut solver_handle)
+                        .await;
+            }
             drop(user_temp);
             drop(solver_temp);
             verdict

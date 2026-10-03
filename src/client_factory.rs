@@ -71,7 +71,10 @@ impl solver::ClientFactory for ProdClientFactory {
         if let Some(url) = &self.prover_endpoint {
             builder = builder.prover(Arc::new(RemoteTransactionProver::new(url.clone())));
         }
-        builder.build().await.context("Failed to build executor Miden client")
+        builder
+            .build()
+            .await
+            .context("Failed to build executor Miden client")
     }
 
     /// Standalone gRPC client at the configured endpoint — the same node the
@@ -84,6 +87,9 @@ impl solver::ClientFactory for ProdClientFactory {
     fn rpc(&self) -> Result<Arc<dyn NodeRpcClient>> {
         let endpoint = Endpoint::try_from(self.endpoint.as_str())
             .map_err(|e| anyhow::anyhow!("Failed to parse endpoint: {}", e))?;
-        Ok(Arc::new(VerifyingRpcClient::new(GrpcClient::new(&endpoint, self.timeout_ms))))
+        Ok(Arc::new(VerifyingRpcClient::new(GrpcClient::new(
+            &endpoint,
+            self.timeout_ms,
+        ))))
     }
 }

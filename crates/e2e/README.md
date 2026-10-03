@@ -10,8 +10,10 @@ It talks to devnet via `ClientBuilder::for_devnet()`, which wires the devnet RPC
 (`rpc.devnet.miden.io`) **and** the remote prover (`tx-prover.devnet.miden.io`),
 so proofs are offloaded to the network — no heavy local proving.
 
-All state lives under `./e2e/` (SQLite stores, keystores, `provisioned.json`,
-the generated `solver.devnet.toml`). These are gitignored.
+Client state lives under `./e2e/` (SQLite stores, keystores,
+`provisioned.json`, and the generated `solver.devnet.toml`). The solver's
+application state lives in a separate PostgreSQL database/schema; it is not
+written under `./e2e/`.
 
 ## Commands
 
@@ -26,7 +28,13 @@ cargo run -p e2e --release -- provision
 cargo run -p e2e --release -- load --rounds 1
 
 # 3. Run the solver in-process against devnet (deterministic fixed prices — no
-#    CoinGecko key needed). Reports the solver balance delta = captured spread.
+#    CoinGecko key needed). First provision a fresh PostgreSQL application
+#    schema; use distinct migration, writer, and reader roles in deployment.
+export SOLVER_MIGRATION_DATABASE_URL='postgresql://migration-role@host/database'
+cargo run -p solver-bin --release -- migrate-db
+export SOLVER_DATABASE_URL='postgresql://writer-role@host/database'
+export SOLVER_READ_DATABASE_URL='postgresql://reader-role@host/database'
+#    Reports the solver balance delta = captured spread.
 cargo run -p e2e --release -- run --secs 180
 
 # 2b. HAND-OFF (you drive): mint tokens to your own wallet so you can create

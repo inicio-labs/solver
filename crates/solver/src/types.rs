@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
 use miden_protocol::account::AccountId;
+use miden_protocol::errors::NoteError;
 use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use std::sync::Arc;
@@ -17,14 +17,16 @@ pub type Amount = u64;
 /// Invalid state detected while preparing, storing, or recovering a settlement.
 #[derive(Debug, Error)]
 pub enum SettlementError {
-    #[error("settlement input belongs to a different transaction")]
-    InputTransactionMismatch,
+    #[error("settlement has no inputs")]
+    NoInputs,
+    #[error("settlement lists the same parent order twice")]
+    DuplicateParent,
+    #[error("settlement input order is missing")]
+    MissingInputOrder,
+    #[error("settlement child is not a valid remainder of its parent")]
+    InvalidRemainder,
     #[error("settlement input order is not active")]
     InputOrderNotActive,
-    #[error("settlement child ID does not match its note")]
-    ChildIdMismatch,
-    #[error("settlement cannot be confirmed from status {0}")]
-    InvalidConfirmationStatus(String),
     #[error("expected payback {0} is absent from the executed outputs")]
     MissingPayback(NoteId),
     #[error("expected remainder {0} is absent from the executed outputs")]
@@ -76,7 +78,9 @@ pub fn now_unix() -> UnixSecs {
 /// previous solver attempt whose DB bookkeeping we lost). No further
 /// processing — the matcher's hydration query already filters
 /// `status = 'active'`, so terminal rows are excluded automatically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stored as its snake_case name (`as_str`, derived by `strum`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum OrderStatus {
     Active,
     Settling,
@@ -85,24 +89,18 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OrderStatus::Active => "active",
-            OrderStatus::Settling => "settling",
-            OrderStatus::Executed => "executed",
-            OrderStatus::OnchainNullified => "onchain_nullified",
-        }
+    pub fn as_str(self) -> &'static str {
+        self.into()
     }
+}
 
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "active" => Some(OrderStatus::Active),
-            "settling" => Some(OrderStatus::Settling),
-            "executed" => Some(OrderStatus::Executed),
-            "onchain_nullified" => Some(OrderStatus::OnchainNullified),
-            _ => None,
-        }
-    }
+/// A note that cannot be traded as a PSWAP order.
+#[derive(Debug, Error)]
+pub enum OrderError {
+    #[error("note is not a PSWAP order")]
+    NotPswap(#[from] NoteError),
+    #[error("order has zero amount (offered={offered}, requested={requested})")]
+    ZeroAmount { offered: u64, requested: u64 },
 }
 
 /// An order extracted from a PSWAP note.
@@ -120,9 +118,8 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn from_note(note: &Note) -> Result<Self> {
-        let pswap =
-            PswapNote::try_from(note).map_err(|e| anyhow!("Failed to parse PSWAP note: {}", e))?;
+    pub fn from_note(note: &Note) -> Result<Self, OrderError> {
+        let pswap = PswapNote::try_from(note)?;
 
         let offered_asset = pswap.offered_asset();
         let offered_faucet_id = offered_asset.faucet_id();
@@ -136,9 +133,10 @@ impl Order {
         let min_fill_step = pswap.storage().min_fill_step().as_u64();
 
         if offered_amount == 0 || requested_amount == 0 {
-            return Err(anyhow!(
-                "order has zero amount (offered={offered_amount}, requested={requested_amount})"
-            ));
+            return Err(OrderError::ZeroAmount {
+                offered: offered_amount,
+                requested: requested_amount,
+            });
         }
 
         Ok(Order {

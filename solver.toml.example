@@ -25,13 +25,13 @@ account_id = "0x<your_solver_account_id_hex>"
 # Filesystem keystore directory holding the solver account's Falcon key.
 # Relative paths resolve against the process working directory.
 keystore_path = "./solver_keystore"
-# Three distinct SQLite paths. MIGRATION: the prior single `store_path` is now
-# three explicit required keys — use distinct files for each (sharing one file
-# reintroduces the app-DB/executor-store overload this split removed).
-app_db_path = "./solver_app.sqlite3"              # Diesel app DB (orders/tokens/sync)
+# The application database is PostgreSQL. Set SOLVER_DATABASE_URL for its
+# writer role and SOLVER_READ_DATABASE_URL for a read-only role in the process
+# environment; do not put credentials in this file. Only the Miden client
+# stores below remain SQLite, and they must use different files.
 executor_store_path = "./executor_store.sqlite3"  # executor miden-client store (signs)
 ingest_store_path = "./ingest_store.sqlite3"      # keyless ingest miden-client store
-# Concurrent SQLite read connections (matcher hydration, admin queries).
+# Concurrent PostgreSQL read connections (matcher hydration, public APIs).
 # Defaults to 4 if omitted.
 read_pool_size = 4
 
@@ -64,10 +64,13 @@ admin_port = 3001
 # warning is logged if it is set.
 # debug_mode = false
 # Observability HTTP server port (binds 127.0.0.1 only). Exposes
-# `/health` (liveness — always 200) and `/readyz` (readiness — 200 if DB is
-# reachable AND last sync < readiness_freshness_secs ago). No auth.
+# `/health` (liveness), `/readyz` (database reachable, writer ownership, sync freshness),
+# and `/metrics` (Prometheus text counters and gauges). No auth.
 # Defaults to 9090.
 # obs_port = 9090
+# While the executor cannot settle (no fee headroom, node RPC or PostgreSQL
+# unavailable) it pauses and re-checks this often. Defaults to 5000.
+# verify_interval_ms = 5000
 # How fresh the last successful sync must be for /readyz to return 200.
 # Defaults to 60s. Bump if chain block time + RPC latency exceeds 60s
 # under normal conditions.

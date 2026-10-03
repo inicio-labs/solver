@@ -417,9 +417,11 @@ async fn release_held(
     pool.write_book(book_tx, move |conn| {
         let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
         db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
-        let mut update = db::postgres_db::active_book_update_tx(conn, orders)?;
-        update.removed.extend(consumed);
-        Ok(update)
+        // `write_book` keeps only the orders that are still live.
+        Ok(BookUpdate {
+            removed: consumed.into_iter().collect(),
+            active: orders,
+        })
     })
     .await?;
     tracing::info!(returned, dropped, "held orders returned to the matcher");
@@ -2142,6 +2144,7 @@ mod recovery_tests {
                     priority_seq: 1,
                     arrival_unix: 1,
                     note: Arc::new(note.clone()),
+                    maker: None,
                 })
                 .collect();
             let adapter = chain(&notes, consumed, fail_lookup);

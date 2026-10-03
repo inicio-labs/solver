@@ -309,6 +309,7 @@ pub async fn start(
             .engine
             .clearing_max_source_skew_secs
             .saturating_mul(1_000),
+        maker_facts: Some(channels.maker_fact_rx),
     };
 
     // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's

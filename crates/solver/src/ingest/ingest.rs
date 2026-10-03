@@ -279,6 +279,7 @@ impl SyncResult {
                 priority_seq: 0,
                 arrival_unix,
                 note: Arc::new(note.clone()),
+                maker: None,
             });
         }
 
@@ -748,7 +749,7 @@ pub mod tests {
             .await
             .unwrap();
         let first = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -756,7 +757,7 @@ pub mod tests {
             .await
             .unwrap();
         let second = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
@@ -766,7 +767,7 @@ pub mod tests {
             .await
             .unwrap();
         assert!(pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -788,7 +789,7 @@ pub mod tests {
         // The remainder is live on chain whoever created it: it is ingested
         // with its parent's FIFO slot, but our settlement stays unconfirmed.
         let live = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -813,7 +814,7 @@ pub mod tests {
         assert!(update.active.is_empty());
         assert!(update.removed.contains(&parent.id()));
         let live = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -841,7 +842,7 @@ pub mod tests {
         assert!(update.active.is_empty());
         assert!(update.removed.contains(&child_id));
         assert!(pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -872,7 +873,7 @@ pub mod tests {
             1
         );
         assert!(pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap()
             .is_empty());
@@ -1110,7 +1111,7 @@ pub mod tests {
         .await
         .unwrap();
         let before: HashMap<NoteId, u64> = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap()
             .into_iter()
@@ -1142,7 +1143,7 @@ pub mod tests {
             0
         );
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_tx)
+            pool.read(db::postgres_db::load_live_orders_tx)
                 .await
                 .unwrap()
                 .len(),
@@ -1166,7 +1167,7 @@ pub mod tests {
             50
         );
         let after = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         assert_eq!(after.len(), 2_500);

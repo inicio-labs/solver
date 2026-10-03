@@ -955,7 +955,12 @@ impl PgPool {
         F: FnOnce(&mut PgConnection) -> DbResult<BookUpdate> + Send + 'static,
     {
         let _publish = self.publish_order.lock().await;
-        let update = self.write(operation).await?;
+        let update = self
+            .write(move |conn| {
+                let update = operation(conn)?;
+                super::postgres_db::live_book_update_tx(conn, update)
+            })
+            .await?;
         if !update.is_empty() {
             sender
                 .send(update)

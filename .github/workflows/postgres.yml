@@ -45,6 +45,7 @@ jobs:
             crates/solver/src/admin/admin.rs crates/solver/src/config.rs \
             crates/solver/src/executor/executor.rs crates/solver/src/ingest/ingest.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
+            crates/solver/src/matcher/maker_book.rs \
             crates/solver/src/obs.rs \
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs \
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \

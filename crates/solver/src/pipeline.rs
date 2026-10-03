@@ -12,6 +12,7 @@ use crate::admin::AdminState;
 use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
+use crate::maker::MakerFact;
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, SharedTokenMap};
@@ -191,6 +192,11 @@ pub struct PipelineChannels {
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
+    /// Maker control lane (maker intake → matcher, ADR 0003). Unbounded so
+    /// the intake never waits for the matcher: each fact is one command the
+    /// intake already committed, and the matcher reads the lane first.
+    pub maker_fact_tx: mpsc::UnboundedSender<MakerFact>,
+    pub maker_fact_rx: mpsc::UnboundedReceiver<MakerFact>,
 }
 
 pub fn create_channels() -> PipelineChannels {
@@ -212,6 +218,7 @@ pub fn create_channels() -> PipelineChannels {
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let (quotes_tx, quotes_rx) = watch::channel(Arc::new(QuotesSnapshot::new()));
     let (route_tx, route_rx) = mpsc::channel(PIPELINE_CHANNEL_BUF);
+    let (maker_fact_tx, maker_fact_rx) = mpsc::unbounded_channel();
     PipelineChannels {
         quotes_tx,
         quotes_rx,
@@ -229,6 +236,8 @@ pub fn create_channels() -> PipelineChannels {
         exec_rx,
         subscribe_tx,
         subscribe_rx,
+        maker_fact_tx,
+        maker_fact_rx,
     }
 }
 
@@ -422,11 +431,20 @@ async fn reconcile_clearing_book(
     pool: &db::DbPool,
     client: &mut dyn MidenClient,
 ) -> Result<matcher::ClearingBootstrap> {
-    let (mut orders, decimals) = pool
+    let backfilled = pool.write(db::postgres_db::backfill_order_keys_tx).await?;
+    if backfilled > 0 {
+        tracing::info!(
+            backfilled,
+            "filled order keys of orders stored before maker support"
+        );
+    }
+    // Cutoffs only rise, so reading them after the orders can only stop more.
+    let (mut orders, decimals, cutoffs) = pool
         .read(|conn| {
-            let orders = db::postgres_db::load_active_orders_tx(conn)?;
+            let orders = db::postgres_db::load_live_orders_tx(conn)?;
             let decimals = db::postgres_db::load_token_decimals_tx(conn)?;
-            Ok((orders, decimals))
+            let cutoffs = db::maker_db::load_cutoffs_tx(conn)?;
+            Ok((orders, decimals, cutoffs))
         })
         .await?;
     let notes: Vec<_> = orders
@@ -445,7 +463,11 @@ async fn reconcile_clearing_book(
         .await?;
         orders.retain(|order| !consumed.contains(&order.id()));
     }
-    Ok(matcher::ClearingBootstrap { orders, decimals })
+    Ok(matcher::ClearingBootstrap {
+        orders,
+        decimals,
+        cutoffs,
+    })
 }
 
 #[cfg(test)]
@@ -532,7 +554,7 @@ mod tests {
         let pool = &test_db.pool;
         let ids = persist_clearing_notes(pool).await;
         let before = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         let mut client = MockMidenClient::new();
@@ -543,7 +565,7 @@ mod tests {
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_tx)
+            pool.read(db::postgres_db::load_live_orders_tx)
                 .await
                 .unwrap()
                 .len(),
@@ -561,7 +583,7 @@ mod tests {
         client.fail_consumed_check = true;
         assert!(reconcile_clearing_book(&pool, &mut client).await.is_err());
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_tx)
+            pool.read(db::postgres_db::load_live_orders_tx)
                 .await
                 .unwrap()
                 .len(),

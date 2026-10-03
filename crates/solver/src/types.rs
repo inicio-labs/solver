@@ -7,7 +7,7 @@ use miden_standards::note::PswapNote;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::maker::{direction_key, market_key, LineageId};
+use crate::maker::{direction_key, market_key, LineageId, MakerTag};
 
 /// Faucet ID identifying a token.
 pub type TokenId = AccountId;
@@ -29,7 +29,7 @@ pub enum SettlementError {
     MissingInputOrder,
     #[error("settlement child is not a valid remainder of its parent")]
     InvalidRemainder,
-    #[error("settlement input order is not active")]
+    #[error("settlement input order is not live")]
     InputOrderNotActive,
     #[error("expected payback {0} is absent from the executed outputs")]
     MissingPayback(NoteId),
@@ -80,8 +80,8 @@ pub fn now_unix() -> UnixSecs {
 /// `OnchainNullified` is terminal: ingest or executor observed that the
 /// note's nullifier is on-chain (consumed by another party, or by a
 /// previous solver attempt whose DB bookkeeping we lost). No further
-/// processing — the matcher's hydration query already filters
-/// `status = 'active'`, so terminal rows are excluded automatically.
+/// processing — the matcher hydrates from the `live_orders` view, which
+/// admits only `status = 'active'`, so terminal rows are excluded.
 /// Stored as its snake_case name (`as_str`, derived by `strum`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -90,6 +90,10 @@ pub enum OrderStatus {
     Settling,
     Executed,
     OnchainNullified,
+    /// A maker order a cancel stopped, recorded when a write that happens
+    /// anyway (insertion, release) finds it below a cutoff. Liveness is read
+    /// through `live_orders`, never from this column alone.
+    Stopped,
 }
 
 impl OrderStatus {
@@ -201,6 +205,10 @@ pub struct BookOrder {
     /// First durable observation time. Re-feeds and remainders preserve it.
     pub arrival_unix: UnixSecs,
     pub note: Arc<Note>,
+    /// Set when a maker claimed the order's lineage. Filled in from the
+    /// database by every book-changing transaction (`write_book`) and by
+    /// startup hydration; `None` elsewhere.
+    pub maker: Option<MakerTag>,
 }
 
 impl BookOrder {
@@ -252,6 +260,7 @@ impl FilledNote {
             priority_seq: self.priority_seq,
             arrival_unix: self.arrival_unix,
             note: self.note.clone(),
+            maker: None,
         }
     }
 }

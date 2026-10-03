@@ -13,12 +13,14 @@ use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
 use super::postgres_models::{
-    NewOrderRow, NewRemainderOrderRow, OrderKeyColumns, OrderRow, RegisteredTokenRow,
-    SettlementAttemptRow, SettlementInputRow, SettlementStatus,
+    maker_tag, LiveOrderRow, NewOrderRow, NewRemainderOrderRow, OrderKeyColumns, OrderRow,
+    RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
-    orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
+    live_orders, maker_lineages, makers, orders, registered_tokens, settlement_attempts,
+    settlement_inputs, sync_state,
 };
+use crate::maker::MakerTag;
 use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
 
 /// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
@@ -88,11 +90,12 @@ pub fn existing_note_ids_tx(
         .collect())
 }
 
-pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
-    let rows: Vec<OrderRow> = orders::table
-        .filter(orders::status.eq(OrderStatus::Active.as_str()))
-        .order(orders::priority_seq.asc())
-        .select(OrderRow::as_select())
+/// Every order that can trade now, through the one liveness rule, with maker
+/// tags: startup hydration of the matcher.
+pub fn load_live_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
+    let rows: Vec<LiveOrderRow> = live_orders::table
+        .order(live_orders::priority_seq.asc())
+        .select(LiveOrderRow::as_select())
         .load(conn)?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
@@ -106,31 +109,90 @@ pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>
     Ok(result)
 }
 
-pub fn active_book_update_tx(
+/// Pass every order a book-changing transaction activates through the one
+/// liveness rule, inside that transaction (`PgPool::write_book` calls this
+/// for every update). Orders that are not live are dropped from the update:
+/// rows no longer Active, and maker orders below a cutoff or stopped, which
+/// are stored Stopped here since this write happens anyway. Live orders gain
+/// their maker tag.
+pub fn live_book_update_tx(
     conn: &mut PgConnection,
-    candidates: Vec<BookOrder>,
+    mut update: BookUpdate,
 ) -> DbResult<BookUpdate> {
-    let ids: Vec<_> = candidates
+    if update.active.is_empty() {
+        return Ok(update);
+    }
+    let ids: Vec<Vec<u8>> = update
+        .active
         .iter()
         .map(|order| order.id().to_bytes().to_vec())
         .collect();
-    if ids.is_empty() {
-        return Ok(BookUpdate::default());
-    }
-    let active: HashSet<Vec<u8>> = orders::table
-        .filter(orders::note_id.eq_any(ids))
-        .filter(orders::status.eq(OrderStatus::Active.as_str()))
-        .select(orders::note_id)
-        .load::<Vec<u8>>(conn)?
+    let live: HashMap<Vec<u8>, Option<MakerTag>> = live_orders::table
+        .filter(live_orders::note_id.eq_any(&ids))
+        .select((
+            live_orders::note_id,
+            live_orders::maker_id,
+            live_orders::root_seq,
+        ))
+        .load::<(Vec<u8>, Option<i64>, Option<i64>)>(conn)?
         .into_iter()
+        .map(|(id, maker_id, root_seq)| Ok((id, maker_tag(maker_id, root_seq)?)))
+        .collect::<DbResult<_>>()?;
+    let excluded: Vec<Vec<u8>> = ids
+        .into_iter()
+        .filter(|id| !live.contains_key(id))
         .collect();
-    Ok(BookUpdate {
-        removed: Vec::new(),
-        active: candidates
-            .into_iter()
-            .filter(|order| active.contains(order.id().to_bytes().as_slice()))
-            .collect(),
-    })
+    if !excluded.is_empty() {
+        // Only a maker order can be Active yet excluded by the rule.
+        diesel::update(
+            orders::table
+                .filter(orders::note_id.eq_any(&excluded))
+                .filter(orders::status.eq(OrderStatus::Active.as_str())),
+        )
+        .set(orders::status.eq(OrderStatus::Stopped.as_str()))
+        .execute(conn)?;
+    }
+    update
+        .active
+        .retain_mut(|order| match live.get(order.id().to_bytes().as_slice()) {
+            Some(tag) => {
+                order.maker = *tag;
+                true
+            }
+            None => false,
+        });
+    Ok(update)
+}
+
+/// Fill the order keys of unfinished rows stored before the maker migration,
+/// so a lineage a maker claims later applies to them too. Run at startup,
+/// before hydration; rows that cannot be parsed keep NULL and are never maker
+/// orders.
+pub fn backfill_order_keys_tx(conn: &mut PgConnection) -> DbResult<usize> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = orders::table
+        .filter(orders::lineage_id.is_null())
+        .filter(
+            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+        )
+        .select((orders::note_id, orders::raw_data))
+        .load(conn)?;
+    let mut filled = 0;
+    for (note_id, raw_data) in rows {
+        let keys = Note::read_from(&mut SliceReader::new(&raw_data))
+            .map_err(DbError::from)
+            .and_then(|note| OrderKeyColumns::of(&note));
+        match keys {
+            Ok(keys) => {
+                filled += diesel::update(orders::table.find(&note_id))
+                    .set(&keys)
+                    .execute(conn)?;
+            }
+            Err(error) => {
+                tracing::warn!(note_id = %hex::encode(&note_id), %error, "stored order has no order keys");
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// Retire orders whose notes are consumed on chain. A consumed note is spent
@@ -150,7 +212,11 @@ pub fn mark_orders_onchain_nullified_tx(
     sorted.dedup();
     Ok(
         diesel::update(orders::table.filter(orders::note_id.eq_any(sorted)).filter(
-            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+            orders::status.eq_any([
+                OrderStatus::Active.as_str(),
+                OrderStatus::Settling.as_str(),
+                OrderStatus::Stopped.as_str(),
+            ]),
         ))
         .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
         .execute(conn)?,
@@ -191,10 +257,32 @@ pub fn prepare_settlement_tx(
     if locked.len() != parent_ids.len() {
         return Err(SettlementError::MissingInputOrder.into());
     }
-    if locked
-        .iter()
-        .any(|parent| parent.status != OrderStatus::Active.as_str())
-    {
+    // Serialize with cancels: lock the control rows of the makers that own
+    // these inputs, found from the locked rows (an attribution can arrive
+    // after the matcher picked a candidate), in maker-ID order. A cancel
+    // raising a cutoff takes the same lock, so either it sees this
+    // reservation as exposure or this check sees its cutoff.
+    let owners: Vec<i64> = orders::table
+        .inner_join(
+            maker_lineages::table.on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+        )
+        .filter(orders::note_id.eq_any(&parent_ids))
+        .select(maker_lineages::maker_id)
+        .distinct()
+        .load(conn)?;
+    if !owners.is_empty() {
+        makers::table
+            .filter(makers::maker_id.eq_any(&owners))
+            .order(makers::maker_id.asc())
+            .for_no_key_update()
+            .select(makers::maker_id)
+            .load::<i64>(conn)?;
+    }
+    let live: i64 = live_orders::table
+        .filter(live_orders::note_id.eq_any(&parent_ids))
+        .count()
+        .get_result(conn)?;
+    if usize::try_from(live)? != parent_ids.len() {
         return Err(SettlementError::InputOrderNotActive.into());
     }
     let parents: HashMap<&[u8], &OrderRow> = locked
@@ -384,6 +472,7 @@ fn remainder_of(
         priority_seq: u64::try_from(parent.priority_seq)?,
         arrival_unix: u64::try_from(parent.arrival_unix)?,
         note: std::sync::Arc::new(note),
+        maker: None,
     };
     Ok((row, order))
 }

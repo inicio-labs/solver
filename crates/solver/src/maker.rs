@@ -71,10 +71,10 @@ impl CutoffScope {
         }
     }
 
-    /// Whether an order trading `offered` for `requested` is in this scope.
-    pub fn covers(&self, offered: TokenId, requested: TokenId) -> bool {
-        (self.market.is_empty() || self.market == market_key(offered, requested))
-            && (self.direction.is_empty() || self.direction == direction_key(offered, requested))
+    /// Whether an order with these keys (see [`OrderKeys`]) is in this scope.
+    pub fn covers(&self, market: &[u8], direction: &[u8]) -> bool {
+        (self.market.is_empty() || self.market == market)
+            && (self.direction.is_empty() || self.direction == direction)
     }
 }
 
@@ -245,12 +245,18 @@ mod tests {
     fn scopes_cover_their_market_and_direction_only() {
         let x = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
         let y = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
-        assert!(CutoffScope::all().covers(x, y));
-        assert!(CutoffScope::market(y, x).covers(x, y));
-        assert!(CutoffScope::market(x, y).covers(y, x));
-        assert!(CutoffScope::direction(x, y).covers(x, y));
-        assert!(!CutoffScope::direction(x, y).covers(y, x));
-        assert!(!CutoffScope::market(x, x).covers(x, y));
+        let covers = |scope: CutoffScope, offered, requested| {
+            scope.covers(
+                &market_key(offered, requested),
+                &direction_key(offered, requested),
+            )
+        };
+        assert!(covers(CutoffScope::all(), x, y));
+        assert!(covers(CutoffScope::market(y, x), x, y));
+        assert!(covers(CutoffScope::market(x, y), y, x));
+        assert!(covers(CutoffScope::direction(x, y), x, y));
+        assert!(!covers(CutoffScope::direction(x, y), y, x));
+        assert!(!covers(CutoffScope::market(x, x), x, y));
     }
 
     #[test]

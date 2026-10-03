@@ -40,7 +40,9 @@ pub fn issue_api_key_tx(
     maker_id: MakerId,
     key_hash: &[u8],
 ) -> DbResult<Option<i64>> {
-    if lock_maker(conn, maker_id)?.is_none() {
+    let exists = diesel::select(diesel::dsl::exists(makers::table.find(maker_id)))
+        .get_result::<bool>(conn)?;
+    if !exists {
         return Ok(None);
     }
     Ok(Some(
@@ -283,6 +285,27 @@ fn settling_in_lineage(
     Ok(u64::try_from(settling)?)
 }
 
+/// Every cancel-all barrier: startup hydration of the matcher's cutoffs.
+pub fn load_cutoffs_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, CutoffScope, u64)>> {
+    maker_cutoffs::table
+        .select((
+            maker_cutoffs::maker_id,
+            maker_cutoffs::market,
+            maker_cutoffs::direction,
+            maker_cutoffs::cutoff,
+        ))
+        .load::<(i64, Vec<u8>, Vec<u8>, i64)>(conn)?
+        .into_iter()
+        .map(|(maker_id, market, direction, cutoff)| {
+            Ok((
+                maker_id,
+                CutoffScope { market, direction },
+                u64::try_from(cutoff)?,
+            ))
+        })
+        .collect()
+}
+
 /// The three V1 events (frozen; ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -324,13 +347,18 @@ pub fn append_event_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::postgres_db::insert_orders_batch_tx;
+    use crate::db::postgres_db::{
+        backfill_order_keys_tx, insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx,
+        prepare_settlement_tx,
+    };
     use crate::db::postgres_migrations;
-    use crate::db::postgres_models::NewOrderRow;
+    use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
     use crate::db::postgres_schema::live_orders;
     use crate::db::postgres_test::TestSchema;
     use crate::types::OrderKeys;
+    use crate::types::{BookOrder, BookUpdate, SettlementError};
     use anyhow::Result;
+    use diesel::connection::SimpleConnection;
     use miden_protocol::account::AccountId;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::note::{Note, NoteType};
@@ -341,6 +369,8 @@ mod tests {
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteAttachment, PswapNoteStorage};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
 
     fn tokens() -> (AccountId, AccountId) {
         (
@@ -764,6 +794,192 @@ mod tests {
         assert!(revoke_api_key_tx(conn, key_id)?);
         assert!(!revoke_api_key_tx(conn, key_id)?);
         assert_eq!(authenticate_tx(conn, &hash)?, None);
+        Ok(())
+    }
+
+    fn reserve(conn: &mut PgConnection, tx: u8, parent: &Note) -> DbResult<()> {
+        prepare_settlement_tx(
+            conn,
+            &SettlementAttemptRow {
+                tx_id: vec![tx],
+                tx_result: vec![tx],
+                status: "prepared".into(),
+            },
+            &[SettlementInputRow {
+                tx_id: vec![tx],
+                parent_note_id: parent.id().to_bytes().to_vec(),
+                child_note_id: None,
+                child_note_data: None,
+            }],
+        )
+    }
+
+    fn connect(fixture: &TestSchema) -> Result<PgConnection> {
+        let mut conn = postgres_migrations::connect(&std::env::var("SOLVER_TEST_DATABASE_URL")?)?;
+        conn.batch_execute(&format!("SET search_path TO {}", fixture.name))?;
+        Ok(conn)
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_cancel_waits_for_a_reservation_in_flight_and_reports_it() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let quote = note(1);
+        run(&mut fixture.conn, alpha, "s1", 1, submit(&quote))?;
+        ingest(&mut fixture.conn, &[&quote])?;
+
+        // The reservation holds the maker control row until it commits.
+        let held = Arc::new(Barrier::new(2));
+        let mut reserver = connect(&fixture)?;
+        let reserving = {
+            let (held, quote) = (held.clone(), quote.clone());
+            std::thread::spawn(move || {
+                reserver.transaction::<_, DbError, _>(|conn| {
+                    reserve(conn, 1, &quote)?;
+                    held.wait();
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+            })
+        };
+        held.wait();
+        let started = Instant::now();
+        let mut canceller = connect(&fixture)?;
+        let (reply, _) = run(
+            &mut canceller,
+            alpha,
+            "c2",
+            2,
+            cancel_all(CutoffScope::all()),
+        )?;
+        reserving.join().expect("reserver panicked")?;
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the cancel waited"
+        );
+        assert_eq!(
+            reply,
+            CommandReply::Committed(CommandResult::Applied {
+                cutoff: 2,
+                settling: 1
+            }),
+            "the reservation that won is reported as exposure"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_committed_cancel_fails_every_later_reservation() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let (quote, stopped, public) = (note(1), note(2), note(3));
+        run(conn, alpha, "s1", 1, submit(&quote))?;
+        run(conn, alpha, "s5", 5, submit(&stopped))?;
+        ingest(conn, &[&quote, &stopped, &public])?;
+        run(conn, alpha, "c2", 2, cancel_all(CutoffScope::all()))?;
+        let lineage_id = OrderKeys::from_note(&stopped)?.lineage_id;
+        run(
+            conn,
+            alpha,
+            "x6",
+            6,
+            MakerCommand::CancelOrder { lineage_id },
+        )?;
+
+        for (tx, parent) in [(1, &quote), (2, &stopped)] {
+            let result = conn.transaction::<_, DbError, _>(|conn| reserve(conn, tx, parent));
+            assert!(matches!(
+                result,
+                Err(DbError::Settlement(SettlementError::InputOrderNotActive))
+            ));
+        }
+        conn.transaction::<_, DbError, _>(|conn| reserve(conn, 3, &public))?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn book_updates_carry_only_live_orders_and_their_tags() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let (cut, kept, public) = (note(1), note(2), note(3));
+        run(conn, alpha, "s1", 1, submit(&cut))?;
+        run(conn, alpha, "s5", 5, submit(&kept))?;
+        run(conn, alpha, "c3", 3, cancel_all(CutoffScope::all()))?;
+        ingest(conn, &[&cut, &kept, &public])?;
+
+        let candidates = [&cut, &kept, &public].map(|note| BookOrder {
+            priority_seq: 1,
+            arrival_unix: 1,
+            note: Arc::new((*note).clone()),
+            maker: None,
+        });
+        let update = conn.transaction::<_, DbError, _>(|conn| {
+            live_book_update_tx(
+                conn,
+                BookUpdate {
+                    removed: Vec::new(),
+                    active: candidates.to_vec(),
+                },
+            )
+        })?;
+        let tags: Vec<_> = update
+            .active
+            .iter()
+            .map(|order| (order.id(), order.maker))
+            .collect();
+        let tag = MakerTag {
+            maker_id: alpha,
+            root_seq: 5,
+        };
+        assert_eq!(tags, [(kept.id(), Some(tag)), (public.id(), None)]);
+        let status: String = orders::table
+            .find(cut.id().to_bytes().to_vec())
+            .select(orders::status)
+            .first(conn)?;
+        assert_eq!(
+            status,
+            OrderStatus::Stopped.as_str(),
+            "stored Stopped by a write that happened anyway"
+        );
+
+        let hydrated: Vec<_> = load_live_orders_tx(conn)?
+            .into_iter()
+            .map(|order| (order.id(), order.maker))
+            .collect();
+        assert_eq!(hydrated, tags);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn order_keys_are_backfilled_for_rows_stored_before_the_migration() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let (older, finished) = (note(1), note(2));
+        ingest(conn, &[&older, &finished])?;
+        diesel::update(orders::table)
+            .set((
+                orders::lineage_id.eq(None::<Vec<u8>>),
+                orders::depth.eq(None::<i64>),
+                orders::market.eq(None::<Vec<u8>>),
+                orders::direction.eq(None::<Vec<u8>>),
+            ))
+            .execute(conn)?;
+        diesel::update(orders::table.find(finished.id().to_bytes().to_vec()))
+            .set(orders::status.eq(OrderStatus::Executed.as_str()))
+            .execute(conn)?;
+        assert_eq!(backfill_order_keys_tx(conn)?, 1, "only unfinished rows");
+        let lineage: Option<Vec<u8>> = orders::table
+            .find(older.id().to_bytes().to_vec())
+            .select(orders::lineage_id)
+            .first(conn)?;
+        assert_eq!(lineage, Some(OrderKeys::from_note(&older)?.lineage_id));
+        assert_eq!(backfill_order_keys_tx(conn)?, 0);
         Ok(())
     }
 

@@ -2,6 +2,7 @@
 //! submodule and re-exports its public surface.
 
 pub(crate) mod clearing_book;
+mod maker_book;
 mod error;
 mod matcher;
 pub(crate) use clearing_book::ClearingBootstrap;

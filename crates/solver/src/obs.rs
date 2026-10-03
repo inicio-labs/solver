@@ -121,7 +121,8 @@ async fn metrics(
          solver_db_fatal_shutdown_requested {}\n\
          solver_matcher_book_channel_remaining {}\n\
          solver_matcher_executor_channel_remaining {}\n\
-         solver_matcher_executor_full_skipped_ticks_total {}\n",
+         solver_matcher_executor_full_skipped_ticks_total {}\n\
+         solver_matcher_maker_lane_backlog {}\n",
         pool.read_total,
         pool.read_errors,
         pool.write_total,
@@ -137,6 +138,7 @@ async fn metrics(
         book_capacity,
         exec_capacity,
         crate::matcher::skipped_executor_full_ticks(),
+        crate::matcher::maker_lane_backlog(),
     );
     for (metric, latency) in [
         ("solver_db_read_pool_wait_seconds", &pool.read_wait),

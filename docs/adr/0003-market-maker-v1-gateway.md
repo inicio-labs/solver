@@ -24,6 +24,7 @@ Adopt the following V1 contract as the working design. Sections that say *recomm
 ### Agreed scope
 
 - Use gRPC with API keys over TLS. Commands, reads and heartbeats are unary calls; events use one server stream on the same client channel.
+- TLS terminates at a proxy or load balancer in front of the solver, holding an automatically renewed certificate (for example a cloud load balancer with a managed certificate). The gateway listens only on a private address, in plain HTTP/2. The proxy must support gRPC streams, and its idle timeout must exceed the heartbeat interval so it never cuts the event stream.
 - PostgreSQL is the authoritative business store for commands, cancellation cutoffs, orders, settlements, notes, accounting and events. Keep the existing in-memory book.
 - Makers assign command sequences. A cancellation at sequence C stops matching root submissions with sequence < C, including delayed submissions and all their remainders.
 - One request contains one command. No atomic replacement or cancel-and-submit.
@@ -130,7 +131,7 @@ Each command is independent: a successful cancellation remains applied if a subs
 
 #### Durable events
 
-Recommended minimal V1 feed, pending maker agreement. Maker-initiated commands have durable replies; the stream reports solver-discovered order and settlement changes:
+The V1 feed is frozen at three events; V2 may extend it. Maker-initiated commands have durable replies; the stream reports solver-discovered order and settlement changes:
 
 - **OrderStatus:** the order becomes Live, is rejected after an earlier Accepted response, or becomes unavailable because its note was verified spent elsewhere. Include order/version and reason. A confirmed remainder that becomes Live later uses this event; if the settlement result already reports it Live, do not repeat the transition.
 - **SettlementPending:** one event per transaction once its recoverable transaction record is durable and broadcast can be attempted. Include batch/transaction ID, input order/notes and versions, intended fill amounts and clearing price. Candidate selection, proving attempts and retries do not each produce events.
@@ -474,6 +475,7 @@ Each event insert shares the business transaction that produced it. A PostgreSQL
 - **A stream event per cancel.** It repeats the unary reply for a single-process maker; a maker with several processes on one identity polls `GetMakerState` instead.
 - **Copying maker metadata onto each remainder row.** Keying it by the PSWAP lineage gives the same inheritance with no copy, and makes a public note found by ingest first and the gateway second (or the reverse) a maker order without a conversion step or a race.
 - **Event cleanup in V1.** Cursor-acknowledged cleanup adds per-session authority and retention floors; a TTL needs a recovery path for expired cursors. V1 keeps every event, timestamped, and adds expiry only when volume requires it.
+- **TLS inside the solver (rustls in tonic).** We would own certificate files, renewal and reloads. Kept as the fallback for a single host without a proxy.
 - **Atomic replace or multi-command batch.** V1 uses one command per request; cancelling one order and submitting a new note are separate outcomes. This avoids a premature atomic-readiness contract for a replacement note.
 - **Full recovery-grade snapshot.** Ordinary replay covers missed solver events; a small GetMakerState read shows current solver state. A gapless historical snapshot across unbounded, concurrently changing pages would require a stronger protocol and is not part of this V1 design.
 - **A stream event for every acknowledgement and worker stage.** Accepted and Applied already have stored command results. Push solver-discovered order and transaction transitions; retain routine import/sync/proving attempts in internal diagnostics.
@@ -509,7 +511,6 @@ These are proposed reviewable changes, not six independent production releases. 
 
 Before implementation of the corresponding feature, agree:
 
-- Whether makers accept the minimal event feed above: OrderStatus, SettlementPending and SettlementResolved (no cancel event).
 - Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
 - When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.

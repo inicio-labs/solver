@@ -37,6 +37,7 @@ diesel::table! {
         parent_note_id -> Binary,
         child_note_id -> Nullable<Binary>,
         child_note_data -> Nullable<Binary>,
+        fill_amount -> Nullable<BigInt>,
     }
 }
 

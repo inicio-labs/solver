@@ -182,14 +182,67 @@ message OrderStatus {
   string reason = 4;
 }
 
-// A settlement transaction is durable and may be broadcast. Fill details
-// arrive with the executor's reporting.
-message SettlementPending {
-  bytes tx_id = 1;
+// One of your orders consumed by a settlement transaction, and the fill.
+// With your original note, the SDK rebuilds both output notes exactly:
+//   payback   = PswapNote::payback_note(consumer,
+//                 PswapNoteAttachment::new(payback_amount, order_id, depth))
+//   remainder = PswapNote::remainder_note(consumer,
+//                 PswapNoteAttachment::new(offered_paid, order_id, depth),
+//                 remaining_offered, remaining_requested)
+// where `order_id` is your note's order ID and `consumer` the solver account.
+message InputFill {
+  // The consumed note: this version of the order.
+  bytes note_id = 1;
+  bytes lineage_id = 2;
+  // The fill round: the consumed note's depth plus one.
+  uint32 depth = 3;
+  // Requested-asset units paid to you (the payback note's amount).
+  uint64 payback_amount = 4;
+  // Offered-asset units paid out of the order.
+  uint64 offered_paid = 5;
+  // What remains in the remainder note; both 0 when fully filled.
+  uint64 remaining_offered = 6;
+  uint64 remaining_requested = 7;
+  // The remainder note; empty when fully filled.
+  bytes remainder_note_id = 8;
 }
 
-// A settlement transaction was verified committed or definitively voided.
+// A settlement transaction reserved some of your orders and may be
+// broadcast. Nothing is filled until SettlementResolved says committed.
+message SettlementPending {
+  bytes tx_id = 1;
+  // The intended fills.
+  repeated InputFill fills = 2;
+}
+
+enum ResultingStatus {
+  RESULTING_STATUS_UNSPECIFIED = 0;
+  // Fully filled: nothing remains.
+  RESULTING_STATUS_FILLED = 1;
+  // The remainder, or the returned input, is live.
+  RESULTING_STATUS_LIVE = 2;
+  // The remainder, or the returned input, is stopped by your cancel.
+  RESULTING_STATUS_STOPPED = 3;
+  // The remainder, or the returned input, was spent elsewhere.
+  RESULTING_STATUS_SPENT = 4;
+}
+
+message InputResult {
+  bytes note_id = 1;
+  bytes lineage_id = 2;
+  ResultingStatus status = 3;
+}
+
+// A settlement transaction was verified committed, or definitively voided
+// (it can never commit; nothing was filled).
 message SettlementResolved {
   bytes tx_id = 1;
   bool committed = 2;
+  // When committed: the block, the solver account that consumed your notes
+  // (the `consumer` above) and the actual fills.
+  uint32 commit_block = 3;
+  bytes consumer_account_id = 4;
+  repeated InputFill fills = 5;
+  // Where each of your orders stands now.
+  repeated InputResult results = 6;
 }

@@ -67,17 +67,18 @@ pub trait MidenClient {
     /// rejected settlement is released, and by startup recovery.
     async fn check_consumed_notes(&mut self, notes: &[Note]) -> ChainResult<HashSet<NoteId>>;
 
-    /// Whether the node has committed transaction `tx_id` of `account_id` in
-    /// blocks `from..=to`. This is the only evidence a settlement landed:
-    /// note IDs cannot prove it, because another filler consuming the same
-    /// parent with the same amount produces identical payback/remainder IDs.
+    /// The block in `from..=to` in which the node committed transaction
+    /// `tx_id` of `account_id`, if it did. This is the only evidence a
+    /// settlement landed: note IDs cannot prove it, because another filler
+    /// consuming the same parent with the same amount produces identical
+    /// payback/remainder IDs.
     async fn transaction_committed(
         &mut self,
         account_id: AccountId,
         tx_id: TransactionId,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> ChainResult<bool>;
+    ) -> ChainResult<Option<BlockNumber>>;
 
     /// Fetch a public fungible faucet's on-chain metadata `(decimals, ticker)`
     /// by id. Returns `None` if the account isn't a public faucet / doesn't
@@ -392,9 +393,9 @@ impl MidenClient for MidenClientAdapter {
         tx_id: TransactionId,
         from: BlockNumber,
         to: BlockNumber,
-    ) -> ChainResult<bool> {
+    ) -> ChainResult<Option<BlockNumber>> {
         if from > to {
-            return Ok(false);
+            return Ok(None);
         }
         let records = self
             .rpc
@@ -402,7 +403,8 @@ impl MidenClient for MidenClientAdapter {
             .await?;
         Ok(records
             .iter()
-            .any(|record| record.transaction_header.id() == tx_id))
+            .find(|record| record.transaction_header.id() == tx_id)
+            .map(|record| record.block_num))
     }
 
     async fn subscribe_pair(&mut self, offered: TokenId, requested: TokenId) -> ChainResult<()> {
@@ -607,6 +609,7 @@ pub mod tests {
                     parent_note_id: parent.id().to_bytes().to_vec(),
                     child_note_id: Some(child.id().to_bytes().to_vec()),
                     child_note_data: Some(child.to_bytes()),
+                    fill_amount: None,
                 }],
             )
         })?;
@@ -645,7 +648,13 @@ pub mod tests {
         // retired, so confirmation retires the parent and activates nothing.
         let consumed_child: HashSet<_> = [child.id()].into_iter().collect();
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            db::postgres_db::confirm_settlement_tx(conn, &tx_id, &consumed_child)
+            db::postgres_db::confirm_settlement_tx(
+                conn,
+                &tx_id,
+                &consumed_child,
+                BlockNumber::GENESIS,
+                crate::db::postgres_db::test_consumer(),
+            )
         })?;
         assert!(update.active.is_empty());
         assert!(update.removed.contains(&parent.id()));
@@ -726,6 +735,7 @@ pub mod tests {
                     parent_note_id: parent.id().to_bytes().to_vec(),
                     child_note_id: Some(child.id().to_bytes().to_vec()),
                     child_note_data: Some(child.to_bytes()),
+                    fill_amount: None,
                 }],
             )
         })
@@ -807,7 +817,13 @@ pub mod tests {
         // already-ingested remainder is not announced to the matcher again.
         let update = pool
             .write(move |conn| {
-                db::postgres_db::confirm_settlement_tx(conn, &tx_id, &HashSet::new())
+                db::postgres_db::confirm_settlement_tx(
+                    conn,
+                    &tx_id,
+                    &HashSet::new(),
+                    BlockNumber::GENESIS,
+                    crate::db::postgres_db::test_consumer(),
+                )
             })
             .await
             .unwrap();
@@ -963,8 +979,8 @@ pub mod tests {
             _tx_id: TransactionId,
             _from: BlockNumber,
             _to: BlockNumber,
-        ) -> ChainResult<bool> {
-            Ok(false)
+        ) -> ChainResult<Option<BlockNumber>> {
+            Ok(None)
         }
 
         async fn subscribe_pair(

@@ -211,6 +211,9 @@ pub struct SettlementInputRow {
     pub parent_note_id: Vec<u8>,
     pub child_note_id: Option<Vec<u8>>,
     pub child_note_data: Option<Vec<u8>>,
+    /// Requested-asset units this input is filled with (its payback amount);
+    /// `None` only for attempts prepared before fills were recorded.
+    pub fill_amount: Option<i64>,
 }
 
 #[derive(Queryable, Selectable, Insertable, Debug, Clone)]

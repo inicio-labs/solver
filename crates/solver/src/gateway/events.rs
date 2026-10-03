@@ -202,7 +202,10 @@ mod tests {
     fn body(note: u8) -> proto::EventBody {
         proto::EventBody {
             kind: Some(event_body::Kind::SettlementPending(
-                proto::SettlementPending { tx_id: vec![note] },
+                proto::SettlementPending {
+                    tx_id: vec![note],
+                    fills: Vec::new(),
+                },
             )),
         }
     }

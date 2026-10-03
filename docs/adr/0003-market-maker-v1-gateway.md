@@ -27,7 +27,7 @@ Adopt the following V1 contract as the working design. Sections that say *recomm
 - PostgreSQL is the authoritative business store for commands, cancellation cutoffs, orders, settlements, notes, accounting and events. Keep the existing in-memory book.
 - Makers assign command sequences. A cancellation at sequence C stops matching root submissions with sequence < C, including delayed submissions and all their remainders.
 - One request contains one command. No atomic replacement or cancel-and-submit.
-- Keep the existing clearing/allocation policy. A maker order is a row in the same `orders` table as a public order, with the same FIFO priority, plus maker metadata: maker ID and root submission sequence. The metadata is stored once per PSWAP lineage, the on-chain identity (creator account, `order_id` = serial number element 1) that the root note and every remainder carry, so each remainder inherits it without copying. The note ID changes every round; the PSWAP `depth` is the order's version.
+- Keep the existing clearing/allocation policy. A maker order is a row in the same `orders` table as a public order, with the same FIFO priority, plus maker metadata: maker ID and root submission sequence. The metadata is stored once per PSWAP lineage, the on-chain identity that the root note and every remainder carry: the creator account plus serial-number elements 0–2 (element 1 is the SDK's `order_id`; only element 3 changes per round). Each remainder therefore inherits the metadata without copying, and two different orders can share a lineage only if their creator deliberately reuses a serial number, which affects only that creator. The note ID changes every round; the PSWAP `depth` is the order's version.
 - The gateway accepts private PSWAP notes primarily, and public ones too. A note submitted through the gateway is a maker order whichever path inserts its order row (the maker-note watcher or public ingest), and every maker rule applies to it and its remainders.
 - Record actual earned fees/surplus and settlement costs only after the relevant transaction is verified committed on-chain. A new maker fee schedule or revenue-distribution policy is outside V1.
 - No business rate limits or live-order caps. Message sizes, concurrent work and memory still need finite bounds.
@@ -380,7 +380,7 @@ Before implementation of the corresponding feature, agree:
 - Whether makers accept the minimal event feed above: OrderStatus, SettlementPending and SettlementResolved (no cancel event).
 - Intake batch size and window, channel capacities, and the maker-note watcher's polling fallback and freshness bound. Measure before fixing them.
 - Live means durable eligibility (recommended for simplicity) or confirmed matcher installation.
-- Targeted cancel identity: proposed as the PSWAP lineage ID (creator, `order_id`). Bulk filters are maker-wide with optional order type, market and direction.
+- Targeted cancel identity: proposed as the PSWAP lineage ID (creator and serial elements 0–2). Bulk filters are maker-wide with optional order type, market and direction.
 - When to add event expiry (rows carry `created_at`). Command results, cutoffs, lineage attributions and canonical history are kept indefinitely in V1.
 - Supported network/script versions, sync freshness bound, deployment failure coverage and workload targets.
 

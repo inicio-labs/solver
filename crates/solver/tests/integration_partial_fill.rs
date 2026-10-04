@@ -274,8 +274,18 @@ async fn partial_fill_repro() -> Result<()> {
                     || solver_handle.is_finished(),
                 )
                 .await?;
-                rpc.prove_block();
-                let committed = rpc.mock_chain.read().committed_notes().len();
+                // The settlement is journaled before it is broadcast, so the
+                // executor may not have submitted it yet: prove blocks until
+                // its notes land. Far fewer than its 20-block validity window.
+                let mut committed = rpc.mock_chain.read().committed_notes().len();
+                for _ in 0..10 {
+                    rpc.prove_block();
+                    committed = rpc.mock_chain.read().committed_notes().len();
+                    if committed >= initial + 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
                 if committed < initial + 2 {
                     bail!("partial settlement produced fewer than two payback notes: committed={committed}, before={initial}");
                 }

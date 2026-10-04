@@ -28,7 +28,7 @@ use super::postgres_schema::{
 use crate::gateway::{self, proto};
 use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, EventWake, LineageId, MakerCommand,
-    MakerFact, MakerId, MakerTag,
+    MakerId, MakerTag, MakerUpdate,
 };
 use crate::types::{BookUpdate, OrderKeys, OrderStatus};
 
@@ -98,27 +98,67 @@ fn lock_maker(conn: &mut PgConnection, maker_id: MakerId) -> DbResult<Option<Mak
         .optional()?)
 }
 
-/// Write one maker command, returning its reply and the fact the matcher must
+/// Intake locks all existing submission orders before any command in its
+/// group acquires a maker row. This preserves reservation's order-row → maker
+/// lock order even when the group contains cancels before submits.
+pub fn prelock_submission_orders_tx(
+    conn: &mut PgConnection,
+    commands: &[(CommandHeader, MakerCommand)],
+) -> DbResult<()> {
+    let lineages: Vec<&Vec<u8>> = commands
+        .iter()
+        .filter_map(|(_, command)| match command {
+            MakerCommand::Submit { keys, .. } => Some(&keys.lineage_id),
+            _ => None,
+        })
+        .collect();
+    if !lineages.is_empty() {
+        orders::table
+            .filter(orders::lineage_id.eq_any(lineages))
+            .filter(
+                orders::status
+                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+            )
+            .order(orders::note_id.asc())
+            .for_update()
+            .select(orders::note_id)
+            .load::<Vec<u8>>(conn)?;
+    }
+    Ok(())
+}
+
+/// Write one maker command, returning its reply and the update the matcher must
 /// learn once the transaction commits. An exact retry or a conflict changes
-/// nothing and has no fact: a fact lost to a crash is restored by the
+/// nothing and has no update: a change lost to a crash is restored by the
 /// matcher's startup hydration.
 pub fn execute_command_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     command: &MakerCommand,
-) -> DbResult<(CommandReply, Option<MakerFact>)> {
-    if matches!(
-        command,
-        MakerCommand::CancelAll { .. } | MakerCommand::CancelOrder { .. }
-    ) && lock_maker(conn, header.maker_id)?.is_none()
-    {
+) -> DbResult<(CommandReply, Option<MakerUpdate>)> {
+    if let MakerCommand::Submit { keys, .. } = command {
+        // Reservation locks order rows before maker rows. Claim in the same
+        // order, so a late claim cannot slip between reservation's ownership
+        // lookup and its liveness check or deadlock with that reservation.
+        orders::table
+            .filter(orders::lineage_id.eq(&keys.lineage_id))
+            .filter(
+                orders::status
+                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+            )
+            .order(orders::note_id.asc())
+            .for_update()
+            .select(orders::note_id)
+            .load::<Vec<u8>>(conn)?;
+    }
+    if lock_maker(conn, header.maker_id)?.is_none() {
         return Err(DbError::Corrupt("authenticated maker is missing"));
     }
     if let Some(reply) = claim_command(conn, header, command)? {
         return Ok((reply, None));
     }
     let maker_id = header.maker_id;
-    let (result, fact) = match command {
+    let (result, update) = match command {
         MakerCommand::Submit { note, keys } => {
             let claimed = diesel::insert_into(maker_lineages::table)
                 .values((
@@ -134,15 +174,33 @@ pub fn execute_command_tx(
                 .execute(conn)?
                 == 1;
             if claimed {
+                let cancelled = diesel::select(diesel::dsl::exists(
+                    maker_stops::table
+                        .filter(maker_stops::maker_id.eq(maker_id))
+                        .filter(maker_stops::lineage_id.eq(&keys.lineage_id)),
+                ))
+                .get_result::<bool>(conn)?;
                 let tag = MakerTag {
                     maker_id,
                     root_seq: header.seq,
                 };
-                let fact = MakerFact::LineageAttributed {
-                    lineage_id: keys.lineage_id.clone(),
+                let order_ids = orders::table
+                    .filter(orders::lineage_id.eq(&keys.lineage_id))
+                    .filter(
+                        orders::status
+                            .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+                    )
+                    .select(orders::note_id)
+                    .load::<Vec<u8>>(conn)?
+                    .into_iter()
+                    .map(|bytes| Ok(crate::types::OrderId::read_from_bytes(&bytes)?))
+                    .collect::<DbResult<Vec<_>>>()?;
+                let update = MakerUpdate::OrdersAttributed {
+                    order_ids,
                     tag,
+                    cancelled,
                 };
-                (CommandResult::Accepted, Some(fact))
+                (CommandResult::Accepted, Some(update))
             } else {
                 (CommandResult::AlreadyRegistered, None)
             }
@@ -168,12 +226,12 @@ pub fn execute_command_tx(
                 .get_result(conn)?;
             let settling = settling_below_cutoff(conn, maker_id, scope, cutoff)?;
             let cutoff = u64::try_from(cutoff)?;
-            let fact = MakerFact::CutoffRaised {
+            let update = MakerUpdate::CutoffRaised {
                 maker_id,
                 scope: scope.clone(),
                 cutoff,
             };
-            (CommandResult::Applied { cutoff, settling }, Some(fact))
+            (CommandResult::Applied { cutoff, settling }, Some(update))
         }
         MakerCommand::CancelOrder { lineage_id } => {
             diesel::insert_into(maker_stops::table)
@@ -184,11 +242,11 @@ pub fn execute_command_tx(
                 .on_conflict_do_nothing()
                 .execute(conn)?;
             let settling = settling_in_lineage(conn, maker_id, lineage_id)?;
-            let fact = MakerFact::LineageStopped {
+            let update = MakerUpdate::LineageCancelled {
                 maker_id,
                 lineage_id: lineage_id.clone(),
             };
-            (CommandResult::Stopped { settling }, Some(fact))
+            (CommandResult::Stopped { settling }, Some(update))
         }
     };
     let stored = serde_json::to_string(&result)
@@ -196,7 +254,7 @@ pub fn execute_command_tx(
     diesel::update(maker_commands::table.find((maker_id, &header.request_id)))
         .set(maker_commands::result.eq(stored))
         .execute(conn)?;
-    Ok((CommandReply::Committed(result), fact))
+    Ok((CommandReply::Committed(result), update))
 }
 
 /// Record the command, or return the reply it already has: the stored result
@@ -523,6 +581,7 @@ pub fn activate_tx(
     Ok(BookUpdate {
         removed: Vec::new(),
         active,
+        maker_updates: Vec::new(),
     })
 }
 
@@ -1019,7 +1078,7 @@ mod tests {
         request_id: &str,
         seq: u64,
         command: MakerCommand,
-    ) -> Result<(CommandReply, Option<MakerFact>)> {
+    ) -> Result<(CommandReply, Option<MakerUpdate>)> {
         Ok(conn.transaction::<_, DbError, _>(|conn| {
             execute_command_tx(conn, &header(maker_id, request_id, seq), &command)
         })?)
@@ -1065,15 +1124,15 @@ mod tests {
 
         let (reply, fact) = run(conn, maker_id, "r1", 1, submit(&order))?;
         assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
-        let lineage_id = OrderKeys::from_note(&order)?.lineage_id;
         assert_eq!(
             fact,
-            Some(MakerFact::LineageAttributed {
-                lineage_id,
+            Some(MakerUpdate::OrdersAttributed {
+                order_ids: Vec::new(),
                 tag: MakerTag {
                     maker_id,
                     root_seq: 1
-                }
+                },
+                cancelled: false,
             })
         );
 
@@ -1176,7 +1235,7 @@ mod tests {
         );
         assert!(matches!(
             fact,
-            Some(MakerFact::CutoffRaised { cutoff: 100, .. })
+            Some(MakerUpdate::CutoffRaised { cutoff: 100, .. })
         ));
         assert_eq!(live(conn, &all)?, [false, true, true, true, true]);
 
@@ -1263,6 +1322,38 @@ mod tests {
             live(conn, &[&before, &after, &kept, &child])?,
             [false, false, true, false]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_stop_before_late_claim_carries_cancelled_metadata_for_public_order() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let quote = note(42);
+        ingest(conn, &[&quote])?;
+        let lineage_id = OrderKeys::from_note(&quote)?.lineage_id;
+        run(
+            conn,
+            alpha,
+            "x1",
+            1,
+            MakerCommand::CancelOrder { lineage_id },
+        )?;
+        let (_, update) = run(conn, alpha, "s2", 2, submit(&quote))?;
+        assert_eq!(
+            update,
+            Some(MakerUpdate::OrdersAttributed {
+                order_ids: vec![quote.id()],
+                tag: MakerTag {
+                    maker_id: alpha,
+                    root_seq: 2
+                },
+                cancelled: true,
+            }),
+        );
+        assert_eq!(live(conn, &[&quote])?, [false]);
         Ok(())
     }
 
@@ -1463,6 +1554,54 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_late_claim_waits_for_a_public_reservation_then_reports_exposure() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let quote = note(41);
+        ingest(&mut fixture.conn, &[&quote])?;
+
+        let held = Arc::new(Barrier::new(2));
+        let mut reserver = connect(&fixture)?;
+        let reserving = {
+            let (held, quote) = (held.clone(), quote.clone());
+            std::thread::spawn(move || {
+                reserver.transaction::<_, DbError, _>(|conn| {
+                    reserve(conn, 41, &quote)?;
+                    held.wait();
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+            })
+        };
+        held.wait();
+        let mut claimant = connect(&fixture)?;
+        let started = Instant::now();
+        let (reply, _) = run(&mut claimant, alpha, "s1", 1, submit(&quote))?;
+        reserving.join().expect("reserver panicked")?;
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "claim waited for the order row"
+        );
+        assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
+        assert_eq!(
+            run(
+                &mut claimant,
+                alpha,
+                "c2",
+                2,
+                cancel_all(CutoffScope::all())
+            )?
+            .0,
+            CommandReply::Committed(CommandResult::Applied {
+                cutoff: 2,
+                settling: 1
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn a_committed_cancel_fails_every_later_reservation() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
@@ -1516,6 +1655,7 @@ mod tests {
                 BookUpdate {
                     removed: Vec::new(),
                     active: candidates.to_vec(),
+                    maker_updates: Vec::new(),
                 },
             )
         })?;

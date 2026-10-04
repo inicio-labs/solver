@@ -12,7 +12,6 @@ use crate::admin::AdminState;
 use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
-use crate::maker::MakerFact;
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{self, PreciseSnapshot, PriceClient, SharedTokenMap};
@@ -192,11 +191,6 @@ pub struct PipelineChannels {
     pub exec_rx: mpsc::Receiver<ExecutionBatch>,
     pub subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     pub subscribe_rx: mpsc::Receiver<(TokenId, TokenId)>,
-    /// Maker control lane (maker intake → matcher, ADR 0003). Unbounded so
-    /// the intake never waits for the matcher: each fact is one command the
-    /// intake already committed, and the matcher reads the lane first.
-    pub maker_fact_tx: mpsc::UnboundedSender<MakerFact>,
-    pub maker_fact_rx: mpsc::UnboundedReceiver<MakerFact>,
 }
 
 pub fn create_channels() -> PipelineChannels {
@@ -218,7 +212,6 @@ pub fn create_channels() -> PipelineChannels {
     let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(SUBSCRIBE_CHANNEL_BUF);
     let (quotes_tx, quotes_rx) = watch::channel(Arc::new(QuotesSnapshot::new()));
     let (route_tx, route_rx) = mpsc::channel(PIPELINE_CHANNEL_BUF);
-    let (maker_fact_tx, maker_fact_rx) = mpsc::unbounded_channel();
     PipelineChannels {
         quotes_tx,
         quotes_rx,
@@ -236,8 +229,6 @@ pub fn create_channels() -> PipelineChannels {
         exec_rx,
         subscribe_tx,
         subscribe_rx,
-        maker_fact_tx,
-        maker_fact_rx,
     }
 }
 

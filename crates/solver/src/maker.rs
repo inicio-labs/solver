@@ -1,5 +1,5 @@
 //! Market-maker domain types shared by the maker store, the matcher and the
-//! maker control lane between them (ADR 0003).
+//! ordered matcher update stream between them (ADR 0003).
 
 use miden_protocol::crypto::hash::blake::Blake3_256;
 use miden_protocol::crypto::utils::Serializable;
@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::types::{OrderError, OrderKeys, TokenId};
+use crate::types::{OrderError, OrderId, OrderKeys, TokenId};
 
 /// Database identity of an onboarded maker.
 pub type MakerId = i64;
@@ -79,29 +79,47 @@ impl CutoffScope {
         (self.market.is_empty() || self.market == market)
             && (self.direction.is_empty() || self.direction == direction)
     }
+
+    /// Match an order's offered/requested tokens without allocating keys.
+    pub fn covers_pair(&self, offered: TokenId, requested: TokenId) -> bool {
+        let offered = offered.to_bytes();
+        let requested = requested.to_bytes();
+        let (first, second) = if offered <= requested {
+            (&offered[..], &requested[..])
+        } else {
+            (&requested[..], &offered[..])
+        };
+        let equals_pair = |key: &[u8], a: &[u8], b: &[u8]| {
+            key.iter()
+                .copied()
+                .eq(a.iter().copied().chain(b.iter().copied()))
+        };
+        (self.market.is_empty() || equals_pair(&self.market, first, second))
+            && (self.direction.is_empty() || equals_pair(&self.direction, &offered, &requested))
+    }
 }
 
-/// A fact the maker intake has committed, sent to the matcher on the maker
-/// control lane. All three only accumulate (cutoffs only rise), so they need
-/// no ordering against book updates.
+/// A committed maker change, sent with book changes in commit order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MakerFact {
+pub enum MakerUpdate {
     /// Orders of `maker_id` in `scope` whose root sequence is below `cutoff`
-    /// are stopped. `cutoff` is the effective, already-maximised barrier.
+    /// are cancelled. `cutoff` is the effective, already-maximised barrier.
     CutoffRaised {
         maker_id: MakerId,
         scope: CutoffScope,
         cutoff: u64,
     },
     /// A targeted cancel: every note of this lineage claimed by `maker_id`.
-    LineageStopped {
+    LineageCancelled {
         maker_id: MakerId,
         lineage_id: LineageId,
     },
-    /// A submit claimed this lineage: its book entries are maker orders.
-    LineageAttributed {
-        lineage_id: LineageId,
+    /// A submit claimed existing orders; update their metadata in place.
+    OrdersAttributed {
+        order_ids: Vec<OrderId>,
         tag: MakerTag,
+        /// A targeted cancellation committed before these orders were claimed.
+        cancelled: bool,
     },
 }
 
@@ -292,10 +310,12 @@ mod tests {
         let x = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap();
         let y = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap();
         let covers = |scope: CutoffScope, offered, requested| {
-            scope.covers(
+            let stored = scope.covers(
                 &market_key(offered, requested),
                 &direction_key(offered, requested),
-            )
+            );
+            assert_eq!(scope.covers_pair(offered, requested), stored);
+            stored
         };
         assert!(covers(CutoffScope::all(), x, y));
         assert!(covers(CutoffScope::market(y, x), x, y));

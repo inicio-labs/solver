@@ -3,11 +3,11 @@ use std::collections::{btree_map, BTreeMap, HashMap};
 use miden_protocol::note::NoteId;
 use tokio::sync::mpsc;
 
-use super::maker_book::MakerBook;
+use super::maker_index::MakerIndex;
 use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
-use crate::maker::{CutoffScope, MakerFact, MakerId};
+use crate::maker::{CutoffScope, MakerId, MakerUpdate};
 use crate::matching::types::{BestLevel, SwapBookSnapshot};
 use crate::types::{BookOrder, BookUpdate, TokenId};
 
@@ -26,13 +26,16 @@ pub struct ClearingBootstrap {
 pub(crate) struct ClearingBook {
     orders: HashMap<NoteId, Order>,
     pairs: HashMap<(TokenId, TokenId), BTreeMap<OrderKey, NoteId>>,
-    makers: MakerBook,
+    makers: MakerIndex,
 }
 
 impl ClearingBook {
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
     pub(super) fn apply(&mut self, update: BookUpdate) {
+        for maker_update in update.maker_updates {
+            self.apply_maker_update(maker_update);
+        }
         for id in update.removed {
             self.remove(id);
         }
@@ -67,6 +70,12 @@ impl ClearingBook {
             self.remove(order.id());
             tracing::warn!(note_id = %order.id(), %error, "order left out of the live book");
         }
+        if let (Some(tag), Some(stored)) = (
+            self.makers.tag(&order.id()),
+            self.orders.get_mut(&order.id()),
+        ) {
+            stored.set_maker(tag);
+        }
     }
 
     fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
@@ -81,7 +90,7 @@ impl ClearingBook {
         }
     }
 
-    pub fn insert(&mut self, order: &BookOrder) -> Result<(), ClearingError> {
+    pub(super) fn insert(&mut self, order: &BookOrder) -> Result<(), ClearingError> {
         let id = order.id();
         self.orders.insert(id, Order::from_book_order(order)?);
         self.add_to_index(id)
@@ -145,8 +154,8 @@ impl ClearingBook {
                 // Maker orders are never routed (ADR 0003).
                 let orders = index
                     .values()
-                    .filter(|id| !self.makers.is_maker_order(id))
                     .filter_map(|id| self.orders.get(id))
+                    .filter(|order| order.can_route_to_rfq())
                     .map(|order| {
                         let offered = order.offered_asset();
                         let requested = order.requested_asset();
@@ -165,31 +174,29 @@ impl ClearingBook {
             .collect()
     }
 
-    /// Apply a fact from the maker control lane: drop what it stops.
-    pub(super) fn apply_maker_fact(&mut self, fact: MakerFact, now_ms: u64) {
-        let stopped = self.makers.apply(fact, now_ms);
-        if !stopped.is_empty() {
-            tracing::debug!(stopped = stopped.len(), "maker cancel dropped book entries");
+    /// Apply a committed maker update and remove any orders it cancels.
+    pub(super) fn apply_maker_update(&mut self, update: MakerUpdate) {
+        let attribution = match &update {
+            MakerUpdate::OrdersAttributed { order_ids, tag, .. } => Some((order_ids.clone(), *tag)),
+            _ => None,
+        };
+        let cancelled = self.makers.apply(update);
+        if let Some((order_ids, tag)) = attribution {
+            for id in order_ids {
+                if let Some(order) = self.orders.get_mut(&id) {
+                    order.set_maker(tag);
+                }
+            }
         }
-        for id in stopped {
+        if !cancelled.is_empty() {
+            tracing::debug!(
+                cancelled = cancelled.len(),
+                "maker cancel dropped book entries"
+            );
+        }
+        for id in cancelled {
             self.remove(id);
         }
-    }
-
-    /// Apply the facts queued at the start of the tick, before book updates
-    /// and matching, so a cancel received before a tick binds that tick.
-    pub(super) fn apply_pending_maker_facts(
-        &mut self,
-        facts: &mut mpsc::UnboundedReceiver<MakerFact>,
-        now_ms: u64,
-    ) {
-        for _ in 0..facts.len() {
-            let Ok(fact) = facts.try_recv() else {
-                break;
-            };
-            self.apply_maker_fact(fact, now_ms);
-        }
-        self.makers.expire(now_ms);
     }
 
     pub(super) fn raise_maker_cutoff(
@@ -457,21 +464,44 @@ mod tests {
         // A public order becomes a maker order when its maker's submit
         // arrives after ingest: from then on it is not routed either.
         book.insert_or_skip(&public);
-        let lineage_id = crate::types::OrderKeys::from_note(&public.note)
-            .unwrap()
-            .lineage_id;
-        book.apply_maker_fact(
-            MakerFact::LineageAttributed {
-                lineage_id,
-                tag: crate::maker::MakerTag {
-                    maker_id: 7,
-                    root_seq: 2,
-                },
+        book.apply_maker_update(MakerUpdate::OrdersAttributed {
+            order_ids: vec![public.id()],
+            tag: crate::maker::MakerTag {
+                maker_id: 7,
+                root_seq: 2,
             },
-            0,
-        );
+            cancelled: false,
+        });
         routing.dispatch(&mut book, 101).unwrap();
         assert!(route_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn late_attribution_preserves_an_inactive_orders_lifecycle() {
+        let mut rng = RandomCoin::new(Word::default());
+        let public = fixture(false, 10, 18, 1, &mut rng);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&public);
+        book.deactivate(public.id());
+        book.apply(BookUpdate {
+            removed: Vec::new(),
+            active: Vec::new(),
+            maker_updates: vec![MakerUpdate::OrdersAttributed {
+                order_ids: vec![public.id()],
+                tag: crate::maker::MakerTag {
+                    maker_id: 7,
+                    root_seq: 1,
+                },
+                cancelled: false,
+            }],
+        });
+        let stored = &book.orders[&public.id()];
+        assert!(
+            !stored.is_active(),
+            "metadata must not release an in-flight order"
+        );
+        assert!(!stored.can_route_to_rfq());
+        assert!(book.best_levels_snapshot().is_empty());
     }
 
     #[test]
@@ -482,24 +512,21 @@ mod tests {
         let mut book = ClearingBook::default();
         book.insert_or_skip(&old);
         book.insert_or_skip(&new);
-        book.apply_maker_fact(
-            MakerFact::CutoffRaised {
-                maker_id: 7,
-                scope: CutoffScope::all(),
-                cutoff: 5,
-            },
-            0,
-        );
+        book.apply_maker_update(MakerUpdate::CutoffRaised {
+            maker_id: 7,
+            scope: CutoffScope::all(),
+            cutoff: 5,
+        });
         assert!(!book.orders.contains_key(&old.id()));
         assert!(book.orders.contains_key(&new.id()));
-        // An Active update committed before the cancel, delivered after it.
+        // A stale activation is still refused by the cutoff.
         book.apply(old.clone().into());
         assert!(!book.orders.contains_key(&old.id()));
         assert_eq!(admit(&book, false, 100).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancel_on_the_maker_lane_binds_the_next_tick() {
+    async fn a_queued_cancel_binds_the_next_tick() {
         let mut rng = RandomCoin::new(Word::default());
         let seller = tagged(fixture(false, 11, 18, 1, &mut rng), 7, 1);
         let buyer = fixture(true, 22, 10, 2, &mut rng);
@@ -527,12 +554,16 @@ mod tests {
         }
         let (_, prices_rx) = watch::channel(prices);
         // The cancel committed while the book was loading.
-        let (facts_tx, facts_rx) = mpsc::unbounded_channel();
-        facts_tx
-            .send(MakerFact::CutoffRaised {
-                maker_id: 7,
-                scope: CutoffScope::all(),
-                cutoff: 2,
+        let (book_tx, book_rx) = mpsc::channel(1);
+        book_tx
+            .try_send(BookUpdate {
+                removed: Vec::new(),
+                active: Vec::new(),
+                maker_updates: vec![MakerUpdate::CutoffRaised {
+                    maker_id: 7,
+                    scope: CutoffScope::all(),
+                    cutoff: 2,
+                }],
             })
             .unwrap();
         let runtime = ClearingRuntime {
@@ -544,9 +575,7 @@ mod tests {
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: None,
-            maker_facts: Some(facts_rx),
         };
-        let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
         let cancel = CancellationToken::new();
@@ -568,8 +597,7 @@ mod tests {
             1,
             "only the buyer's side is left"
         );
-        // The intake stopping closes the lane; matching carries on.
-        drop(facts_tx);
+        // The ordered book stream remains open for subsequent updates.
         tokio::time::advance(Duration::from_secs(1)).await;
         snapshot_rx.changed().await.unwrap();
         assert!(!task.is_finished());
@@ -637,7 +665,6 @@ mod tests {
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: Some(routing),
-            maker_facts: None,
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -712,7 +739,6 @@ mod tests {
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: Some(routing),
-            maker_facts: None,
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -772,7 +798,6 @@ mod tests {
                 max_source_age_ms: 1_000,
                 max_source_skew_ms: 0,
                 routing: None,
-                maker_facts: None,
             };
             let (_book_tx, book_rx) = mpsc::channel(1);
             let (exec_tx, _exec_rx) = mpsc::channel(1);
@@ -906,6 +931,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: vec![parent.id()],
             active: vec![child.clone()],
+            maker_updates: Vec::new(),
         });
         assert_eq!(admit(&book, false, 100)[0].order().id(), child.id());
     }
@@ -930,7 +956,6 @@ mod tests {
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
-            maker_facts: None,
         };
         let (book_tx, book_rx) = mpsc::channel(1);
         drop(book_tx);
@@ -982,7 +1007,6 @@ mod tests {
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
-            maker_facts: None,
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, _exec_rx) = mpsc::channel(1);
@@ -1040,7 +1064,6 @@ mod tests {
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
-            maker_facts: None,
         };
         let (book_tx, book_rx) = mpsc::channel(4);
         let (exec_tx, mut exec_rx) = mpsc::channel(4);
@@ -1144,6 +1167,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: Vec::new(),
             active: vec![holder.clone(), stale.clone(), other.clone()],
+            maker_updates: Vec::new(),
         });
 
         assert!(book.orders.contains_key(&holder.id()));

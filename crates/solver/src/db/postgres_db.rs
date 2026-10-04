@@ -674,7 +674,11 @@ pub fn confirm_settlement_tx(
         status = "confirmed",
         "persisted settlement confirmation"
     );
-    Ok(BookUpdate { removed, active })
+    Ok(BookUpdate {
+        removed,
+        active,
+        maker_updates: Vec::new(),
+    })
 }
 
 /// Ingest observed notes that our own settlements expect as remainders. Each

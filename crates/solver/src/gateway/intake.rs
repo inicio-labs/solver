@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::error::IntakeError;
 use crate::db::maker_db::execute_command_tx;
 use crate::db::{DbResult, IntakeSession};
-use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerFact};
+use crate::maker::{CommandHeader, CommandReply, MakerCommand};
 
 type Reply = oneshot::Sender<Result<CommandReply, IntakeError>>;
 
@@ -74,13 +74,13 @@ impl Intake {
 }
 
 /// Write commands until `cancel` fires or every handler is gone. After each
-/// commit the committed facts go to the matcher first, so a maker that sees
+/// commit the committed maker updates go to the matcher first, so a maker that sees
 /// Applied knows its cutoff is already queued there, then every handler gets
 /// its reply. A failed round replies `NotCommitted` to all of its commands.
 pub async fn run_intake(
     mut session: IntakeSession,
     mut queues: IntakeQueues,
-    facts: mpsc::UnboundedSender<MakerFact>,
+    book_tx: mpsc::Sender<crate::types::BookUpdate>,
     max_submits: usize,
     cancel: CancellationToken,
 ) {
@@ -114,8 +114,10 @@ pub async fn run_intake(
             .map(|request| ((request.header, request.command), request.reply))
             .unzip();
         let size = commands.len();
+        let mut publication = session.publication_guard().await;
         let outcome = session
             .transaction(move |conn| {
+                crate::db::maker_db::prelock_submission_orders_tx(conn, &commands)?;
                 commands
                     .iter()
                     .map(|(header, command)| execute_command_tx(conn, header, command))
@@ -125,10 +127,25 @@ pub async fn run_intake(
         match outcome {
             Ok(outcomes) => {
                 let (results, committed): (Vec<_>, Vec<_>) = outcomes.into_iter().unzip();
-                for fact in committed.into_iter().flatten() {
-                    // A closed lane means the matcher stopped, and the
-                    // solver with it; the facts are durable either way.
-                    let _ = facts.send(fact);
+                let maker_updates: Vec<_> = committed.into_iter().flatten().collect();
+                if !maker_updates.is_empty() {
+                    // The publication guard makes this the next committed
+                    // matcher update after every earlier book transaction.
+                    if book_tx
+                        .send(crate::types::BookUpdate {
+                            removed: Vec::new(),
+                            active: Vec::new(),
+                            maker_updates,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        let error = Arc::new(crate::db::DbError::MatcherStopped);
+                        for reply in replies {
+                            let _ = reply.send(Err(IntakeError::NotCommitted(error.clone())));
+                        }
+                        return;
+                    }
                 }
                 for (reply, result) in replies.into_iter().zip(results) {
                     let _ = reply.send(Ok(result));
@@ -142,6 +159,7 @@ pub async fn run_intake(
                 }
             }
         }
+        publication.complete();
     }
 }
 
@@ -150,6 +168,7 @@ pub(super) mod tests {
     use super::*;
     use crate::db::postgres_test::TestDb;
     use crate::db::{maker_db, DbError};
+    use crate::maker::MakerUpdate;
     use crate::maker::{CommandResult, CutoffScope, MakerId};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::note::{Note, NoteType};
@@ -197,11 +216,11 @@ pub(super) mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn a_round_writes_cancels_first_and_queues_facts_before_replying() {
+    async fn a_round_writes_cancels_first_and_queues_updates_before_replying() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
         let (intake, mut queues) = intake_queues(8, 8);
-        let (facts_tx, mut facts) = mpsc::unbounded_channel();
+        let (updates_tx, mut updates) = mpsc::channel(8);
         let execute = |request_id: &'static str, seq, command| {
             let intake = intake.clone();
             tokio::spawn(async move {
@@ -227,7 +246,7 @@ pub(super) mod tests {
         let writer = tokio::spawn({
             let session = db.pool.intake_session();
             let queues = std::mem::replace(&mut queues, intake_queues(1, 1).1);
-            run_intake(session, queues, facts_tx, 500, stop.clone())
+            run_intake(session, queues, updates_tx, 500, stop.clone())
         });
 
         assert_eq!(
@@ -237,11 +256,12 @@ pub(super) mod tests {
                 settling: 0
             })
         );
-        // The cancel was written first, and its fact is queued before any
+        // The cancel was written first, and its update is queued before any
         // handler hears back.
+        let committed = updates.try_recv().unwrap();
         assert!(matches!(
-            facts.try_recv().unwrap(),
-            MakerFact::CutoffRaised { cutoff: 2, .. }
+            committed.maker_updates.first(),
+            Some(MakerUpdate::CutoffRaised { cutoff: 2, .. })
         ));
         for submit in [first, last] {
             assert_eq!(
@@ -250,11 +270,94 @@ pub(super) mod tests {
             );
         }
         assert!(matches!(
-            facts.try_recv().unwrap(),
-            MakerFact::LineageAttributed { .. }
+            committed.maker_updates.get(1),
+            Some(MakerUpdate::OrdersAttributed { .. })
         ));
         stop.cancel();
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_maker_cancel_follows_earlier_book_updates_on_one_stream() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let order_id = pswap_note(9).id();
+        let (book_tx, mut book_rx) = mpsc::channel(2);
+        db.pool
+            .write_book(&book_tx, move |_| {
+                Ok(crate::types::BookUpdate {
+                    removed: vec![order_id],
+                    active: Vec::new(),
+                    maker_updates: Vec::new(),
+                })
+            })
+            .await
+            .unwrap();
+
+        let (intake, queues) = intake_queues(2, 2);
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn(run_intake(
+            db.pool.intake_session(),
+            queues,
+            book_tx,
+            2,
+            stop.clone(),
+        ));
+        assert_eq!(
+            intake
+                .execute(
+                    header(alpha, "c1", 1),
+                    MakerCommand::CancelAll {
+                        scope: CutoffScope::all()
+                    },
+                )
+                .await
+                .unwrap(),
+            CommandReply::Committed(CommandResult::Applied {
+                cutoff: 1,
+                settling: 0
+            }),
+        );
+        assert_eq!(book_rx.recv().await.unwrap().removed, vec![order_id]);
+        assert!(matches!(
+            book_rx.recv().await.unwrap().maker_updates.first(),
+            Some(MakerUpdate::CutoffRaised { cutoff: 1, .. })
+        ));
+        stop.cancel();
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_committed_cancel_with_no_matcher_stops_publication() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let (book_tx, book_rx) = mpsc::channel(1);
+        drop(book_rx);
+        let (intake, queues) = intake_queues(2, 2);
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn(run_intake(
+            db.pool.intake_session(),
+            queues,
+            book_tx,
+            2,
+            stop,
+        ));
+        let reply = intake
+            .execute(
+                header(alpha, "c1", 1),
+                MakerCommand::CancelAll {
+                    scope: CutoffScope::all(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            reply,
+            Err(IntakeError::NotCommitted(ref error)) if matches!(**error, DbError::MatcherStopped)
+        ));
+        writer.await.unwrap();
+        assert!(db.pool.fatal_token().is_cancelled());
     }
 
     #[tokio::test]
@@ -300,14 +403,14 @@ pub(super) mod tests {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
         let (intake, queues) = intake_queues(8, 8);
-        let (facts_tx, mut facts) = mpsc::unbounded_channel();
+        let (updates_tx, mut updates) = mpsc::channel(8);
         // The pool turned fatal: the intake session refuses to write.
         db.pool.fatal_token().cancel();
         let stop = CancellationToken::new();
         let writer = tokio::spawn(run_intake(
             db.pool.intake_session(),
             queues,
-            facts_tx,
+            updates_tx,
             500,
             stop.clone(),
         ));
@@ -323,7 +426,10 @@ pub(super) mod tests {
             reply,
             Err(IntakeError::NotCommitted(ref error)) if matches!(**error, DbError::WriterUnsafe)
         ));
-        assert!(facts.try_recv().is_err(), "nothing committed, nothing sent");
+        assert!(
+            updates.try_recv().is_err(),
+            "nothing committed, nothing sent"
+        );
         stop.cancel();
         writer.await.unwrap();
     }

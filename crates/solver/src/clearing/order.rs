@@ -7,6 +7,7 @@ use miden_protocol::note::{Note, NoteId};
 use miden_standards::note::PswapNote;
 use ruint::aliases::U256;
 
+use crate::maker::MakerTag;
 use crate::types::{now_unix, BookOrder, FilledNote, UnixSecs};
 
 use super::config::PPM_DENOMINATOR;
@@ -36,6 +37,7 @@ pub struct Order {
     priority: NonZeroU64,
     status: BookStatus,
     arrival_unix: UnixSecs,
+    maker: Option<MakerTag>,
 }
 
 impl Order {
@@ -63,12 +65,25 @@ impl Order {
             priority,
             status: BookStatus::Active,
             arrival_unix,
+            maker: None,
         })
     }
 
     /// Parse the shared original note once, preserving its attachments.
     pub fn from_book_order(order: &BookOrder) -> Result<Self, ClearingError> {
-        Self::new(order.note.clone(), order.priority_seq, order.arrival_unix)
+        let mut parsed = Self::new(order.note.clone(), order.priority_seq, order.arrival_unix)?;
+        parsed.maker = order.maker;
+        Ok(parsed)
+    }
+
+    /// Maker-owned orders stay in the common book but cannot be offered to RFQ.
+    pub(crate) fn can_route_to_rfq(&self) -> bool {
+        self.maker.is_none()
+    }
+
+    /// Attribution changes routing only; it must not reactivate an in-flight order.
+    pub(crate) fn set_maker(&mut self, tag: MakerTag) {
+        self.maker = Some(tag);
     }
 
     pub fn id(&self) -> NoteId {

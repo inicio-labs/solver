@@ -29,7 +29,7 @@ use crate::db::{maker_db, postgres_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
     api_key_hash, market_key, CommandHeader, CommandReply, CommandResult, CutoffScope,
-    MakerCommand, MakerFact, MakerId,
+    MakerCommand, MakerId,
 };
 use crate::types::{BookUpdate, TokenId};
 
@@ -445,7 +445,6 @@ fn intake_status(error: &IntakeError) -> Status {
 pub fn spawn_gateway_thread(
     cfg: GatewayConfig,
     pool: DbPool,
-    facts: mpsc::UnboundedSender<MakerFact>,
     events: EventWake,
     rpc: Arc<dyn NodeRpcClient>,
     book_tx: mpsc::Sender<BookUpdate>,
@@ -484,7 +483,7 @@ pub fn spawn_gateway_thread(
                 let writer = tokio::spawn(run_intake(
                     pool.intake_session(),
                     queues,
-                    facts,
+                    book_tx.clone(),
                     cfg.round_submits,
                     cancel.clone(),
                 ));
@@ -528,6 +527,7 @@ mod tests {
     use super::super::proto::maker_gateway_client::MakerGatewayClient;
     use super::*;
     use crate::db::postgres_test::TestDb;
+    use crate::maker::MakerUpdate;
     use crate::types::OrderKeys;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -538,7 +538,7 @@ mod tests {
 
     struct Gateway {
         client: MakerGatewayClient<Channel>,
-        facts: mpsc::UnboundedReceiver<MakerFact>,
+        facts: mpsc::Receiver<BookUpdate>,
         key: String,
         key_id: i64,
         maker_id: MakerId,
@@ -568,7 +568,7 @@ mod tests {
             .await
             .unwrap();
         let (intake, queues) = intake_queues(16, 16);
-        let (facts_tx, facts) = mpsc::unbounded_channel();
+        let (facts_tx, facts) = mpsc::channel(16);
         let stop = CancellationToken::new();
         tokio::spawn(run_intake(
             db.pool.intake_session(),
@@ -701,8 +701,8 @@ mod tests {
             .into_inner();
         assert_eq!(accepted, reply(CommandResult::Accepted, false));
         assert!(matches!(
-            facts.recv().await,
-            Some(MakerFact::LineageAttributed { .. })
+            facts.recv().await.unwrap().maker_updates.first(),
+            Some(MakerUpdate::OrdersAttributed { .. })
         ));
         let retried = client
             .submit_order(signed(&key, submit("s1", 1, &order)))
@@ -820,8 +820,8 @@ mod tests {
             )
         );
         assert_eq!(
-            facts.recv().await,
-            Some(MakerFact::CutoffRaised {
+            facts.recv().await.unwrap().maker_updates.first().cloned(),
+            Some(MakerUpdate::CutoffRaised {
                 maker_id: 1,
                 scope: CutoffScope::direction(
                     AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap(),
@@ -946,7 +946,6 @@ mod tests {
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn the_gateway_thread_starts_and_stops_with_the_solver() {
         let db = TestDb::new().await.unwrap();
-        let (facts_tx, _facts) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let cfg = |port| GatewayConfig {
             bind: "127.0.0.1".into(),
@@ -968,7 +967,6 @@ mod tests {
         let (thread, ready) = spawn_gateway_thread(
             cfg(0),
             db.pool.clone(),
-            facts_tx.clone(),
             EventWake::default(),
             rpc(),
             book_tx.clone(),
@@ -987,7 +985,6 @@ mod tests {
         let (thread, ready) = spawn_gateway_thread(
             cfg(port),
             db.pool.clone(),
-            facts_tx,
             EventWake::default(),
             rpc(),
             book_tx,

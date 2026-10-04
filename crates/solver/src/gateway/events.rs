@@ -541,6 +541,80 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn failed_auth_read_closes_a_revoked_stream_before_event_reads_resume() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db, "alpha", 0).await;
+        let (mut rx, cancel) = start(
+            &db,
+            &alpha,
+            StreamConfig {
+                buffer: 8,
+                heartbeat: Duration::from_secs(1),
+            },
+        );
+        assert_eq!(replay_complete(rx.recv().await.unwrap()), 0);
+        let key_id = alpha.key_id;
+        db.pool
+            .write(move |conn| maker_db::revoke_api_key_tx(conn, key_id))
+            .await
+            .unwrap();
+
+        // TestDb has three public read slots. Occupy exactly those slots so
+        // the next auth read times out while the DB itself stays available.
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let pool = db.pool.clone();
+            let started = started_tx.clone();
+            readers.push(tokio::spawn(async move {
+                pool.read_public(move |_| {
+                    let _ = started.send(());
+                    std::thread::sleep(Duration::from_secs(7));
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        for _ in 0..3 {
+            started_rx.recv().await.expect("read slot was acquired");
+        }
+        let maker_id = alpha.maker_id;
+        db.pool
+            .write(move |conn| append_event_tx(conn, maker_id, None, &body(7)))
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(7), async {
+            loop {
+                match rx.recv().await {
+                    Some(Err(status)) => break status,
+                    Some(Ok(message)) => {
+                        assert!(
+                            !matches!(message.message, Some(stream_message::Message::Event(_))),
+                            "no event may pass an unsuccessful auth check"
+                        );
+                    }
+                    None => panic!("stream closed without an error status"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        for reader in readers {
+            reader.await.unwrap().unwrap();
+        }
+        let events = db
+            .pool
+            .read_public(move |conn| maker_db::read_events_tx(conn, maker_id, 0, PAGE))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "event reads recover after the auth fault");
+        assert!(rx.recv().await.is_none(), "the old stream stays closed");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn revocation_interrupts_a_paced_multi_page_replay() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db, "alpha", 0).await;

@@ -631,6 +631,8 @@ pub struct IntakeSession {
     fatal_db: CancellationToken,
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
+    #[cfg(test)]
+    drop_next_commit_reply: bool,
 }
 
 pub(crate) struct PublicationGuard {
@@ -656,6 +658,11 @@ impl Drop for PublicationGuard {
 }
 
 impl IntakeSession {
+    #[cfg(test)]
+    pub(crate) fn simulate_lost_commit_reply(&mut self) {
+        self.drop_next_commit_reply = true;
+    }
+
     /// Serialize the intake commit and publication with all book writers.
     pub(crate) fn publication_guard(
         &self,
@@ -672,9 +679,9 @@ impl IntakeSession {
     }
 
     /// Run `work` as one transaction on a blocking worker, connecting first
-    /// if needed. Refuses once the pool is fatal. After any error the session
-    /// is replaced on the next call; a failure during COMMIT leaves the
-    /// outcome unknown, which a retry by request ID resolves.
+    /// if needed. Refuses once the pool is fatal. An error may mean COMMIT
+    /// succeeded without a reply, so it stops the solver for hydration before
+    /// the maker retries the same request ID.
     pub async fn transaction<T, F>(&mut self, work: F) -> DbResult<T>
     where
         T: Send + 'static,
@@ -708,6 +715,14 @@ impl IntakeSession {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        if self.drop_next_commit_reply && result.is_ok() {
+            self.drop_next_commit_reply = false;
+            // The transaction really committed. Model losing the response
+            // before intake can publish its matcher update.
+            self.fatal_db.cancel();
+            return Err(DbError::Corrupt("simulated lost COMMIT response"));
+        }
         if result.is_ok() {
             self.conn = Some(conn);
         } else {
@@ -845,6 +860,8 @@ impl PgPool {
             fatal_db: self.fatal_db.clone(),
             deadline: self.operation_deadline,
             publish_order: self.publish_order.clone(),
+            #[cfg(test)]
+            drop_next_commit_reply: false,
         }
     }
 

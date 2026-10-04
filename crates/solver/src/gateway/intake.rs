@@ -98,21 +98,28 @@ pub async fn run_intake(
             else => return,
         };
         let mut round = Vec::new();
-        let mut submits = Vec::new();
+        let mut first_submit = None;
         match first.command {
-            MakerCommand::Submit { .. } => submits.push(first),
+            MakerCommand::Submit { .. } => first_submit = Some(first),
             _ => round.push(first),
         }
         while let Ok(request) = intake.cancels_rx.try_recv() {
             round.push(request);
         }
-        while submits.len() < max_submits {
+        let mut submit_count = 0;
+        if let Some(request) = first_submit {
+            round.push(request);
+            submit_count = 1;
+        }
+        while submit_count < max_submits {
             match intake.submits_rx.try_recv() {
-                Ok(request) => submits.push(request),
+                Ok(request) => {
+                    round.push(request);
+                    submit_count += 1;
+                }
                 Err(_) => break,
             }
         }
-        round.extend(submits);
 
         let (commands, replies): (Vec<_>, Vec<_>) = round
             .into_iter()
@@ -131,9 +138,11 @@ pub async fn run_intake(
             })
             .await;
         match outcome {
-            Ok(outcomes) => {
-                let (results, committed): (Vec<_>, Vec<_>) = outcomes.into_iter().unzip();
-                let maker_updates: Vec<_> = committed.into_iter().flatten().collect();
+            Ok(mut outcomes) => {
+                let maker_updates: Vec<_> = outcomes
+                    .iter_mut()
+                    .filter_map(|(_, update)| update.take())
+                    .collect();
                 if !maker_updates.is_empty() {
                     // The publication guard makes this the next committed
                     // matcher update after every earlier book transaction.
@@ -153,7 +162,7 @@ pub async fn run_intake(
                         return;
                     }
                 }
-                for (reply, result) in replies.into_iter().zip(results) {
+                for (reply, (result, _)) in replies.into_iter().zip(outcomes) {
                     let _ = reply.send(Ok(result));
                 }
             }
@@ -439,5 +448,64 @@ pub(super) mod tests {
         );
         stop.cancel();
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_lost_commit_reply_stops_intake_until_hydration_restores_attribution() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let order = pswap_note(66);
+        let row = crate::db::postgres_models::NewOrderRow::ingested(&order, 1).unwrap();
+        db.pool
+            .write(move |conn| crate::db::postgres_db::insert_orders_batch_tx(conn, &[row], 1))
+            .await
+            .unwrap();
+        let mut session = db.pool.intake_session();
+        session.simulate_lost_commit_reply();
+        let (intake, queues) = IntakeSender::new(2, 2);
+        let (book_tx, mut book_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(run_intake(
+            session,
+            queues,
+            book_tx,
+            2,
+            CancellationToken::new(),
+        ));
+        let reply = intake
+            .execute(
+                header(alpha, "s1", 1),
+                MakerCommand::submit(order.clone()).unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            reply,
+            Err(IntakeError::OutcomeUnknown(ref error))
+                if matches!(**error, DbError::Corrupt("simulated lost COMMIT response"))
+        ));
+        writer.await.unwrap();
+        assert!(db.pool.fatal_token().is_cancelled());
+        assert!(
+            book_rx.try_recv().is_err(),
+            "no matcher update was published"
+        );
+
+        // The stored command is replayable, but a replay has no update of
+        // its own. Recovery must hydrate the matcher before accepting it.
+        let request_id = String::from("s1");
+        let url = db.url().to_owned();
+        let (stored, live) = tokio::task::spawn_blocking(move || -> DbResult<_> {
+            let mut conn = crate::db::postgres_migrations::connect(&url)?;
+            let stored = maker_db::stored_result_tx(&mut conn, alpha, &request_id)?;
+            let live = crate::db::postgres_db::load_live_orders_tx(&mut conn)?;
+            Ok((stored, live))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored, Some(CommandResult::Accepted));
+        let hydrated = live.iter().find(|entry| entry.id() == order.id()).unwrap();
+        assert_eq!(hydrated.maker.unwrap().maker_id, alpha);
+        assert_eq!(hydrated.maker.unwrap().root_seq, 1);
     }
 }

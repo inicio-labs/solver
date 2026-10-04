@@ -493,12 +493,15 @@ pub(super) mod tests {
         // The stored command is replayable, but a replay has no update of
         // its own. Recovery must hydrate the matcher before accepting it.
         let request_id = String::from("s1");
+        let retry_header = header(alpha, "s1", 1);
+        let retry_command = MakerCommand::submit(order.clone()).unwrap();
         let url = db.url().to_owned();
-        let (stored, live) = tokio::task::spawn_blocking(move || -> DbResult<_> {
+        let (stored, live, replay) = tokio::task::spawn_blocking(move || -> DbResult<_> {
             let mut conn = crate::db::postgres_migrations::connect(&url)?;
             let stored = maker_db::stored_result_tx(&mut conn, alpha, &request_id)?;
             let live = crate::db::postgres_db::load_live_orders_tx(&mut conn)?;
-            Ok((stored, live))
+            let replay = maker_db::execute_command_tx(&mut conn, &retry_header, &retry_command)?;
+            Ok((stored, live, replay))
         })
         .await
         .unwrap()
@@ -507,5 +510,9 @@ pub(super) mod tests {
         let hydrated = live.iter().find(|entry| entry.id() == order.id()).unwrap();
         assert_eq!(hydrated.maker.unwrap().maker_id, alpha);
         assert_eq!(hydrated.maker.unwrap().root_seq, 1);
+        assert_eq!(
+            replay,
+            (CommandReply::Replayed(CommandResult::Accepted), None)
+        );
     }
 }

@@ -24,29 +24,33 @@ struct Request {
 /// Handlers' side of the intake: cancels have their own queue, so a flood of
 /// submits can neither fill it nor delay them.
 #[derive(Clone)]
-pub struct Intake {
-    cancels: mpsc::Sender<Request>,
-    submits: mpsc::Sender<Request>,
+pub struct IntakeSender {
+    cancels_tx: mpsc::Sender<Request>,
+    submits_tx: mpsc::Sender<Request>,
 }
 
-pub struct IntakeQueues {
-    cancels: mpsc::Receiver<Request>,
-    submits: mpsc::Receiver<Request>,
+pub struct IntakeReceiver {
+    cancels_rx: mpsc::Receiver<Request>,
+    submits_rx: mpsc::Receiver<Request>,
 }
 
-pub fn intake_queues(cancel_capacity: usize, submit_capacity: usize) -> (Intake, IntakeQueues) {
-    let (cancels, cancel_rx) = mpsc::channel(cancel_capacity);
-    let (submits, submit_rx) = mpsc::channel(submit_capacity);
-    (
-        Intake { cancels, submits },
-        IntakeQueues {
-            cancels: cancel_rx,
-            submits: submit_rx,
-        },
-    )
-}
+impl IntakeSender {
+    /// Create the service-wide command queues and their single writer side.
+    pub fn new(cancel_capacity: usize, submit_capacity: usize) -> (Self, IntakeReceiver) {
+        let (cancels_tx, cancels_rx) = mpsc::channel(cancel_capacity);
+        let (submits_tx, submits_rx) = mpsc::channel(submit_capacity);
+        (
+            Self {
+                cancels_tx,
+                submits_tx,
+            },
+            IntakeReceiver {
+                cancels_rx,
+                submits_rx,
+            },
+        )
+    }
 
-impl Intake {
     /// Queue a validated command and wait for its durable reply. A full queue
     /// fails at once instead of hanging the caller.
     pub async fn execute(
@@ -55,8 +59,8 @@ impl Intake {
         command: MakerCommand,
     ) -> Result<CommandReply, IntakeError> {
         let queue = match command {
-            MakerCommand::Submit { .. } => &self.submits,
-            MakerCommand::CancelAll { .. } | MakerCommand::CancelOrder { .. } => &self.cancels,
+            MakerCommand::Submit { .. } => &self.submits_tx,
+            MakerCommand::CancelAll { .. } | MakerCommand::CancelOrder { .. } => &self.cancels_tx,
         };
         let (reply, replied) = oneshot::channel();
         queue
@@ -76,10 +80,11 @@ impl Intake {
 /// Write commands until `cancel` fires or every handler is gone. After each
 /// commit the committed maker updates go to the matcher first, so a maker that sees
 /// Applied knows its cutoff is already queued there, then every handler gets
-/// its reply. A failed round replies `NotCommitted` to all of its commands.
+/// its reply. A failed or uncertain round replies `OutcomeUnknown` to all of
+/// its commands; a retry with the same request ID resolves the durable result.
 pub async fn run_intake(
     mut session: IntakeSession,
-    mut queues: IntakeQueues,
+    mut intake: IntakeReceiver,
     book_tx: mpsc::Sender<crate::types::BookUpdate>,
     max_submits: usize,
     cancel: CancellationToken,
@@ -88,8 +93,8 @@ pub async fn run_intake(
         let first = tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            Some(request) = queues.cancels.recv() => request,
-            Some(request) = queues.submits.recv() => request,
+            Some(request) = intake.cancels_rx.recv() => request,
+            Some(request) = intake.submits_rx.recv() => request,
             else => return,
         };
         let mut round = Vec::new();
@@ -98,11 +103,11 @@ pub async fn run_intake(
             MakerCommand::Submit { .. } => submits.push(first),
             _ => round.push(first),
         }
-        while let Ok(request) = queues.cancels.try_recv() {
+        while let Ok(request) = intake.cancels_rx.try_recv() {
             round.push(request);
         }
         while submits.len() < max_submits {
-            match queues.submits.try_recv() {
+            match intake.submits_rx.try_recv() {
                 Ok(request) => submits.push(request),
                 Err(_) => break,
             }
@@ -118,6 +123,7 @@ pub async fn run_intake(
         let outcome = session
             .transaction(move |conn| {
                 crate::db::maker_db::prelock_submission_orders_tx(conn, &commands)?;
+                crate::db::maker_db::prelock_command_makers_tx(conn, &commands)?;
                 commands
                     .iter()
                     .map(|(header, command)| execute_command_tx(conn, header, command))
@@ -142,7 +148,7 @@ pub async fn run_intake(
                     {
                         let error = Arc::new(crate::db::DbError::MatcherStopped);
                         for reply in replies {
-                            let _ = reply.send(Err(IntakeError::NotCommitted(error.clone())));
+                            let _ = reply.send(Err(IntakeError::OutcomeUnknown(error.clone())));
                         }
                         return;
                     }
@@ -152,11 +158,12 @@ pub async fn run_intake(
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, commands = size, "maker intake round not committed");
+                tracing::warn!(%error, commands = size, "maker intake round outcome unknown");
                 let error = Arc::new(error);
                 for reply in replies {
-                    let _ = reply.send(Err(IntakeError::NotCommitted(error.clone())));
+                    let _ = reply.send(Err(IntakeError::OutcomeUnknown(error.clone())));
                 }
+                return;
             }
         }
         publication.complete();
@@ -219,7 +226,7 @@ pub(super) mod tests {
     async fn a_round_writes_cancels_first_and_queues_updates_before_replying() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
-        let (intake, mut queues) = intake_queues(8, 8);
+        let (intake, mut queues) = IntakeSender::new(8, 8);
         let (updates_tx, mut updates) = mpsc::channel(8);
         let execute = |request_id: &'static str, seq, command| {
             let intake = intake.clone();
@@ -239,13 +246,13 @@ pub(super) mod tests {
             },
         );
         let last = execute("s3", 3, MakerCommand::submit(pswap_note(3)).unwrap());
-        while queues.cancels.len() + queues.submits.len() < 3 {
+        while queues.cancels_rx.len() + queues.submits_rx.len() < 3 {
             tokio::task::yield_now().await;
         }
         let stop = CancellationToken::new();
         let writer = tokio::spawn({
             let session = db.pool.intake_session();
-            let queues = std::mem::replace(&mut queues, intake_queues(1, 1).1);
+            let queues = std::mem::replace(&mut queues, IntakeSender::new(1, 1).1);
             run_intake(session, queues, updates_tx, 500, stop.clone())
         });
 
@@ -295,7 +302,7 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-        let (intake, queues) = intake_queues(2, 2);
+        let (intake, queues) = IntakeSender::new(2, 2);
         let stop = CancellationToken::new();
         let writer = tokio::spawn(run_intake(
             db.pool.intake_session(),
@@ -335,7 +342,7 @@ pub(super) mod tests {
         let alpha = maker(&db).await;
         let (book_tx, book_rx) = mpsc::channel(1);
         drop(book_rx);
-        let (intake, queues) = intake_queues(2, 2);
+        let (intake, queues) = IntakeSender::new(2, 2);
         let stop = CancellationToken::new();
         let writer = tokio::spawn(run_intake(
             db.pool.intake_session(),
@@ -354,7 +361,7 @@ pub(super) mod tests {
             .await;
         assert!(matches!(
             reply,
-            Err(IntakeError::NotCommitted(ref error)) if matches!(**error, DbError::MatcherStopped)
+            Err(IntakeError::OutcomeUnknown(ref error)) if matches!(**error, DbError::MatcherStopped)
         ));
         writer.await.unwrap();
         assert!(db.pool.fatal_token().is_cancelled());
@@ -362,13 +369,13 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn a_full_queue_fails_fast_and_a_gone_writer_answers_stopped() {
-        let (intake, queues) = intake_queues(1, 1);
+        let (intake, queues) = IntakeSender::new(1, 1);
         let submit = || MakerCommand::submit(pswap_note(1)).unwrap();
         let waiting = tokio::spawn({
             let intake = intake.clone();
             async move { intake.execute(header(1, "a", 1), submit()).await }
         });
-        while queues.submits.is_empty() {
+        while queues.submits_rx.is_empty() {
             tokio::task::yield_now().await;
         }
         assert!(matches!(
@@ -389,7 +396,7 @@ pub(super) mod tests {
                     .await
             }
         });
-        while queues.cancels.is_empty() {
+        while queues.cancels_rx.is_empty() {
             tokio::task::yield_now().await;
         }
         drop(queues);
@@ -402,7 +409,7 @@ pub(super) mod tests {
     async fn a_round_that_cannot_commit_acknowledges_nothing() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
-        let (intake, queues) = intake_queues(8, 8);
+        let (intake, queues) = IntakeSender::new(8, 8);
         let (updates_tx, mut updates) = mpsc::channel(8);
         // The pool turned fatal: the intake session refuses to write.
         db.pool.fatal_token().cancel();
@@ -424,7 +431,7 @@ pub(super) mod tests {
             .await;
         assert!(matches!(
             reply,
-            Err(IntakeError::NotCommitted(ref error)) if matches!(**error, DbError::WriterUnsafe)
+            Err(IntakeError::OutcomeUnknown(ref error)) if matches!(**error, DbError::WriterUnsafe)
         ));
         assert!(
             updates.try_recv().is_err(),

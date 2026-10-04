@@ -126,11 +126,15 @@ pub enum MakerUpdate {
 /// Wakes maker event streams after a commit that appended events. Only a
 /// hint: streams read durable rows, and also look on every keep-alive.
 #[derive(Clone)]
-pub struct EventWake(watch::Sender<u64>);
+pub struct EventWake {
+    generation_tx: watch::Sender<u64>,
+}
 
 impl Default for EventWake {
     fn default() -> Self {
-        Self(watch::channel(0).0)
+        Self {
+            generation_tx: watch::channel(0).0,
+        }
     }
 }
 
@@ -144,11 +148,12 @@ impl EventWake {
     }
 
     pub fn notify(&self) {
-        self.0.send_modify(|count| *count = count.wrapping_add(1));
+        self.generation_tx
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.0.subscribe()
+        self.generation_tx.subscribe()
     }
 
     /// Recorded by every event append, inside its transaction.

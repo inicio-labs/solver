@@ -4,6 +4,7 @@
 //! every command durable. Note payloads and API keys are never logged.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
@@ -13,15 +14,17 @@ use miden_client::rpc::NodeRpcClient;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
+use super::config::{GatewayConfig, StreamConfig};
 use super::error::IntakeError;
-use super::events::{feed, unix_ms, StreamConfig, Subscriber};
-use super::intake::{intake_queues, run_intake, Intake};
+use super::events::{feed, unix_ms, Subscriber};
+use super::intake::{run_intake, IntakeSender};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
 use super::watcher::{run_watcher, RpcChain, Watcher};
@@ -35,6 +38,8 @@ use crate::types::{BookUpdate, TokenId};
 
 /// Largest accepted request. A PSWAP note is a few kilobytes.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Bounds persistent feed tasks, channel memory, and periodic public reads.
+const MAX_EVENT_STREAMS: usize = 128;
 
 /// Creator account ID plus four serial-number elements of eight bytes.
 const LINEAGE_ID_LEN: usize = AccountId::SERIALIZED_SIZE + 32;
@@ -43,27 +48,14 @@ const LINEAGE_ID_LEN: usize = AccountId::SERIALIZED_SIZE + 32;
 const DEFAULT_STATE_PAGE: u32 = 500;
 const MAX_STATE_PAGE: u32 = 1_000;
 
-pub struct GatewayConfig {
-    pub bind: String,
-    pub port: u16,
-    /// Market keys of the pairs this solver clears; submits for any other
-    /// pair are rejected, since nothing would ever match them.
-    pub markets: HashSet<Vec<u8>>,
-    /// How often the maker-note watcher looks for new blocks.
-    pub watch_interval: std::time::Duration,
-    pub round_submits: usize,
-    pub submit_queue: usize,
-    pub cancel_queue: usize,
-    pub stream: StreamConfig,
-}
-
 #[derive(Clone)]
 pub struct MakerGatewayService {
     pool: DbPool,
-    intake: Intake,
+    intake: IntakeSender,
     markets: Arc<HashSet<Vec<u8>>>,
     events: EventWake,
     stream: StreamConfig,
+    event_slots: Arc<Semaphore>,
     /// Ends every event stream at shutdown, so the server can stop.
     cancel: CancellationToken,
 }
@@ -71,7 +63,7 @@ pub struct MakerGatewayService {
 impl MakerGatewayService {
     pub fn new(
         pool: DbPool,
-        intake: Intake,
+        intake: IntakeSender,
         markets: HashSet<Vec<u8>>,
         events: EventWake,
         stream: StreamConfig,
@@ -83,6 +75,7 @@ impl MakerGatewayService {
             markets: Arc::new(markets),
             events,
             stream,
+            event_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
             cancel,
         }
     }
@@ -143,15 +136,20 @@ impl MakerGateway for MakerGatewayService {
             key_hash,
             cursor: request.into_inner().after_seq,
         };
+        let slot = self
+            .event_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many event subscriptions"))?;
         let (tx, rx) = mpsc::channel(self.stream.buffer.max(2));
-        tokio::spawn(feed(
-            self.pool.clone(),
-            self.events.clone(),
-            self.stream,
-            subscriber,
-            tx,
-            self.cancel.clone(),
-        ));
+        let pool = self.pool.clone();
+        let events = self.events.clone();
+        let stream = self.stream;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            feed(pool, events, stream, subscriber, tx, cancel).await;
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -184,9 +182,7 @@ impl MakerGateway for MakerGatewayService {
         request: Request<proto::CancelAllRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
         let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let header = header(maker_id, request.header.clone())?;
-        let scope = scope(&request)?;
+        let (header, scope) = request.into_inner().verify(maker_id)?;
         self.execute(header, MakerCommand::CancelAll { scope })
             .await
     }
@@ -314,6 +310,15 @@ fn header(
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
+impl proto::CancelAllRequest {
+    /// Validate the whole request before it reaches the durable intake.
+    fn verify(self, maker_id: MakerId) -> Result<(CommandHeader, CutoffScope), Status> {
+        let scope = scope(&self)?;
+        let header = header(maker_id, self.header)?;
+        Ok((header, scope))
+    }
+}
+
 /// A faucet ID in its canonical 15-byte serialization.
 fn faucet(bytes: &[u8]) -> Result<TokenId, Status> {
     AccountId::read_from_bytes(bytes)
@@ -432,7 +437,7 @@ fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
 fn intake_status(error: &IntakeError) -> Status {
     match error {
         IntakeError::Busy => Status::unavailable("durable acceptance unavailable: intake is full"),
-        IntakeError::Stopped | IntakeError::NotCommitted(_) => {
+        IntakeError::Stopped | IntakeError::OutcomeUnknown(_) => {
             Status::unavailable("durable acceptance unavailable; retry with the same request ID")
         }
     }
@@ -479,19 +484,35 @@ pub fn spawn_gateway_thread(
                         return;
                     }
                 };
-                let (intake, queues) = intake_queues(cfg.cancel_queue, cfg.submit_queue);
-                let writer = tokio::spawn(run_intake(
-                    pool.intake_session(),
-                    queues,
-                    book_tx.clone(),
-                    cfg.round_submits,
-                    cancel.clone(),
-                ));
-                let watcher = tokio::spawn(run_watcher(
-                    Watcher::new(pool.clone(), RpcChain::new(rpc), book_tx),
-                    cfg.watch_interval,
-                    cancel.clone(),
-                ));
+                let (intake, queues) = IntakeSender::new(cfg.cancel_queue, cfg.submit_queue);
+                let mut workers = JoinSet::new();
+                let intake_pool = pool.clone();
+                let intake_book = book_tx.clone();
+                let intake_cancel = cancel.clone();
+                let round_submits = cfg.round_submits;
+                workers.spawn(async move {
+                    run_intake(
+                        intake_pool.intake_session(),
+                        queues,
+                        intake_book,
+                        round_submits,
+                        intake_cancel,
+                    )
+                    .await;
+                    "intake"
+                });
+                let watcher_pool = pool.clone();
+                let watcher_cancel = cancel.clone();
+                let watch_interval = cfg.watch_interval;
+                workers.spawn(async move {
+                    run_watcher(
+                        Watcher::new(watcher_pool, RpcChain::new(rpc), book_tx),
+                        watch_interval,
+                        watcher_cancel,
+                    )
+                    .await;
+                    "watcher"
+                });
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "maker gateway listening");
                 let shutdown = cancel.clone();
@@ -503,22 +524,53 @@ pub fn spawn_gateway_thread(
                     cfg.stream,
                     cancel.clone(),
                 );
-                let served = tonic::transport::Server::builder()
+                let serving = tonic::transport::Server::builder()
                     .add_service(service.into_server())
                     .serve_with_incoming_shutdown(TcpIncoming::from(listener), async move {
                         shutdown.cancelled().await
-                    })
-                    .await;
-                if let Err(error) = served {
-                    tracing::error!(%error, "maker gateway server failed");
-                }
-                // An unexpected gateway exit needs coordinated recovery.
-                cancel.cancel();
-                let _ = writer.await;
-                let _ = watcher.await;
+                    });
+                supervise_gateway(serving, workers, cancel).await;
             });
         })?;
     Ok((handle, ready_rx))
+}
+
+/// Keep the server and both workers supervised until shutdown. Dropping a
+/// JoinSet would abort tasks, including an intake whose blocking DB worker
+/// may already have committed, so every worker is drained after cancellation.
+async fn supervise_gateway<S, E>(
+    serving: S,
+    mut workers: JoinSet<&'static str>,
+    cancel: CancellationToken,
+) where
+    S: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => {
+            if let Err(error) = result {
+                tracing::error!(%error, "maker gateway server failed");
+            }
+        }
+        worker = workers.join_next() => {
+            match worker {
+                Some(Ok(name)) => tracing::error!(name, "maker gateway worker exited early"),
+                Some(Err(error)) => tracing::error!(%error, "maker gateway worker panicked"),
+                None => tracing::error!("maker gateway workers vanished"),
+            }
+            cancel.cancel();
+            if let Err(error) = serving.await {
+                tracing::error!(%error, "maker gateway server failed during shutdown");
+            }
+        }
+    }
+    cancel.cancel();
+    while let Some(worker) = workers.join_next().await {
+        if let Err(error) = worker {
+            tracing::error!(%error, "maker gateway worker failed during shutdown");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +605,10 @@ mod tests {
     };
 
     async fn gateway() -> Gateway {
+        gateway_with_stream_limit(MAX_EVENT_STREAMS).await
+    }
+
+    async fn gateway_with_stream_limit(stream_limit: usize) -> Gateway {
         let db = TestDb::new().await.unwrap();
         let key = crate::maker::new_api_key();
         let hash = api_key_hash(&key);
@@ -567,7 +623,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (intake, queues) = intake_queues(16, 16);
+        let (intake, queues) = IntakeSender::new(16, 16);
         let (facts_tx, facts) = mpsc::channel(16);
         let stop = CancellationToken::new();
         tokio::spawn(run_intake(
@@ -582,15 +638,16 @@ mod tests {
         let events = EventWake::default();
         let [x, y, _] = ids();
         let markets = [x, y].map(|id| AccountId::read_from_bytes(&id).unwrap());
-        let service = MakerGatewayService::new(
+        let mut service = MakerGatewayService::new(
             db.pool.clone(),
             intake,
             HashSet::from([market_key(markets[0], markets[1])]),
             events.clone(),
             TEST_STREAM,
             stop.clone(),
-        )
-        .into_server();
+        );
+        service.event_slots = Arc::new(Semaphore::new(stream_limit));
+        let service = service.into_server();
         let shutdown = stop.clone();
         tokio::spawn(
             tonic::transport::Server::builder()
@@ -1088,5 +1145,75 @@ mod tests {
         assert_eq!(reply.latest_seq, 4);
         assert!(reply.server_time_unix_ms > 0);
         stop.cancel();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn event_subscription_limit_releases_on_disconnect() {
+        let Gateway {
+            mut client,
+            key,
+            stop,
+            db: _db,
+            ..
+        } = gateway_with_stream_limit(1).await;
+        let request = || signed(&key, proto::StreamEventsRequest { after_seq: 0 });
+        let mut first = client.stream_events(request()).await.unwrap().into_inner();
+        assert!(matches!(
+            first.message().await.unwrap().unwrap().message,
+            Some(proto::stream_message::Message::ReplayComplete(_))
+        ));
+        assert_eq!(
+            client.stream_events(request()).await.unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        drop(first);
+        let mut released = false;
+        for _ in 0..50 {
+            match client.stream_events(request()).await {
+                Ok(stream) => {
+                    drop(stream);
+                    released = true;
+                    break;
+                }
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(status) => panic!("unexpected stream error: {status}"),
+            }
+        }
+        assert!(released, "disconnect must release the subscription slot");
+        stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn gateway_supervision_cancels_and_drains_after_worker_exit_or_panic() {
+        for panic_worker in [false, true] {
+            let cancel = CancellationToken::new();
+            let mut workers = JoinSet::new();
+            workers.spawn(async move {
+                if panic_worker {
+                    panic!("test worker failure");
+                }
+                "intake"
+            });
+            let waiting = cancel.clone();
+            workers.spawn(async move {
+                waiting.cancelled().await;
+                "watcher"
+            });
+            let server_cancel = cancel.clone();
+            let serving = async move {
+                server_cancel.cancelled().await;
+                Ok::<(), &'static str>(())
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                supervise_gateway(serving, workers, cancel.clone()),
+            )
+            .await
+            .expect("supervision must shut the server and drain the watcher");
+            assert!(cancel.is_cancelled());
+        }
     }
 }

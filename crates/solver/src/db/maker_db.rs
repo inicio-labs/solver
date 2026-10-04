@@ -127,6 +127,75 @@ pub fn prelock_submission_orders_tx(
     Ok(())
 }
 
+/// Reserve every maker control row for a group-commit round in the same
+/// order as settlement. A round may contain commands for several makers in
+/// arbitrary arrival order; locking one per command can deadlock a
+/// reservation covering those makers in the opposite order.
+pub fn prelock_command_makers_tx(
+    conn: &mut PgConnection,
+    commands: &[(CommandHeader, MakerCommand)],
+) -> DbResult<()> {
+    let maker_ids: Vec<_> = commands.iter().map(|(header, _)| header.maker_id).collect();
+    lock_makers_ordered_tx(conn, &maker_ids)
+}
+
+/// Lock all event-counter rows a multi-maker business transaction may update.
+pub fn lock_makers_ordered_tx(conn: &mut PgConnection, maker_ids: &[MakerId]) -> DbResult<()> {
+    let mut maker_ids = maker_ids.to_vec();
+    maker_ids.sort_unstable();
+    maker_ids.dedup();
+    if maker_ids.is_empty() {
+        return Ok(());
+    }
+    makers::table
+        .filter(makers::maker_id.eq_any(maker_ids))
+        .order(makers::maker_id.asc())
+        .for_no_key_update()
+        .select(makers::maker_id)
+        .load::<MakerId>(conn)?;
+    Ok(())
+}
+
+/// The watcher may write status events for several makers in one round.
+/// Acquire existing order rows first, then all maker counters in ID order,
+/// matching a multi-maker settlement reservation.
+pub fn prelock_watcher_tx(
+    conn: &mut PgConnection,
+    activations: &[PendingSubmission],
+    rejections: &[(PendingSubmission, proto::OrderState, &'static str)],
+    spent_ids: &[Vec<u8>],
+) -> DbResult<()> {
+    let mut note_ids = spent_ids.to_vec();
+    note_ids.extend(activations.iter().map(|s| s.note.id().to_bytes().to_vec()));
+    note_ids.extend(
+        rejections
+            .iter()
+            .map(|(s, ..)| s.note.id().to_bytes().to_vec()),
+    );
+    note_ids.sort();
+    note_ids.dedup();
+    if !note_ids.is_empty() {
+        orders::table
+            .filter(orders::note_id.eq_any(&note_ids))
+            .order(orders::note_id.asc())
+            .for_update()
+            .select(orders::note_id)
+            .load::<Vec<u8>>(conn)?;
+    }
+    let mut makers: Vec<_> = activations.iter().map(|s| s.maker_id).collect();
+    makers.extend(rejections.iter().map(|(s, ..)| s.maker_id));
+    if !spent_ids.is_empty() {
+        makers.extend(
+            live_orders::table
+                .filter(live_orders::note_id.eq_any(spent_ids))
+                .filter(live_orders::maker_id.is_not_null())
+                .select(live_orders::maker_id.assume_not_null())
+                .load::<MakerId>(conn)?,
+        );
+    }
+    lock_makers_ordered_tx(conn, &makers)
+}
+
 /// Write one maker command, returning its reply and the update the matcher must
 /// learn once the transaction commits. An exact retry or a conflict changes
 /// nothing and has no update: a change lost to a crash is restored by the
@@ -1549,6 +1618,66 @@ mod tests {
             }),
             "the reservation that won is reported as exposure"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn reverse_arrival_cancel_round_does_not_deadlock_a_two_maker_reservation() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let beta = maker(&mut fixture.conn, "beta")?;
+        let first = note(51);
+        let second = note(52);
+        run(&mut fixture.conn, alpha, "s1", 1, submit(&first))?;
+        run(&mut fixture.conn, beta, "s1", 1, submit(&second))?;
+        ingest(&mut fixture.conn, &[&first, &second])?;
+
+        let held = Arc::new(Barrier::new(2));
+        let mut reserver = connect(&fixture)?;
+        let reserving = {
+            let held = held.clone();
+            std::thread::spawn(move || -> DbResult<()> {
+                reserver.transaction::<_, DbError, _>(|conn| {
+                    // Hold A while the B-then-A cancel round begins.
+                    lock_maker(conn, alpha)?;
+                    held.wait();
+                    std::thread::sleep(Duration::from_millis(100));
+                    prepare_settlement_tx(
+                        conn,
+                        &SettlementAttemptRow {
+                            tx_id: vec![51],
+                            tx_result: vec![51],
+                            status: "prepared".into(),
+                        },
+                        &[first, second]
+                            .into_iter()
+                            .map(|note| SettlementInputRow {
+                                tx_id: vec![51],
+                                parent_note_id: note.id().to_bytes().to_vec(),
+                                child_note_id: None,
+                                child_note_data: None,
+                                fill_amount: None,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+        };
+        let mut canceller = connect(&fixture)?;
+        held.wait();
+        let commands = vec![
+            (header(beta, "c2", 2), cancel_all(CutoffScope::all())),
+            (header(alpha, "c2", 2), cancel_all(CutoffScope::all())),
+        ];
+        canceller.transaction::<_, DbError, _>(|conn| {
+            prelock_command_makers_tx(conn, &commands)?;
+            for (header, command) in &commands {
+                execute_command_tx(conn, header, command)?;
+            }
+            Ok(())
+        })?;
+        reserving.join().expect("reservation panicked")?;
         Ok(())
     }
 

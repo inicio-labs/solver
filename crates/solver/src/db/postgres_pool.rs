@@ -710,6 +710,13 @@ impl IntakeSession {
         };
         if result.is_ok() {
             self.conn = Some(conn);
+        } else {
+            // A failed COMMIT response is indistinguishable here from an
+            // earlier transaction error. The transaction may have committed
+            // without its maker update being published. Stop the solver so
+            // startup hydration reconciles the durable state before another
+            // command can be acknowledged.
+            self.fatal_db.cancel();
         }
         result
     }
@@ -1580,6 +1587,34 @@ mod tests {
             Err(DbError::WriterUnsafe)
         ));
         tokio::time::sleep(Duration::from_millis(350)).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn failed_intake_transaction_requires_hydration_before_more_commands() -> Result<()> {
+        let fixture = TestSchema::migrated()?;
+        let pool = PgPool::open(
+            fixture.url.clone(),
+            fixture.url.clone(),
+            1,
+            "solver/intake-error".into(),
+        )
+        .await?;
+        let mut session = pool.intake_session();
+        let error = session
+            .transaction(|_| Err::<(), _>(DbError::Corrupt("simulated intake failure")))
+            .await
+            .expect_err("an intake error must fail closed");
+        assert!(matches!(
+            error,
+            DbError::Corrupt("simulated intake failure")
+        ));
+        assert!(pool.fatal_token().is_cancelled());
+        assert!(matches!(
+            session.transaction(|_| Ok(())).await,
+            Err(DbError::WriterUnsafe)
+        ));
         Ok(())
     }
 

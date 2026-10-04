@@ -192,14 +192,7 @@ impl MakerGateway for MakerGatewayService {
         request: Request<proto::CancelOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
         let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let header = header(maker_id, request.header)?;
-        if request.lineage_id.len() != LINEAGE_ID_LEN {
-            return Err(Status::invalid_argument(format!(
-                "lineage ID must be {LINEAGE_ID_LEN} bytes"
-            )));
-        }
-        let lineage_id = request.lineage_id;
+        let (header, lineage_id) = request.into_inner().verify(maker_id)?;
         self.execute(header, MakerCommand::CancelOrder { lineage_id })
             .await
     }
@@ -316,6 +309,18 @@ impl proto::CancelAllRequest {
         let scope = scope(&self)?;
         let header = header(maker_id, self.header)?;
         Ok((header, scope))
+    }
+}
+
+impl proto::CancelOrderRequest {
+    /// Validate the lineage key and command header before queueing the cancel.
+    fn verify(self, maker_id: MakerId) -> Result<(CommandHeader, Vec<u8>), Status> {
+        if self.lineage_id.len() != LINEAGE_ID_LEN {
+            return Err(Status::invalid_argument(format!(
+                "lineage ID must be {LINEAGE_ID_LEN} bytes"
+            )));
+        }
+        Ok((header(maker_id, self.header)?, self.lineage_id))
     }
 }
 

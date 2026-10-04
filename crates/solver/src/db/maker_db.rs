@@ -10,7 +10,7 @@
 use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use miden_protocol::account::AccountId;
@@ -127,6 +127,8 @@ pub fn execute_command_tx(
                     maker_lineages::request_id.eq(&header.request_id),
                     maker_lineages::root_seq.eq(seq_column(header.seq)?),
                     maker_lineages::note_id.eq(note.id().to_bytes().to_vec()),
+                    maker_lineages::market.eq(&keys.market),
+                    maker_lineages::direction.eq(&keys.direction),
                 ))
                 .on_conflict_do_nothing()
                 .execute(conn)?
@@ -804,6 +806,92 @@ pub fn report_settlement_tx(
         gateway::append_event_tx(conn, maker_id, None, &body)?;
     }
     Ok(())
+}
+
+/// One lineage as `GetMakerState` shows it: its current order version, or
+/// the submitted note while its submission is pending.
+#[derive(QueryableByName, Debug, Clone, PartialEq, Eq)]
+pub struct MakerOrderView {
+    #[diesel(sql_type = Binary)]
+    pub lineage_id: Vec<u8>,
+    #[diesel(sql_type = BigInt)]
+    pub root_seq: i64,
+    #[diesel(sql_type = Text)]
+    pub request_id: String,
+    #[diesel(sql_type = Binary)]
+    pub note_id: Vec<u8>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    pub depth: Option<i64>,
+    /// The current order row's status; `None` while the submission is pending.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub status: Option<String>,
+    /// Admitted by `live_orders`.
+    #[diesel(sql_type = Bool)]
+    pub live: bool,
+    /// A cutoff or targeted stop covers the lineage.
+    #[diesel(sql_type = Bool)]
+    pub cancelled: bool,
+}
+
+/// One page of `maker_id`'s unfinished lineages after `after` (empty for the
+/// first page): pending submissions, and lineages with an Active, Settling or
+/// Stopped order, with the newest such order. Lineages whose orders are all
+/// filled or spent, and rejected submissions, are left out.
+pub fn maker_orders_page_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    after: &[u8],
+    limit: i64,
+) -> DbResult<Vec<MakerOrderView>> {
+    Ok(diesel::sql_query(
+        "SELECT m.lineage_id, m.root_seq, m.request_id,
+                COALESCE(o.note_id, m.note_id) AS note_id, o.depth, o.status,
+                EXISTS (SELECT 1 FROM live_orders l WHERE l.note_id = o.note_id) AS live,
+                (EXISTS (SELECT 1 FROM maker_cutoffs c
+                         WHERE c.maker_id = m.maker_id AND m.root_seq < c.cutoff
+                           AND (c.market = '' OR c.market = COALESCE(o.market, m.market))
+                           AND (c.direction = ''
+                                OR c.direction = COALESCE(o.direction, m.direction)))
+                 OR EXISTS (SELECT 1 FROM maker_stops s
+                            WHERE s.maker_id = m.maker_id AND s.lineage_id = m.lineage_id))
+                    AS cancelled
+         FROM maker_lineages m
+         LEFT JOIN LATERAL (
+             SELECT note_id, depth, status, market, direction FROM orders
+             WHERE lineage_id = m.lineage_id AND status IN ('active', 'settling', 'stopped')
+             ORDER BY depth DESC
+             LIMIT 1
+         ) o ON true
+         WHERE m.maker_id = $1 AND m.lineage_id > $2
+           AND (m.state = 'pending' OR o.note_id IS NOT NULL)
+         ORDER BY m.lineage_id
+         LIMIT $3",
+    )
+    .bind::<BigInt, _>(maker_id)
+    .bind::<Binary, _>(after)
+    .bind::<BigInt, _>(limit)
+    .load(conn)?)
+}
+
+/// `maker_id`'s cancel-all barriers.
+pub fn maker_cutoffs_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> DbResult<Vec<(CutoffScope, u64)>> {
+    maker_cutoffs::table
+        .filter(maker_cutoffs::maker_id.eq(maker_id))
+        .order((maker_cutoffs::market, maker_cutoffs::direction))
+        .select((
+            maker_cutoffs::market,
+            maker_cutoffs::direction,
+            maker_cutoffs::cutoff,
+        ))
+        .load::<(Vec<u8>, Vec<u8>, i64)>(conn)?
+        .into_iter()
+        .map(|(market, direction, cutoff)| {
+            Ok((CutoffScope { market, direction }, u64::try_from(cutoff)?))
+        })
+        .collect()
 }
 
 /// The three V1 events (frozen; ADR 0003).
@@ -1727,18 +1815,122 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn the_state_read_shows_unfinished_orders_page_by_page() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let (alpha, beta) = (maker(conn, "alpha")?, maker(conn, "beta")?);
+        let (x, y) = tokens();
+        let pending = note(1);
+        let live = note(2);
+        let targeted = note(3);
+        let settling = note(4);
+        let other_side = Note::from(pswap(5, y, x));
+        let filled = note(6);
+        for (seq, order) in [
+            (1, &pending),
+            (10, &live),
+            (3, &targeted),
+            (4, &settling),
+            (6, &other_side),
+            (7, &filled),
+        ] {
+            run(conn, alpha, &format!("s{seq}"), seq, submit(order))?;
+        }
+        run(conn, beta, "s1", 1, submit(&note(7)))?;
+        ingest(conn, &[&live, &targeted, &settling, &filled])?;
+        // The watcher would have activated the ones on chain.
+        let activated: Vec<_> = [&live, &targeted, &settling, &filled]
+            .into_iter()
+            .map(|order| OrderKeys::from_note(order).unwrap().lineage_id)
+            .collect();
+        diesel::update(maker_lineages::table.filter(maker_lineages::lineage_id.eq_any(&activated)))
+            .set(maker_lineages::state.eq(LineageState::Activated.as_str()))
+            .execute(conn)?;
+        let stop = MakerCommand::CancelOrder {
+            lineage_id: OrderKeys::from_note(&targeted)?.lineage_id,
+        };
+        run(conn, alpha, "x11", 11, stop)?;
+        prepare(conn, 1, &[fill(1, &settling, 40).0])?;
+        prepare(conn, 2, &[fill(2, &filled, 100).0])?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(
+                conn,
+                &[2],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+            )
+        })?;
+        // Cancel the x→y direction below 8, after the reservation.
+        run(
+            conn,
+            alpha,
+            "c8",
+            8,
+            cancel_all(CutoffScope::direction(x, y)),
+        )?;
+
+        let mut seen = Vec::new();
+        let mut after = Vec::new();
+        loop {
+            let page = maker_orders_page_tx(conn, alpha, &after, 2)?;
+            let full = page.len() == 2;
+            if let Some(last) = page.last() {
+                after = last.lineage_id.clone();
+            }
+            seen.extend(page);
+            if !full {
+                break;
+            }
+        }
+        let lineages: Vec<_> = seen.iter().map(|view| view.lineage_id.clone()).collect();
+        let mut sorted = lineages.clone();
+        sorted.sort();
+        assert_eq!(lineages, sorted, "pages run in lineage order");
+        let view = |order: &Note| {
+            let lineage = OrderKeys::from_note(order).unwrap().lineage_id;
+            seen.iter()
+                .find(|view| view.lineage_id == lineage)
+                .map(|view| (view.status.clone(), view.live, view.cancelled))
+        };
+        assert_eq!(seen.len(), 5, "the filled order and beta's are left out");
+        assert_eq!(
+            view(&pending),
+            Some((None, false, true)),
+            "market-scoped cutoff applies"
+        );
+        assert_eq!(view(&live), Some((Some("active".into()), true, false)));
+        assert_eq!(view(&targeted), Some((Some("active".into()), false, true)));
+        assert_eq!(
+            view(&settling),
+            Some((Some("settling".into()), false, true)),
+            "exposure"
+        );
+        assert_eq!(view(&other_side), Some((None, false, false)));
+        assert_eq!(view(&filled), None);
+        assert_eq!(
+            maker_cutoffs_tx(conn, alpha)?,
+            [(CutoffScope::direction(x, y), 8)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn reverting_after_maker_activity_is_refused() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
         run(conn, alpha, "s1", 1, submit(&note(1)))?;
-        // The settlement-fills column goes first; the maker tables refuse.
+        // The later columns go first; the maker tables refuse.
+        postgres_migrations::revert_last(conn)?;
         postgres_migrations::revert_last(conn)?;
         assert!(postgres_migrations::revert_last(conn).is_err());
 
         let mut empty = TestSchema::migrated()?;
-        postgres_migrations::revert_last(&mut empty.conn)?;
-        postgres_migrations::revert_last(&mut empty.conn)?;
+        for _ in 0..3 {
+            postgres_migrations::revert_last(&mut empty.conn)?;
+        }
         postgres_migrations::migrate(&mut empty.conn)?;
         Ok(())
     }

@@ -1,156 +1,269 @@
-//! The maker-note watcher (ADR 0003). It makes accepted submits Live once
-//! their notes are verified committed and unspent, and retires maker orders
-//! whose notes are spent elsewhere. It uses node RPC only: maker notes are
-//! never imported into the ingest client, so no private note reaches the
-//! book without the gateway's checks.
+//! Tracks maker notes with a dedicated Miden client. The SDK owns note
+//! inclusion, nullifier sync and its chain cursor; PostgreSQL owns whether an
+//! order is live and which maker events have been committed.
 //!
-//! Each round:
-//! 1. new submissions are looked up by note ID once (catches notes committed
-//!    before their data arrived);
-//! 2. older pending ones are found through their note tags over the blocks
-//!    committed since the last round, never by re-querying every ID;
-//! 3. a found note must match what was submitted and be unspent;
-//! 4. watched maker orders are checked for spends in the new blocks (a newly
-//!    watched one over its whole history);
-//! 5. one `write_book` commits every activation, rejection and spend, with
-//!    their OrderStatus events and the book update.
-//!
-//! A round that fails changes nothing and is repeated whole. The node is
-//! trusted for inclusion, as the ingest and executor paths already trust it.
+//! A round can be repeated after any failure. The SDK store may advance before
+//! the PostgreSQL write; pending and live rows are reconciled against the SDK
+//! on every round, so a restart or failed write does not lose a transition.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use miden_client::rpc::domain::note::FetchedNote;
-use miden_client::rpc::{NodeRpcClient, RpcLimits};
+use miden_client::keystore::FilesystemKeyStore;
+use miden_client::note::{NoteFile, NoteSyncHint};
+use miden_client::rpc::domain::note::CommittedNote;
+use miden_client::rpc::NodeRpcClient;
+use miden_client::store::{InputNoteRecord, NoteFilter};
+use miden_client::sync::{NoteUpdateAction, OnNoteReceived, StateSync, StateSyncInput};
+use miden_client::{Client, ClientError};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::{NoteId, NoteMetadata, NoteTag, Nullifier};
+use miden_protocol::note::{Note, NoteId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::proto::OrderState;
-use crate::db::maker_db::{self, PendingSubmission};
+use crate::db::maker_db;
 use crate::db::{postgres_db, DbPool};
 use crate::ingest::{ChainError, ChainResult};
 use crate::types::{now_unix, BookUpdate, OrderId};
 
-/// What the watcher needs from the chain.
-#[async_trait]
-pub trait MakerChain: Send + Sync {
-    /// The committed chain tip.
-    async fn tip(&mut self) -> ChainResult<BlockNumber>;
-    /// The committed notes among `ids`, with their committed metadata.
-    async fn committed(&mut self, ids: &[NoteId]) -> ChainResult<HashMap<NoteId, NoteMetadata>>;
-    /// Notes committed in `from..=to` carrying one of `tags`.
-    async fn tagged(
-        &mut self,
-        from: BlockNumber,
-        to: BlockNumber,
-        tags: &BTreeSet<NoteTag>,
-    ) -> ChainResult<HashMap<NoteId, NoteMetadata>>;
-    /// Which of `nullifiers` were spent in `from..=to`.
-    async fn spent(
-        &mut self,
-        nullifiers: &[Nullifier],
-        from: BlockNumber,
-        to: BlockNumber,
-    ) -> ChainResult<HashSet<Nullifier>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteObservation {
+    Pending,
+    Committed,
+    Consumed,
+    Mismatched,
 }
 
-/// [`MakerChain`] over the solver's node RPC, in requests sized to the
-/// node's published limits.
-pub struct RpcChain {
+/// Check a set of exact notes without deciding whether their orders may trade.
+#[async_trait(?Send)]
+pub trait MakerTracker {
+    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
+}
+
+/// Only exact notes supplied by PostgreSQL may enter the maker client store.
+struct MakerNoteScreen(HashSet<NoteId>);
+
+#[async_trait(?Send)]
+impl OnNoteReceived for MakerNoteScreen {
+    async fn on_note_received(
+        &self,
+        committed: CommittedNote,
+        _public: Option<InputNoteRecord>,
+    ) -> Result<NoteUpdateAction, ClientError> {
+        Ok(if self.0.contains(committed.note_id()) {
+            NoteUpdateAction::Commit(committed)
+        } else {
+            NoteUpdateAction::Discard
+        })
+    }
+}
+
+/// The SDK's client store is dedicated to maker notes, separate from ingest.
+/// An exact-ID RPC fallback handles the exceptional case in which an expected
+/// record with the same details commitment resolved to another note's metadata.
+pub struct SdkTracker {
+    client: Client<FilesystemKeyStore>,
     rpc: Arc<dyn NodeRpcClient>,
-    limits: Option<RpcLimits>,
+    // Recheck exact identity and historic spends when a note enters the watch
+    // set, including after restart or a period excluded from scoped sync.
+    tracked: HashSet<NoteId>,
 }
 
-impl RpcChain {
-    pub fn new(rpc: Arc<dyn NodeRpcClient>) -> Self {
-        Self { rpc, limits: None }
-    }
-
-    async fn limits(&mut self) -> ChainResult<RpcLimits> {
-        if let Some(limits) = self.limits {
-            return Ok(limits);
+impl SdkTracker {
+    pub fn new(client: Client<FilesystemKeyStore>, rpc: Arc<dyn NodeRpcClient>) -> Self {
+        Self {
+            client,
+            rpc,
+            tracked: HashSet::new(),
         }
-        let limits = self.rpc.get_rpc_limits().await?;
-        self.limits = Some(limits);
-        Ok(limits)
-    }
-}
-
-fn chunk_size(limit: u32) -> usize {
-    usize::try_from(limit).unwrap_or(usize::MAX).max(1)
-}
-
-#[async_trait]
-impl MakerChain for RpcChain {
-    async fn tip(&mut self) -> ChainResult<BlockNumber> {
-        let (header, _) = self.rpc.get_block_header_by_number(None, false).await?;
-        Ok(header.block_num())
     }
 
-    async fn committed(&mut self, ids: &[NoteId]) -> ChainResult<HashMap<NoteId, NoteMetadata>> {
-        let size = chunk_size(self.limits().await?.note_ids_limit);
-        let mut found = HashMap::new();
-        for chunk in ids.chunks(size) {
-            for note in self.rpc.get_notes_by_id(chunk).await? {
-                let id = match &note {
-                    FetchedNote::Private(id, ..) => *id,
-                    FetchedNote::Public(note, _) => note.id(),
-                };
-                found.insert(id, *note.metadata());
-            }
-        }
-        Ok(found)
-    }
-
-    async fn tagged(
-        &mut self,
-        from: BlockNumber,
-        to: BlockNumber,
-        tags: &BTreeSet<NoteTag>,
-    ) -> ChainResult<HashMap<NoteId, NoteMetadata>> {
-        let size = chunk_size(self.limits().await?.note_tags_limit);
-        let tags: Vec<NoteTag> = tags.iter().copied().collect();
-        let mut found = HashMap::new();
-        for chunk in tags.chunks(size) {
-            let chunk: BTreeSet<NoteTag> = chunk.iter().copied().collect();
-            for block in self.rpc.sync_notes(from, to, &chunk).await? {
-                for (id, note) in block.notes {
-                    found.insert(id, *note.metadata());
-                }
-            }
-        }
-        Ok(found)
-    }
-
-    async fn spent(
-        &mut self,
-        nullifiers: &[Nullifier],
-        from: BlockNumber,
-        to: BlockNumber,
-    ) -> ChainResult<HashSet<Nullifier>> {
-        let size = chunk_size(self.limits().await?.nullifiers_limit);
-        let wanted: HashSet<Nullifier> = nullifiers.iter().copied().collect();
-        let prefixes: Vec<u16> = wanted
-            .iter()
-            .map(Nullifier::prefix)
-            .collect::<BTreeSet<_>>()
+    /// Build sync input from the authoritative set, never all SQLite records.
+    /// This also excludes unrelated records left by earlier watcher versions.
+    async fn maker_sync_input(&self, notes: &[Note]) -> ChainResult<StateSyncInput> {
+        let allowed: HashSet<_> = notes.iter().map(Note::id).collect();
+        let input_notes: Vec<_> = self
+            .client
+            .get_input_notes(NoteFilter::DetailsCommitments(
+                notes.iter().map(Note::details_commitment).collect(),
+            ))
+            .await?
             .into_iter()
+            .filter(|record| {
+                !record.is_consumed() && record.id().is_none_or(|id| allowed.contains(&id))
+            })
             .collect();
-        let mut spent = HashSet::new();
-        for chunk in prefixes.chunks(size) {
-            for update in self.rpc.sync_nullifiers(chunk, from, to).await? {
-                if wanted.contains(&update.nullifier) {
-                    spent.insert(update.nullifier);
+        let pending: BTreeSet<_> = input_notes
+            .iter()
+            .filter(|record| !record.is_committed())
+            .map(|record| record.details_commitment())
+            .collect();
+        Ok(StateSyncInput {
+            accounts: Vec::new(),
+            note_tags: notes
+                .iter()
+                .filter(|note| pending.contains(&note.details_commitment()))
+                .map(|note| note.metadata().tag())
+                .collect(),
+            input_notes,
+            output_notes: Vec::new(),
+            uncommitted_transactions: Vec::new(),
+        })
+    }
+
+    async fn sync_maker_notes(&mut self, notes: &[Note]) -> ChainResult<()> {
+        let input = self.maker_sync_input(notes).await?;
+        let allowed = notes.iter().map(Note::id).collect();
+        let sync = StateSync::new(
+            self.rpc.clone(),
+            Arc::new(MakerNoteScreen(allowed)),
+            None,
+            self.client.get_validator_config().await?,
+        );
+        let mut update = sync
+            .fetch_state(self.client.get_sync_height().await?, input)
+            .await?;
+        sync.derive_state_updates(&mut update).await?;
+        sync.fetch_nullifiers(&mut update).await?;
+        self.client.apply_chain_updates(&sync, update).await?;
+        Ok(())
+    }
+
+    async fn exact_lookup(&self, note: &Note) -> ChainResult<NoteObservation> {
+        let Some(found) = self
+            .rpc
+            .get_notes_by_id(&[note.id()])
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(NoteObservation::Pending);
+        };
+        if found.id() != note.id() || found.metadata() != note.metadata() {
+            return Ok(NoteObservation::Mismatched);
+        }
+        let spent = self
+            .rpc
+            .get_nullifier_commit_heights(BTreeSet::from([note.nullifier()]), BlockNumber::GENESIS)
+            .await?;
+        Ok(
+            if spent.get(&note.nullifier()).copied().flatten().is_some() {
+                NoteObservation::Consumed
+            } else {
+                NoteObservation::Committed
+            },
+        )
+    }
+}
+
+#[async_trait(?Send)]
+impl MakerTracker for SdkTracker {
+    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+        self.client.ensure_genesis_in_place().await?;
+        self.client.ensure_rpc_limits_in_place().await?;
+        // Capture before lookup: a note committed during import must still be
+        // covered by the following forward sync.
+        let cursor = self.client.get_sync_height().await?;
+        let commitments: Vec<_> = notes.iter().map(Note::details_commitment).collect();
+        let mut count_by_commitment = BTreeMap::new();
+        for commitment in &commitments {
+            *count_by_commitment.entry(*commitment).or_insert(0_usize) += 1;
+        }
+        let known: BTreeSet<_> = self
+            .client
+            .get_input_notes(NoteFilter::DetailsCommitments(commitments.clone()))
+            .await?
+            .iter()
+            .map(|record| record.details_commitment())
+            .collect();
+        let mut queued = BTreeSet::new();
+        let new_notes: Vec<_> = notes
+            .iter()
+            .filter(|note| {
+                let commitment = note.details_commitment();
+                (!known.contains(&commitment) || !self.tracked.contains(&note.id()))
+                    && queued.insert(commitment)
+            })
+            .collect();
+        if !new_notes.is_empty() {
+            let limit = self.rpc.get_rpc_limits().await?.note_ids_limit.max(1) as usize;
+            for batch in new_notes.chunks(limit) {
+                let ids: Vec<_> = batch.iter().map(|note| note.id()).collect();
+                let found: HashMap<_, _> = self
+                    .rpc
+                    .get_notes_by_id(&ids)
+                    .await?
+                    .into_iter()
+                    .map(|note| (note.id(), note))
+                    .collect();
+                let mut imports = Vec::with_capacity(batch.len());
+                for note in batch {
+                    imports.push(if let Some(found) = found.get(&note.id()) {
+                        if found.metadata() != note.metadata() {
+                            return Err(ClientError::NoteImportError(
+                                "committed maker note metadata differs from submission".into(),
+                            )
+                            .into());
+                        }
+                        NoteFile::Committed {
+                            note: (*note).clone(),
+                            proof: found.inclusion_proof().clone(),
+                        }
+                    } else {
+                        NoteFile::ExpectedNote {
+                            details: (*note).clone().into(),
+                            // Skip historical import; forward sync starts at the
+                            // captured cursor and covers commitments racing lookup.
+                            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
+                        }
+                    });
                 }
+                self.client.import_notes(&imports).await?;
             }
         }
-        Ok(spent)
+
+        self.sync_maker_notes(notes).await?;
+        let records: BTreeMap<_, _> = self
+            .client
+            .get_input_notes(NoteFilter::DetailsCommitments(commitments))
+            .await?
+            .into_iter()
+            .map(|record| (record.details_commitment(), record))
+            .collect();
+        let mut observed = HashMap::with_capacity(notes.len());
+        for note in notes {
+            // The SDK stores only one expected record per details commitment.
+            // If two submitted IDs share it, use exact SDK RPC lookup for both
+            // rather than treating either record as the other's commitment.
+            if count_by_commitment[&note.details_commitment()] > 1 {
+                observed.insert(note.id(), self.exact_lookup(note).await?);
+                continue;
+            }
+            let record = records
+                .get(&note.details_commitment())
+                .ok_or(ChainError::MissingSyncedNote(note.id()))?;
+            let state =
+                if record.id() == Some(note.id()) && record.metadata() == Some(note.metadata()) {
+                    if record.is_consumed() {
+                        NoteObservation::Consumed
+                    } else if record.is_committed() {
+                        NoteObservation::Committed
+                    } else {
+                        NoteObservation::Pending
+                    }
+                } else if record.id().is_some() {
+                    self.exact_lookup(note).await?
+                } else {
+                    NoteObservation::Pending
+                };
+            observed.insert(note.id(), state);
+        }
+        self.tracked = notes.iter().map(Note::id).collect();
+        Ok(observed)
     }
 }
 
@@ -160,129 +273,92 @@ pub enum WatchError {
     Chain(#[from] ChainError),
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
+    #[error("tracker omitted note {0}")]
+    MissingObservation(NoteId),
 }
 
-/// The watcher's memory; all of it is rebuilt from the database and chain
-/// after a restart.
-pub struct Watcher<C> {
+pub struct Watcher<T> {
     pool: DbPool,
-    chain: C,
+    tracker: T,
     book_tx: mpsc::Sender<BookUpdate>,
-    /// The last block whose tags and nullifiers were scanned.
-    cursor: Option<BlockNumber>,
-    /// Pending notes already looked up by ID; later found by tag.
-    looked_up: HashSet<NoteId>,
-    /// Maker orders watched for spends, by stored note ID.
-    watched: HashMap<Vec<u8>, Nullifier>,
+    // PostgreSQL supplies the authoritative set; this cache avoids decoding
+    // every unchanged live note on every round. It is rebuilt after restart.
+    watched: HashMap<Vec<u8>, Note>,
 }
 
-impl<C: MakerChain> Watcher<C> {
-    pub fn new(pool: DbPool, chain: C, book_tx: mpsc::Sender<BookUpdate>) -> Self {
+impl<T: MakerTracker> Watcher<T> {
+    pub fn new(pool: DbPool, tracker: T, book_tx: mpsc::Sender<BookUpdate>) -> Self {
         Self {
             pool,
-            chain,
+            tracker,
             book_tx,
-            cursor: None,
-            looked_up: HashSet::new(),
             watched: HashMap::new(),
         }
     }
 
-    /// One round. Nothing is remembered unless its write committed.
+    /// Reconcile pending submissions and previously live maker orders against
+    /// the SDK, then commit every resulting order and event change together.
     pub async fn round(&mut self) -> Result<(), WatchError> {
-        let tip = self.chain.tip().await?;
-        // Blocks not scanned yet; `None` when the tip has not moved.
-        let fresh = match self.cursor {
-            Some(cursor) if tip <= cursor => None,
-            Some(cursor) => Some(cursor.child()),
-            None => Some(tip),
-        };
-
-        // 1–2: find committed submissions.
         let pending = self.pool.read(maker_db::pending_submissions_tx).await?;
-        let new_ids: Vec<NoteId> = pending
-            .iter()
-            .map(|submission| submission.note.id())
-            .filter(|id| !self.looked_up.contains(id))
-            .collect();
-        let mut committed = self.chain.committed(&new_ids).await?;
-        if let (Some(from), Some(_)) = (fresh, self.cursor) {
-            let tags: BTreeSet<NoteTag> = pending
-                .iter()
-                .filter(|submission| self.looked_up.contains(&submission.note.id()))
-                .map(|submission| submission.note.metadata().tag())
-                .collect();
-            if !tags.is_empty() {
-                // Other notes share these tags; only submitted IDs count.
-                committed.extend(self.chain.tagged(from, tip, &tags).await?);
-            }
-        }
-
-        // 3: a found note must be the submitted one, and unspent.
-        let mut found = Vec::new();
-        let mut rejections = Vec::new();
-        for submission in &pending {
-            match committed.get(&submission.note.id()) {
-                None => {}
-                Some(metadata) if metadata != submission.note.metadata() => rejections.push((
-                    submission.clone(),
-                    OrderState::Rejected,
-                    "committed note differs from the submitted note",
-                )),
-                Some(_) => found.push(submission.clone()),
-            }
-        }
-        let nullifiers: Vec<Nullifier> = found.iter().map(|s| s.note.nullifier()).collect();
-        let spent_before = self
-            .chain
-            .spent(&nullifiers, BlockNumber::GENESIS, tip)
-            .await?;
-        let (spent, activations): (Vec<PendingSubmission>, Vec<PendingSubmission>) = found
-            .into_iter()
-            .partition(|submission| spent_before.contains(&submission.note.nullifier()));
-        rejections.extend(spent.into_iter().map(|submission| {
-            (
-                submission,
-                OrderState::Unavailable,
-                "note spent before it became live",
-            )
-        }));
-
-        // 4: maker orders spent elsewhere.
         let watched_ids = self.pool.read(maker_db::watched_maker_orders_tx).await?;
-        let newly_watched: Vec<Vec<u8>> = watched_ids
-            .iter()
-            .filter(|id| !self.watched.contains_key(*id))
-            .cloned()
+        let wanted: HashSet<_> = watched_ids.iter().cloned().collect();
+        let new_ids: Vec<_> = watched_ids
+            .into_iter()
+            .filter(|id| !self.watched.contains_key(id))
             .collect();
         let new_notes = self
             .pool
-            .read(move |conn| maker_db::order_notes_tx(conn, &newly_watched))
+            .read(move |conn| maker_db::order_notes_tx(conn, &new_ids))
             .await?;
-        let mut watched: HashMap<Vec<u8>, Nullifier> = watched_ids
+        self.watched.retain(|id, _| wanted.contains(id));
+        for note in new_notes {
+            self.watched.insert(note.id().to_bytes().to_vec(), note);
+        }
+
+        let notes: BTreeMap<NoteId, Note> = pending
             .iter()
-            .filter_map(|id| Some((id.clone(), *self.watched.get(id)?)))
+            .map(|submission| (submission.note.id(), submission.note.clone()))
+            .chain(self.watched.values().map(|note| (note.id(), note.clone())))
             .collect();
-        let new_nullifiers: Vec<Nullifier> =
-            new_notes.iter().map(|note| note.nullifier()).collect();
-        let mut spent_orders = self
-            .chain
-            .spent(&new_nullifiers, BlockNumber::GENESIS, tip)
+        let observations = self
+            .tracker
+            .observe(&notes.into_values().collect::<Vec<_>>())
             .await?;
-        if let (Some(from), Some(_)) = (fresh, self.cursor) {
-            let known: Vec<Nullifier> = watched.values().copied().collect();
-            spent_orders.extend(self.chain.spent(&known, from, tip).await?);
-        }
-        for note in &new_notes {
-            watched.insert(note.id().to_bytes().to_vec(), note.nullifier());
-        }
-        let spent_ids: Vec<Vec<u8>> = watched
+        for note in pending
             .iter()
-            .filter(|(_, nullifier)| spent_orders.contains(nullifier))
+            .map(|submission| &submission.note)
+            .chain(self.watched.values())
+        {
+            if !observations.contains_key(&note.id()) {
+                return Err(WatchError::MissingObservation(note.id()));
+            }
+        }
+
+        let mut activations = Vec::new();
+        let mut rejections = Vec::new();
+        for submission in pending {
+            match observations[&submission.note.id()] {
+                NoteObservation::Committed => activations.push(submission),
+                NoteObservation::Consumed => rejections.push((
+                    submission,
+                    OrderState::Unavailable,
+                    "note spent before it became live",
+                )),
+                NoteObservation::Mismatched => rejections.push((
+                    submission,
+                    OrderState::Rejected,
+                    "committed note differs from the submitted note",
+                )),
+                NoteObservation::Pending => {}
+            }
+        }
+        let spent_ids: Vec<Vec<u8>> = self
+            .watched
+            .iter()
+            .filter(|(_, note)| observations.get(&note.id()) == Some(&NoteObservation::Consumed))
             .map(|(id, _)| id.clone())
             .collect();
 
-        // 5: one commit for everything found.
         if !activations.is_empty() || !rejections.is_empty() || !spent_ids.is_empty() {
             let removed = spent_ids
                 .iter()
@@ -306,28 +382,15 @@ impl<C: MakerChain> Watcher<C> {
                 "maker notes verified"
             );
         }
-
-        // The round committed: remember what it learned.
-        for id in &spent_ids {
-            watched.remove(id);
-        }
-        self.watched = watched;
-        self.looked_up = pending
-            .iter()
-            .map(|submission| submission.note.id())
-            .filter(|id| !committed.contains_key(id))
-            .collect();
-        if fresh.is_some() {
-            self.cursor = Some(tip);
+        for id in spent_ids {
+            self.watched.remove(&id);
         }
         Ok(())
     }
 }
 
-/// Run rounds every `interval` until `cancel` fires. A failed round is
-/// logged and repeated whole on the next tick.
-pub async fn run_watcher<C: MakerChain>(
-    mut watcher: Watcher<C>,
+pub async fn run_watcher<T: MakerTracker>(
+    mut watcher: Watcher<T>,
     interval: Duration,
     cancel: CancellationToken,
 ) {
@@ -353,14 +416,18 @@ mod tests {
     use crate::db::postgres_test::TestDb;
     use crate::gateway::proto;
     use crate::maker::{CommandHeader, CutoffScope, MakerCommand, MakerId};
+    use miden_client::builder::ClientBuilder;
+    use miden_client::testing::mock::MockRpcApi;
+    use miden_client_sqlite_store::ClientBuilderSqliteExt;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
-    use miden_protocol::note::{Note, NoteType};
+    use miden_protocol::note::{Note, NoteMetadata, NoteType, Nullifier};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
+    use miden_testing::MockChain;
     use prost::Message;
     use std::sync::Mutex;
 
@@ -370,7 +437,6 @@ mod tests {
         notes: HashMap<NoteId, (u32, NoteMetadata)>,
         spent: HashMap<Nullifier, u32>,
         down: bool,
-        looked_up_by_id: Vec<NoteId>,
     }
 
     #[derive(Default, Clone)]
@@ -401,62 +467,29 @@ mod tests {
         Ok(())
     }
 
-    #[async_trait]
-    impl MakerChain for FakeChain {
-        async fn tip(&mut self) -> ChainResult<BlockNumber> {
+    #[async_trait(?Send)]
+    impl MakerTracker for FakeChain {
+        async fn observe(
+            &mut self,
+            notes: &[Note],
+        ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
             let state = self.state();
             up(&state)?;
-            Ok(state.tip.into())
-        }
-
-        async fn committed(
-            &mut self,
-            ids: &[NoteId],
-        ) -> ChainResult<HashMap<NoteId, NoteMetadata>> {
-            let mut state = self.state();
-            up(&state)?;
-            state.looked_up_by_id.extend(ids);
-            Ok(ids
+            Ok(notes
                 .iter()
-                .filter_map(|id| Some((*id, state.notes.get(id)?.1)))
-                .collect())
-        }
-
-        async fn tagged(
-            &mut self,
-            from: BlockNumber,
-            to: BlockNumber,
-            tags: &BTreeSet<NoteTag>,
-        ) -> ChainResult<HashMap<NoteId, NoteMetadata>> {
-            let state = self.state();
-            up(&state)?;
-            Ok(state
-                .notes
-                .iter()
-                .filter(|(_, (block, metadata))| {
-                    (from.as_u32()..=to.as_u32()).contains(block) && tags.contains(&metadata.tag())
+                .map(|note| {
+                    let observation = match state.notes.get(&note.id()) {
+                        None => NoteObservation::Pending,
+                        Some((_, metadata)) if metadata != note.metadata() => {
+                            NoteObservation::Mismatched
+                        }
+                        Some(_) if state.spent.contains_key(&note.nullifier()) => {
+                            NoteObservation::Consumed
+                        }
+                        Some(_) => NoteObservation::Committed,
+                    };
+                    (note.id(), observation)
                 })
-                .map(|(id, (_, metadata))| (*id, *metadata))
-                .collect())
-        }
-
-        async fn spent(
-            &mut self,
-            nullifiers: &[Nullifier],
-            from: BlockNumber,
-            to: BlockNumber,
-        ) -> ChainResult<HashSet<Nullifier>> {
-            let state = self.state();
-            up(&state)?;
-            Ok(nullifiers
-                .iter()
-                .filter(|nullifier| {
-                    state
-                        .spent
-                        .get(nullifier)
-                        .is_some_and(|block| (from.as_u32()..=to.as_u32()).contains(block))
-                })
-                .copied()
                 .collect())
         }
     }
@@ -465,6 +498,14 @@ mod tests {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
             .try_into()
             .unwrap();
+        note_for_creator(serial, note_type, creator)
+    }
+
+    fn note_for_creator(
+        serial: u32,
+        note_type: NoteType,
+        creator: miden_protocol::account::AccountId,
+    ) -> Note {
         let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
         let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
         PswapNote::builder()
@@ -482,6 +523,209 @@ mod tests {
             .build()
             .unwrap()
             .into()
+    }
+
+    #[tokio::test]
+    async fn sdk_tracker_recovers_note_committed_before_submission() {
+        let committed = note(700, NoteType::Private);
+        let mut builder = MockChain::builder();
+        builder.add_output_note(miden_protocol::transaction::RawOutputNote::Full(
+            committed.clone(),
+        ));
+        let rpc = Arc::new(MockRpcApi::new(builder.build().unwrap()));
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().join("maker.sqlite3");
+        let client = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(store_path.clone())
+            .build()
+            .await
+            .unwrap();
+        let mut tracker = SdkTracker::new(client, rpc.clone());
+
+        let first = tracker
+            .observe(std::slice::from_ref(&committed))
+            .await
+            .unwrap();
+        assert_eq!(first[&committed.id()], NoteObservation::Committed);
+
+        drop(tracker);
+        let reopened = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(store_path)
+            .build()
+            .await
+            .unwrap();
+        let mut tracker = SdkTracker::new(reopened, rpc);
+        let after_restart = tracker
+            .observe(std::slice::from_ref(&committed))
+            .await
+            .unwrap();
+        assert_eq!(after_restart[&committed.id()], NoteObservation::Committed);
+    }
+
+    #[tokio::test]
+    async fn sdk_tracker_filters_same_tag_notes_and_legacy_store_records() {
+        use miden_protocol::transaction::RawOutputNote;
+        use miden_testing::Auth;
+        let mut builder = MockChain::builder();
+        let asset =
+            FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(), 100).unwrap();
+        let sender = builder
+            .add_existing_wallet_with_assets(Auth::IncrNonce, [asset.into()])
+            .unwrap();
+        let wanted = note_for_creator(701, NoteType::Public, sender.id());
+        let unrelated = note_for_creator(702, NoteType::Public, sender.id());
+        assert_eq!(wanted.metadata().tag(), unrelated.metadata().tag());
+        let spawn = builder.add_spawn_note([&wanted, &unrelated]).unwrap();
+        let chain = builder.build().unwrap();
+        let executed = chain
+            .build_transaction(sender)
+            .authenticated_input_note(spawn.id())
+            .expected_output_note(RawOutputNote::Full(wanted.clone()))
+            .expected_output_note(RawOutputNote::Full(unrelated.clone()))
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let rpc = Arc::new(MockRpcApi::new(chain));
+        let dir = tempfile::tempdir().unwrap();
+        let client = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(dir.path().join("maker.sqlite3"))
+            .build()
+            .await
+            .unwrap();
+        let mut tracker = SdkTracker::new(client, rpc.clone());
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&spawn)).await.unwrap()[&spawn.id()],
+            NoteObservation::Committed
+        );
+        assert_eq!(
+            tracker
+                .observe(std::slice::from_ref(&wanted))
+                .await
+                .unwrap()[&wanted.id()],
+            NoteObservation::Pending
+        );
+        rpc.mock_chain
+            .write()
+            .add_pending_executed_transaction(&executed)
+            .unwrap();
+        rpc.prove_block();
+        assert_eq!(
+            tracker
+                .observe(std::slice::from_ref(&wanted))
+                .await
+                .unwrap()[&wanted.id()],
+            NoteObservation::Committed
+        );
+        let stored = tracker
+            .client
+            .get_input_notes(NoteFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            2,
+            "only the explicitly imported notes are stored"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|record| record.id() != Some(unrelated.id())),
+            "same-tag public notes must not enter the maker store"
+        );
+        assert!(stored.iter().any(|record| record.id() == Some(wanted.id())));
+        // The spawn was consumed while excluded and the cursor already passed
+        // its spend block. Re-entering the set must recover that historic spend.
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&spawn)).await.unwrap()[&spawn.id()],
+            NoteObservation::Consumed
+        );
+
+        // Simulate a record retained by the earlier watcher. It must not be
+        // loaded into subsequent nullifier sync, including an empty watch set.
+        let proof = rpc
+            .get_notes_by_id(&[unrelated.id()])
+            .await
+            .unwrap()
+            .remove(0)
+            .inclusion_proof()
+            .clone();
+        tracker
+            .client
+            .import_notes(&[NoteFile::Committed {
+                note: unrelated,
+                proof,
+            }])
+            .await
+            .unwrap();
+        let input = tracker
+            .maker_sync_input(std::slice::from_ref(&wanted))
+            .await
+            .unwrap();
+        assert_eq!(input.input_notes.len(), 1);
+        assert_eq!(input.input_notes[0].id(), Some(wanted.id()));
+        assert!(
+            input.note_tags.is_empty(),
+            "committed notes only need nullifier tracking"
+        );
+        let empty = tracker.maker_sync_input(&[]).await.unwrap();
+        assert!(empty.input_notes.is_empty());
+        assert!(empty.note_tags.is_empty());
+        tracker.observe(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdk_tracker_new_pending_notes_start_after_the_synced_cursor() {
+        use miden_client::store::InputNoteState;
+        let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
+        rpc.prove_block();
+        let dir = tempfile::tempdir().unwrap();
+        let client = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(dir.path().join("maker.sqlite3"))
+            .build()
+            .await
+            .unwrap();
+        let mut tracker = SdkTracker::new(client, rpc.clone());
+        tracker.observe(&[]).await.unwrap();
+        let cursor = tracker.client.get_sync_height().await.unwrap();
+        assert!(cursor > BlockNumber::GENESIS);
+        let pending = note(703, NoteType::Private);
+        let calls = rpc.get_notes_by_id_call_count();
+        assert_eq!(
+            tracker
+                .observe(std::slice::from_ref(&pending))
+                .await
+                .unwrap()[&pending.id()],
+            NoteObservation::Pending
+        );
+        assert_eq!(
+            rpc.get_notes_by_id_call_count(),
+            calls + 1,
+            "new notes get one initial exact-ID lookup"
+        );
+        let records = tracker
+            .client
+            .get_input_notes(NoteFilter::All)
+            .await
+            .unwrap();
+        let InputNoteState::Expected(state) = records[0].state() else {
+            panic!("expected pending note")
+        };
+        assert_eq!(state.after_block_num, cursor.child());
+        tracker
+            .observe(std::slice::from_ref(&pending))
+            .await
+            .unwrap();
+        assert_eq!(
+            rpc.get_notes_by_id_call_count(),
+            calls + 1,
+            "pending retries use forward sync"
+        );
     }
 
     struct Fixture {
@@ -614,11 +858,6 @@ mod tests {
         f.chain.commit(&order, 7);
         f.watcher.round().await.unwrap();
         assert_eq!(f.book.try_recv().unwrap().active[0].id(), order.id());
-        assert_eq!(
-            f.chain.state().looked_up_by_id,
-            [order.id()],
-            "looked up by ID once, then found by tag"
-        );
     }
 
     #[tokio::test]

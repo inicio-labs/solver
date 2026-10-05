@@ -35,6 +35,7 @@ pub struct ClearingRuntime {
     pub pairs: Vec<(TokenId, TokenId)>,
     pub config: ClearingConfig,
     pub max_price_age_ms: u64,
+    pub maker_settlement_buffer_ms: u64,
     pub max_source_age_ms: u64,
     pub max_source_skew_ms: u64,
     pub routing: Option<crate::router::Routing>,
@@ -121,6 +122,8 @@ pub(super) async fn run_worker(
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
+                } else {
+                    book.remove_expired(now, runtime.maker_settlement_buffer_ms);
                 }
                 // Latest order-book levels for the price API's swap-ETA estimates.
                 snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
@@ -193,6 +196,7 @@ pub(super) fn internal_clear(
     exec_tx: &mpsc::Sender<ExecutionBatch>,
     now_ms: u64,
 ) -> Result<(), MatcherError> {
+    book.remove_expired(now_ms, runtime.maker_settlement_buffer_ms);
     let prices = runtime.prices.borrow().clone();
 
     // Each independently solvent pair stays indivisible when the executor
@@ -471,6 +475,7 @@ mod tests {
             pairs: vec![(imiden(), iusdt()), (ieth(), iusdt())],
             config: ClearingConfig::default(),
             max_price_age_ms: 1_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: None,
@@ -562,6 +567,7 @@ mod tests {
             pairs: runtime.pairs.clone(),
             config: runtime.config,
             max_price_age_ms: 30_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 30_000,
             max_source_skew_ms: 0,
             routing: None,

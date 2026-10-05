@@ -45,6 +45,9 @@ message SubmitOrderRequest {
   CommandHeader header = 1;
   // The PSWAP note in miden's canonical `Note` serialization.
   bytes note = 2;
+  // Optional MM deadline in Unix milliseconds. Selection stops settlement_buffer
+  // before this time; an already selected order may settle after the deadline.
+  optional uint64 expires_at_unix_ms = 3;
 }
 
 enum OrderType {
@@ -152,6 +155,7 @@ message ActiveMakerOrder {
   // This order version, including a remainder if a partial fill created one.
   bytes note_id = 4;
   uint32 depth = 5;
+  optional uint64 expires_at_unix_ms = 6;
 }
 
 message ListActiveMakerOrdersReply {

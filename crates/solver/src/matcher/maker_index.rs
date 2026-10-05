@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use miden_protocol::note::NoteId;
 use miden_standards::note::PswapNote;
 
-use crate::maker::{CutoffScope, LineageId, MakerId, MakerTag, MakerUpdate};
+use crate::maker::{CutoffScope, LineageId, MakerId, MakerTag, MakerUpdate, OrderPair};
 use crate::types::{BookOrder, OrderKeys, TokenId};
 
 struct Entry {
@@ -26,8 +26,9 @@ pub(crate) struct MakerIndex {
     entries: HashMap<NoteId, Entry>,
     by_lineage: HashMap<LineageId, HashSet<NoteId>>,
     by_maker: HashMap<MakerId, HashSet<NoteId>>,
-    /// Every cutoff (hydrated at startup): few per maker, kept forever.
-    cutoffs: HashMap<MakerId, HashMap<CutoffScope, u64>>,
+    /// Ordered pair cutoffs, hydrated at startup and kept until superseded.
+    cutoffs: HashMap<MakerId, HashMap<OrderPair, u64>>,
+    global_cutoffs: HashMap<MakerId, u64>,
 }
 
 impl MakerIndex {
@@ -82,13 +83,29 @@ impl MakerIndex {
     }
 
     pub(super) fn raise_cutoff(&mut self, maker_id: MakerId, scope: CutoffScope, cutoff: u64) {
-        let barrier = self
-            .cutoffs
-            .entry(maker_id)
-            .or_default()
-            .entry(scope)
-            .or_default();
-        *barrier = (*barrier).max(cutoff);
+        if scope.market.is_empty() && scope.direction.is_empty() {
+            let barrier = self.global_cutoffs.entry(maker_id).or_default();
+            *barrier = (*barrier).max(cutoff);
+            return;
+        }
+        let pairs = if scope.direction.is_empty() {
+            let half = scope.market.len() / 2;
+            vec![
+                OrderPair(scope.market.clone()),
+                OrderPair([&scope.market[half..], &scope.market[..half]].concat()),
+            ]
+        } else {
+            vec![OrderPair(scope.direction)]
+        };
+        for pair in pairs {
+            let barrier = self
+                .cutoffs
+                .entry(maker_id)
+                .or_default()
+                .entry(pair)
+                .or_default();
+            *barrier = (*barrier).max(cutoff);
+        }
     }
 
     /// Apply a committed maker update; return entries to remove from the book.
@@ -144,11 +161,24 @@ impl MakerIndex {
     }
 
     fn below_cutoff(&self, tag: MakerTag, offered: TokenId, requested: TokenId) -> bool {
-        self.cutoffs.get(&tag.maker_id).is_some_and(|cutoffs| {
-            cutoffs.iter().any(|(scope, &cutoff)| {
-                tag.root_seq < cutoff && scope.covers_pair(offered, requested)
+        let global = self.global_cutoffs.get(&tag.maker_id).copied().unwrap_or(0);
+        let pair = self
+            .cutoffs
+            .get(&tag.maker_id)
+            .and_then(|cutoffs| cutoffs.get(&OrderPair::new(offered, requested)))
+            .copied()
+            .unwrap_or(0);
+        tag.root_seq < global.max(pair)
+    }
+
+    pub(super) fn expired(&self, now_ms: u64, buffer_ms: u64) -> Vec<NoteId> {
+        self.entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let expiry = entry.tag?.expires_at_unix_ms?;
+                (now_ms >= expiry.saturating_sub(buffer_ms)).then_some(*id)
             })
-        })
+            .collect()
     }
 
     fn entries_of_maker(
@@ -240,7 +270,11 @@ mod tests {
             priority_seq: u64::from(serial),
             arrival_unix: 1,
             note: Arc::new(note),
-            maker: maker.map(|(maker_id, root_seq)| MakerTag { maker_id, root_seq }),
+            maker: maker.map(|(maker_id, root_seq)| MakerTag {
+                maker_id,
+                root_seq,
+                expires_at_unix_ms: None,
+            }),
         }
     }
 
@@ -309,6 +343,7 @@ mod tests {
             tag: MakerTag {
                 maker_id: ALPHA,
                 root_seq,
+                expires_at_unix_ms: None,
             },
             cancelled: false,
         };
@@ -330,7 +365,8 @@ mod tests {
                 order_ids: vec![early.id()],
                 tag: MakerTag {
                     maker_id: ALPHA,
-                    root_seq: 5
+                    root_seq: 5,
+                    expires_at_unix_ms: None,
                 },
                 cancelled: true,
             },),
@@ -344,5 +380,36 @@ mod tests {
         book.raise_cutoff(ALPHA, CutoffScope::all(), 10);
         book.raise_cutoff(ALPHA, CutoffScope::all(), 8);
         assert!(!book.admit(&order(1, true, Some((ALPHA, 9)))));
+    }
+    #[test]
+    fn pair_cutoffs_expand_market_both_ways_and_keep_global_separate() {
+        let (x, y) = tokens();
+        let mut index = MakerIndex::default();
+        index.raise_cutoff(ALPHA, CutoffScope::market(x, y), 10);
+        index.raise_cutoff(ALPHA, CutoffScope::direction(x, y), 20);
+        index.raise_cutoff(ALPHA, CutoffScope::market(x, y), 5);
+        assert_eq!(index.cutoffs[&ALPHA].len(), 2);
+        assert_eq!(index.cutoffs[&ALPHA][&OrderPair::new(x, y)], 20);
+        assert_eq!(index.cutoffs[&ALPHA][&OrderPair::new(y, x)], 10);
+        assert!(!index.admit(&order(1, true, Some((ALPHA, 15)))));
+        assert!(index.admit(&order(2, false, Some((ALPHA, 15)))));
+        index.raise_cutoff(ALPHA, CutoffScope::all(), 30);
+        assert!(!index.admit(&order(3, false, Some((ALPHA, 25)))));
+        assert!(index.admit(&order(4, false, Some((BETA, 1)))));
+    }
+
+    #[test]
+    fn expiry_uses_buffer_boundary_and_handles_underflow_and_absence() {
+        let mut index = MakerIndex::default();
+        let mut expiring = order(1, true, Some((ALPHA, 1)));
+        expiring.maker.as_mut().unwrap().expires_at_unix_ms = Some(1000);
+        index.admit(&expiring);
+        index.admit(&order(2, true, Some((ALPHA, 2))));
+        index.admit(&order(3, true, None));
+        assert!(index.expired(899, 100).is_empty());
+        assert_eq!(index.expired(900, 100), vec![expiring.id()]);
+        assert!(index.expired(999, 0).is_empty());
+        assert_eq!(index.expired(1000, 0), vec![expiring.id()]);
+        assert_eq!(index.expired(0, 1001), vec![expiring.id()]);
     }
 }

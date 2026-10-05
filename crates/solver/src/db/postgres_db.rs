@@ -136,10 +136,11 @@ pub fn live_book_update_tx(
             live_orders::note_id,
             live_orders::maker_id,
             live_orders::root_seq,
+            live_orders::expires_at_unix_ms,
         ))
-        .load::<(Vec<u8>, Option<i64>, Option<i64>)>(conn)?
+        .load::<(Vec<u8>, Option<i64>, Option<i64>, Option<i64>)>(conn)?
         .into_iter()
-        .map(|(id, maker_id, root_seq)| Ok((id, maker_tag(maker_id, root_seq)?)))
+        .map(|(id, maker_id, root_seq, expiry)| Ok((id, maker_tag(maker_id, root_seq, expiry)?)))
         .collect::<DbResult<_>>()?;
     let excluded: Vec<Vec<u8>> = ids
         .into_iter()

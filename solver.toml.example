@@ -118,4 +118,5 @@ admin_port = 3001
 # maker_intake_cancel_queue = 1024   # cancels queue separately
 # maker_stream_buffer = 256          # per-stream buffer; a stalled stream is dropped
 # maker_stream_heartbeat_ms = 10000  # also ends streams of a revoked key
+# maker_settlement_buffer_ms = 30000 # selection stops this long before MM expiry
 # maker_watch_interval_ms = 1000     # maker-note watcher: new blocks, spends

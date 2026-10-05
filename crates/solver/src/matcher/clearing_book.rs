@@ -30,6 +30,17 @@ pub(crate) struct ClearingBook {
 }
 
 impl ClearingBook {
+    /// Expiry gates new selection only. Already selected proofs/settlements
+    /// continue, and give-backs/remainders are checked again on their next tick.
+    pub(super) fn remove_expired(&mut self, now_ms: u64, buffer_ms: u64) {
+        let expired = self.makers.expired(now_ms, buffer_ms);
+        for id in expired {
+            if self.orders.get(&id).is_some_and(|order| order.is_active()) {
+                self.remove(id);
+            }
+        }
+    }
+
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
     pub(super) fn apply(&mut self, update: BookUpdate) {
@@ -438,7 +449,11 @@ mod tests {
     }
 
     fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
-        order.maker = Some(crate::maker::MakerTag { maker_id, root_seq });
+        order.maker = Some(crate::maker::MakerTag {
+            maker_id,
+            root_seq,
+            expires_at_unix_ms: None,
+        });
         order
     }
 
@@ -469,6 +484,7 @@ mod tests {
             tag: crate::maker::MakerTag {
                 maker_id: 7,
                 root_seq: 2,
+                expires_at_unix_ms: None,
             },
             cancelled: false,
         });
@@ -491,6 +507,7 @@ mod tests {
                 tag: crate::maker::MakerTag {
                     maker_id: 7,
                     root_seq: 1,
+                    expires_at_unix_ms: None,
                 },
                 cancelled: false,
             }],
@@ -572,6 +589,7 @@ mod tests {
             pairs: vec![pair],
             config: ClearingConfig::default(),
             max_price_age_ms: 1_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: None,
@@ -662,6 +680,7 @@ mod tests {
             pairs: vec![pair],
             config: ClearingConfig::default(),
             max_price_age_ms: 1_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: Some(routing),
@@ -736,6 +755,7 @@ mod tests {
             pairs: vec![pair],
             config: ClearingConfig::default(),
             max_price_age_ms: 1_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: Some(routing),
@@ -795,6 +815,7 @@ mod tests {
                 pairs,
                 config: ClearingConfig::default(),
                 max_price_age_ms: 1_000,
+                maker_settlement_buffer_ms: 0,
                 max_source_age_ms: 1_000,
                 max_source_skew_ms: 0,
                 routing: None,
@@ -953,6 +974,7 @@ mod tests {
             pairs: Vec::new(),
             config: ClearingConfig::default(),
             max_price_age_ms: 10_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
@@ -1004,6 +1026,7 @@ mod tests {
                 ..ClearingConfig::default()
             },
             max_price_age_ms: 10_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
@@ -1061,6 +1084,7 @@ mod tests {
             pairs: vec![(base, quote)],
             config: ClearingConfig::default(),
             max_price_age_ms: 10_000,
+            maker_settlement_buffer_ms: 0,
             max_source_age_ms: 10_000,
             max_source_skew_ms: 100,
             routing: None,
@@ -1175,5 +1199,97 @@ mod tests {
         assert!(!book.orders.contains_key(&stale.id()));
         let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
         assert_eq!(indexed, 2, "the slot still belongs to the holder");
+    }
+    #[test]
+    fn expiry_removes_active_orders_but_preserves_selected_work_and_checks_givebacks() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut quote = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        quote.maker.as_mut().unwrap().expires_at_unix_ms = Some(1000);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&quote);
+        book.remove_expired(899, 100);
+        assert!(book.orders.contains_key(&quote.id()));
+        book.deactivate(quote.id());
+        book.remove_expired(900, 100);
+        assert!(
+            book.orders.contains_key(&quote.id()),
+            "selected work continues"
+        );
+        book.apply(BookUpdate::from(quote.clone()));
+        book.remove_expired(900, 100);
+        assert!(
+            !book.orders.contains_key(&quote.id()),
+            "expired giveback cannot be selected again"
+        );
+        assert!(book.best_levels_snapshot().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_maker_order_is_not_selected_after_hydration() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut seller = tagged(fixture(false, 11, 18, 1, &mut rng), 7, 1);
+        seller.maker.as_mut().unwrap().expires_at_unix_ms = Some(now_millis() + 100);
+        let buyer = fixture(true, 22, 10, 2, &mut rng);
+        let pair = Order::from_book_order(&seller).unwrap().index_key().0;
+        let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                decimals: [(pair.0, 0), (pair.1, 0)].into_iter().collect(),
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
+        let observed_at = now_millis();
+        let mut prices = crate::price::PreciseSnapshot::new();
+        for (token, price) in [(pair.0, "2"), (pair.1, "1")] {
+            prices.insert(
+                token,
+                PriceData {
+                    usd: price.parse().unwrap(),
+                    exact_reference: Some(ReferencePrice::from_decimal(price).unwrap()),
+                    source_updated_at_unix_ms: Some(observed_at),
+                    observed_at_unix_ms: observed_at,
+                },
+            );
+        }
+        let (_, prices_rx) = watch::channel(prices);
+        let (_book_tx, book_rx) = mpsc::channel(1);
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices: prices_rx,
+            pairs: vec![pair],
+            config: ClearingConfig::default(),
+            max_price_age_ms: 1_000,
+            maker_settlement_buffer_ms: 100,
+            max_source_age_ms: 1_000,
+            max_source_skew_ms: 0,
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_matcher(
+            book_rx,
+            exec_tx,
+            Duration::from_secs(1),
+            snapshot_tx,
+            runtime,
+            cancel.clone(),
+        ));
+        snapshot_rx.changed().await.unwrap();
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "the expired quote never reached clearing"
+        );
+        assert_eq!(
+            snapshot_rx.borrow().len(),
+            1,
+            "only the buyer's side is left"
+        );
+        // The ordered book stream remains open for subsequent updates.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        snapshot_rx.changed().await.unwrap();
+        assert!(!task.is_finished());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
     }
 }

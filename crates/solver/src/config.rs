@@ -233,6 +233,10 @@ pub struct EngineConfig {
     /// 1000.
     #[serde(default = "default_maker_watch_interval_ms")]
     pub maker_watch_interval_ms: u64,
+    /// Stop selecting MM orders this many milliseconds before their expiry.
+    /// Already selected settlements continue. Default 30000; zero is allowed.
+    #[serde(default = "default_maker_settlement_buffer_ms")]
+    pub maker_settlement_buffer_ms: u64,
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
@@ -349,6 +353,9 @@ fn default_maker_stream_buffer() -> usize {
 fn default_maker_stream_heartbeat_ms() -> u64 {
     10_000
 }
+fn default_maker_settlement_buffer_ms() -> u64 {
+    30_000
+}
 fn default_maker_watch_interval_ms() -> u64 {
     1_000
 }
@@ -421,5 +428,24 @@ impl SolverConfig {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write config file: {}", path))
+    }
+}
+
+#[cfg(test)]
+mod maker_expiry_tests {
+    use super::*;
+
+    #[test]
+    fn settlement_buffer_defaults_and_can_be_disabled() {
+        let example = include_str!("../../../solver.toml.example");
+        let config: SolverConfig = toml::from_str(example).unwrap();
+        assert_eq!(config.engine.maker_settlement_buffer_ms, 30_000);
+        let explicit = example.replace(
+            "# maker_settlement_buffer_ms = 30000",
+            "maker_settlement_buffer_ms = 0",
+        );
+        let config: SolverConfig = toml::from_str(&explicit).unwrap();
+        assert_eq!(config.engine.maker_settlement_buffer_ms, 0);
+        config.validate().unwrap();
     }
 }

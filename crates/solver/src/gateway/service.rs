@@ -168,9 +168,23 @@ impl MakerGateway for MakerGatewayService {
             .ok()
             .filter(|note| note.to_bytes() == request.note)
             .ok_or_else(|| Status::invalid_argument("note is not a canonical miden note"))?;
-        let command = MakerCommand::submit(note).map_err(|error| {
+        if request
+            .expires_at_unix_ms
+            .is_some_and(|expiry| expiry == 0 || expiry > i64::MAX as u64)
+        {
+            return Err(Status::invalid_argument(
+                "expiry must be a positive Unix millisecond timestamp within i64",
+            ));
+        }
+        let mut command = MakerCommand::submit(note).map_err(|error| {
             Status::invalid_argument(format!("note is not a valid PSWAP order: {error}"))
         })?;
+        if let MakerCommand::Submit {
+            expires_at_unix_ms, ..
+        } = &mut command
+        {
+            *expires_at_unix_ms = request.expires_at_unix_ms;
+        }
         if let MakerCommand::Submit { keys, .. } = &command {
             if !self.markets.contains(&keys.market) {
                 return Err(Status::invalid_argument(
@@ -368,6 +382,11 @@ fn active_maker_order(
         request_id: view.request_id,
         note_id: view.note_id,
         depth: u32::try_from(view.depth).map_err(corrupt)?,
+        expires_at_unix_ms: view
+            .expires_at_unix_ms
+            .map(u64::try_from)
+            .transpose()
+            .map_err(corrupt)?,
     })
 }
 
@@ -662,6 +681,7 @@ mod tests {
         proto::SubmitOrderRequest {
             header: command_header(request_id, seq),
             note: note.to_bytes(),
+            expires_at_unix_ms: None,
         }
     }
 
@@ -1206,5 +1226,49 @@ mod tests {
             .expect("supervision must shut the server and drain the watcher");
             assert!(cancel.is_cancelled());
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn submit_expiry_is_validated_persisted_and_part_of_retry_identity() {
+        let Gateway {
+            mut client,
+            facts: _facts,
+            key,
+            db,
+            stop,
+            ..
+        } = gateway().await;
+        let mut request = submit("expiry", 1, &pswap_note(1));
+        for invalid in [0, u64::MAX] {
+            request.expires_at_unix_ms = Some(invalid);
+            assert_eq!(
+                code(client.submit_order(signed(&key, request.clone())).await),
+                Code::InvalidArgument
+            );
+        }
+        request.expires_at_unix_ms = Some(1);
+        assert!(
+            !client
+                .submit_order(signed(&key, request.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .replayed
+        );
+        assert!(
+            client
+                .submit_order(signed(&key, request.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .replayed
+        );
+        request.expires_at_unix_ms = Some(2);
+        assert_eq!(
+            code(client.submit_order(signed(&key, request)).await),
+            Code::AlreadyExists
+        );
+        assert!(!db.pool.fatal_token().is_cancelled());
+        stop.cancel();
     }
 }

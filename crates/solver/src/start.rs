@@ -302,6 +302,7 @@ pub async fn start(
             ..crate::clearing::ClearingConfig::default()
         },
         max_price_age_ms: config.engine.price_staleness_secs.saturating_mul(1_000),
+        maker_settlement_buffer_ms: config.engine.maker_settlement_buffer_ms,
         max_source_age_ms: config
             .engine
             .clearing_max_source_age_secs

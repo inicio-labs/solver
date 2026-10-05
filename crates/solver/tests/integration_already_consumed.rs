@@ -238,6 +238,7 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     maker_stream_buffer: 256,
                     maker_stream_heartbeat_ms: 10_000,
                     maker_watch_interval_ms: 1_000,
+                    maker_settlement_buffer_ms: 30_000,
                 },
             };
 

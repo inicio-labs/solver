@@ -88,6 +88,7 @@ diesel::table! {
         state -> Text,
         market -> Nullable<Binary>,
         direction -> Nullable<Binary>,
+        expires_at_unix_ms -> Nullable<BigInt>,
     }
 }
 
@@ -133,6 +134,7 @@ diesel::table! {
         direction -> Nullable<Binary>,
         maker_id -> Nullable<BigInt>,
         root_seq -> Nullable<BigInt>,
+        expires_at_unix_ms -> Nullable<BigInt>,
     }
 }
 

@@ -108,11 +108,12 @@ pub struct LiveOrderRow {
     pub priority_seq: i64,
     pub maker_id: Option<i64>,
     pub root_seq: Option<i64>,
+    pub expires_at_unix_ms: Option<i64>,
 }
 
 impl LiveOrderRow {
     pub fn into_book_order(self) -> DbResult<BookOrder> {
-        let maker = maker_tag(self.maker_id, self.root_seq)?;
+        let maker = maker_tag(self.maker_id, self.root_seq, self.expires_at_unix_ms)?;
         let mut order = OrderRow {
             note_id: self.note_id,
             raw_data: self.raw_data,
@@ -127,11 +128,16 @@ impl LiveOrderRow {
 }
 
 /// The view's maker columns: both set for a claimed lineage, both NULL else.
-pub fn maker_tag(maker_id: Option<i64>, root_seq: Option<i64>) -> DbResult<Option<MakerTag>> {
+pub fn maker_tag(
+    maker_id: Option<i64>,
+    root_seq: Option<i64>,
+    expires_at_unix_ms: Option<i64>,
+) -> DbResult<Option<MakerTag>> {
     match (maker_id, root_seq) {
         (Some(maker_id), Some(root_seq)) => Ok(Some(MakerTag {
             maker_id,
             root_seq: u64::try_from(root_seq)?,
+            expires_at_unix_ms: expires_at_unix_ms.map(u64::try_from).transpose()?,
         })),
         (None, None) => Ok(None),
         _ => Err(DbError::Corrupt("lineage claim without maker or sequence")),

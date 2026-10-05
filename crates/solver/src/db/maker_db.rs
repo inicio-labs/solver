@@ -228,7 +228,11 @@ pub fn execute_command_tx(
     }
     let maker_id = header.maker_id;
     let (result, update) = match command {
-        MakerCommand::Submit { note, keys } => {
+        MakerCommand::Submit {
+            note,
+            keys,
+            expires_at_unix_ms,
+        } => {
             let claimed = diesel::insert_into(maker_lineages::table)
                 .values((
                     maker_lineages::lineage_id.eq(&keys.lineage_id),
@@ -238,6 +242,8 @@ pub fn execute_command_tx(
                     maker_lineages::note_id.eq(note.id().to_bytes().to_vec()),
                     maker_lineages::market.eq(&keys.market),
                     maker_lineages::direction.eq(&keys.direction),
+                    maker_lineages::expires_at_unix_ms
+                        .eq(expires_at_unix_ms.map(i64::try_from).transpose()?),
                 ))
                 .on_conflict_do_nothing()
                 .execute(conn)?
@@ -252,6 +258,7 @@ pub fn execute_command_tx(
                 let tag = MakerTag {
                     maker_id,
                     root_seq: header.seq,
+                    expires_at_unix_ms: *expires_at_unix_ms,
                 };
                 let order_ids = orders::table
                     .filter(orders::lineage_id.eq(&keys.lineage_id))
@@ -956,6 +963,8 @@ pub struct ActiveMakerOrderRow {
     pub request_id: String,
     #[diesel(sql_type = BigInt)]
     pub depth: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+    pub expires_at_unix_ms: Option<i64>,
 }
 
 /// A page of the maker's active orders, ordered by exact note ID. `live_orders`
@@ -968,7 +977,7 @@ pub fn active_maker_orders_page_tx(
     limit: i64,
 ) -> DbResult<Vec<ActiveMakerOrderRow>> {
     Ok(diesel::sql_query(
-        "SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth
+        "SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth, m.expires_at_unix_ms
          FROM live_orders l
          JOIN maker_lineages m ON m.lineage_id = l.lineage_id
          WHERE l.maker_id = $1 AND l.note_id > $2 AND l.depth IS NOT NULL
@@ -1158,7 +1167,8 @@ mod tests {
                 order_ids: Vec::new(),
                 tag: MakerTag {
                     maker_id,
-                    root_seq: 1
+                    root_seq: 1,
+                    expires_at_unix_ms: None,
                 },
                 cancelled: false,
             })
@@ -1376,7 +1386,8 @@ mod tests {
                 order_ids: vec![quote.id()],
                 tag: MakerTag {
                     maker_id: alpha,
-                    root_seq: 2
+                    root_seq: 2,
+                    expires_at_unix_ms: None,
                 },
                 cancelled: true,
             }),
@@ -1757,6 +1768,7 @@ mod tests {
         let tag = MakerTag {
             maker_id: alpha,
             root_seq: 5,
+            expires_at_unix_ms: None,
         };
         assert_eq!(tags, [(kept.id(), Some(tag)), (public.id(), None)]);
         let status: String = orders::table
@@ -2390,16 +2402,77 @@ mod tests {
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
         run(conn, alpha, "s1", 1, submit(&note(1)))?;
-        // The later columns go first; the maker tables refuse.
+        // Expiry and the later columns go first; the maker tables refuse.
+        postgres_migrations::revert_last(conn)?;
         postgres_migrations::revert_last(conn)?;
         postgres_migrations::revert_last(conn)?;
         assert!(postgres_migrations::revert_last(conn).is_err());
 
         let mut empty = TestSchema::migrated()?;
-        for _ in 0..3 {
+        for _ in 0..4 {
             postgres_migrations::revert_last(&mut empty.conn)?;
         }
         postgres_migrations::migrate(&mut empty.conn)?;
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    fn expiry_survives_hydration_retries_and_remainders_without_reservation_check() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "expiry")?;
+        let parent = note(1);
+        let mut command = submit(&parent);
+        if let MakerCommand::Submit {
+            expires_at_unix_ms, ..
+        } = &mut command
+        {
+            *expires_at_unix_ms = Some(1);
+        }
+        assert!(matches!(
+            run(conn, alpha, "s1", 1, command.clone())?.0,
+            CommandReply::Committed(CommandResult::Accepted)
+        ));
+        assert!(matches!(
+            run(conn, alpha, "s1", 1, command.clone())?.0,
+            CommandReply::Replayed(CommandResult::Accepted)
+        ));
+        if let MakerCommand::Submit {
+            expires_at_unix_ms, ..
+        } = &mut command
+        {
+            *expires_at_unix_ms = Some(2);
+        }
+        assert_eq!(
+            run(conn, alpha, "s1", 1, command)?.0,
+            CommandReply::Conflict
+        );
+        ingest(conn, &[&parent])?;
+        let page = active_maker_orders_page_tx(conn, alpha, &[], 10)?;
+        assert_eq!(page[0].expires_at_unix_ms, Some(1));
+        let hydrated = load_live_orders_tx(conn)?;
+        assert_eq!(hydrated[0].maker.unwrap().expires_at_unix_ms, Some(1));
+        let (input, _, child) = fill(1, &parent, 40);
+        // Deliberately long-expired: reservation must still accept work the
+        // matcher selected earlier. Expiry is not a live_orders SQL predicate.
+        prepare(conn, 1, &[input])?;
+        let update = conn.transaction::<_, DbError, _>(|conn| {
+            let update = confirm_settlement_tx(
+                conn,
+                &[1; 32],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                None,
+            )?;
+            live_book_update_tx(conn, update)
+        })?;
+        assert_eq!(update.active[0].id(), child.unwrap().id());
+        assert_eq!(update.active[0].maker.unwrap().expires_at_unix_ms, Some(1));
+        assert!(
+            postgres_migrations::revert_last(conn).is_err(),
+            "rollback cannot discard a recorded expiry"
+        );
         Ok(())
     }
 }

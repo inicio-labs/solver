@@ -26,6 +26,8 @@ pub type LineageId = Vec<u8>;
 pub struct MakerTag {
     pub maker_id: MakerId,
     pub root_seq: u64,
+    /// MM deadline, in Unix milliseconds; applies to the whole lineage.
+    pub expires_at_unix_ms: Option<u64>,
 }
 
 /// Both faucet IDs, smaller bytes first: the same key for either direction.
@@ -41,6 +43,16 @@ pub fn market_key(a: TokenId, b: TokenId) -> Vec<u8> {
 /// Offered faucet ID, then requested faucet ID.
 pub fn direction_key(offered: TokenId, requested: TokenId) -> Vec<u8> {
     [offered.to_bytes(), requested.to_bytes()].concat()
+}
+
+/// Canonical offered-token bytes followed by requested-token bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrderPair(pub Vec<u8>);
+
+impl OrderPair {
+    pub fn new(offered: TokenId, requested: TokenId) -> Self {
+        Self(direction_key(offered, requested))
+    }
 }
 
 /// Which of a maker's orders a cancel-all stops, in the byte form stored in
@@ -217,6 +229,7 @@ pub enum MakerCommand {
     Submit {
         note: Box<Note>,
         keys: OrderKeys,
+        expires_at_unix_ms: Option<u64>,
     },
     CancelAll {
         scope: CutoffScope,
@@ -234,6 +247,7 @@ impl MakerCommand {
         Ok(Self::Submit {
             note: Box::new(note),
             keys,
+            expires_at_unix_ms: None,
         })
     }
 
@@ -249,7 +263,18 @@ impl MakerCommand {
     /// Canonical bytes compared when a request ID is retried.
     pub fn payload(&self) -> Vec<u8> {
         match self {
-            Self::Submit { note, .. } => note.to_bytes(),
+            Self::Submit {
+                note,
+                expires_at_unix_ms,
+                ..
+            } => {
+                // Keep no-expiry payloads compatible with previously stored retries.
+                let mut payload = note.to_bytes();
+                if let Some(expiry) = expires_at_unix_ms {
+                    payload.extend_from_slice(&expiry.to_be_bytes());
+                }
+                payload
+            }
             Self::CancelAll { scope } => {
                 // A market key is empty or two faucet IDs long.
                 let mut payload = vec![scope.market.len() as u8];

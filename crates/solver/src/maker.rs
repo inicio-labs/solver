@@ -198,7 +198,7 @@ pub const MAX_REQUEST_ID_LEN: usize = 128;
 /// A command header the store can write without a constraint violation.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InvalidCommand {
-    #[error("request ID must be 1 to {MAX_REQUEST_ID_LEN} bytes")]
+    #[error("request ID must be 1 to {MAX_REQUEST_ID_LEN} bytes, without NUL characters")]
     RequestId,
     #[error("sequence must be between 1 and {}", i64::MAX)]
     Sequence,
@@ -208,7 +208,11 @@ impl CommandHeader {
     /// Validated here, before the intake batches it: a command that reached
     /// the store must not be able to abort the batch's transaction.
     pub fn new(maker_id: MakerId, request_id: String, seq: u64) -> Result<Self, InvalidCommand> {
-        if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID_LEN {
+        // PostgreSQL text cannot hold a NUL character.
+        if request_id.is_empty()
+            || request_id.len() > MAX_REQUEST_ID_LEN
+            || request_id.contains('\0')
+        {
             return Err(InvalidCommand::RequestId);
         }
         if seq == 0 || i64::try_from(seq).is_err() {
@@ -364,6 +368,10 @@ mod tests {
         );
         assert_eq!(
             CommandHeader::new(1, "r".repeat(MAX_REQUEST_ID_LEN + 1), 1),
+            Err(InvalidCommand::RequestId)
+        );
+        assert_eq!(
+            CommandHeader::new(1, "bad\0id".into(), 1),
             Err(InvalidCommand::RequestId)
         );
         assert_eq!(

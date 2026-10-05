@@ -32,7 +32,7 @@ use super::intake::{run_intake, IntakeSender};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
 use super::watcher::{run_watcher, SdkTracker, Watcher};
-use crate::db::{maker_db, postgres_db, DbPool};
+use crate::db::{maker_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
     api_key_hash, market_key, CommandHeader, CommandReply, CommandResult, CutoffScope,
@@ -48,9 +48,9 @@ const MAX_EVENT_STREAMS: usize = 128;
 /// Creator account ID plus four serial-number elements of eight bytes.
 const LINEAGE_ID_LEN: usize = AccountId::SERIALIZED_SIZE + 32;
 
-/// Orders per GetMakerState page, by default and at most.
-const DEFAULT_STATE_PAGE: u32 = 500;
-const MAX_STATE_PAGE: u32 = 1_000;
+/// Active orders per page, by default and at most.
+const DEFAULT_ORDER_PAGE: u32 = 500;
+const MAX_ORDER_PAGE: u32 = 1_000;
 
 #[derive(Clone)]
 pub struct MakerGatewayService {
@@ -224,60 +224,38 @@ impl MakerGateway for MakerGatewayService {
         }))
     }
 
-    async fn get_maker_state(
+    async fn list_active_maker_orders(
         &self,
-        request: Request<proto::GetMakerStateRequest>,
-    ) -> Result<Response<proto::GetMakerStateReply>, Status> {
+        request: Request<proto::ListActiveMakerOrdersRequest>,
+    ) -> Result<Response<proto::ListActiveMakerOrdersReply>, Status> {
         let (maker_id, _) = self.authenticate(&request).await?;
         let request = request.into_inner();
         let after = request.page_token;
-        if !after.is_empty() && after.len() != LINEAGE_ID_LEN {
+        if !after.is_empty() && after.len() != 32 {
             return Err(Status::invalid_argument("invalid page token"));
         }
         let size = match request.page_size {
-            0 => DEFAULT_STATE_PAGE,
-            size => size.min(MAX_STATE_PAGE),
+            0 => DEFAULT_ORDER_PAGE,
+            size => size.min(MAX_ORDER_PAGE),
         };
-        let first = after.is_empty();
-        let (page, summary) = self
+        let page = self
             .pool
             .read_public(move |conn| {
-                let page = maker_db::maker_orders_page_tx(conn, maker_id, &after, i64::from(size))?;
-                let summary = if first {
-                    Some((
-                        maker_db::maker_cutoffs_tx(conn, maker_id)?,
-                        postgres_db::get_last_fetched_block_tx(conn)?,
-                        maker_db::latest_event_seq_tx(conn, maker_id)?,
-                    ))
-                } else {
-                    None
-                };
-                Ok((page, summary))
+                maker_db::active_maker_orders_page_tx(conn, maker_id, &after, i64::from(size))
             })
             .await
-            .map_err(|_| Status::unavailable("cannot read maker state now; retry"))?;
+            .map_err(|_| Status::unavailable("cannot read active orders now; retry"))?;
         let next_page_token = match page.last() {
-            Some(last) if page.len() == size as usize => last.lineage_id.clone(),
+            Some(last) if page.len() == size as usize => last.note_id.clone(),
             _ => Vec::new(),
         };
-        let mut reply = proto::GetMakerStateReply {
+        Ok(Response::new(proto::ListActiveMakerOrdersReply {
             orders: page
                 .into_iter()
-                .map(maker_order)
+                .map(active_maker_order)
                 .collect::<Result<_, _>>()?,
             next_page_token,
-            server_time_unix_ms: unix_ms(),
-            ..Default::default()
-        };
-        if let Some((cutoffs, height, latest)) = summary {
-            reply.cutoffs = cutoffs
-                .into_iter()
-                .map(|(scope, cutoff)| cutoff_message(&scope, cutoff))
-                .collect();
-            reply.sync_height = u32::try_from(height).unwrap_or(u32::MAX);
-            reply.latest_event_seq = latest;
-        }
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn get_command(
@@ -380,48 +358,17 @@ fn scope(request: &proto::CancelAllRequest) -> Result<CutoffScope, Status> {
     })
 }
 
-fn maker_order(view: maker_db::MakerOrderView) -> Result<proto::MakerOrder, Status> {
-    let state = match (view.status.as_deref(), view.live) {
-        (None, _) => proto::MakerOrderState::Pending,
-        (Some("settling"), _) => proto::MakerOrderState::Settling,
-        (Some("active"), true) => proto::MakerOrderState::Live,
-        // Active below a cutoff, or stored Stopped.
-        (Some(_), _) => proto::MakerOrderState::Stopped,
-    };
+fn active_maker_order(
+    view: maker_db::ActiveMakerOrderRow,
+) -> Result<proto::ActiveMakerOrder, Status> {
     let corrupt = |_| Status::internal("stored maker order is unreadable");
-    Ok(proto::MakerOrder {
+    Ok(proto::ActiveMakerOrder {
         lineage_id: view.lineage_id,
         root_seq: u64::try_from(view.root_seq).map_err(corrupt)?,
         request_id: view.request_id,
-        state: state.into(),
         note_id: view.note_id,
-        depth: u32::try_from(view.depth.unwrap_or(0)).map_err(corrupt)?,
-        cancelled: view.cancelled,
+        depth: u32::try_from(view.depth).map_err(corrupt)?,
     })
-}
-
-/// A stored scope back on the wire: each key holds two faucet IDs.
-fn cutoff_message(scope: &CutoffScope, cutoff: u64) -> proto::Cutoff {
-    let halves = |key: &[u8]| {
-        let (a, b) = key.split_at(key.len() / 2);
-        (a.to_vec(), b.to_vec())
-    };
-    let market = (!scope.market.is_empty()).then(|| {
-        let (faucet_a, faucet_b) = halves(&scope.market);
-        proto::Market { faucet_a, faucet_b }
-    });
-    let direction = (!scope.direction.is_empty()).then(|| {
-        let (offered_faucet, requested_faucet) = halves(&scope.direction);
-        proto::Direction {
-            offered_faucet,
-            requested_faucet,
-        }
-    });
-    proto::Cutoff {
-        market,
-        direction,
-        cutoff,
-    }
 }
 
 fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
@@ -941,30 +888,49 @@ mod tests {
             reply(CommandResult::Stopped { settling: 0 }, false)
         );
 
-        // The current view: the submitted order is pending, and the
-        // x→y cutoff covers it.
-        let state = client
-            .get_maker_state(signed(&key, proto::GetMakerStateRequest::default()))
+        // Pending and cancelled orders are absent from the active list.
+        let empty = client
+            .list_active_maker_orders(signed(&key, proto::ListActiveMakerOrdersRequest::default()))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(state.orders.len(), 1);
-        assert_eq!(state.orders[0].state(), proto::MakerOrderState::Pending);
-        assert!(state.orders[0].cancelled);
-        assert_eq!(state.orders[0].note_id, order.id().to_bytes().to_vec());
-        assert!(state.next_page_token.is_empty());
-        assert_eq!(state.cutoffs.len(), 1);
-        assert_eq!(state.cutoffs[0].cutoff, 2);
-        assert_eq!(state.cutoffs[0].direction, direction(&x, &y));
+        assert!(empty.orders.is_empty());
+        assert!(empty.next_page_token.is_empty());
+        let active = pswap_note(99);
+        client
+            .submit_order(signed(&key, submit("s5", 5, &active)))
+            .await
+            .unwrap();
+        facts.recv().await.unwrap();
+        let stored = active.clone();
+        db.pool
+            .write(move |conn| {
+                let row = crate::db::postgres_models::NewOrderRow::ingested(&stored, 1)?;
+                crate::db::postgres_db::insert_orders_batch_tx(conn, &[row], 1)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let listed = client
+            .list_active_maker_orders(signed(&key, proto::ListActiveMakerOrdersRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.orders.len(), 1);
+        assert_eq!(listed.orders[0].note_id, active.id().to_bytes().to_vec());
+        assert_eq!(listed.orders[0].root_seq, 5);
+        assert_eq!(listed.orders[0].request_id, "s5");
+        assert_eq!(listed.orders[0].depth, 0);
+        assert!(listed.next_page_token.is_empty());
         assert_eq!(
             code(
                 client
-                    .get_maker_state(signed(
+                    .list_active_maker_orders(signed(
                         &key,
-                        proto::GetMakerStateRequest {
+                        proto::ListActiveMakerOrdersRequest {
                             page_token: vec![1, 2, 3],
-                            page_size: 0,
-                        },
+                            page_size: 0
+                        }
                     ))
                     .await
             ),

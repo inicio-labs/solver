@@ -11,7 +11,7 @@ use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
@@ -751,11 +751,10 @@ pub enum SettlementPhase {
 /// consumed input. The executor always fills with
 /// `PswapNote::execute(solver, None, Some(fill))`, so the parent note, the
 /// fill amount and the stored remainder determine every value exactly.
-fn input_fill(
+pub(crate) fn input_fill(
     parent: &Note,
     fill_amount: u64,
     remainder: Option<&Note>,
-    lineage_id: &[u8],
 ) -> DbResult<proto::InputFill> {
     let pswap = PswapNote::try_from(parent).map_err(crate::types::OrderError::from)?;
     let offered = pswap.offered_asset().amount().as_u64();
@@ -771,7 +770,6 @@ fn input_fill(
     };
     Ok(proto::InputFill {
         note_id: parent.id().to_bytes().to_vec(),
-        lineage_id: lineage_id.to_vec(),
         depth: pswap.parent_depth() + 1,
         payback_amount: fill_amount,
         offered_paid: offered
@@ -795,26 +793,29 @@ fn resulting_status(
     } else if statuses.get(subject).map(String::as_str)
         == Some(OrderStatus::OnchainNullified.as_str())
     {
-        proto::ResultingStatus::Spent
+        proto::ResultingStatus::SpentElsewhere
     } else {
-        proto::ResultingStatus::Stopped
+        proto::ResultingStatus::Cancelled
     }
 }
 
-/// Report a settlement to each maker whose orders are among its inputs, one
-/// event per maker, in the transaction that made the change: SettlementPending
-/// when it is reserved, SettlementResolved when it commits or is voided.
-/// `inputs` pairs each journal row with its parent order. Inputs of public
-/// orders, and of attempts prepared before fills were recorded, are not
-/// reported.
+/// Immutable fill details computed once from the executor's original notes and
+/// predicted remainders, or rebuilt from durable inputs during startup.
+pub type SettlementFills = HashMap<Vec<u8>, proto::InputFill>;
+
+/// Append one event per maker-owned input in the settlement's transaction.
+/// Public inputs and legacy inputs without a recorded fill are excluded in
+/// every phase. Current ownership and final eligibility always come from SQL.
 pub fn report_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
-    inputs: &[(SettlementInputRow, OrderRow)],
+    inputs: &[(&SettlementInputRow, &OrderRow)],
     phase: SettlementPhase,
+    cached_fills: Option<&SettlementFills>,
 ) -> DbResult<()> {
-    let parent_ids: Vec<&Vec<u8>> = inputs
+    let parent_ids: Vec<_> = inputs
         .iter()
+        .filter(|(input, _)| input.fill_amount.is_some())
         .map(|(input, _)| &input.parent_note_id)
         .collect();
     let owners: HashMap<Vec<u8>, (MakerId, Vec<u8>)> = orders::table
@@ -829,109 +830,115 @@ pub fn report_settlement_tx(
         ))
         .load::<(Vec<u8>, i64, Vec<u8>)>(conn)?
         .into_iter()
-        .map(|(note_id, maker_id, lineage_id)| (note_id, (maker_id, lineage_id)))
+        .map(|(note, maker, lineage)| (note, (maker, lineage)))
         .collect();
     if owners.is_empty() {
         return Ok(());
     }
-    // A resolved input's order now lives on in its remainder, if any.
-    let subjects: Vec<Vec<u8>> = inputs
-        .iter()
-        .map(|(input, _)| {
-            input
-                .child_note_id
-                .clone()
-                .unwrap_or_else(|| input.parent_note_id.clone())
-        })
-        .collect();
-    let live: HashSet<Vec<u8>> = live_orders::table
-        .filter(live_orders::note_id.eq_any(&subjects))
-        .select(live_orders::note_id)
-        .load::<Vec<u8>>(conn)?
-        .into_iter()
-        .collect();
-    let statuses: HashMap<Vec<u8>, String> = orders::table
-        .filter(orders::note_id.eq_any(&subjects))
-        .select((orders::note_id, orders::status))
-        .load::<(Vec<u8>, String)>(conn)?
-        .into_iter()
-        .collect();
 
-    let mut reports: BTreeMap<MakerId, (Vec<proto::InputFill>, Vec<proto::InputResult>)> =
-        BTreeMap::new();
-    for ((input, parent), subject) in inputs.iter().zip(&subjects) {
-        let Some((maker_id, lineage_id)) = owners.get(&input.parent_note_id) else {
+    // Cancellation and event append share these locks. Acquire them in maker-ID
+    // order before final liveness reads, using the same helper as intake.
+    let maker_ids: Vec<_> = owners.values().map(|(maker, _)| *maker).collect();
+    lock_makers_ordered_tx(conn, &maker_ids)?;
+
+    let subject = |input: &SettlementInputRow| match phase {
+        SettlementPhase::Committed { .. } => input
+            .child_note_id
+            .clone()
+            .unwrap_or_else(|| input.parent_note_id.clone()),
+        _ => input.parent_note_id.clone(),
+    };
+    let (live, statuses) = if matches!(phase, SettlementPhase::Pending) {
+        (HashSet::new(), HashMap::new())
+    } else {
+        let subjects: Vec<_> = inputs
+            .iter()
+            .filter(|(input, _)| owners.contains_key(&input.parent_note_id))
+            .map(|(input, _)| subject(input))
+            .collect();
+        let live = live_orders::table
+            .filter(live_orders::note_id.eq_any(&subjects))
+            .select(live_orders::note_id)
+            .load::<Vec<u8>>(conn)?
+            .into_iter()
+            .collect();
+        let statuses = orders::table
+            .filter(orders::note_id.eq_any(&subjects))
+            .select((orders::note_id, orders::status))
+            .load::<(Vec<u8>, String)>(conn)?
+            .into_iter()
+            .collect();
+        (live, statuses)
+    };
+    // Stable per-maker ordering makes replay independent of SQL plan order.
+    let mut ordered: Vec<_> = inputs
+        .iter()
+        .filter(|(input, _)| owners.contains_key(&input.parent_note_id))
+        .collect();
+    ordered.sort_by_key(|(input, _)| (owners[&input.parent_note_id].0, &input.parent_note_id));
+    for (input, parent) in ordered {
+        let (maker_id, lineage_id) = &owners[&input.parent_note_id];
+        let Some(amount) = input.fill_amount else {
             continue;
         };
-        let remainder = input
-            .child_note_data
-            .as_deref()
-            .map(Note::read_from_bytes)
-            .transpose()?;
-        let fill = input
-            .fill_amount
-            .map(|amount| {
-                input_fill(
-                    &parent.note()?,
-                    u64::try_from(amount)?,
-                    remainder.as_ref(),
-                    lineage_id,
-                )
-            })
-            .transpose()?;
-        let (fills, results) = reports.entry(*maker_id).or_default();
-        let status = match phase {
-            SettlementPhase::Pending => {
-                fills.extend(fill);
-                continue;
-            }
-            SettlementPhase::Committed { .. } => {
-                fills.extend(fill);
-                if input.child_note_id.is_some() {
-                    resulting_status(subject, &live, &statuses)
-                } else {
-                    proto::ResultingStatus::Filled
+        // A void only returns the parent; it needs neither fill decoding nor a
+        // predicted child that will never exist on chain.
+        let fill = if matches!(phase, SettlementPhase::Voided) {
+            None
+        } else {
+            Some(match cached_fills {
+                Some(fills) => fills
+                    .get(&input.parent_note_id)
+                    .cloned()
+                    .ok_or(DbError::Corrupt("missing cached settlement fill"))?,
+                None => {
+                    let remainder = input
+                        .child_note_data
+                        .as_deref()
+                        .map(Note::read_from_bytes)
+                        .transpose()?;
+                    input_fill(&parent.note()?, u64::try_from(amount)?, remainder.as_ref())?
                 }
-            }
-            SettlementPhase::Voided => resulting_status(subject, &live, &statuses),
+            })
         };
-        results.push(proto::InputResult {
-            note_id: input.parent_note_id.clone(),
-            lineage_id: lineage_id.clone(),
-            status: status.into(),
-        });
-    }
-
-    for (maker_id, (fills, results)) in reports {
         let kind = match phase {
-            SettlementPhase::Pending if fills.is_empty() => continue,
             SettlementPhase::Pending => {
                 proto::event_body::Kind::SettlementPending(proto::SettlementPending {
                     tx_id: tx_id.to_vec(),
-                    fills,
+                    fill,
                 })
             }
-            SettlementPhase::Committed { block, consumer } => {
+            resolved => {
+                let (committed, commit_block, consumer_account_id) = match resolved {
+                    SettlementPhase::Committed { block, consumer } => {
+                        (true, block.as_u32(), consumer.to_bytes())
+                    }
+                    _ => (false, 0, Vec::new()),
+                };
+                let status = if committed && input.child_note_id.is_none() {
+                    proto::ResultingStatus::FullyFilled
+                } else {
+                    resulting_status(&subject(input), &live, &statuses)
+                };
                 proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
                     tx_id: tx_id.to_vec(),
-                    committed: true,
-                    commit_block: block.as_u32(),
-                    consumer_account_id: consumer.to_bytes(),
-                    fills,
-                    results,
-                })
-            }
-            SettlementPhase::Voided => {
-                proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
-                    tx_id: tx_id.to_vec(),
-                    committed: false,
-                    results,
-                    ..Default::default()
+                    committed,
+                    commit_block,
+                    consumer_account_id,
+                    fill,
+                    result: Some(proto::InputResult {
+                        note_id: input.parent_note_id.clone(),
+                        status: status.into(),
+                    }),
                 })
             }
         };
-        let body = proto::EventBody { kind: Some(kind) };
-        gateway::append_event_tx(conn, maker_id, None, &body)?;
+        gateway::append_event_tx(
+            conn,
+            *maker_id,
+            Some(lineage_id),
+            &proto::EventBody { kind: Some(kind) },
+        )?;
     }
     Ok(())
 }
@@ -1563,6 +1570,7 @@ mod tests {
                 child_note_data: None,
                 fill_amount: None,
             }],
+            None,
         )
     }
 
@@ -1660,6 +1668,7 @@ mod tests {
                                 fill_amount: None,
                             })
                             .collect::<Vec<_>>(),
+                        None,
                     )
                 })
             })
@@ -1844,7 +1853,7 @@ mod tests {
         Ok(())
     }
 
-    /// A journal row filling `parent` with `amount` exactly as the executor
+    /// A settlement input filling `parent` with `amount` exactly as the executor
     /// does, and the payback and remainder notes the transaction creates.
     fn fill(tx: u8, parent: &Note, amount: u64) -> (SettlementInputRow, Note, Option<Note>) {
         let pswap = PswapNote::try_from(parent).unwrap();
@@ -1858,7 +1867,7 @@ mod tests {
             .unwrap();
         let remainder = remainder.map(Note::from);
         let row = SettlementInputRow {
-            tx_id: vec![tx],
+            tx_id: vec![tx; 32],
             parent_note_id: parent.id().to_bytes().to_vec(),
             child_note_id: remainder.as_ref().map(|note| note.id().to_bytes().to_vec()),
             child_note_data: remainder.as_ref().map(Serializable::to_bytes),
@@ -1869,11 +1878,13 @@ mod tests {
 
     fn prepare(conn: &mut PgConnection, tx: u8, inputs: &[SettlementInputRow]) -> Result<()> {
         let attempt = SettlementAttemptRow {
-            tx_id: vec![tx],
+            tx_id: vec![tx; 32],
             tx_result: vec![tx],
             status: "prepared".into(),
         };
-        conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, inputs))?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            prepare_settlement_tx(conn, &attempt, inputs, None)
+        })?;
         Ok(())
     }
 
@@ -1947,47 +1958,67 @@ mod tests {
         let proto::event_body::Kind::SettlementPending(pending) = &pending[0] else {
             panic!("expected SettlementPending");
         };
-        assert_eq!(pending.fills.len(), 1, "only alpha's own input");
-        assert_eq!(pending.fills[0].payback_amount, 40);
+        assert!(pending.fill.is_some(), "alpha has one input per event");
+        assert_eq!(pending.fill.as_ref().unwrap().payback_amount, 40);
 
         let block = BlockNumber::from(42_u32);
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &[1], &HashSet::new(), block, test_consumer())
+            confirm_settlement_tx(
+                conn,
+                &[1; 32],
+                &HashSet::new(),
+                block,
+                test_consumer(),
+                None,
+            )
         })?;
         let events = settlement_events(conn, alpha)?;
         let report = resolved(&events[1]);
         assert!(report.committed);
         assert_eq!(report.commit_block, 42);
-        assert_eq!(report.fills, pending.fills, "the fill is what was intended");
+        assert_eq!(report.fill, pending.fill, "the fill is what was intended");
         assert_eq!(
-            report.results[0].status(),
+            report.result.as_ref().unwrap().status(),
             proto::ResultingStatus::Live,
             "the remainder is live"
         );
-        let (rebuilt_payback, rebuilt_remainder) =
-            rebuild(&quote, &report.fills[0], &report.consumer_account_id);
+        let (rebuilt_payback, rebuilt_remainder) = rebuild(
+            &quote,
+            report.fill.as_ref().unwrap(),
+            &report.consumer_account_id,
+        );
         assert_eq!(rebuilt_payback.id(), payback.id());
         let remainder = remainder.unwrap();
         assert_eq!(rebuilt_remainder.unwrap().id(), remainder.id());
         // Beta hears about its own full fill only.
         let beta_events = settlement_events(conn, beta)?;
-        assert_eq!(resolved(&beta_events[1]).fills.len(), 1);
+        assert!(resolved(&beta_events[1]).fill.is_some());
         assert_eq!(
-            resolved(&beta_events[1]).results[0].status(),
-            proto::ResultingStatus::Filled
+            resolved(&beta_events[1]).result.as_ref().unwrap().status(),
+            proto::ResultingStatus::FullyFilled
         );
 
         // Round 2 fills the remainder; the maker still rebuilds from its original note.
         let (row, payback, second) = fill(2, &remainder, 20);
         prepare(conn, 2, &[row])?;
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &[2], &HashSet::new(), block, test_consumer())
+            confirm_settlement_tx(
+                conn,
+                &[2; 32],
+                &HashSet::new(),
+                block,
+                test_consumer(),
+                None,
+            )
         })?;
         let events = settlement_events(conn, alpha)?;
         let report = resolved(events.last().unwrap());
-        assert_eq!(report.fills[0].depth, 2);
-        let (rebuilt_payback, rebuilt_remainder) =
-            rebuild(&quote, &report.fills[0], &report.consumer_account_id);
+        assert_eq!(report.fill.as_ref().unwrap().depth, 2);
+        let (rebuilt_payback, rebuilt_remainder) = rebuild(
+            &quote,
+            report.fill.as_ref().unwrap(),
+            &report.consumer_account_id,
+        );
         assert_eq!(rebuilt_payback.id(), payback.id());
         assert_eq!(rebuilt_remainder.unwrap().id(), second.unwrap().id());
         Ok(())
@@ -1995,7 +2026,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn a_late_fill_after_a_cancel_reports_its_remainder_stopped() -> Result<()> {
+    fn a_late_fill_after_a_cancel_reports_its_remainder_cancelled() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
@@ -2015,17 +2046,21 @@ mod tests {
         conn.transaction::<_, DbError, _>(|conn| {
             confirm_settlement_tx(
                 conn,
-                &[1],
+                &[1; 32],
                 &HashSet::new(),
                 BlockNumber::GENESIS,
                 test_consumer(),
+                None,
             )
         })?;
         let events = settlement_events(conn, alpha)?;
         let report = resolved(events.last().unwrap());
         assert!(report.committed);
-        assert_eq!(report.fills.len(), 1, "the fill is reported");
-        assert_eq!(report.results[0].status(), proto::ResultingStatus::Stopped);
+        assert!(report.fill.is_some(), "the fill is reported");
+        assert_eq!(
+            report.result.as_ref().unwrap().status(),
+            proto::ResultingStatus::Cancelled
+        );
         Ok(())
     }
 
@@ -2042,7 +2077,7 @@ mod tests {
         ingest(conn, &[&returned, &spent, &stopped])?;
         let rows: Vec<_> = [&returned, &spent, &stopped]
             .into_iter()
-            .map(|order| fill(1, order, 100).0)
+            .map(|order| fill(1, order, 40).0)
             .collect();
         prepare(conn, 1, &rows)?;
         let lineage_id = OrderKeys::from_note(&stopped)?.lineage_id;
@@ -2056,15 +2091,17 @@ mod tests {
 
         let consumed = HashSet::from([spent.id()]);
         conn.transaction::<_, DbError, _>(|conn| {
-            finish_discarded_settlement_tx(conn, &[1], &consumed)
+            finish_discarded_settlement_tx(conn, &[1; 32], &consumed)
         })?;
         let events = settlement_events(conn, alpha)?;
-        let report = resolved(events.last().unwrap());
-        assert!(!report.committed);
-        assert!(report.fills.is_empty(), "nothing was filled");
-        let statuses: HashMap<Vec<u8>, proto::ResultingStatus> = report
-            .results
+        assert_eq!(events.len(), 6, "one pending and one resolution per order");
+        let reports: Vec<_> = events[3..].iter().map(resolved).collect();
+        assert!(reports
             .iter()
+            .all(|report| !report.committed && report.fill.is_none()));
+        let statuses: HashMap<Vec<u8>, proto::ResultingStatus> = reports
+            .iter()
+            .map(|report| report.result.as_ref().unwrap())
             .map(|result| (result.note_id.clone(), result.status()))
             .collect();
         assert_eq!(
@@ -2073,12 +2110,231 @@ mod tests {
         );
         assert_eq!(
             statuses[&spent.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Spent
+            proto::ResultingStatus::SpentElsewhere
         );
         assert_eq!(
             statuses[&stopped.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Stopped
+            proto::ResultingStatus::Cancelled
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn per_order_events_are_atomic_replayable_and_recovered() -> Result<()> {
+        use crate::db::postgres_db::load_unresolved_attempts_tx;
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let quotes = [note(1), note(2)];
+        for (index, quote) in quotes.iter().enumerate() {
+            run(
+                conn,
+                alpha,
+                &format!("s{index}"),
+                index as u64 + 1,
+                submit(quote),
+            )?;
+        }
+        ingest(conn, &[&quotes[0], &quotes[1]])?;
+        let rows: Vec<_> = quotes.iter().map(|quote| fill(1, quote, 40).0).collect();
+        let fills: SettlementFills = quotes
+            .iter()
+            .map(|quote| {
+                let (_, _, child) = fill(1, quote, 40);
+                Ok((
+                    quote.id().to_bytes().to_vec(),
+                    input_fill(quote, 40, child.as_ref())?,
+                ))
+            })
+            .collect::<DbResult<_>>()?;
+        let attempt = SettlementAttemptRow {
+            tx_id: vec![1; 32],
+            tx_result: vec![1],
+            status: "prepared".into(),
+        };
+        let rolled_back = conn.transaction::<(), DbError, _>(|conn| {
+            prepare_settlement_tx(conn, &attempt, &rows, Some(&fills))?;
+            Err(diesel::result::Error::RollbackTransaction.into())
+        });
+        assert!(rolled_back.is_err());
+        assert!(read_events_tx(conn, alpha, 0, 100)?.is_empty());
+        conn.transaction::<_, DbError, _>(|conn| {
+            prepare_settlement_tx(conn, &attempt, &rows, Some(&fills))
+        })?;
+        let recovered = load_unresolved_attempts_tx(conn)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].fills, fills);
+        // Failing after the first per-order event must roll back both the
+        // earlier event and every settlement state change.
+        let first = fills.keys().min().unwrap();
+        let incomplete = HashMap::from([(first.clone(), fills[first].clone())]);
+        let failed = conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(
+                conn,
+                &[1; 32],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                Some(&incomplete),
+            )
+        });
+        assert!(matches!(
+            failed,
+            Err(DbError::Corrupt("missing cached settlement fill"))
+        ));
+        assert_eq!(read_events_tx(conn, alpha, 0, 100)?.len(), 2);
+        assert_eq!(load_unresolved_attempts_tx(conn)?.len(), 1);
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(
+                conn,
+                &[1; 32],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                Some(&recovered[0].fills),
+            )
+        })?;
+        let events = read_events_tx(conn, alpha, 0, 100)?;
+        assert_eq!(events.len(), 4);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.seq, index as u64 + 1);
+            assert!(event.lineage_id.is_some());
+        }
+        for (pending, resolved) in events[..2].iter().zip(&events[2..]) {
+            assert_eq!(pending.lineage_id, resolved.lineage_id);
+        }
+        let replay = read_events_tx(conn, alpha, 2, 100)?;
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].payload, events[2].payload);
+        // Repeated observations cannot append another resolution.
+        conn.transaction::<_, DbError, _>(|conn| {
+            confirm_settlement_tx(
+                conn,
+                &[1; 32],
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                Some(&fills),
+            )
+        })?;
+        assert_eq!(read_events_tx(conn, alpha, 0, 100)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn legacy_inputs_never_emit_settlement_events_even_if_claimed_later() -> Result<()> {
+        for committed in [false, true] {
+            let mut fixture = TestSchema::migrated()?;
+            let conn = &mut fixture.conn;
+            let alpha = maker(conn, "alpha")?;
+            let quote = note(1);
+            ingest(conn, &[&quote])?;
+            let (mut row, ..) = fill(1, &quote, 40);
+            row.fill_amount = None;
+            prepare(conn, 1, &[row])?;
+            run(conn, alpha, "s1", 1, submit(&quote))?;
+            if committed {
+                conn.transaction::<_, DbError, _>(|conn| {
+                    confirm_settlement_tx(
+                        conn,
+                        &[1; 32],
+                        &HashSet::new(),
+                        BlockNumber::GENESIS,
+                        test_consumer(),
+                        None,
+                    )
+                })?;
+            } else {
+                conn.transaction::<_, DbError, _>(|conn| {
+                    finish_discarded_settlement_tx(conn, &[1; 32], &HashSet::new())
+                })?;
+            }
+            assert!(settlement_events(conn, alpha)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn resolution_reads_cancellation_only_after_acquiring_the_maker_lock() -> Result<()> {
+        #[derive(diesel::QueryableByName)]
+        struct Pid {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            pid: i32,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Blocked {
+            #[diesel(sql_type = diesel::sql_types::Bool)]
+            blocked: bool,
+        }
+        for committed in [false, true] {
+            let mut fixture = TestSchema::migrated()?;
+            let alpha = maker(&mut fixture.conn, "alpha")?;
+            let quote = note(1);
+            run(&mut fixture.conn, alpha, "s1", 1, submit(&quote))?;
+            ingest(&mut fixture.conn, &[&quote])?;
+            prepare(&mut fixture.conn, 1, &[fill(1, &quote, 40).0])?;
+            let mut resolver = connect(&fixture)?;
+            resolver.batch_execute("SET statement_timeout = '10s'")?;
+            let pid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+                .get_result::<Pid>(&mut resolver)?
+                .pid;
+            fixture.conn.batch_execute("BEGIN")?;
+            makers::table
+                .find(alpha)
+                .for_no_key_update()
+                .select(makers::maker_id)
+                .first::<i64>(&mut fixture.conn)?;
+            let resolving = std::thread::spawn(move || -> DbResult<()> {
+                resolver.transaction(|conn| {
+                    if committed {
+                        confirm_settlement_tx(
+                            conn,
+                            &[1; 32],
+                            &HashSet::new(),
+                            BlockNumber::GENESIS,
+                            test_consumer(),
+                            None,
+                        )?;
+                    } else {
+                        finish_discarded_settlement_tx(conn, &[1; 32], &HashSet::new())?;
+                    }
+                    Ok(())
+                })
+            });
+            // Wait for a real database lock wait, not an assumed scheduling delay.
+            let started = Instant::now();
+            loop {
+                let blocked =
+                    diesel::sql_query("SELECT cardinality(pg_blocking_pids($1)) > 0 AS blocked")
+                        .bind::<diesel::sql_types::Integer, _>(pid)
+                        .get_result::<Blocked>(&mut fixture.conn)?
+                        .blocked;
+                if blocked {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "resolver never waited"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            execute_command_tx(
+                &mut fixture.conn,
+                &header(alpha, "c2", 2),
+                &cancel_all(CutoffScope::all()),
+            )?;
+            fixture.conn.batch_execute("COMMIT")?;
+            resolving.join().expect("resolver panicked")?;
+            let events = settlement_events(&mut fixture.conn, alpha)?;
+            let report = resolved(events.last().unwrap());
+            assert_eq!(
+                report.result.as_ref().unwrap().status(),
+                proto::ResultingStatus::Cancelled
+            );
+        }
         Ok(())
     }
 
@@ -2124,10 +2380,11 @@ mod tests {
         conn.transaction::<_, DbError, _>(|conn| {
             confirm_settlement_tx(
                 conn,
-                &[2],
+                &[2; 32],
                 &HashSet::new(),
                 BlockNumber::GENESIS,
                 test_consumer(),
+                None,
             )
         })?;
         // Cancel the x→y direction below 8, after the reservation.

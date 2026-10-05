@@ -233,6 +233,7 @@ pub fn prepare_settlement_tx(
     conn: &mut PgConnection,
     attempt: &SettlementAttemptRow,
     inputs: &[SettlementInputRow],
+    cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<()> {
     if inputs.is_empty() {
         return Err(SettlementError::NoInputs.into());
@@ -313,16 +314,22 @@ pub fn prepare_settlement_tx(
     diesel::insert_into(settlement_inputs::table)
         .values(inputs)
         .execute(conn)?;
-    let journal = inputs
+    let report_inputs = inputs
         .iter()
         .map(|input| {
             let parent = parents
                 .get(input.parent_note_id.as_slice())
                 .ok_or(SettlementError::MissingInputOrder)?;
-            Ok((input.clone(), (*parent).clone()))
+            Ok((input, *parent))
         })
         .collect::<DbResult<Vec<_>>>()?;
-    maker_db::report_settlement_tx(conn, &attempt.tx_id, &journal, SettlementPhase::Pending)?;
+    maker_db::report_settlement_tx(
+        conn,
+        &attempt.tx_id,
+        &report_inputs,
+        SettlementPhase::Pending,
+        cached_fills,
+    )?;
     tracing::info!(
         tx_id = %hex::encode(&attempt.tx_id),
         parents = changed,
@@ -393,6 +400,7 @@ pub struct UnresolvedAttempt {
     pub parents: Vec<BookOrder>,
     /// Remainders the transaction creates when it commits.
     pub children: Vec<Note>,
+    pub fills: maker_db::SettlementFills,
 }
 
 type UnresolvedAttemptJoinRow = (
@@ -435,7 +443,14 @@ pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> DbResult<Vec<Unre
                 attempt,
                 parents: Vec::new(),
                 children: Vec::new(),
+                fills: HashMap::new(),
             });
+        if let Some(amount) = input.fill_amount {
+            entry.fills.insert(
+                input.parent_note_id.clone(),
+                maker_db::input_fill(&parent.note, u64::try_from(amount)?, child.as_ref())?,
+            );
+        }
         entry.parents.push(parent);
         entry.children.extend(child);
     }
@@ -522,29 +537,24 @@ pub fn finish_discarded_settlement_tx(
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
     }
-    let journal: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
-        .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
-        .filter(settlement_inputs::tx_id.eq(tx_id))
-        .select((SettlementInputRow::as_select(), OrderRow::as_select()))
-        .load(conn)?;
-    let rows: Vec<OrderRow> = settlement_inputs::table
+    let inputs: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
         .filter(settlement_inputs::tx_id.eq(tx_id))
         .order(settlement_inputs::parent_note_id.asc())
         .for_update()
-        .select(OrderRow::as_select())
+        .select((SettlementInputRow::as_select(), OrderRow::as_select()))
         .load(conn)?;
 
     let mut active_ids = Vec::new();
     let mut consumed_ids = Vec::new();
     let mut update = BookUpdate::default();
-    for row in rows {
+    for (_, row) in &inputs {
         // Only a reserved parent is ours to release.
         if row.status != OrderStatus::Settling.as_str() {
             tracing::warn!(note_id = %hex::encode(&row.note_id), status = %row.status, "discarded settlement parent is not settling; leaving it");
             continue;
         }
-        let parent = row.into_book_order()?;
+        let parent = row.clone().into_book_order()?;
         let id = parent.id();
         if consumed.contains(&id) {
             consumed_ids.push(id.to_bytes().to_vec());
@@ -564,7 +574,11 @@ pub fn finish_discarded_settlement_tx(
                 .execute(conn)?;
         }
     }
-    maker_db::report_settlement_tx(conn, tx_id, &journal, SettlementPhase::Voided)?;
+    let report_inputs: Vec<_> = inputs
+        .iter()
+        .map(|(input, parent)| (input, parent))
+        .collect();
+    maker_db::report_settlement_tx(conn, tx_id, &report_inputs, SettlementPhase::Voided, None)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     tracing::info!(
         tx_id = %hex::encode(tx_id),
@@ -590,6 +604,7 @@ pub fn confirm_settlement_tx(
     consumed_children: &HashSet<OrderId>,
     commit_block: BlockNumber,
     consumer: AccountId,
+    cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<BookUpdate> {
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
@@ -601,13 +616,12 @@ pub fn confirm_settlement_tx(
         .for_update()
         .select((SettlementInputRow::as_select(), OrderRow::as_select()))
         .load(conn)?;
-    let journal = rows.clone();
 
     let mut removed = Vec::with_capacity(rows.len());
     let mut children = Vec::new();
     let mut child_rows = Vec::new();
     let mut parent_ids = Vec::with_capacity(rows.len());
-    for (input, parent) in rows {
+    for (input, parent) in &rows {
         // Our transaction consumed it, whatever the database last recorded.
         if parent.status != OrderStatus::Settling.as_str() {
             tracing::warn!(note_id = %hex::encode(&parent.note_id), status = %parent.status, "confirmed parent was not settling; retiring it");
@@ -615,11 +629,11 @@ pub fn confirm_settlement_tx(
         removed.push(OrderId::read_from(&mut SliceReader::new(
             &input.parent_note_id,
         ))?);
-        parent_ids.push(input.parent_note_id);
+        parent_ids.push(input.parent_note_id.clone());
         // Validated against this parent at prepare time.
-        if let Some(raw) = input.child_note_data {
-            let child_note = Note::read_from(&mut SliceReader::new(&raw))?;
-            let (row, child) = remainder_of(&parent, child_note, raw)?;
+        if let Some(raw) = &input.child_note_data {
+            let child_note = Note::read_from(&mut SliceReader::new(raw))?;
+            let (row, child) = remainder_of(parent, child_note, raw.clone())?;
             child_rows.push(row);
             children.push(child);
         }
@@ -658,7 +672,8 @@ pub fn confirm_settlement_tx(
         block: commit_block,
         consumer,
     };
-    maker_db::report_settlement_tx(conn, tx_id, &journal, committed)?;
+    let report_inputs: Vec<_> = rows.iter().map(|(input, parent)| (input, parent)).collect();
+    maker_db::report_settlement_tx(conn, tx_id, &report_inputs, committed, cached_fills)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     let active: Vec<BookOrder> = children
         .into_iter()
@@ -938,7 +953,9 @@ mod tests {
             tx_result: vec![9],
             status: "prepared".into(),
         };
-        conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, &inputs))?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            prepare_settlement_tx(conn, &attempt, &inputs, None)
+        })?;
         let settling: i64 = orders::table
             .filter(orders::status.eq(OrderStatus::Settling.as_str()))
             .count()
@@ -960,7 +977,7 @@ mod tests {
             .collect();
         assert!(conn
             .transaction::<_, DbError, _>(|conn| {
-                prepare_settlement_tx(conn, &competing, &competing_inputs)
+                prepare_settlement_tx(conn, &competing, &competing_inputs, None)
             })
             .is_err());
         let attempts: i64 = settlement_attempts::table.count().get_result(conn)?;
@@ -974,6 +991,7 @@ mod tests {
                 &HashSet::new(),
                 BlockNumber::GENESIS,
                 test_consumer(),
+                None,
             )
         })?;
         assert_eq!(update.removed.len(), 511);
@@ -997,6 +1015,7 @@ mod tests {
                 &HashSet::new(),
                 BlockNumber::GENESIS,
                 test_consumer(),
+                None,
             )
         })?;
         assert!(duplicate.is_empty());
@@ -1031,6 +1050,7 @@ mod tests {
                     child_note_data: None,
                     fill_amount: None,
                 }],
+                None,
             )
         })?;
 
@@ -1052,6 +1072,7 @@ mod tests {
                         &HashSet::new(),
                         BlockNumber::GENESIS,
                         test_consumer(),
+                        None,
                     )
                 })?;
                 Ok(update.removed.len())
@@ -1107,7 +1128,7 @@ mod tests {
                 };
                 barrier.wait();
                 match conn.transaction::<_, DbError, _>(|conn| {
-                    prepare_settlement_tx(conn, &attempt, &[input])
+                    prepare_settlement_tx(conn, &attempt, &[input], None)
                 }) {
                     Ok(()) => Ok(true),
                     Err(DbError::Settlement(SettlementError::InputOrderNotActive)) => Ok(false),
@@ -1153,6 +1174,7 @@ mod tests {
                     child_note_data: None,
                     fill_amount: None,
                 }],
+                None,
             )
         })?;
         let url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
@@ -1172,6 +1194,7 @@ mod tests {
                     &HashSet::new(),
                     BlockNumber::GENESIS,
                     test_consumer(),
+                    None,
                 )
             })
             .map_err(Into::into)
@@ -1244,6 +1267,7 @@ mod tests {
                         child_note_data: None,
                         fill_amount: None,
                     }],
+                    None,
                 )
             }) {
                 Ok(()) => Ok(true),
@@ -1337,7 +1361,7 @@ mod tests {
         };
         assert!(conn
             .transaction::<_, DbError, _>(|conn| {
-                prepare_settlement_tx(conn, &attempt, &[input])
+                prepare_settlement_tx(conn, &attempt, &[input], None)
             })
             .is_err());
         assert_eq!(

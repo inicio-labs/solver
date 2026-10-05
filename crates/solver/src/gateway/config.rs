@@ -1,6 +1,7 @@
 //! Configuration for the maker gateway and its event streams.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -19,6 +20,8 @@ pub struct GatewayConfig {
     pub markets: HashSet<Vec<u8>>,
     /// How often the maker-note watcher looks for new blocks.
     pub watch_interval: Duration,
+    /// Dedicated Miden client store for maker-note sync state.
+    pub maker_store_path: PathBuf,
     pub round_submits: usize,
     pub submit_queue: usize,
     pub cancel_queue: usize,

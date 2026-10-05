@@ -16,7 +16,7 @@ pub use error::IntakeError;
 pub use events::append_event_tx;
 pub use intake::{run_intake, IntakeReceiver, IntakeSender};
 pub use service::{spawn_gateway_thread, MakerGatewayService};
-pub use watcher::{run_watcher, MakerChain, RpcChain, WatchError, Watcher};
+pub use watcher::{run_watcher, MakerTracker, NoteObservation, SdkTracker, WatchError, Watcher};
 
 /// Generated from `proto/maker/v1/gateway.proto`.
 pub mod proto {

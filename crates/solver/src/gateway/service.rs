@@ -10,7 +10,11 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use miden_client::builder::ClientBuilder;
+use miden_client::keystore::FilesystemKeyStore;
 use miden_client::rpc::NodeRpcClient;
+use miden_client::Client;
+use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
@@ -27,7 +31,7 @@ use super::events::{feed, unix_ms, Subscriber};
 use super::intake::{run_intake, IntakeSender};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
-use super::watcher::{run_watcher, RpcChain, Watcher};
+use super::watcher::{run_watcher, SdkTracker, Watcher};
 use crate::db::{maker_db, postgres_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
@@ -474,7 +478,8 @@ pub fn spawn_gateway_thread(
                     return;
                 }
             };
-            runtime.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {
                     Ok(addr) => addr,
                     Err(error) => {
@@ -486,6 +491,19 @@ pub fn spawn_gateway_thread(
                     Ok(listener) => listener,
                     Err(error) => {
                         let _ = ready_tx.send(Err(anyhow!("maker gateway bind {addr}: {error}")));
+                        return;
+                    }
+                };
+                let maker_client: Client<FilesystemKeyStore> = match ClientBuilder::new()
+                    .rpc(rpc.clone())
+                    .sqlite_store(cfg.maker_store_path.clone())
+                    .build()
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(anyhow!("maker note client: {error}")));
+                        cancel.cancel();
                         return;
                     }
                 };
@@ -509,9 +527,9 @@ pub fn spawn_gateway_thread(
                 let watcher_pool = pool.clone();
                 let watcher_cancel = cancel.clone();
                 let watch_interval = cfg.watch_interval;
-                workers.spawn(async move {
+                workers.spawn_local(async move {
                     run_watcher(
-                        Watcher::new(watcher_pool, RpcChain::new(rpc), book_tx),
+                        Watcher::new(watcher_pool, SdkTracker::new(maker_client, rpc), book_tx),
                         watch_interval,
                         watcher_cancel,
                     )
@@ -1009,10 +1027,12 @@ mod tests {
     async fn the_gateway_thread_starts_and_stops_with_the_solver() {
         let db = TestDb::new().await.unwrap();
         let cancel = CancellationToken::new();
+        let store_dir = tempfile::tempdir().unwrap();
         let cfg = |port| GatewayConfig {
             bind: "127.0.0.1".into(),
             port,
             watch_interval: std::time::Duration::from_millis(50),
+            maker_store_path: store_dir.path().join(format!("maker-{port}.sqlite3")),
             markets: HashSet::new(),
             round_submits: 10,
             submit_queue: 4,

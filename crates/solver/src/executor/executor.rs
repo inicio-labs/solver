@@ -126,6 +126,7 @@ struct PendingSettlement {
     tx_id: TransactionId,
     attempt: SettlementAttemptRow,
     parent_notes: Vec<Note>,
+    fills: Arc<db::maker_db::SettlementFills>,
     /// Remainders this transaction creates when it commits.
     child_notes: Vec<Note>,
     retry_at: Option<tokio::time::Instant>,
@@ -138,6 +139,22 @@ impl PendingSettlement {
             tx_id,
             attempt,
             parent_notes: components.notes(),
+            fills: Arc::new(
+                components
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        Ok((
+                            input.note.id().to_bytes().to_vec(),
+                            db::maker_db::input_fill(
+                                &input.note,
+                                input.fill_amount,
+                                input.remainder.as_ref(),
+                            )?,
+                        ))
+                    })
+                    .collect::<db::DbResult<_>>()?,
+            ),
             child_notes: components
                 .inputs
                 .iter()
@@ -173,6 +190,7 @@ impl PendingSettlement {
                     tx_id,
                     attempt,
                     parent_notes,
+                    fills: Arc::new(recovered.fills),
                     child_notes,
                     retry_at: None,
                 },
@@ -1143,10 +1161,16 @@ impl Executor {
             Err(error) => return Ok(build_failed(error)),
         };
         let durable_attempt = pending.attempt.clone();
+        let fills = pending.fills.clone();
         let persisted = self
             .pool
             .write(move |conn| {
-                db::postgres_db::prepare_settlement_tx(conn, &durable_attempt, &inputs)
+                db::postgres_db::prepare_settlement_tx(
+                    conn,
+                    &durable_attempt,
+                    &inputs,
+                    Some(&fills),
+                )
             })
             .await;
         match persisted {
@@ -1407,6 +1431,7 @@ impl Executor {
         };
         let attempt_id = settlement.id_bytes().to_vec();
         let consumer = self.solver_id;
+        let fills = settlement.fills.clone();
         self.pool
             .write_book(&self.book_tx, move |conn| {
                 db::postgres_db::confirm_settlement_tx(
@@ -1415,6 +1440,7 @@ impl Executor {
                     &consumed_children,
                     commit_block,
                     consumer,
+                    Some(&fills),
                 )
             })
             .await?;
@@ -2037,7 +2063,7 @@ mod recovery_tests {
             };
             pool.write(move |conn| {
                 db::postgres_db::insert_orders_batch_tx(conn, &[order_row], 1)?;
-                db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input])?;
+                db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input], None)?;
                 db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_for_write.tx_id)
             })
             .await?;
@@ -2048,6 +2074,7 @@ mod recovery_tests {
                 tx_id,
                 attempt: rejected_attempt,
                 parent_notes: vec![parent],
+                fills: Arc::default(),
                 child_notes: Vec::new(),
                 retry_at: None,
             };

@@ -486,6 +486,10 @@ pub async fn start(
             bind: config.engine.maker_gateway_bind.clone(),
             port: config.engine.maker_gateway_port,
             watch_interval: Duration::from_millis(config.engine.maker_watch_interval_ms),
+            maker_store_path: std::path::PathBuf::from(format!(
+                "{}.maker.sqlite3",
+                config.solver.ingest_store_path
+            )),
             markets: maker_markets,
             round_submits: config.engine.maker_intake_round_submits,
             submit_queue: config.engine.maker_intake_submit_queue,

@@ -6,7 +6,10 @@ use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::Note;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::types::{OrderError, OrderKeys, TokenId};
 
@@ -100,6 +103,49 @@ pub enum MakerFact {
         lineage_id: LineageId,
         tag: MakerTag,
     },
+}
+
+/// Wakes maker event streams after a commit that appended events. Only a
+/// hint: streams read durable rows, and also look on every keep-alive.
+#[derive(Clone)]
+pub struct EventWake(watch::Sender<u64>);
+
+impl Default for EventWake {
+    fn default() -> Self {
+        Self(watch::channel(0).0)
+    }
+}
+
+static EVENT_WAKE: LazyLock<EventWake> = LazyLock::new(EventWake::default);
+static EVENTS_APPENDED: AtomicBool = AtomicBool::new(false);
+
+impl EventWake {
+    /// The process's wake, notified by the core writer.
+    pub fn global() -> &'static EventWake {
+        &EVENT_WAKE
+    }
+
+    pub fn notify(&self) {
+        self.0.send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+
+    /// Recorded by every event append, inside its transaction.
+    pub(crate) fn mark_appended() {
+        EVENTS_APPENDED.store(true, Ordering::Release);
+    }
+
+    /// Called after every core-writer commit: wakes the streams if the
+    /// committed transaction appended events. A rolled-back append leaves
+    /// the mark for the next commit, which only wakes streams once more.
+    pub(crate) fn notify_if_appended() {
+        if EVENTS_APPENDED.swap(false, Ordering::AcqRel) {
+            Self::global().notify();
+        }
+    }
 }
 
 /// Maker commands carry a request ID and a maker-assigned sequence, unique

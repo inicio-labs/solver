@@ -6,43 +6,21 @@ use std::time::Duration;
 
 use diesel::pg::PgConnection;
 use prost::Message;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use super::proto::{self, event_body, stream_message};
 use crate::db::maker_db::{self, EventKind, StoredEvent};
 use crate::db::{DbError, DbPool, DbResult};
-use crate::maker::MakerId;
+use crate::maker::{EventWake, MakerId};
 use crate::types::now_millis;
 
 /// Events read per query while a stream catches up.
 const PAGE: i64 = 256;
 
-/// Wakes event streams after a commit that inserted maker events. Only a
-/// hint: streams read durable rows, and also look on every heartbeat.
-#[derive(Clone)]
-pub struct EventWake(watch::Sender<u64>);
-
-impl Default for EventWake {
-    fn default() -> Self {
-        Self(watch::channel(0).0)
-    }
-}
-
-impl EventWake {
-    /// Call after the transaction that appended events has committed.
-    pub fn notify(&self) {
-        self.0.send_modify(|count| *count = count.wrapping_add(1));
-    }
-
-    fn subscribe(&self) -> watch::Receiver<u64> {
-        self.0.subscribe()
-    }
-}
-
 /// Append `body` to `maker_id`'s feed in the caller's business transaction;
-/// returns its sequence. Notify [`EventWake`] once that transaction commits.
+/// returns its sequence. The core writer wakes the streams after commit.
 pub fn append_event_tx(
     conn: &mut PgConnection,
     maker_id: MakerId,

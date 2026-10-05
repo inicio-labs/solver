@@ -11,18 +11,23 @@ use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
-use miden_protocol::crypto::utils::Serializable;
+use std::collections::HashSet;
+
+use miden_protocol::crypto::utils::{Deserializable, Serializable};
+use miden_protocol::note::Note;
 
 use super::error::{DbError, DbResult};
+use super::postgres_models::{NewOrderRow, OrderRow};
 use super::postgres_schema::{
-    api_keys, maker_commands, maker_cutoffs, maker_events, maker_lineages, maker_stops, makers,
-    orders,
+    api_keys, live_orders, maker_commands, maker_cutoffs, maker_events, maker_lineages,
+    maker_stops, makers, orders,
 };
+use crate::gateway::{self, proto};
 use crate::maker::{
-    CommandHeader, CommandReply, CommandResult, CutoffScope, LineageId, MakerCommand, MakerFact,
-    MakerId, MakerTag,
+    CommandHeader, CommandReply, CommandResult, CutoffScope, EventWake, LineageId, MakerCommand,
+    MakerFact, MakerId, MakerTag,
 };
-use crate::types::OrderStatus;
+use crate::types::{BookUpdate, OrderKeys, OrderStatus};
 
 /// Create a maker; `None` when the name is taken.
 pub fn create_maker_tx(conn: &mut PgConnection, name: &str) -> DbResult<Option<MakerId>> {
@@ -379,6 +384,221 @@ pub fn load_cutoffs_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, Cutoff
         .collect()
 }
 
+/// An accepted submit whose note the maker-note watcher has not verified.
+#[derive(Debug, Clone)]
+pub struct PendingSubmission {
+    pub lineage_id: LineageId,
+    pub maker_id: MakerId,
+    pub note: Note,
+}
+
+/// Every pending submission, with the note its submit stored.
+pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSubmission>> {
+    maker_lineages::table
+        .inner_join(
+            maker_commands::table.on(maker_commands::maker_id
+                .eq(maker_lineages::maker_id)
+                .and(maker_commands::request_id.eq(maker_lineages::request_id))),
+        )
+        .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
+        .select((
+            maker_lineages::lineage_id,
+            maker_lineages::maker_id,
+            maker_commands::payload,
+        ))
+        .load::<(Vec<u8>, i64, Vec<u8>)>(conn)?
+        .into_iter()
+        .map(|(lineage_id, maker_id, payload)| {
+            Ok(PendingSubmission {
+                lineage_id,
+                maker_id,
+                note: Note::read_from_bytes(&payload)?,
+            })
+        })
+        .collect()
+}
+
+/// A lineage's chain verification by the maker-note watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum LineageState {
+    Pending,
+    Activated,
+    Rejected,
+}
+
+impl LineageState {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Mark pending lineages `state`; returns the ones this call changed, so a
+/// repeated round reports each lineage once.
+fn settle_lineages(
+    conn: &mut PgConnection,
+    lineages: &[&LineageId],
+    state: LineageState,
+) -> DbResult<HashSet<LineageId>> {
+    Ok(diesel::update(
+        maker_lineages::table
+            .filter(maker_lineages::lineage_id.eq_any(lineages))
+            .filter(maker_lineages::state.eq(LineageState::Pending.as_str())),
+    )
+    .set(maker_lineages::state.eq(state.as_str()))
+    .returning(maker_lineages::lineage_id)
+    .get_results::<Vec<u8>>(conn)?
+    .into_iter()
+    .collect())
+}
+
+fn order_status(note: &Note, state: proto::OrderState, reason: &str) -> proto::EventBody {
+    let depth = OrderKeys::from_note(note).map_or(0, |keys| keys.depth);
+    proto::EventBody {
+        kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
+            note_id: note.id().to_bytes().to_vec(),
+            depth,
+            state: state.into(),
+            reason: reason.to_owned(),
+        })),
+    }
+}
+
+/// Activate submitted notes the watcher verified as committed and unspent,
+/// in one core-writer transaction: store each order (ingest may already have
+/// stored a public one), mark its lineage activated, and report Live for the
+/// ones the liveness rule admits. Returns the book update; `write_book`
+/// passes it through `live_orders`, storing cancelled ones Stopped.
+pub fn activate_tx(
+    conn: &mut PgConnection,
+    submissions: &[PendingSubmission],
+    arrival_unix: u64,
+) -> DbResult<BookUpdate> {
+    if submissions.is_empty() {
+        return Ok(BookUpdate::default());
+    }
+    let rows = submissions
+        .iter()
+        .map(|submission| NewOrderRow::parsed(&submission.note, arrival_unix))
+        .collect::<DbResult<Vec<_>>>()?;
+    diesel::insert_into(orders::table)
+        .values(&rows)
+        .on_conflict(orders::note_id)
+        .do_nothing()
+        .execute(conn)?;
+    let lineages: Vec<_> = submissions.iter().map(|s| &s.lineage_id).collect();
+    let activated = settle_lineages(conn, &lineages, LineageState::Activated)?;
+    let ids: Vec<Vec<u8>> = rows.iter().map(|row| row.note_id.clone()).collect();
+    let live: HashSet<Vec<u8>> = live_orders::table
+        .filter(live_orders::note_id.eq_any(&ids))
+        .select(live_orders::note_id)
+        .load::<Vec<u8>>(conn)?
+        .into_iter()
+        .collect();
+    for submission in submissions {
+        let id = submission.note.id().to_bytes().to_vec();
+        if activated.contains(&submission.lineage_id) && live.contains(&id) {
+            let body = order_status(&submission.note, proto::OrderState::Live, "");
+            gateway::append_event_tx(
+                conn,
+                submission.maker_id,
+                Some(&submission.lineage_id),
+                &body,
+            )?;
+        }
+    }
+    let active = orders::table
+        .filter(orders::note_id.eq_any(&ids))
+        .filter(orders::status.eq(OrderStatus::Active.as_str()))
+        .select(OrderRow::as_select())
+        .load::<OrderRow>(conn)?
+        .into_iter()
+        .map(OrderRow::into_book_order)
+        .collect::<DbResult<_>>()?;
+    Ok(BookUpdate {
+        removed: Vec::new(),
+        active,
+    })
+}
+
+/// Reject submissions the watcher found unusable, reporting each once.
+pub fn reject_tx(
+    conn: &mut PgConnection,
+    rejections: &[(PendingSubmission, proto::OrderState, &'static str)],
+) -> DbResult<()> {
+    let lineages: Vec<_> = rejections.iter().map(|(s, ..)| &s.lineage_id).collect();
+    let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
+    for (submission, state, reason) in rejections {
+        if rejected.contains(&submission.lineage_id) {
+            let body = order_status(&submission.note, *state, reason);
+            gateway::append_event_tx(
+                conn,
+                submission.maker_id,
+                Some(&submission.lineage_id),
+                &body,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Report Unavailable for the live maker orders among `note_ids`, which are
+/// about to be retired because their notes were spent elsewhere. Called by
+/// every path that retires consumed orders, before it updates them. Orders
+/// already reserved by our own settlement are not live, so they are not
+/// reported.
+pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<()> {
+    /// Note ID, maker, lineage and depth of a live maker order.
+    type Spent = (Vec<u8>, i64, Option<Vec<u8>>, Option<i64>);
+    let spent: Vec<Spent> = live_orders::table
+        .filter(live_orders::note_id.eq_any(note_ids))
+        .filter(live_orders::maker_id.is_not_null())
+        .select((
+            live_orders::note_id,
+            live_orders::maker_id.assume_not_null(),
+            live_orders::lineage_id,
+            live_orders::depth,
+        ))
+        .load(conn)?;
+    for (note_id, maker_id, lineage_id, depth) in spent {
+        let body = proto::EventBody {
+            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
+                note_id,
+                depth: u32::try_from(depth.unwrap_or(0))?,
+                state: proto::OrderState::Unavailable.into(),
+                reason: "note spent outside this solver".into(),
+            })),
+        };
+        gateway::append_event_tx(conn, maker_id, lineage_id.as_deref(), &body)?;
+    }
+    Ok(())
+}
+
+/// Maker orders that may still be spent elsewhere: Active or Stopped rows
+/// of a claimed lineage. Settling ones are resolved by the executor.
+pub fn watched_maker_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<Vec<u8>>> {
+    Ok(orders::table
+        .inner_join(
+            maker_lineages::table.on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+        )
+        .filter(
+            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Stopped.as_str()]),
+        )
+        .select(orders::note_id)
+        .load(conn)?)
+}
+
+/// The stored notes of `note_ids`.
+pub fn order_notes_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<Vec<Note>> {
+    orders::table
+        .filter(orders::note_id.eq_any(note_ids))
+        .select(OrderRow::as_select())
+        .load::<OrderRow>(conn)?
+        .iter()
+        .map(OrderRow::note)
+        .collect()
+}
+
 /// The three V1 events (frozen; ADR 0003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -404,6 +624,7 @@ pub fn append_event_tx(
         .returning(makers::next_event_seq)
         .get_result(conn)?;
     let event_seq = next - 1;
+    EventWake::mark_appended();
     let kind: &'static str = kind.into();
     diesel::insert_into(maker_events::table)
         .values((

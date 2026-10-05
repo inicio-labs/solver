@@ -193,7 +193,8 @@ message OrderStatus {
 message InputFill {
   // The consumed note: this version of the order.
   bytes note_id = 1;
-  bytes lineage_id = 2;
+  reserved 2; // Lineage is carried by MakerEvent.
+  reserved "lineage_id";
   // The fill round: the consumed note's depth plus one.
   uint32 depth = 3;
   // Requested-asset units paid to you (the payback note's amount).
@@ -207,29 +208,32 @@ message InputFill {
   bytes remainder_note_id = 8;
 }
 
-// A settlement transaction reserved some of your orders and may be
+// A settlement transaction reserved this order and may be
 // broadcast. Nothing is filled until SettlementResolved says committed.
 message SettlementPending {
   bytes tx_id = 1;
-  // The intended fills.
-  repeated InputFill fills = 2;
+  reserved 2;
+  reserved "fills";
+  // The intended fill for this order.
+  InputFill fill = 3;
 }
 
 enum ResultingStatus {
   RESULTING_STATUS_UNSPECIFIED = 0;
   // Fully filled: nothing remains.
-  RESULTING_STATUS_FILLED = 1;
+  RESULTING_STATUS_FULLY_FILLED = 1;
   // The remainder, or the returned input, is live.
   RESULTING_STATUS_LIVE = 2;
-  // The remainder, or the returned input, is stopped by your cancel.
-  RESULTING_STATUS_STOPPED = 3;
+  // The remainder, or the returned input, is cancelled.
+  RESULTING_STATUS_CANCELLED = 3;
   // The remainder, or the returned input, was spent elsewhere.
-  RESULTING_STATUS_SPENT = 4;
+  RESULTING_STATUS_SPENT_ELSEWHERE = 4;
 }
 
 message InputResult {
   bytes note_id = 1;
-  bytes lineage_id = 2;
+  reserved 2;
+  reserved "lineage_id";
   ResultingStatus status = 3;
 }
 
@@ -239,10 +243,13 @@ message SettlementResolved {
   bytes tx_id = 1;
   bool committed = 2;
   // When committed: the block, the solver account that consumed your notes
-  // (the `consumer` above) and the actual fills.
+  // (the `consumer` above) and the actual fill.
   uint32 commit_block = 3;
   bytes consumer_account_id = 4;
-  repeated InputFill fills = 5;
-  // Where each of your orders stands now.
-  repeated InputResult results = 6;
+  reserved 5, 6;
+  reserved "fills", "results";
+  // Present only when committed.
+  InputFill fill = 7;
+  // Where this order stands now.
+  InputResult result = 8;
 }

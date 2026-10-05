@@ -611,6 +611,7 @@ pub mod tests {
                     child_note_data: Some(child.to_bytes()),
                     fill_amount: None,
                 }],
+                None,
             )
         })?;
         let unresolved = db::postgres_db::load_unresolved_attempts_tx(conn)?;
@@ -654,6 +655,7 @@ pub mod tests {
                 &consumed_child,
                 BlockNumber::GENESIS,
                 crate::db::postgres_db::test_consumer(),
+                None,
             )
         })?;
         assert!(update.active.is_empty());
@@ -737,6 +739,7 @@ pub mod tests {
                     child_note_data: Some(child.to_bytes()),
                     fill_amount: None,
                 }],
+                None,
             )
         })
         .await
@@ -823,6 +826,7 @@ pub mod tests {
                     &HashSet::new(),
                     BlockNumber::GENESIS,
                     crate::db::postgres_db::test_consumer(),
+                    None,
                 )
             })
             .await

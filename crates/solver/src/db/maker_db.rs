@@ -662,13 +662,47 @@ pub fn activate_tx(
 }
 
 /// Reject submissions the watcher found unusable, reporting each once.
+///
+/// A public note can trade before its claim is activated. When the note the
+/// watcher found spent was consumed by our own settlement, the settlement
+/// events already told the maker, so the claim is activated without an
+/// event; while that settlement is still in flight, the claim waits for the
+/// next round. The caller holds the order rows (`prelock_watcher_tx`).
 pub fn reject_tx(
     conn: &mut PgConnection,
     rejections: &[(PendingSubmission, proto::OrderState, &'static str)],
 ) -> DbResult<()> {
-    let lineages: Vec<_> = rejections.iter().map(|(s, ..)| &s.lineage_id).collect();
+    let spent: Vec<Vec<u8>> = rejections
+        .iter()
+        .filter(|(_, state, _)| *state == proto::OrderState::Unavailable)
+        .map(|(s, ..)| s.note.id().to_bytes().to_vec())
+        .collect();
+    let ours: HashMap<Vec<u8>, String> = orders::table
+        .filter(orders::note_id.eq_any(&spent))
+        .filter(orders::status.eq_any([
+            OrderStatus::Settling.as_str(),
+            OrderStatus::Executed.as_str(),
+        ]))
+        .select((orders::note_id, orders::status))
+        .load(conn)?
+        .into_iter()
+        .collect();
+    let mut traded = Vec::new();
+    let mut unusable = Vec::new();
+    for rejection in rejections {
+        let note_id = rejection.0.note.id().to_bytes().to_vec();
+        match ours.get(&note_id).map(String::as_str) {
+            // Our settlement is still in flight: decide once it resolves.
+            Some(status) if status == OrderStatus::Settling.as_str() => {}
+            Some(_) => traded.push(&rejection.0.lineage_id),
+            None => unusable.push(rejection),
+        }
+    }
+    settle_lineages(conn, &traded, LineageState::Activated)?;
+
+    let lineages: Vec<_> = unusable.iter().map(|(s, ..)| &s.lineage_id).collect();
     let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
-    for (submission, state, reason) in rejections {
+    for (submission, state, reason) in unusable {
         if rejected.contains(&submission.lineage_id) {
             let body = order_status(&submission.note, *state, reason);
             gateway::append_event_tx(

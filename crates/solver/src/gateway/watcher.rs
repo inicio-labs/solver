@@ -953,12 +953,15 @@ mod tests {
 
     /// A public maker note can trade before the watcher activates its claim:
     /// ingest stores it and `live_orders` admits it. When our own settlement
-    /// fills it in that window, the feed already reports the fill, so the
-    /// watcher must not then report the note spent before it went live.
+    /// consumes it in that window, the settlement events report the fill, so
+    /// the watcher waits while the settlement is in flight, then activates
+    /// the claim without reporting the note spent.
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_pending_note_filled_by_our_settlement_is_not_reported_spent() {
         use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow};
+        use crate::db::postgres_schema::maker_lineages;
+        use diesel::prelude::*;
 
         let mut f = fixture().await;
         let order = note(1, NoteType::Public);
@@ -981,6 +984,50 @@ mod tests {
             .write(move |conn| {
                 postgres_db::insert_orders_batch_tx(conn, &[row], 1)?;
                 postgres_db::prepare_settlement_tx(conn, &attempt, &[input], None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Our transaction lands before the watcher's next round.
+        f.chain.commit(&order, 2);
+        f.chain.spend(&order, 3);
+
+        let maker_id = f.maker_id;
+        let pool = f.db.pool.clone();
+        let state = || {
+            pool.read(|conn| {
+                Ok(maker_lineages::table
+                    .select(maker_lineages::state)
+                    .first::<String>(conn)?)
+            })
+        };
+        let events = || {
+            pool.read(move |conn| {
+                Ok(read_events_tx(conn, maker_id, 0, 100)?
+                    .into_iter()
+                    .map(|event| {
+                        proto::EventBody::decode(event.payload.as_slice())
+                            .unwrap()
+                            .kind
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>())
+            })
+        };
+        let statuses = |events: &[proto::event_body::Kind]| {
+            events
+                .iter()
+                .filter(|kind| matches!(kind, proto::event_body::Kind::OrderStatus(_)))
+                .count()
+        };
+
+        // While the settlement is in flight the claim waits.
+        f.watcher.round().await.unwrap();
+        assert_eq!(state().await.unwrap(), "pending");
+        assert_eq!(statuses(&events().await.unwrap()), 0);
+
+        f.db.pool
+            .write(move |conn| {
                 postgres_db::confirm_settlement_tx(
                     conn,
                     &tx_id,
@@ -993,24 +1040,9 @@ mod tests {
             })
             .await
             .unwrap();
-        f.chain.commit(&order, 2);
-        f.chain.spend(&order, 3);
         f.watcher.round().await.unwrap();
-
-        let maker_id = f.maker_id;
-        let events: Vec<_> =
-            f.db.pool
-                .read(move |conn| read_events_tx(conn, maker_id, 0, 100))
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|event| {
-                    proto::EventBody::decode(event.payload.as_slice())
-                        .unwrap()
-                        .kind
-                        .unwrap()
-                })
-                .collect();
+        assert_eq!(state().await.unwrap(), "activated");
+        let events = events().await.unwrap();
         assert!(
             events.iter().any(|kind| matches!(
                 kind,
@@ -1018,19 +1050,10 @@ mod tests {
             )),
             "the fill is reported: {events:?}"
         );
-        let contradictions: Vec<_> = events
-            .iter()
-            .filter(|kind| {
-                matches!(
-                    kind,
-                    proto::event_body::Kind::OrderStatus(status)
-                        if status.state() != proto::OrderState::Live
-                )
-            })
-            .collect();
-        assert!(
-            contradictions.is_empty(),
-            "a note our settlement filled is not reported unavailable: {contradictions:?}"
+        assert_eq!(
+            statuses(&events),
+            0,
+            "a note our settlement filled is not reported unavailable: {events:?}"
         );
     }
 

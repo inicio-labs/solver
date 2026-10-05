@@ -1496,6 +1496,77 @@ mod tests {
         Ok(())
     }
 
+    /// Several sessions append one maker's events at once, some rolling back,
+    /// while a reader follows the feed by cursor the way a stream does. The
+    /// reader must never see a later event before an earlier one commits,
+    /// or it would move its cursor past an event and lose it.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_cursor_reader_never_skips_events_appended_concurrently() -> Result<()> {
+        const WRITERS: usize = 3;
+        const APPENDS: usize = 150;
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let mut writers = (0..WRITERS)
+            .map(|_| connect(&fixture))
+            .collect::<Result<Vec<_>>>()?;
+        let mut reader = connect(&fixture)?;
+        let done = std::sync::atomic::AtomicUsize::new(0);
+
+        let (committed, followed) = std::thread::scope(|scope| {
+            let appending: Vec<_> = writers
+                .iter_mut()
+                .map(|conn| {
+                    let done = &done;
+                    scope.spawn(move || -> Result<usize> {
+                        let mut committed = 0;
+                        for i in 0..APPENDS {
+                            let rollback = i % 7 == 3;
+                            let outcome = conn.transaction::<_, DbError, _>(|conn| {
+                                append_event_tx(conn, alpha, EventKind::OrderStatus, None, b"")?;
+                                // Hold the event uncommitted for a moment.
+                                std::thread::sleep(Duration::from_micros(rand::random_range(
+                                    0..300,
+                                )));
+                                if rollback {
+                                    return Err(DbError::Corrupt("roll back"));
+                                }
+                                Ok(())
+                            });
+                            committed += usize::from(outcome.is_ok());
+                        }
+                        done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(committed)
+                    })
+                })
+                .collect();
+            // Follow the feed: each read starts right after the cursor.
+            let mut cursor = 0u64;
+            let following = (|| -> Result<u64> {
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::SeqCst) == WRITERS;
+                    for event in read_events_tx(&mut reader, alpha, cursor, 1_000)? {
+                        assert_eq!(event.seq, cursor + 1, "the feed skipped an event");
+                        cursor = event.seq;
+                    }
+                    if finished {
+                        return Ok(cursor);
+                    }
+                }
+            })();
+            let committed: usize = appending
+                .into_iter()
+                .map(|writer| writer.join().expect("writer panicked"))
+                .sum::<Result<usize>>()?;
+            Ok::<_, anyhow::Error>((committed, following?))
+        })?;
+        assert_eq!(
+            followed, committed as u64,
+            "every committed event was followed"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn api_keys_authenticate_until_revoked() -> Result<()> {
@@ -1589,6 +1660,68 @@ mod tests {
             }),
             "the reservation that won is reported as exposure"
         );
+        Ok(())
+    }
+
+    /// Races a cancel against a reservation of the same order on two sessions,
+    /// many times. Whichever commits first, the two agree: the cancel reports
+    /// the order as exposure exactly when the reservation won, and a
+    /// reservation never commits after the cancel.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_cancel_and_a_reservation_racing_always_agree() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let mut reserver = connect(&fixture)?;
+        let mut canceller = connect(&fixture)?;
+        let mut won = [0u32; 2];
+        for round in 0..60u8 {
+            let maker_id = maker(&mut fixture.conn, &format!("m{round}"))?;
+            let quote = note(u32::from(round) + 1);
+            run(&mut fixture.conn, maker_id, "s1", 1, submit(&quote))?;
+            ingest(&mut fixture.conn, &[&quote])?;
+
+            let start = Barrier::new(2);
+            let jitter = || {
+                std::thread::sleep(Duration::from_micros(rand::random_range(0..1_500)));
+            };
+            let (reserved, reply) = std::thread::scope(|scope| {
+                let reserving = scope.spawn(|| {
+                    start.wait();
+                    jitter();
+                    reserver.transaction::<_, DbError, _>(|conn| reserve(conn, round, &quote))
+                });
+                start.wait();
+                jitter();
+                let reply = run(
+                    &mut canceller,
+                    maker_id,
+                    "c2",
+                    2,
+                    cancel_all(CutoffScope::all()),
+                );
+                (reserving.join().expect("reserver panicked"), reply)
+            });
+            let (reply, _) = reply?;
+            let CommandReply::Committed(CommandResult::Applied {
+                cutoff: 2,
+                settling,
+            }) = reply
+            else {
+                panic!("round {round}: unexpected cancel reply {reply:?}");
+            };
+            assert_eq!(
+                settling,
+                u64::from(reserved.is_ok()),
+                "round {round}: the cancel reports the reservation iff it won ({reserved:?})"
+            );
+            assert_eq!(
+                live(&mut fixture.conn, &[&quote])?,
+                [false],
+                "round {round}"
+            );
+            won[usize::from(reserved.is_err())] += 1;
+        }
+        println!("reservation won {} rounds, cancel won {}", won[0], won[1]);
         Ok(())
     }
 

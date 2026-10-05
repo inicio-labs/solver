@@ -293,6 +293,104 @@ pub(super) mod tests {
         writer.await.unwrap();
     }
 
+    /// Retries can land in the same round as the command they repeat. Each
+    /// still gets the stored outcome, conflicts are refused, nothing is
+    /// stored twice, and the cancel's barrier holds within the round.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn duplicates_and_conflicts_in_one_round_get_consistent_replies() {
+        use crate::db::postgres_models::NewOrderRow;
+        use crate::db::postgres_schema::{live_orders, maker_commands};
+        use diesel::prelude::*;
+        use miden_protocol::crypto::utils::Serializable;
+
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let (intake, mut queues) = IntakeSender::new(16, 16);
+        let (updates_tx, _updates) = mpsc::channel(16);
+        let submit = |serial| MakerCommand::submit(pswap_note(serial)).unwrap();
+        let all = || MakerCommand::CancelAll {
+            scope: CutoffScope::all(),
+        };
+        let commands = [
+            ("s1", 1, submit(1)),
+            ("s1", 1, submit(1)),    // the same command again
+            ("s1", 1, submit(2)),    // its ID with another note
+            ("other", 1, submit(3)), // its sequence with another ID
+            ("s4", 4, submit(4)),    // below the cancel's barrier
+            ("c5", 5, all()),
+            ("s6", 6, submit(6)), // above it
+        ];
+        let mut replies = Vec::new();
+        for (queued, (request_id, seq, command)) in commands.into_iter().enumerate() {
+            let intake = intake.clone();
+            replies.push(tokio::spawn(async move {
+                intake
+                    .execute(header(alpha, request_id, seq), command)
+                    .await
+            }));
+            // Queue them in this order, all before the writer starts.
+            while queues.cancels_rx.len() + queues.submits_rx.len() <= queued {
+                tokio::task::yield_now().await;
+            }
+        }
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn({
+            let session = db.pool.intake_session();
+            let queues = std::mem::replace(&mut queues, IntakeSender::new(1, 1).1);
+            run_intake(session, queues, updates_tx, 500, stop.clone())
+        });
+        let mut results = Vec::new();
+        for reply in replies {
+            results.push(reply.await.unwrap().unwrap());
+        }
+        let accepted = CommandResult::Accepted;
+        assert_eq!(
+            results,
+            [
+                CommandReply::Committed(accepted.clone()),
+                CommandReply::Replayed(accepted.clone()),
+                CommandReply::Conflict,
+                CommandReply::Conflict,
+                CommandReply::Committed(accepted.clone()),
+                CommandReply::Committed(CommandResult::Applied {
+                    cutoff: 5,
+                    settling: 0
+                }),
+                CommandReply::Committed(accepted),
+            ]
+        );
+
+        let notes = [pswap_note(1), pswap_note(4), pswap_note(6)];
+        let (stored, live) = db
+            .pool
+            .write(move |conn| {
+                let stored: i64 = maker_commands::table
+                    .filter(maker_commands::maker_id.eq(alpha))
+                    .count()
+                    .get_result(conn)?;
+                let rows = notes
+                    .iter()
+                    .map(|note| NewOrderRow::ingested(note, 1))
+                    .collect::<crate::db::DbResult<Vec<_>>>()?;
+                crate::db::postgres_db::insert_orders_batch_tx(conn, &rows, 1)?;
+                let live = live_orders::table
+                    .select(live_orders::note_id)
+                    .load::<Vec<u8>>(conn)?;
+                Ok((stored, live))
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, 4, "s1, s4, c5 and s6, once each");
+        assert_eq!(
+            live,
+            [pswap_note(6).id().to_bytes().to_vec()],
+            "only the submit above the barrier can trade"
+        );
+        stop.cancel();
+        writer.await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_maker_cancel_follows_earlier_book_updates_on_one_stream() {

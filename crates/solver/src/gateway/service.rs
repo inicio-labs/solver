@@ -5,11 +5,16 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use miden_client::builder::ClientBuilder;
+use miden_client::keystore::FilesystemKeyStore;
 use miden_client::rpc::NodeRpcClient;
+use miden_client::Client;
+use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
@@ -24,7 +29,7 @@ use super::events::{feed, unix_ms, StreamConfig, Subscriber};
 use super::intake::{intake_queues, run_intake, Intake};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
-use super::watcher::{run_watcher, RpcChain, Watcher};
+use super::watcher::{run_watcher, SdkTracker, Watcher};
 use crate::db::{maker_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
@@ -47,6 +52,8 @@ pub struct GatewayConfig {
     pub markets: HashSet<Vec<u8>>,
     /// How often the maker-note watcher looks for new blocks.
     pub watch_interval: std::time::Duration,
+    /// Dedicated Miden client store for maker-note sync state.
+    pub maker_store_path: PathBuf,
     pub round_submits: usize,
     pub submit_queue: usize,
     pub cancel_queue: usize,
@@ -361,7 +368,8 @@ pub fn spawn_gateway_thread(
                     return;
                 }
             };
-            runtime.block_on(async move {
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {
                     Ok(addr) => addr,
                     Err(error) => {
@@ -384,8 +392,22 @@ pub fn spawn_gateway_thread(
                     cfg.round_submits,
                     cancel.clone(),
                 ));
-                let watcher = tokio::spawn(run_watcher(
-                    Watcher::new(pool.clone(), RpcChain::new(rpc), book_tx),
+                let maker_client: Client<FilesystemKeyStore> = match ClientBuilder::new()
+                    .rpc(rpc.clone())
+                    .sqlite_store(cfg.maker_store_path.clone())
+                    .build()
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(anyhow!("maker note client: {error}")));
+                        cancel.cancel();
+                        let _ = writer.await;
+                        return;
+                    }
+                };
+                let watcher = tokio::task::spawn_local(run_watcher(
+                    Watcher::new(pool.clone(), SdkTracker::new(maker_client, rpc), book_tx),
                     cfg.watch_interval,
                     cancel.clone(),
                 ));
@@ -814,10 +836,12 @@ mod tests {
         let db = TestDb::new().await.unwrap();
         let (facts_tx, _facts) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
+        let store_dir = tempfile::tempdir().unwrap();
         let cfg = |port| GatewayConfig {
             bind: "127.0.0.1".into(),
             port,
             watch_interval: std::time::Duration::from_millis(50),
+            maker_store_path: store_dir.path().join(format!("maker-{port}.sqlite3")),
             markets: HashSet::new(),
             round_submits: 10,
             submit_queue: 4,

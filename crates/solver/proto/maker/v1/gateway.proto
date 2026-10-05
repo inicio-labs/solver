@@ -27,6 +27,11 @@ service MakerGateway {
   // Report how far you have processed the feed; returns the server time and
   // your latest event sequence, so you can see your lag.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  // What the solver currently holds for you, a page at a time: pending, live,
+  // stopped and settling orders, and (on the first page) your cutoffs. Pages
+  // may observe concurrent changes: this is a current view, not a snapshot
+  // or a replay cursor.
+  rpc GetMakerState(GetMakerStateRequest) returns (GetMakerStateReply);
 }
 
 message CommandHeader {
@@ -131,6 +136,59 @@ message KeepAlive {
   // The `seq` of the last event sent on this stream (or `after_seq`).
   uint64 cursor = 1;
   int64 server_time_unix_ms = 2;
+}
+
+message GetMakerStateRequest {
+  // From the previous reply; empty for the first page.
+  bytes page_token = 1;
+  // Orders per page: 0 for the default (500); at most 1000.
+  uint32 page_size = 2;
+}
+
+enum MakerOrderState {
+  MAKER_ORDER_STATE_UNSPECIFIED = 0;
+  // Accepted; its note is not yet verified on chain.
+  MAKER_ORDER_STATE_PENDING = 1;
+  // Eligible for matching.
+  MAKER_ORDER_STATE_LIVE = 2;
+  // Stopped by your cancel.
+  MAKER_ORDER_STATE_STOPPED = 3;
+  // Reserved by a settlement in flight: it may still fill.
+  MAKER_ORDER_STATE_SETTLING = 4;
+}
+
+message MakerOrder {
+  bytes lineage_id = 1;
+  // The sequence of the submit that claimed the lineage.
+  uint64 root_seq = 2;
+  string request_id = 3;
+  MakerOrderState state = 4;
+  // The current version of the order; the submitted note while pending.
+  bytes note_id = 5;
+  // 0 for the submitted note, one more per partial fill.
+  uint32 depth = 6;
+  // A cancel covers it. Settling and cancelled: exposure that may still fill.
+  bool cancelled = 7;
+}
+
+message Cutoff {
+  // Unset market and direction: every market.
+  Market market = 1;
+  Direction direction = 2;
+  uint64 cutoff = 3;
+}
+
+message GetMakerStateReply {
+  repeated MakerOrder orders = 1;
+  // Pass back for the next page; empty on the last page.
+  bytes next_page_token = 2;
+  // First page only.
+  repeated Cutoff cutoffs = 3;
+  // The solver's chain-sync height.
+  uint32 sync_height = 4;
+  // Your newest event's `seq`.
+  uint64 latest_event_seq = 5;
+  int64 server_time_unix_ms = 6;
 }
 
 message HeartbeatRequest {

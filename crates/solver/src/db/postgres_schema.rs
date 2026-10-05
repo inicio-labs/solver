@@ -86,6 +86,8 @@ diesel::table! {
         root_seq -> BigInt,
         note_id -> Binary,
         state -> Text,
+        market -> Nullable<Binary>,
+        direction -> Nullable<Binary>,
     }
 }
 

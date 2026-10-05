@@ -4,8 +4,8 @@
 //! every command durable. Note payloads and API keys are never logged.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -18,55 +18,48 @@ use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
+use super::config::{GatewayConfig, StreamConfig};
 use super::error::IntakeError;
-use super::events::{feed, unix_ms, StreamConfig, Subscriber};
-use super::intake::{intake_queues, run_intake, Intake};
+use super::events::{feed, unix_ms, Subscriber};
+use super::intake::{run_intake, IntakeSender};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
 use super::watcher::{run_watcher, SdkTracker, Watcher};
-use crate::db::{maker_db, DbPool};
+use crate::db::{maker_db, postgres_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
     api_key_hash, market_key, CommandHeader, CommandReply, CommandResult, CutoffScope,
-    MakerCommand, MakerFact, MakerId,
+    MakerCommand, MakerId,
 };
 use crate::types::{BookUpdate, TokenId};
 
 /// Largest accepted request. A PSWAP note is a few kilobytes.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Bounds persistent feed tasks, channel memory, and periodic public reads.
+const MAX_EVENT_STREAMS: usize = 128;
 
 /// Creator account ID plus four serial-number elements of eight bytes.
 const LINEAGE_ID_LEN: usize = AccountId::SERIALIZED_SIZE + 32;
 
-pub struct GatewayConfig {
-    pub bind: String,
-    pub port: u16,
-    /// Market keys of the pairs this solver clears; submits for any other
-    /// pair are rejected, since nothing would ever match them.
-    pub markets: HashSet<Vec<u8>>,
-    /// How often the maker-note watcher looks for new blocks.
-    pub watch_interval: std::time::Duration,
-    /// Dedicated Miden client store for maker-note sync state.
-    pub maker_store_path: PathBuf,
-    pub round_submits: usize,
-    pub submit_queue: usize,
-    pub cancel_queue: usize,
-    pub stream: StreamConfig,
-}
+/// Orders per GetMakerState page, by default and at most.
+const DEFAULT_STATE_PAGE: u32 = 500;
+const MAX_STATE_PAGE: u32 = 1_000;
 
 #[derive(Clone)]
 pub struct MakerGatewayService {
     pool: DbPool,
-    intake: Intake,
+    intake: IntakeSender,
     markets: Arc<HashSet<Vec<u8>>>,
     events: EventWake,
     stream: StreamConfig,
+    event_slots: Arc<Semaphore>,
     /// Ends every event stream at shutdown, so the server can stop.
     cancel: CancellationToken,
 }
@@ -74,7 +67,7 @@ pub struct MakerGatewayService {
 impl MakerGatewayService {
     pub fn new(
         pool: DbPool,
-        intake: Intake,
+        intake: IntakeSender,
         markets: HashSet<Vec<u8>>,
         events: EventWake,
         stream: StreamConfig,
@@ -86,6 +79,7 @@ impl MakerGatewayService {
             markets: Arc::new(markets),
             events,
             stream,
+            event_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
             cancel,
         }
     }
@@ -146,15 +140,20 @@ impl MakerGateway for MakerGatewayService {
             key_hash,
             cursor: request.into_inner().after_seq,
         };
+        let slot = self
+            .event_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many event subscriptions"))?;
         let (tx, rx) = mpsc::channel(self.stream.buffer.max(2));
-        tokio::spawn(feed(
-            self.pool.clone(),
-            self.events.clone(),
-            self.stream,
-            subscriber,
-            tx,
-            self.cancel.clone(),
-        ));
+        let pool = self.pool.clone();
+        let events = self.events.clone();
+        let stream = self.stream;
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            feed(pool, events, stream, subscriber, tx, cancel).await;
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -187,9 +186,7 @@ impl MakerGateway for MakerGatewayService {
         request: Request<proto::CancelAllRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
         let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let header = header(maker_id, request.header.clone())?;
-        let scope = scope(&request)?;
+        let (header, scope) = request.into_inner().verify(maker_id)?;
         self.execute(header, MakerCommand::CancelAll { scope })
             .await
     }
@@ -199,14 +196,7 @@ impl MakerGateway for MakerGatewayService {
         request: Request<proto::CancelOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
         let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let header = header(maker_id, request.header)?;
-        if request.lineage_id.len() != LINEAGE_ID_LEN {
-            return Err(Status::invalid_argument(format!(
-                "lineage ID must be {LINEAGE_ID_LEN} bytes"
-            )));
-        }
-        let lineage_id = request.lineage_id;
+        let (header, lineage_id) = request.into_inner().verify(maker_id)?;
         self.execute(header, MakerCommand::CancelOrder { lineage_id })
             .await
     }
@@ -234,6 +224,62 @@ impl MakerGateway for MakerGatewayService {
         }))
     }
 
+    async fn get_maker_state(
+        &self,
+        request: Request<proto::GetMakerStateRequest>,
+    ) -> Result<Response<proto::GetMakerStateReply>, Status> {
+        let (maker_id, _) = self.authenticate(&request).await?;
+        let request = request.into_inner();
+        let after = request.page_token;
+        if !after.is_empty() && after.len() != LINEAGE_ID_LEN {
+            return Err(Status::invalid_argument("invalid page token"));
+        }
+        let size = match request.page_size {
+            0 => DEFAULT_STATE_PAGE,
+            size => size.min(MAX_STATE_PAGE),
+        };
+        let first = after.is_empty();
+        let (page, summary) = self
+            .pool
+            .read_public(move |conn| {
+                let page = maker_db::maker_orders_page_tx(conn, maker_id, &after, i64::from(size))?;
+                let summary = if first {
+                    Some((
+                        maker_db::maker_cutoffs_tx(conn, maker_id)?,
+                        postgres_db::get_last_fetched_block_tx(conn)?,
+                        maker_db::latest_event_seq_tx(conn, maker_id)?,
+                    ))
+                } else {
+                    None
+                };
+                Ok((page, summary))
+            })
+            .await
+            .map_err(|_| Status::unavailable("cannot read maker state now; retry"))?;
+        let next_page_token = match page.last() {
+            Some(last) if page.len() == size as usize => last.lineage_id.clone(),
+            _ => Vec::new(),
+        };
+        let mut reply = proto::GetMakerStateReply {
+            orders: page
+                .into_iter()
+                .map(maker_order)
+                .collect::<Result<_, _>>()?,
+            next_page_token,
+            server_time_unix_ms: unix_ms(),
+            ..Default::default()
+        };
+        if let Some((cutoffs, height, latest)) = summary {
+            reply.cutoffs = cutoffs
+                .into_iter()
+                .map(|(scope, cutoff)| cutoff_message(&scope, cutoff))
+                .collect();
+            reply.sync_height = u32::try_from(height).unwrap_or(u32::MAX);
+            reply.latest_event_seq = latest;
+        }
+        Ok(Response::new(reply))
+    }
+
     async fn get_command(
         &self,
         request: Request<proto::GetCommandRequest>,
@@ -259,6 +305,27 @@ fn header(
     let header = header.ok_or_else(|| Status::invalid_argument("missing command header"))?;
     CommandHeader::new(maker_id, header.request_id, header.seq)
         .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+impl proto::CancelAllRequest {
+    /// Validate the whole request before it reaches the durable intake.
+    fn verify(self, maker_id: MakerId) -> Result<(CommandHeader, CutoffScope), Status> {
+        let scope = scope(&self)?;
+        let header = header(maker_id, self.header)?;
+        Ok((header, scope))
+    }
+}
+
+impl proto::CancelOrderRequest {
+    /// Validate the lineage key and command header before queueing the cancel.
+    fn verify(self, maker_id: MakerId) -> Result<(CommandHeader, Vec<u8>), Status> {
+        if self.lineage_id.len() != LINEAGE_ID_LEN {
+            return Err(Status::invalid_argument(format!(
+                "lineage ID must be {LINEAGE_ID_LEN} bytes"
+            )));
+        }
+        Ok((header(maker_id, self.header)?, self.lineage_id))
+    }
 }
 
 /// A faucet ID in its canonical 15-byte serialization.
@@ -313,6 +380,50 @@ fn scope(request: &proto::CancelAllRequest) -> Result<CutoffScope, Status> {
     })
 }
 
+fn maker_order(view: maker_db::MakerOrderView) -> Result<proto::MakerOrder, Status> {
+    let state = match (view.status.as_deref(), view.live) {
+        (None, _) => proto::MakerOrderState::Pending,
+        (Some("settling"), _) => proto::MakerOrderState::Settling,
+        (Some("active"), true) => proto::MakerOrderState::Live,
+        // Active below a cutoff, or stored Stopped.
+        (Some(_), _) => proto::MakerOrderState::Stopped,
+    };
+    let corrupt = |_| Status::internal("stored maker order is unreadable");
+    Ok(proto::MakerOrder {
+        lineage_id: view.lineage_id,
+        root_seq: u64::try_from(view.root_seq).map_err(corrupt)?,
+        request_id: view.request_id,
+        state: state.into(),
+        note_id: view.note_id,
+        depth: u32::try_from(view.depth.unwrap_or(0)).map_err(corrupt)?,
+        cancelled: view.cancelled,
+    })
+}
+
+/// A stored scope back on the wire: each key holds two faucet IDs.
+fn cutoff_message(scope: &CutoffScope, cutoff: u64) -> proto::Cutoff {
+    let halves = |key: &[u8]| {
+        let (a, b) = key.split_at(key.len() / 2);
+        (a.to_vec(), b.to_vec())
+    };
+    let market = (!scope.market.is_empty()).then(|| {
+        let (faucet_a, faucet_b) = halves(&scope.market);
+        proto::Market { faucet_a, faucet_b }
+    });
+    let direction = (!scope.direction.is_empty()).then(|| {
+        let (offered_faucet, requested_faucet) = halves(&scope.direction);
+        proto::Direction {
+            offered_faucet,
+            requested_faucet,
+        }
+    });
+    proto::Cutoff {
+        market,
+        direction,
+        cutoff,
+    }
+}
+
 fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
     let result = match result {
         CommandResult::Accepted => command_reply::Result::Accepted(proto::Accepted {}),
@@ -335,7 +446,7 @@ fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
 fn intake_status(error: &IntakeError) -> Status {
     match error {
         IntakeError::Busy => Status::unavailable("durable acceptance unavailable: intake is full"),
-        IntakeError::Stopped | IntakeError::NotCommitted(_) => {
+        IntakeError::Stopped | IntakeError::OutcomeUnknown(_) => {
             Status::unavailable("durable acceptance unavailable; retry with the same request ID")
         }
     }
@@ -348,7 +459,6 @@ fn intake_status(error: &IntakeError) -> Status {
 pub fn spawn_gateway_thread(
     cfg: GatewayConfig,
     pool: DbPool,
-    facts: mpsc::UnboundedSender<MakerFact>,
     events: EventWake,
     rpc: Arc<dyn NodeRpcClient>,
     book_tx: mpsc::Sender<BookUpdate>,
@@ -384,14 +494,6 @@ pub fn spawn_gateway_thread(
                         return;
                     }
                 };
-                let (intake, queues) = intake_queues(cfg.cancel_queue, cfg.submit_queue);
-                let writer = tokio::spawn(run_intake(
-                    pool.intake_session(),
-                    queues,
-                    facts,
-                    cfg.round_submits,
-                    cancel.clone(),
-                ));
                 let maker_client: Client<FilesystemKeyStore> = match ClientBuilder::new()
                     .rpc(rpc.clone())
                     .sqlite_store(cfg.maker_store_path.clone())
@@ -402,15 +504,38 @@ pub fn spawn_gateway_thread(
                     Err(error) => {
                         let _ = ready_tx.send(Err(anyhow!("maker note client: {error}")));
                         cancel.cancel();
-                        let _ = writer.await;
                         return;
                     }
                 };
-                let watcher = tokio::task::spawn_local(run_watcher(
-                    Watcher::new(pool.clone(), SdkTracker::new(maker_client, rpc), book_tx),
-                    cfg.watch_interval,
-                    cancel.clone(),
-                ));
+                let (intake, queues) = IntakeSender::new(cfg.cancel_queue, cfg.submit_queue);
+                let mut workers = JoinSet::new();
+                let intake_pool = pool.clone();
+                let intake_book = book_tx.clone();
+                let intake_cancel = cancel.clone();
+                let round_submits = cfg.round_submits;
+                workers.spawn(async move {
+                    run_intake(
+                        intake_pool.intake_session(),
+                        queues,
+                        intake_book,
+                        round_submits,
+                        intake_cancel,
+                    )
+                    .await;
+                    "intake"
+                });
+                let watcher_pool = pool.clone();
+                let watcher_cancel = cancel.clone();
+                let watch_interval = cfg.watch_interval;
+                workers.spawn_local(async move {
+                    run_watcher(
+                        Watcher::new(watcher_pool, SdkTracker::new(maker_client, rpc), book_tx),
+                        watch_interval,
+                        watcher_cancel,
+                    )
+                    .await;
+                    "watcher"
+                });
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "maker gateway listening");
                 let shutdown = cancel.clone();
@@ -422,22 +547,53 @@ pub fn spawn_gateway_thread(
                     cfg.stream,
                     cancel.clone(),
                 );
-                let served = tonic::transport::Server::builder()
+                let serving = tonic::transport::Server::builder()
                     .add_service(service.into_server())
                     .serve_with_incoming_shutdown(TcpIncoming::from(listener), async move {
                         shutdown.cancelled().await
-                    })
-                    .await;
-                if let Err(error) = served {
-                    tracing::error!(%error, "maker gateway server failed");
-                }
-                // An unexpected gateway exit needs coordinated recovery.
-                cancel.cancel();
-                let _ = writer.await;
-                let _ = watcher.await;
+                    });
+                supervise_gateway(serving, workers, cancel).await;
             });
         })?;
     Ok((handle, ready_rx))
+}
+
+/// Keep the server and both workers supervised until shutdown. Dropping a
+/// JoinSet would abort tasks, including an intake whose blocking DB worker
+/// may already have committed, so every worker is drained after cancellation.
+async fn supervise_gateway<S, E>(
+    serving: S,
+    mut workers: JoinSet<&'static str>,
+    cancel: CancellationToken,
+) where
+    S: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => {
+            if let Err(error) = result {
+                tracing::error!(%error, "maker gateway server failed");
+            }
+        }
+        worker = workers.join_next() => {
+            match worker {
+                Some(Ok(name)) => tracing::error!(name, "maker gateway worker exited early"),
+                Some(Err(error)) => tracing::error!(%error, "maker gateway worker panicked"),
+                None => tracing::error!("maker gateway workers vanished"),
+            }
+            cancel.cancel();
+            if let Err(error) = serving.await {
+                tracing::error!(%error, "maker gateway server failed during shutdown");
+            }
+        }
+    }
+    cancel.cancel();
+    while let Some(worker) = workers.join_next().await {
+        if let Err(error) = worker {
+            tracing::error!(%error, "maker gateway worker failed during shutdown");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +602,7 @@ mod tests {
     use super::super::proto::maker_gateway_client::MakerGatewayClient;
     use super::*;
     use crate::db::postgres_test::TestDb;
+    use crate::maker::MakerUpdate;
     use crate::types::OrderKeys;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -456,7 +613,7 @@ mod tests {
 
     struct Gateway {
         client: MakerGatewayClient<Channel>,
-        facts: mpsc::UnboundedReceiver<MakerFact>,
+        facts: mpsc::Receiver<BookUpdate>,
         key: String,
         key_id: i64,
         maker_id: MakerId,
@@ -471,6 +628,10 @@ mod tests {
     };
 
     async fn gateway() -> Gateway {
+        gateway_with_stream_limit(MAX_EVENT_STREAMS).await
+    }
+
+    async fn gateway_with_stream_limit(stream_limit: usize) -> Gateway {
         let db = TestDb::new().await.unwrap();
         let key = crate::maker::new_api_key();
         let hash = api_key_hash(&key);
@@ -485,8 +646,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let (intake, queues) = intake_queues(16, 16);
-        let (facts_tx, facts) = mpsc::unbounded_channel();
+        let (intake, queues) = IntakeSender::new(16, 16);
+        let (facts_tx, facts) = mpsc::channel(16);
         let stop = CancellationToken::new();
         tokio::spawn(run_intake(
             db.pool.intake_session(),
@@ -500,15 +661,16 @@ mod tests {
         let events = EventWake::default();
         let [x, y, _] = ids();
         let markets = [x, y].map(|id| AccountId::read_from_bytes(&id).unwrap());
-        let service = MakerGatewayService::new(
+        let mut service = MakerGatewayService::new(
             db.pool.clone(),
             intake,
             HashSet::from([market_key(markets[0], markets[1])]),
             events.clone(),
             TEST_STREAM,
             stop.clone(),
-        )
-        .into_server();
+        );
+        service.event_slots = Arc::new(Semaphore::new(stream_limit));
+        let service = service.into_server();
         let shutdown = stop.clone();
         tokio::spawn(
             tonic::transport::Server::builder()
@@ -619,8 +781,8 @@ mod tests {
             .into_inner();
         assert_eq!(accepted, reply(CommandResult::Accepted, false));
         assert!(matches!(
-            facts.recv().await,
-            Some(MakerFact::LineageAttributed { .. })
+            facts.recv().await.unwrap().maker_updates.first(),
+            Some(MakerUpdate::OrdersAttributed { .. })
         ));
         let retried = client
             .submit_order(signed(&key, submit("s1", 1, &order)))
@@ -738,8 +900,8 @@ mod tests {
             )
         );
         assert_eq!(
-            facts.recv().await,
-            Some(MakerFact::CutoffRaised {
+            facts.recv().await.unwrap().maker_updates.first().cloned(),
+            Some(MakerUpdate::CutoffRaised {
                 maker_id: 1,
                 scope: CutoffScope::direction(
                     AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap(),
@@ -777,6 +939,36 @@ mod tests {
         assert_eq!(
             stopped,
             reply(CommandResult::Stopped { settling: 0 }, false)
+        );
+
+        // The current view: the submitted order is pending, and the
+        // x→y cutoff covers it.
+        let state = client
+            .get_maker_state(signed(&key, proto::GetMakerStateRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.orders.len(), 1);
+        assert_eq!(state.orders[0].state(), proto::MakerOrderState::Pending);
+        assert!(state.orders[0].cancelled);
+        assert_eq!(state.orders[0].note_id, order.id().to_bytes().to_vec());
+        assert!(state.next_page_token.is_empty());
+        assert_eq!(state.cutoffs.len(), 1);
+        assert_eq!(state.cutoffs[0].cutoff, 2);
+        assert_eq!(state.cutoffs[0].direction, direction(&x, &y));
+        assert_eq!(
+            code(
+                client
+                    .get_maker_state(signed(
+                        &key,
+                        proto::GetMakerStateRequest {
+                            page_token: vec![1, 2, 3],
+                            page_size: 0,
+                        },
+                    ))
+                    .await
+            ),
+            Code::InvalidArgument
         );
 
         // A lost reply is recovered by request ID.
@@ -834,7 +1026,6 @@ mod tests {
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn the_gateway_thread_starts_and_stops_with_the_solver() {
         let db = TestDb::new().await.unwrap();
-        let (facts_tx, _facts) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let store_dir = tempfile::tempdir().unwrap();
         let cfg = |port| GatewayConfig {
@@ -858,7 +1049,6 @@ mod tests {
         let (thread, ready) = spawn_gateway_thread(
             cfg(0),
             db.pool.clone(),
-            facts_tx.clone(),
             EventWake::default(),
             rpc(),
             book_tx.clone(),
@@ -877,7 +1067,6 @@ mod tests {
         let (thread, ready) = spawn_gateway_thread(
             cfg(port),
             db.pool.clone(),
-            facts_tx,
             EventWake::default(),
             rpc(),
             book_tx,
@@ -981,5 +1170,75 @@ mod tests {
         assert_eq!(reply.latest_seq, 4);
         assert!(reply.server_time_unix_ms > 0);
         stop.cancel();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn event_subscription_limit_releases_on_disconnect() {
+        let Gateway {
+            mut client,
+            key,
+            stop,
+            db: _db,
+            ..
+        } = gateway_with_stream_limit(1).await;
+        let request = || signed(&key, proto::StreamEventsRequest { after_seq: 0 });
+        let mut first = client.stream_events(request()).await.unwrap().into_inner();
+        assert!(matches!(
+            first.message().await.unwrap().unwrap().message,
+            Some(proto::stream_message::Message::ReplayComplete(_))
+        ));
+        assert_eq!(
+            client.stream_events(request()).await.unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        drop(first);
+        let mut released = false;
+        for _ in 0..50 {
+            match client.stream_events(request()).await {
+                Ok(stream) => {
+                    drop(stream);
+                    released = true;
+                    break;
+                }
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(status) => panic!("unexpected stream error: {status}"),
+            }
+        }
+        assert!(released, "disconnect must release the subscription slot");
+        stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn gateway_supervision_cancels_and_drains_after_worker_exit_or_panic() {
+        for panic_worker in [false, true] {
+            let cancel = CancellationToken::new();
+            let mut workers = JoinSet::new();
+            workers.spawn(async move {
+                if panic_worker {
+                    panic!("test worker failure");
+                }
+                "intake"
+            });
+            let waiting = cancel.clone();
+            workers.spawn(async move {
+                waiting.cancelled().await;
+                "watcher"
+            });
+            let server_cancel = cancel.clone();
+            let serving = async move {
+                server_cancel.cancelled().await;
+                Ok::<(), &'static str>(())
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                supervise_gateway(serving, workers, cancel.clone()),
+            )
+            .await
+            .expect("supervision must shut the server and drain the watcher");
+            assert!(cancel.is_cancelled());
+        }
     }
 }

@@ -7,9 +7,11 @@ use std::time::Duration;
 use diesel::pg::PgConnection;
 use prost::Message;
 use tokio::sync::mpsc;
+use tokio::time::{Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
+use super::config::StreamConfig;
 use super::proto::{self, event_body, stream_message};
 use crate::db::maker_db::{self, EventKind, StoredEvent};
 use crate::db::{DbError, DbPool, DbResult};
@@ -34,14 +36,6 @@ pub fn append_event_tx(
         None => return Err(DbError::Corrupt("maker event has no body")),
     };
     maker_db::append_event_tx(conn, maker_id, kind, lineage_id, &body.encode_to_vec())
-}
-
-#[derive(Clone, Copy)]
-pub struct StreamConfig {
-    /// Messages a subscriber may leave unread before it is disconnected.
-    pub buffer: usize,
-    /// Keep-alive interval, which also re-checks the API key.
-    pub heartbeat: Duration,
 }
 
 pub(super) type StreamSender = mpsc::Sender<Result<proto::StreamMessage, Status>>;
@@ -78,6 +72,19 @@ pub(super) async fn feed(
         tokio::time::Instant::now() + config.heartbeat,
         config.heartbeat,
     );
+    keep_alive.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Snapshot the replay boundary. New writes are delivered after
+    // ReplayComplete, even if producers append faster than this client reads.
+    let replay_through = match pool
+        .read_public(move |conn| maker_db::latest_event_seq_tx(conn, maker_id))
+        .await
+    {
+        Ok(seq) => seq,
+        Err(_) => {
+            let _ = tx.try_send(Err(Status::unavailable("event feed unavailable")));
+            return;
+        }
+    };
     let mut replayed = false;
     loop {
         // Mark the wake seen before reading, so a commit during the read
@@ -97,8 +104,12 @@ pub(super) async fn feed(
                     return;
                 }
             };
-            let caught_up = page.len() < PAGE as usize;
+            let mut caught_up = page.len() < PAGE as usize;
             for event in page {
+                if !replayed && event.seq > replay_through {
+                    caught_up = true;
+                    break;
+                }
                 let seq = event.seq;
                 let message = match event_message(event) {
                     Ok(message) => message,
@@ -107,12 +118,24 @@ pub(super) async fn feed(
                         return;
                     }
                 };
-                if !send(&tx, message, config.heartbeat).await {
+                if !send_checked(
+                    &pool,
+                    &tx,
+                    &cancel,
+                    &mut keep_alive,
+                    &key_hash,
+                    maker_id,
+                    cursor,
+                    message,
+                    config.heartbeat,
+                )
+                .await
+                {
                     return;
                 }
                 cursor = seq;
             }
-            if caught_up {
+            if caught_up || (!replayed && cursor >= replay_through) {
                 break;
             }
         }
@@ -121,8 +144,14 @@ pub(super) async fn feed(
             let complete = proto::ReplayComplete {
                 through_seq: cursor,
             };
-            if !send(
+            if !send_checked(
+                &pool,
                 &tx,
+                &cancel,
+                &mut keep_alive,
+                &key_hash,
+                maker_id,
+                cursor,
                 stream_message::Message::ReplayComplete(complete),
                 config.heartbeat,
             )
@@ -136,13 +165,7 @@ pub(super) async fn feed(
             _ = tx.closed() => return,
             _ = woken.changed() => {}
             _ = keep_alive.tick() => {
-                let key_hash = key_hash.clone();
-                let owner = pool
-                    .read_public(move |conn| maker_db::authenticate_tx(conn, &key_hash))
-                    .await;
-                // A failed check is retried at the next keep-alive.
-                if matches!(owner, Ok(owner) if owner != Some(maker_id)) {
-                    let _ = tx.try_send(Err(Status::unauthenticated("API key revoked")));
+                if !reauthenticate(&pool, &tx, &key_hash, maker_id).await {
                     return;
                 }
                 let beat = proto::KeepAlive {
@@ -155,6 +178,64 @@ pub(super) async fn feed(
             }
         }
     }
+}
+
+/// While a message waits behind a slow reader, continue checking shutdown
+/// and credential revocation. This also bounds replay independently of its
+/// number of pages.
+#[allow(clippy::too_many_arguments)]
+async fn send_checked(
+    pool: &DbPool,
+    tx: &StreamSender,
+    cancel: &CancellationToken,
+    keep_alive: &mut Interval,
+    key_hash: &[u8],
+    maker_id: MakerId,
+    cursor: u64,
+    message: stream_message::Message,
+    patience: Duration,
+) -> bool {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = tx.closed() => return false,
+            _ = keep_alive.tick() => {
+                if !reauthenticate(pool, tx, key_hash, maker_id).await {
+                    return false;
+                }
+                let beat = proto::KeepAlive {
+                    cursor,
+                    server_time_unix_ms: unix_ms(),
+                };
+                if !send(tx, stream_message::Message::KeepAlive(beat), patience).await {
+                    return false;
+                }
+            }
+            sent = send(tx, message.clone(), patience) => return sent,
+        }
+    }
+}
+
+/// Any failed credential read closes the stream. A reconnect must authenticate
+/// again before it can read events.
+async fn reauthenticate(
+    pool: &DbPool,
+    tx: &StreamSender,
+    key_hash: &[u8],
+    maker_id: MakerId,
+) -> bool {
+    let lookup = key_hash.to_vec();
+    let status = match pool
+        .read_public(move |conn| maker_db::authenticate_tx(conn, &lookup))
+        .await
+    {
+        Ok(Some(owner)) if owner == maker_id => return true,
+        Ok(_) => Status::unauthenticated("API key revoked"),
+        Err(_) => Status::unavailable("cannot recheck API key; reconnect"),
+    };
+    let _ = tx.try_send(Err(status));
+    false
 }
 
 /// Queue a message, waiting up to `patience` for the subscriber to make
@@ -331,6 +412,78 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn events_committed_during_replay_follow_its_fixed_watermark() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db, "alpha", 0).await;
+        let maker_id = alpha.maker_id;
+        db.pool
+            .write(move |conn| {
+                for note in 0..300 {
+                    append_event_tx(conn, maker_id, None, &body(note as u8))?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (mut rx, cancel) = start(
+            &db,
+            &alpha,
+            StreamConfig {
+                buffer: 3,
+                heartbeat: Duration::from_millis(50),
+            },
+        );
+        loop {
+            let message = rx.recv().await.unwrap().unwrap();
+            match message.message.unwrap() {
+                stream_message::Message::Event(event) => {
+                    assert_eq!(event.seq, 1);
+                    break;
+                }
+                stream_message::Message::KeepAlive(_) => {}
+                stream_message::Message::ReplayComplete(_) => panic!("empty replay"),
+            }
+        }
+        db.pool
+            .write(move |conn| append_event_tx(conn, maker_id, None, &body(1)))
+            .await
+            .unwrap();
+        let mut last = 1;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = rx.recv().await.unwrap().unwrap();
+                match message.message.unwrap() {
+                    stream_message::Message::Event(event) => {
+                        last = event.seq;
+                        assert!(last <= 300, "live event preceded ReplayComplete");
+                    }
+                    stream_message::Message::ReplayComplete(complete) => {
+                        assert_eq!(complete.through_seq, 300);
+                        assert_eq!(last, 300);
+                        break;
+                    }
+                    stream_message::Message::KeepAlive(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = rx.recv().await.unwrap().unwrap();
+                if let stream_message::Message::Event(event) = message.message.unwrap() {
+                    assert_eq!(event.seq, 301);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_consumer_that_takes_nothing_is_disconnected_to_resume_later() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db, "alpha", 5).await;
@@ -384,5 +537,153 @@ mod tests {
         };
         assert_eq!(ended.code(), tonic::Code::Unauthenticated);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn failed_auth_read_closes_a_revoked_stream_before_event_reads_resume() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db, "alpha", 0).await;
+        let (mut rx, cancel) = start(
+            &db,
+            &alpha,
+            StreamConfig {
+                buffer: 8,
+                heartbeat: Duration::from_secs(1),
+            },
+        );
+        assert_eq!(replay_complete(rx.recv().await.unwrap()), 0);
+        let key_id = alpha.key_id;
+        db.pool
+            .write(move |conn| maker_db::revoke_api_key_tx(conn, key_id))
+            .await
+            .unwrap();
+
+        // TestDb has three public read slots. Occupy exactly those slots so
+        // the next auth read times out while the DB itself stays available.
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let pool = db.pool.clone();
+            let started = started_tx.clone();
+            readers.push(tokio::spawn(async move {
+                pool.read_public(move |_| {
+                    let _ = started.send(());
+                    std::thread::sleep(Duration::from_secs(7));
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        for _ in 0..3 {
+            started_rx.recv().await.expect("read slot was acquired");
+        }
+        let maker_id = alpha.maker_id;
+        db.pool
+            .write(move |conn| append_event_tx(conn, maker_id, None, &body(7)))
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(7), async {
+            loop {
+                match rx.recv().await {
+                    Some(Err(status)) => break status,
+                    Some(Ok(message)) => {
+                        assert!(
+                            !matches!(message.message, Some(stream_message::Message::Event(_))),
+                            "no event may pass an unsuccessful auth check"
+                        );
+                    }
+                    None => panic!("stream closed without an error status"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        for reader in readers {
+            reader.await.unwrap().unwrap();
+        }
+        let events = db
+            .pool
+            .read_public(move |conn| maker_db::read_events_tx(conn, maker_id, 0, PAGE))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "event reads recover after the auth fault");
+        assert!(rx.recv().await.is_none(), "the old stream stays closed");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn revocation_interrupts_a_paced_multi_page_replay() {
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db, "alpha", 0).await;
+        let maker_id = alpha.maker_id;
+        db.pool
+            .write(move |conn| {
+                for note in 0..520 {
+                    append_event_tx(conn, maker_id, None, &body(note as u8))?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (mut rx, cancel) = start(
+            &db,
+            &alpha,
+            StreamConfig {
+                buffer: 3,
+                heartbeat: Duration::from_millis(50),
+            },
+        );
+        let mut delivered = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while delivered < 270 {
+                let message = rx.recv().await.unwrap().unwrap();
+                match message.message.unwrap() {
+                    stream_message::Message::Event(event) => {
+                        delivered += 1;
+                        assert_eq!(event.seq, delivered);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    stream_message::Message::KeepAlive(_) => {}
+                    stream_message::Message::ReplayComplete(_) => {
+                        panic!("replay finished before the second page")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let key_id = alpha.key_id;
+        db.pool
+            .write(move |conn| maker_db::revoke_api_key_tx(conn, key_id))
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(Ok(message)) => match message.message.unwrap() {
+                        stream_message::Message::Event(_) => {
+                            delivered += 1;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        stream_message::Message::KeepAlive(_) => {}
+                        stream_message::Message::ReplayComplete(_) => {
+                            panic!("revoked subscriber finished replay")
+                        }
+                    },
+                    Some(Err(status)) => break Some(status),
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if let Some(status) = ended {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        }
+        assert!(delivered < 520, "revocation must interrupt replay");
+        cancel.cancel();
     }
 }

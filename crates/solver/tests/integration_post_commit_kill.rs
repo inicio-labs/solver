@@ -71,6 +71,7 @@ async fn crash_worker() -> Result<()> {
         Ok(BookUpdate {
             removed: vec![id],
             active: Vec::new(),
+            maker_updates: Vec::new(),
         })
     })
     .await?;

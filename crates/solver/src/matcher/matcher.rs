@@ -11,23 +11,20 @@ use super::error::MatcherError;
 use crate::clearing::{
     self, ClearingConfig, ClearingError, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
 };
-use crate::maker::MakerFact;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PreciseSnapshot;
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
-static MAKER_LANE_BACKLOG: AtomicU64 = AtomicU64::new(0);
+static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
 }
 
-/// Facts waiting on the maker control lane at the last tick. The lane is
-/// unbounded so the maker intake never waits for the matcher; this shows
-/// whether the matcher keeps up.
-pub(crate) fn maker_lane_backlog() -> u64 {
-    MAKER_LANE_BACKLOG.load(Ordering::Relaxed)
+/// Backlog on the ordered book/maker update stream at the last tick.
+pub(crate) fn ordered_update_backlog() -> u64 {
+    ORDERED_UPDATE_BACKLOG.load(Ordering::Relaxed)
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
@@ -41,10 +38,6 @@ pub struct ClearingRuntime {
     pub max_source_age_ms: u64,
     pub max_source_skew_ms: u64,
     pub routing: Option<crate::router::Routing>,
-    /// The maker control lane (ADR 0003): cutoffs, stops and lineage
-    /// attributions the maker intake committed. `None`, or a closed lane,
-    /// when this process runs no maker intake.
-    pub maker_facts: Option<mpsc::UnboundedReceiver<MakerFact>>,
 }
 
 impl ClearingRuntime {
@@ -105,26 +98,16 @@ pub(super) async fn run_worker(
     for order in &bootstrap.orders {
         book.insert_or_skip(order);
     }
-    let mut facts = runtime.maker_facts.take();
     let mut interval = tokio::time::interval(match_interval);
     loop {
         // Update the book immediately; run matching only on the batch timer.
-        // Maker facts come first so a cancel never waits behind book
-        // updates; the timer precedes book updates so a busy producer cannot
-        // postpone matching (the tick applies queued updates itself).
+        // The timer precedes new receives so a busy producer cannot postpone
+        // matching; it drains the already queued committed updates in order.
         tokio::select! {
             biased;
-            fact = next_fact(&mut facts), if facts.is_some() => match fact {
-                Some(fact) => book.apply_maker_fact(fact, now_millis()),
-                // No maker intake in this process: stop polling the lane.
-                None => facts = None,
-            },
             _ = interval.tick() => {
                 let now = now_millis();
-                if let Some(facts) = facts.as_mut() {
-                    MAKER_LANE_BACKLOG.store(facts.len() as u64, Ordering::Relaxed);
-                    book.apply_pending_maker_facts(facts, now);
-                }
+                ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
                 book.apply_pending(&mut book_rx);
                 if let Some(routing) = runtime.routing.as_mut() {
                     routing.release_expired(&mut book, now).map_err(MatcherError::Routing)?;
@@ -146,13 +129,6 @@ pub(super) async fn run_worker(
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
             }
         }
-    }
-}
-
-async fn next_fact(facts: &mut Option<mpsc::UnboundedReceiver<MakerFact>>) -> Option<MakerFact> {
-    match facts {
-        Some(facts) => facts.recv().await,
-        None => None,
     }
 }
 
@@ -498,7 +474,6 @@ mod tests {
             max_source_age_ms: 1_000,
             max_source_skew_ms: 0,
             routing: None,
-            maker_facts: None,
         };
         runtime.validate().unwrap();
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -590,7 +565,6 @@ mod tests {
             max_source_age_ms: 30_000,
             max_source_skew_ms: 0,
             routing: None,
-            maker_facts: None,
         };
         let removed_id = persisted[0].id();
         let local = tokio::task::LocalSet::new();
@@ -617,6 +591,7 @@ mod tests {
                     .send(BookUpdate {
                         removed: vec![removed_id],
                         active: Vec::new(),
+                        maker_updates: Vec::new(),
                     })
                     .await
                     .unwrap();

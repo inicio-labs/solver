@@ -179,6 +179,23 @@ pub struct OrderKeys {
 impl OrderKeys {
     pub fn from_note(note: &Note) -> Result<Self, OrderError> {
         let pswap = PswapNote::try_from(note)?;
+        Ok(Self::from_pswap(&pswap))
+    }
+
+    pub fn from_pswap(pswap: &PswapNote) -> Self {
+        let depth = pswap.parent_depth();
+        let lineage_id = Self::lineage_id_from_pswap(pswap);
+        let offered = pswap.offered_asset().faucet_id();
+        let requested = pswap.storage().requested_faucet_id();
+        Self {
+            lineage_id,
+            depth,
+            market: market_key(offered, requested),
+            direction: direction_key(offered, requested),
+        }
+    }
+
+    pub fn lineage_id_from_pswap(pswap: &PswapNote) -> LineageId {
         let depth = pswap.parent_depth();
         let serial = pswap.serial_number();
         let root_s3 = serial[3] - Felt::from(depth);
@@ -186,14 +203,7 @@ impl OrderKeys {
         for element in [serial[0], serial[1], serial[2], root_s3] {
             lineage_id.extend_from_slice(&element.as_canonical_u64().to_be_bytes());
         }
-        let offered = pswap.offered_asset().faucet_id();
-        let requested = pswap.storage().requested_faucet_id();
-        Ok(Self {
-            lineage_id,
-            depth,
-            market: market_key(offered, requested),
-            direction: direction_key(offered, requested),
-        })
+        lineage_id
     }
 }
 
@@ -223,12 +233,14 @@ impl BookOrder {
 pub struct BookUpdate {
     pub removed: Vec<OrderId>,
     pub active: Vec<BookOrder>,
+    /// Maker control changes committed in the same ordered publication stream.
+    pub maker_updates: Vec<crate::maker::MakerUpdate>,
 }
 
 impl BookUpdate {
     /// Avoid waking the matcher for a transaction that changed no book entries.
     pub fn is_empty(&self) -> bool {
-        self.removed.is_empty() && self.active.is_empty()
+        self.removed.is_empty() && self.active.is_empty() && self.maker_updates.is_empty()
     }
 }
 
@@ -237,6 +249,7 @@ impl From<BookOrder> for BookUpdate {
         Self {
             removed: Vec::new(),
             active: vec![order],
+            maker_updates: Vec::new(),
         }
     }
 }

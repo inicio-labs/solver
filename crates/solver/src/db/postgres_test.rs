@@ -68,6 +68,10 @@ pub struct TestDb {
 }
 
 impl TestDb {
+    pub fn url(&self) -> &str {
+        &self._schema.url
+    }
+
     pub async fn new() -> Result<Self> {
         let schema = tokio::task::spawn_blocking(TestSchema::migrated).await??;
         let pool = DbPool::open(

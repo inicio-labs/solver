@@ -253,6 +253,7 @@ impl SyncResult {
         let mut update = BookUpdate {
             removed: Vec::new(),
             active: remainders,
+            maker_updates: Vec::new(),
         };
 
         let mut order_rows = Vec::new();

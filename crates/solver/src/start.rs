@@ -310,7 +310,6 @@ pub async fn start(
             .engine
             .clearing_max_source_skew_secs
             .saturating_mul(1_000),
-        maker_facts: Some(channels.maker_fact_rx),
     };
 
     // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's
@@ -481,7 +480,7 @@ pub async fn start(
     // 13d. MAKER GATEWAY THREAD (ADR 0003): gRPC maker commands and the maker
     //      intake writer on their own OS thread, runtime and database session,
     //      so maker traffic cannot slow ingest or settlement. Only spawned when
-    //      enabled; committed cancels reach the matcher on the maker lane.
+    //      enabled; committed cancels reach the matcher in book update order.
     let gateway_ready_rx = if config.engine.maker_gateway_enabled {
         let gateway_cfg = crate::gateway::GatewayConfig {
             bind: config.engine.maker_gateway_bind.clone(),
@@ -507,7 +506,6 @@ pub async fn start(
             crate::gateway::spawn_gateway_thread(
                 gateway_cfg,
                 db_pool.clone(),
-                channels.maker_fact_tx,
                 maker_events,
                 rpc,
                 channels.book_tx.clone(),

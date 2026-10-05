@@ -368,6 +368,7 @@ impl<T: MakerTracker> Watcher<T> {
             self.pool
                 .write_book(&self.book_tx, move |conn| {
                     let (activations, rejections, spent_ids) = writes;
+                    maker_db::prelock_watcher_tx(conn, &activations, &rejections, &spent_ids)?;
                     maker_db::reject_tx(conn, &rejections)?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
                     let mut update = maker_db::activate_tx(conn, &activations, now_unix())?;

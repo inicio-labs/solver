@@ -14,6 +14,6 @@ pub enum IntakeError {
     Busy,
     #[error("maker intake stopped")]
     Stopped,
-    #[error("maker commands were not committed")]
-    NotCommitted(#[source] Arc<DbError>),
+    #[error("maker command outcome is unknown; retry with the same request ID after recovery")]
+    OutcomeUnknown(#[source] Arc<DbError>),
 }

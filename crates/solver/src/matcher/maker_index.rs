@@ -9,68 +9,57 @@
 use std::collections::{HashMap, HashSet};
 
 use miden_protocol::note::NoteId;
+use miden_standards::note::PswapNote;
 
-use crate::maker::{CutoffScope, LineageId, MakerFact, MakerId, MakerTag};
-use crate::types::{BookOrder, OrderKeys};
-
-/// How long a fact is kept for book updates that arrive after it. A book
-/// update committed before the fact can still be queued behind it on
-/// `book_tx`, which the matcher drains every tick; a minute is far longer.
-const RECENT_FACT_TTL_MS: u64 = 60_000;
+use crate::maker::{CutoffScope, LineageId, MakerId, MakerTag, MakerUpdate};
+use crate::types::{BookOrder, OrderKeys, TokenId};
 
 struct Entry {
     lineage_id: LineageId,
-    market: Vec<u8>,
-    direction: Vec<u8>,
+    offered: TokenId,
+    requested: TokenId,
     tag: Option<MakerTag>,
-}
-
-/// Facts kept for book updates delivered after them.
-struct Recent {
-    tag: Option<MakerTag>,
-    stopped_by: HashSet<MakerId>,
-    at_ms: u64,
 }
 
 #[derive(Default)]
-pub(crate) struct MakerBook {
+pub(crate) struct MakerIndex {
     entries: HashMap<NoteId, Entry>,
     by_lineage: HashMap<LineageId, HashSet<NoteId>>,
     by_maker: HashMap<MakerId, HashSet<NoteId>>,
     /// Every cutoff (hydrated at startup): few per maker, kept forever.
     cutoffs: HashMap<MakerId, HashMap<CutoffScope, u64>>,
-    recent: HashMap<LineageId, Recent>,
 }
 
-impl MakerBook {
+impl MakerIndex {
     /// Record a book entry. `false` when a cutoff or stop bars it, so it must
     /// stay out of the book. An entry whose keys cannot be computed is not a
     /// maker order (the book rejects such a note anyway).
     pub(super) fn admit(&mut self, order: &BookOrder) -> bool {
         let id = order.id();
         self.forget(id);
-        let Ok(keys) = OrderKeys::from_note(&order.note) else {
+        let Ok(pswap) = PswapNote::try_from(order.note.as_ref()) else {
             return true;
         };
-        let recent = self.recent.get(&keys.lineage_id);
-        let tag = order.maker.or_else(|| recent.and_then(|recent| recent.tag));
+        let lineage_id = OrderKeys::lineage_id_from_pswap(&pswap);
+        let offered = pswap.offered_asset().faucet_id();
+        let requested = pswap.storage().requested_faucet_id();
+        let tag = order.maker;
         if let Some(tag) = tag {
-            let stopped = recent.is_some_and(|recent| recent.stopped_by.contains(&tag.maker_id));
-            if stopped || self.below_cutoff(tag, &keys.market, &keys.direction) {
+            if self.below_cutoff(tag, offered, requested) {
                 return false;
             }
             self.by_maker.entry(tag.maker_id).or_default().insert(id);
         }
         self.by_lineage
-            .entry(keys.lineage_id.clone())
+            .entry(lineage_id.clone())
             .or_default()
             .insert(id);
         self.entries.insert(
             id,
             Entry {
-                lineage_id: keys.lineage_id,
-                market: keys.market,
-                direction: keys.direction,
+                lineage_id,
+                offered,
+                requested,
                 tag,
             },
         );
@@ -87,11 +76,9 @@ impl MakerBook {
         }
     }
 
-    /// Whether the RFQ router must skip this entry.
-    pub(super) fn is_maker_order(&self, id: &NoteId) -> bool {
-        self.entries
-            .get(id)
-            .is_some_and(|entry| entry.tag.is_some())
+    /// Maker metadata to copy onto the single order model after admission.
+    pub(super) fn tag(&self, id: &NoteId) -> Option<MakerTag> {
+        self.entries.get(id).and_then(|entry| entry.tag)
     }
 
     pub(super) fn raise_cutoff(&mut self, maker_id: MakerId, scope: CutoffScope, cutoff: u64) {
@@ -104,11 +91,10 @@ impl MakerBook {
         *barrier = (*barrier).max(cutoff);
     }
 
-    /// Apply a fact from the maker control lane; returns the entries it
-    /// stops, which the caller removes from the book.
-    pub(super) fn apply(&mut self, fact: MakerFact, now_ms: u64) -> Vec<NoteId> {
-        match fact {
-            MakerFact::CutoffRaised {
+    /// Apply a committed maker update; return entries to remove from the book.
+    pub(super) fn apply(&mut self, update: MakerUpdate) -> Vec<NoteId> {
+        match update {
+            MakerUpdate::CutoffRaised {
                 maker_id,
                 scope,
                 cutoff,
@@ -116,72 +102,52 @@ impl MakerBook {
                 self.raise_cutoff(maker_id, scope, cutoff);
                 self.entries_of_maker(maker_id)
                     .filter(|(_, entry, tag)| {
-                        self.below_cutoff(*tag, &entry.market, &entry.direction)
+                        self.below_cutoff(*tag, entry.offered, entry.requested)
                     })
                     .map(|(id, ..)| id)
                     .collect()
             }
-            MakerFact::LineageStopped {
+            MakerUpdate::LineageCancelled {
                 maker_id,
                 lineage_id,
             } => {
-                let stopped = self
+                let cancelled = self
                     .entries_of_lineage(&lineage_id)
                     .filter(|(_, entry)| entry.tag.is_some_and(|tag| tag.maker_id == maker_id))
                     .map(|(id, _)| id)
                     .collect();
-                self.remember(lineage_id, now_ms)
-                    .stopped_by
-                    .insert(maker_id);
-                stopped
+                cancelled
             }
-            MakerFact::LineageAttributed { lineage_id, tag } => {
-                // Tag entries that arrived first (a public note ingested
-                // before its maker submitted it).
-                let ids: Vec<NoteId> = self
-                    .entries_of_lineage(&lineage_id)
-                    .filter(|(_, entry)| entry.tag.is_none())
-                    .map(|(id, _)| id)
-                    .collect();
-                let mut stopped = Vec::new();
-                for id in ids {
+            MakerUpdate::OrdersAttributed {
+                order_ids,
+                tag,
+                cancelled,
+            } => {
+                let mut cancelled_ids = Vec::new();
+                for id in order_ids {
                     let Some(entry) = self.entries.get_mut(&id) else {
                         continue;
                     };
+                    if entry.tag.is_some() {
+                        continue;
+                    }
                     entry.tag = Some(tag);
                     self.by_maker.entry(tag.maker_id).or_default().insert(id);
                     let entry = &self.entries[&id];
-                    if self.below_cutoff(tag, &entry.market, &entry.direction) {
-                        stopped.push(id);
+                    if cancelled || self.below_cutoff(tag, entry.offered, entry.requested) {
+                        cancelled_ids.push(id);
                     }
                 }
-                self.remember(lineage_id, now_ms).tag = Some(tag);
-                stopped
+                cancelled_ids
             }
         }
     }
 
-    /// Drop facts old enough that no earlier book update can still arrive.
-    pub(super) fn expire(&mut self, now_ms: u64) {
-        self.recent
-            .retain(|_, recent| now_ms.saturating_sub(recent.at_ms) < RECENT_FACT_TTL_MS);
-    }
-
-    fn remember(&mut self, lineage_id: LineageId, now_ms: u64) -> &mut Recent {
-        let recent = self.recent.entry(lineage_id).or_insert_with(|| Recent {
-            tag: None,
-            stopped_by: HashSet::new(),
-            at_ms: now_ms,
-        });
-        recent.at_ms = now_ms;
-        recent
-    }
-
-    fn below_cutoff(&self, tag: MakerTag, market: &[u8], direction: &[u8]) -> bool {
+    fn below_cutoff(&self, tag: MakerTag, offered: TokenId, requested: TokenId) -> bool {
         self.cutoffs.get(&tag.maker_id).is_some_and(|cutoffs| {
-            cutoffs
-                .iter()
-                .any(|(scope, &cutoff)| tag.root_seq < cutoff && scope.covers(market, direction))
+            cutoffs.iter().any(|(scope, &cutoff)| {
+                tag.root_seq < cutoff && scope.covers_pair(offered, requested)
+            })
         })
     }
 
@@ -282,8 +248,8 @@ mod tests {
         OrderKeys::from_note(&order.note).unwrap().lineage_id
     }
 
-    fn cutoff(maker_id: MakerId, scope: CutoffScope, cutoff: u64) -> MakerFact {
-        MakerFact::CutoffRaised {
+    fn cutoff(maker_id: MakerId, scope: CutoffScope, cutoff: u64) -> MakerUpdate {
+        MakerUpdate::CutoffRaised {
             maker_id,
             scope,
             cutoff,
@@ -293,7 +259,7 @@ mod tests {
     #[test]
     fn a_cutoff_stops_its_makers_older_orders_in_scope_only() {
         let (x, y) = tokens();
-        let mut book = MakerBook::default();
+        let mut book = MakerIndex::default();
         let old = order(1, true, Some((ALPHA, 5)));
         let new = order(2, true, Some((ALPHA, 20)));
         let other_side = order(3, false, Some((ALPHA, 5)));
@@ -302,70 +268,79 @@ mod tests {
         for order in [&old, &new, &other_side, &other_maker, &public] {
             assert!(book.admit(order));
         }
-        let stopped = book.apply(cutoff(ALPHA, CutoffScope::direction(x, y), 10), 0);
-        assert_eq!(stopped, vec![old.id()]);
-        let stopped = book.apply(cutoff(ALPHA, CutoffScope::market(x, y), 10), 0);
-        assert_eq!(stopped.len(), 2, "the market scope adds the other side");
-        assert!(stopped.contains(&other_side.id()));
+        let cancelled = book.apply(cutoff(ALPHA, CutoffScope::direction(x, y), 10));
+        assert_eq!(cancelled, vec![old.id()]);
+        let cancelled = book.apply(cutoff(ALPHA, CutoffScope::market(x, y), 10));
+        assert_eq!(cancelled.len(), 2, "the market scope adds the other side");
+        assert!(cancelled.contains(&other_side.id()));
         // A later Active update below the barrier stays out.
         assert!(!book.admit(&order(6, false, Some((ALPHA, 9)))));
         assert!(book.admit(&order(7, false, Some((ALPHA, 10)))));
     }
 
     #[test]
-    fn a_stop_binds_its_lineage_and_late_updates_for_a_while() {
-        let mut book = MakerBook::default();
+    fn a_stop_removes_owned_entries() {
+        let mut book = MakerIndex::default();
         let quote = order(1, true, Some((ALPHA, 5)));
         assert!(book.admit(&quote));
-        let stop = |maker_id| MakerFact::LineageStopped {
+        let stop = |maker_id| MakerUpdate::LineageCancelled {
             maker_id,
             lineage_id: lineage(&quote),
         };
         assert!(
-            book.apply(stop(BETA), 0).is_empty(),
+            book.apply(stop(BETA)).is_empty(),
             "only its owner can stop it"
         );
-        assert_eq!(book.apply(stop(ALPHA), 0), vec![quote.id()]);
+        assert_eq!(book.apply(stop(ALPHA)), vec![quote.id()]);
         book.forget(quote.id());
-        // An Active update committed before the stop but delivered after it.
-        assert!(!book.admit(&quote));
-        book.expire(RECENT_FACT_TTL_MS);
-        assert!(book.admit(&quote), "reservation still re-checks it");
+        // The ordered update stream delivers earlier activations before this
+        // cancellation; later activations have already passed live_orders.
     }
 
     #[test]
     fn an_attribution_tags_entries_that_arrived_first() {
         let (x, y) = tokens();
-        let mut book = MakerBook::default();
+        let mut book = MakerIndex::default();
         let early = order(1, true, None);
         assert!(book.admit(&early));
-        assert!(!book.is_maker_order(&early.id()));
-        let attribute = |root_seq| MakerFact::LineageAttributed {
-            lineage_id: lineage(&early),
+        assert!(book.tag(&early.id()).is_none());
+        let attribute = |root_seq| MakerUpdate::OrdersAttributed {
+            order_ids: vec![early.id()],
             tag: MakerTag {
                 maker_id: ALPHA,
                 root_seq,
             },
+            cancelled: false,
         };
-        assert!(book.apply(attribute(5), 0).is_empty());
-        assert!(book.is_maker_order(&early.id()), "never routed from now on");
-
-        // An untagged copy delivered after the attribution is tagged too.
-        let late = order(1, true, None);
-        book.forget(early.id());
-        assert!(book.admit(&late));
-        assert!(book.is_maker_order(&late.id()));
+        assert!(book.apply(attribute(5)).is_empty());
+        assert!(book.tag(&early.id()).is_some(), "never routed from now on");
 
         // A delayed submit below an existing cutoff is dropped at once.
-        let mut other = MakerBook::default();
+        let mut other = MakerIndex::default();
         other.raise_cutoff(ALPHA, CutoffScope::market(x, y), 10);
         assert!(other.admit(&early));
-        assert_eq!(other.apply(attribute(5), 0), vec![early.id()]);
+        assert_eq!(other.apply(attribute(5)), vec![early.id()]);
+
+        // A cancellation committed before the claim is carried by that
+        // claim, so an already-booked public order is removed at attribution.
+        let mut cancelled = MakerIndex::default();
+        assert!(cancelled.admit(&early));
+        assert_eq!(
+            cancelled.apply(MakerUpdate::OrdersAttributed {
+                order_ids: vec![early.id()],
+                tag: MakerTag {
+                    maker_id: ALPHA,
+                    root_seq: 5
+                },
+                cancelled: true,
+            },),
+            vec![early.id()]
+        );
     }
 
     #[test]
     fn cutoffs_only_rise() {
-        let mut book = MakerBook::default();
+        let mut book = MakerIndex::default();
         book.raise_cutoff(ALPHA, CutoffScope::all(), 10);
         book.raise_cutoff(ALPHA, CutoffScope::all(), 8);
         assert!(!book.admit(&order(1, true, Some((ALPHA, 9)))));

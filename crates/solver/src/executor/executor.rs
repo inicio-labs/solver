@@ -443,6 +443,7 @@ async fn release_held(
         Ok(BookUpdate {
             removed: consumed.into_iter().collect(),
             active: orders,
+            maker_updates: Vec::new(),
         })
     })
     .await?;

@@ -951,6 +951,89 @@ mod tests {
         assert_eq!(f.statuses().await.len(), 1);
     }
 
+    /// A public maker note can trade before the watcher activates its claim:
+    /// ingest stores it and `live_orders` admits it. When our own settlement
+    /// fills it in that window, the feed already reports the fill, so the
+    /// watcher must not then report the note spent before it went live.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_pending_note_filled_by_our_settlement_is_not_reported_spent() {
+        use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow};
+
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Public);
+        f.submit(1, &order).await;
+        let row = NewOrderRow::ingested(&order, 1).unwrap();
+        let tx_id = vec![7; 32];
+        let attempt = SettlementAttemptRow {
+            tx_id: tx_id.clone(),
+            tx_result: vec![7],
+            status: "prepared".into(),
+        };
+        let input = SettlementInputRow {
+            tx_id: tx_id.clone(),
+            parent_note_id: id(&order),
+            child_note_id: None,
+            child_note_data: None,
+            fill_amount: Some(100),
+        };
+        f.db.pool
+            .write(move |conn| {
+                postgres_db::insert_orders_batch_tx(conn, &[row], 1)?;
+                postgres_db::prepare_settlement_tx(conn, &attempt, &[input], None)?;
+                postgres_db::confirm_settlement_tx(
+                    conn,
+                    &tx_id,
+                    &HashSet::new(),
+                    BlockNumber::from(3),
+                    postgres_db::test_consumer(),
+                    None,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        f.chain.commit(&order, 2);
+        f.chain.spend(&order, 3);
+        f.watcher.round().await.unwrap();
+
+        let maker_id = f.maker_id;
+        let events: Vec<_> =
+            f.db.pool
+                .read(move |conn| read_events_tx(conn, maker_id, 0, 100))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| {
+                    proto::EventBody::decode(event.payload.as_slice())
+                        .unwrap()
+                        .kind
+                        .unwrap()
+                })
+                .collect();
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                proto::event_body::Kind::SettlementResolved(resolved) if resolved.committed
+            )),
+            "the fill is reported: {events:?}"
+        );
+        let contradictions: Vec<_> = events
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    proto::event_body::Kind::OrderStatus(status)
+                        if status.state() != proto::OrderState::Live
+                )
+            })
+            .collect();
+        assert!(
+            contradictions.is_empty(),
+            "a note our settlement filled is not reported unavailable: {contradictions:?}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_live_order_spent_elsewhere_is_retired_and_reported() {

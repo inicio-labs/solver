@@ -515,6 +515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2072,7 +2081,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -3566,6 +3575,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-binance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mock-mirror"
 version = "0.1.0"
 dependencies = [
@@ -4751,7 +4774,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -5370,6 +5393,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
+ "backon",
  "consume-script",
  "diesel",
  "diesel_migrations",
@@ -5382,6 +5406,7 @@ dependencies = [
  "miden-protocol",
  "miden-standards",
  "miden-testing",
+ "mock-binance",
  "proptest",
  "pswap-lp-sdk",
  "rand 0.9.4",
@@ -5389,6 +5414,7 @@ dependencies = [
  "reqwest",
  "ruint",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
  "strum",
@@ -5402,6 +5428,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.8",
  "wiremock",
 ]
 
@@ -5810,8 +5837,12 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6208,6 +6239,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror",
 ]
@@ -6543,6 +6576,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]

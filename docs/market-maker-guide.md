@@ -126,8 +126,8 @@ sequenceDiagram
 
 ### Compatible Miden SDK versions
 
-- `miden-client` 0.17.0-rc.2
-- `miden-protocol` and `miden-standards` 0.17.0-rc.6
+- `miden-client` 0.17.1
+- `miden-protocol` and `miden-standards` 0.17.0
 
 Your note serialization and PSWAP behaviour must match these versions. Check with us before you upgrade.
 

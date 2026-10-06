@@ -97,6 +97,9 @@ pub async fn create_faucet(
         .account_type(AccountType::Public)
         .with_component(auth)
         .with_component(faucet)
+        // As miden-client 0.17's own test faucets are built. Without it, the
+        // first mint fails in the kernel when the minted tokens leave the vault.
+        .with_component(BasicWallet)
         .with_components(policy)
         .build_with_schema_commitment()
         .context("build faucet account")?;

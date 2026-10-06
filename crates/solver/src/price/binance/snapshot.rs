@@ -162,6 +162,16 @@ impl PriceSnapshot {
         Offer::Accepted
     }
 
+    /// Carry the published quotes of `previous` over for every symbol both
+    /// snapshots subscribe, so a restart of the readers pauses nothing.
+    pub(super) fn inherit(&mut self, previous: &PriceSnapshot) {
+        for (symbol, quote) in previous.quotes() {
+            if let Some(index) = self.markets.symbol_index(symbol.as_str()) {
+                self.quotes[index] = *quote;
+            }
+        }
+    }
+
     pub(crate) fn markets(&self) -> &Markets {
         &self.markets
     }

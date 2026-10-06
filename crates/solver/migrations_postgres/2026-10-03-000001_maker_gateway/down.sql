@@ -1,9 +1,12 @@
 -- The previous binary knows nothing of makers or cutoffs: reverting after any
--- maker activity would let it trade orders that makers were told are cancelled.
+-- maker command would drop acknowledged claims, cutoffs and stops, and let it
+-- trade orders that makers were told are cancelled. A cancel can come before
+-- any submit, so checking claims alone is not enough. Every claim, cutoff and
+-- stop is written by a stored command, so this one check covers them all.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM maker_lineages) OR EXISTS (SELECT 1 FROM orders WHERE status = 'stopped') THEN
-        RAISE EXCEPTION 'maker orders exist; reverting this migration would revive cancelled orders';
+    IF EXISTS (SELECT 1 FROM maker_commands) THEN
+        RAISE EXCEPTION 'maker commands exist; reverting this migration would lose acknowledged maker commands, including cancels';
     END IF;
 END $$;
 

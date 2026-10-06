@@ -2582,6 +2582,32 @@ mod tests {
         postgres_migrations::migrate(&mut empty.conn)?;
         Ok(())
     }
+    /// A cancel can be the only command a maker ever sent. Reverting would
+    /// drop that acknowledged cancel, so the rollback is refused for it too.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn reverting_after_a_cancel_alone_is_refused() -> Result<()> {
+        let (x, y) = tokens();
+        let cancels = [
+            cancel_all(CutoffScope::direction(x, y)),
+            MakerCommand::CancelOrder {
+                lineage_id: OrderKeys::from_note(&note(1))?.lineage_id,
+            },
+        ];
+        for cancel in cancels {
+            let mut fixture = TestSchema::migrated()?;
+            let conn = &mut fixture.conn;
+            let alpha = maker(conn, "alpha")?;
+            run(conn, alpha, "c1", 1, cancel)?;
+            // Expiry and the later columns go first; the maker tables refuse.
+            for _ in 0..3 {
+                postgres_migrations::revert_last(conn)?;
+            }
+            assert!(postgres_migrations::revert_last(conn).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     fn expiry_survives_hydration_retries_and_remainders_without_reservation_check() -> Result<()> {

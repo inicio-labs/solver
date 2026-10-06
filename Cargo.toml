@@ -3,21 +3,21 @@ members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-
 resolver = "2"
 
 [workspace.dependencies]
-# Miden 0.17 release candidates: client rc.2 depends on protocol/standards
-# rc.6 and VM 0.33. Pin the full set so price and PSWAP behavior cannot drift
-# across builds. MSRV 1.98.1 — see rust-toolchain.toml.
+# Miden 0.17 final: client 0.17.1 depends on protocol/standards 0.17.0 and
+# VM 0.35. Pin the full set so price and PSWAP behavior cannot drift across
+# builds. MSRV 1.98.1 — see rust-toolchain.toml.
 #
 # NO "testing" feature on the production miden-client/miden-protocol deps — it
 # gates miden-client's test helpers and protocol test utilities. Tests
 # re-enable it in `[dev-dependencies]` (see crates/solver); resolver = "2" keeps
 # it out of the production build.
-miden-client = { version = "=0.17.0-rc.2", default-features = false, features = ["std", "tonic"] }
-miden-client-sqlite-store = "=0.17.0-rc.2"
-miden-protocol = { version = "=0.17.0-rc.6", default-features = false }
-miden-standards = "=0.17.0-rc.6"
-miden-testing = "=0.17.0-rc.6"
-miden-core = "=0.33.0"
-miden-crypto = "=0.33.0"
+miden-client = { version = "=0.17.1", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = "=0.17.1"
+miden-protocol = { version = "=0.17.0", default-features = false }
+miden-standards = "=0.17.0"
+miden-testing = "=0.17.0"
+miden-core = "=0.35.0"
+miden-crypto = "=0.35.0"
 
 [package]
 name = "solver-bin"

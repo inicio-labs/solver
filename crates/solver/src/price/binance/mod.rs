@@ -1,0 +1,15 @@
+//! Binance Spot `bookTicker` prices (ADR 0004).
+//!
+//! [`market`] maps configured faucets and pairs to Binance symbols and checks
+//! them against `exchangeInfo` listings; [`ticker`] parses and validates one
+//! stream frame; [`snapshot`] merges both readers' observations and answers
+//! freshness-checked price lookups.
+
+// The solver uses these once the feed is wired in.
+#![cfg_attr(not(test), allow(dead_code))]
+
+pub(crate) mod market;
+pub(crate) mod snapshot;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod ticker;

@@ -1,8 +1,8 @@
-# 3. Binance bookTicker prices for PSWAP batch clearing
+# 4. Binance bookTicker prices for PSWAP batch clearing
 
-- **Status:** Accepted design; implementation pending
+- **Status:** Accepted; implementation in progress
 - **Date:** 2026-10-06
-- **Scope:** Internal PSWAP batch clearing and swap guidance in the 0.17 solver
+- **Scope:** Internal PSWAP batch clearing, swap guidance, and wallet token valuation in the 0.17 solver. Binance is the only price source; CoinGecko is removed.
 - **Related:** [Binance Spot WebSocket streams](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md), [market-data-only endpoints](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md), [exchange information](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#exchange-information), [price API](../price-api.md)
 
 ## Context
@@ -33,6 +33,20 @@ Keep the arithmetic exact and checked. Reuse `ReferencePrice` parsing and the ex
 
 The operator configures each Binance symbol against its Miden faucet pair. On startup, validate the symbol, its base and quote assets, and trading status through public `exchangeInfo`. Derive direct or reverse orientation from that mapping; there is no separate operator-supplied orientation flag. Token names alone do not establish the mapping. Only directly listed and approved markets are supported. A pair without a valid direct market remains unavailable for internal clearing while other pairs continue.
 
+Each faucet maps to a Binance asset code and each clearing pair names its approved symbol:
+
+```toml
+[[pairs]]
+name = "USDT-ETH"
+asset_x_faucet_id = "0x…"
+asset_x_binance_asset = "USDT"
+asset_y_faucet_id = "0x…"
+asset_y_binance_asset = "ETH"
+binance_symbol = "ETHUSDT"
+```
+
+`exchangeInfo` must list `ETHUSDT` with exactly these two assets and status `TRADING`. Here the pair's base (`asset_x`, USDT) is Binance's quote asset, so the pair price is `1 / P`. Query each symbol on its own: a multi-symbol `exchangeInfo` request fails as a whole (HTTP 400, code `-1121`) when one symbol is unknown, which would hide which configured market is wrong.
+
 At the external-data boundary require positive bid, ask, and displayed quantities; `bid <= ask`; a known symbol; and a valid update ID. Require the spread to satisfy a configurable maximum, compared with exact arithmetic:
 
 ```text
@@ -53,7 +67,7 @@ Reader B ─┘                                        └─> swap guidance API
 
 Use one combined stream per reader rather than a connection per symbol. Default both connections to the public market-data endpoint `wss://data-stream.binance.vision:443`; allow separately configured endpoints, including `wss://stream.binance.com:443`. This uses no Binance account, user-data stream, or API key. Two sockets improve tolerance to an individual connection failure; they do not imply independent provider infrastructure, network paths, processes, or machines.
 
-Each reader publishes its latest observation per configured symbol, including the original local receipt time and an unusable marker when a newer identifiable quote fails validation. A bounded latest-value `watch` snapshot avoids a historical tick queue. The publisher owns one per-symbol high-water update ID and one output `watch::Sender<Arc<PairPriceSnapshot>>`:
+Each reader publishes its latest observation per configured symbol, including the original local receipt time and an unusable marker when a newer identifiable quote fails validation. A bounded latest-value `watch` snapshot avoids a historical tick queue. The publisher owns one per-symbol high-water update ID and one output `watch::Sender<Arc<PriceSnapshot>>`:
 
 - Accept a higher ID from either reader and publish its validated state.
 - Ignore an equal or lower ID, without renewing the quote's age.
@@ -86,9 +100,13 @@ Unsupported or non-trading symbols and bad operator mappings are reported indivi
 
 ### Implementation boundaries
 
-Keep price state in memory. The pricing thread needs no database handle, quote table, event journal, or replay; it starts empty after a restart. Existing token metadata and order/settlement persistence remain separate. The swap guidance API currently fetches token metadata from PostgreSQL; changing its price source does not remove those metadata reads. Wallet token-to-USD valuation may keep a distinct source, but must not become an implicit clearing fallback.
+Keep price state in memory. The pricing thread needs no database handle, quote table, event journal, or replay; it starts empty after a restart. Existing token metadata and order/settlement persistence remain separate. The swap guidance API currently fetches token metadata from PostgreSQL; changing its price source does not remove those metadata reads.
 
-Reuse `tokio-tungstenite` for WebSocket transport, `reqwest` for public metadata HTTP, Tokio timers and task supervision, the solver's cancellation token, Serde, and existing exact arithmetic. Use a retry strategy helper such as `tokio-retry` for backoff and jitter, while the feed owns error classification and Binance cooldown policy. Do not nest retry engines. The reviewed Binance Rust SDK introduces callback/runtime and reconnect behavior that would still need our own supervision; for these public endpoints the existing transport libraries make a smaller adapter.
+### One price source
+
+Binance is the solver's only price source. CoinGecko is removed everywhere: the clearing path, the wallet price endpoints, the admin token symbol (and its database column), and the CoinGecko mock service. Wallet valuation (`/v1/price`, `/v1/prices`) prices each mapped token by the midpoint of `<ASSET><VALUATION_QUOTE>` (default quote `USDT`, e.g. `ETHUSDT`), validated through `exchangeInfo` like any other market; the valuation quote asset itself is worth exactly one. Responses report `vs_currency` as the quote asset (`usdt`) and `source` as `binance`. Valuation markets use the same readers, publisher, and TTL, but they never price a clearing pair: a pair without its own approved direct symbol does not clear. Devnet, localnet, and tests run the same code against a local mock Binance server (`exchangeInfo` plus the combined `bookTicker` stream) instead of a CoinGecko mock.
+
+Reuse `tokio-tungstenite` for WebSocket transport, `reqwest` for public metadata HTTP, Tokio timers and task supervision, the solver's cancellation token, Serde, and existing exact arithmetic. Use a retry strategy helper (`backon`'s exponential builder, used only as a delay iterator) for backoff and jitter, while the feed owns error classification and Binance cooldown policy. Do not nest retry engines. The reviewed Binance Rust SDK introduces callback/runtime and reconnect behavior that would still need our own supervision; for these public endpoints the existing transport libraries make a smaller adapter.
 
 Use bounded frames, HTTP bodies, and connection/close timeouts. Keep the WebSocket polled and flushed so pong responses are sent. Respect Binance's stream, control-message, connection-attempt, and connection-lifetime limits. Explicitly configure the Rustls crypto provider and trusted roots rather than depending on another dependency's incidental TLS setup. Validate external messages before publishing; hold no `watch` borrow across an await or a matching pass.
 

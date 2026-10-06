@@ -11,7 +11,8 @@ pub struct BatchPrice {
     pub(crate) base_units: U256,
 }
 
-/// An exact whole-token price in a common reference currency.
+/// An exact, positive whole-token price: one token in a reference currency, or
+/// a pair price in whole quote tokens per whole base token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReferencePrice {
     pub(crate) numerator: U256,

@@ -7,8 +7,10 @@
 //!
 //! A frame whose subscribed symbol or update ID cannot be identified is
 //! discarded without touching published state. An identifiable frame becomes an
-//! [`Observation`]; if its prices fail validation, the observation marks the
-//! symbol unusable. Prices are parsed exactly; nothing passes through `f64`.
+//! [`Observation`]; if its quote fails validation, the observation marks the
+//! symbol invalid. Prices are parsed exactly; nothing passes through `f64`.
+//! Binance's `serverShutdown` event, which precedes a disconnect, is reported
+//! so the reader can reconnect before the server closes the socket.
 
 use std::time::Instant;
 
@@ -17,26 +19,33 @@ use serde_json::value::RawValue;
 
 use super::market::Markets;
 use super::snapshot::Observation;
-use crate::clearing::ReferencePrice;
+use crate::clearing::{MidpointError, ReferencePrice};
 
-/// Why an identifiable quote is unusable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+/// Why an identifiable quote is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum QuoteRejection {
     /// A bid or ask price is missing, malformed, or zero.
     BadPrice,
     /// A displayed quantity is missing, malformed, or zero.
     BadQuantity,
-    /// `bid > ask`.
+    /// The best bid is above the best ask (`bid > ask`). A consistent order
+    /// book never shows this, so the update is garbled or out of date and
+    /// its midpoint is not a price.
     Crossed,
-    /// The spread exceeds the configured maximum.
+    /// The spread is wider than `binance.max_spread_bps`: the spread in
+    /// basis points, `10_000 × (ask − bid) / mid`, computed exactly, is above
+    /// the limit (equal is accepted). A wide spread means a thin or
+    /// disrupted book whose midpoint is not a reliable price.
     TooWide,
+    /// A side's displayed notional is below the configured minimum.
+    ThinBook,
     /// Exact arithmetic overflowed.
     Overflow,
 }
 
 /// Why a frame was discarded without changing published state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum Discard {
     /// Not a combined-stream frame with a symbol and update ID.
@@ -47,6 +56,24 @@ pub(crate) enum Discard {
     StreamMismatch,
 }
 
+/// What makes a quote usable, from configuration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuoteLimits {
+    /// Widest accepted spread, inclusive.
+    pub(crate) max_spread_bps: u32,
+    /// Least displayed notional (`quantity × price`, in the symbol's quote
+    /// asset) on each side; `None` accepts any positive quantity.
+    pub(crate) min_notional: Option<ReferencePrice>,
+}
+
+/// A parsed text frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Frame {
+    Quote(Observation),
+    /// Binance is about to close this connection.
+    ServerShutdown,
+}
+
 #[derive(Deserialize)]
 struct Envelope<'a> {
     #[serde(borrow)]
@@ -55,19 +82,61 @@ struct Envelope<'a> {
     data: BookTicker<'a>,
 }
 
+/// The `data` object of a `bookTicker` frame. The `serde` attributes tell the
+/// derived `Deserialize` how to read it:
+///
+/// - `rename = "u"` etc. map Binance's one-letter JSON keys to readable
+///   field names (`u` update ID, `s` symbol, `b`/`B` best bid price and
+///   quantity, `a`/`A` best ask price and quantity).
+/// - `borrow` makes a `&str` or `&RawValue` field point into the received
+///   frame text instead of copying it, so parsing a frame allocates nothing.
+/// - `default` makes a missing price or quantity `None` instead of a parse
+///   error: the frame still identifies its symbol and update ID, so it marks
+///   the symbol invalid rather than being discarded.
+/// - Prices and quantities stay `RawValue`, the untouched JSON token, so
+///   [`positive_decimal`] can require a JSON string and parse its digits
+///   exactly; a JSON number would go through `f64`.
 #[derive(Deserialize)]
 struct BookTicker<'a> {
-    u: u64,
-    #[serde(borrow)]
-    s: &'a str,
-    #[serde(borrow, default)]
-    b: Option<&'a RawValue>,
+    #[serde(rename = "u")]
+    update_id: u64,
+    #[serde(rename = "s", borrow)]
+    symbol: &'a str,
+    #[serde(rename = "b", borrow, default)]
+    bid_price: Option<&'a RawValue>,
     #[serde(rename = "B", borrow, default)]
     bid_quantity: Option<&'a RawValue>,
-    #[serde(borrow, default)]
-    a: Option<&'a RawValue>,
+    #[serde(rename = "a", borrow, default)]
+    ask_price: Option<&'a RawValue>,
     #[serde(rename = "A", borrow, default)]
     ask_quantity: Option<&'a RawValue>,
+}
+
+/// The fields that identify a `serverShutdown` event, raw or in a combined
+/// stream envelope.
+#[derive(Deserialize)]
+struct EventProbe<'a> {
+    #[serde(borrow, default)]
+    stream: Option<&'a str>,
+    #[serde(borrow, default)]
+    e: Option<&'a str>,
+    #[serde(borrow, default)]
+    data: Option<EventName<'a>>,
+}
+
+#[derive(Deserialize)]
+struct EventName<'a> {
+    #[serde(borrow, default)]
+    e: Option<&'a str>,
+}
+
+fn is_server_shutdown(text: &str) -> bool {
+    const EVENT: &str = "serverShutdown";
+    serde_json::from_str::<EventProbe>(text).is_ok_and(|probe| {
+        probe.stream == Some("!serverShutdown")
+            || probe.e == Some(EVENT)
+            || probe.data.is_some_and(|data| data.e == Some(EVENT))
+    })
 }
 
 /// A positive decimal sent as a JSON string, parsed exactly. Binance never
@@ -79,63 +148,70 @@ fn positive_decimal(raw: Option<&RawValue>) -> Option<ReferencePrice> {
 
 impl BookTicker<'_> {
     /// The exact midpoint of a valid quote.
-    fn midpoint(&self, max_spread_bps: u32) -> Result<ReferencePrice, QuoteRejection> {
-        let bid = positive_decimal(self.b).ok_or(QuoteRejection::BadPrice)?;
-        let ask = positive_decimal(self.a).ok_or(QuoteRejection::BadPrice)?;
-        positive_decimal(self.bid_quantity).ok_or(QuoteRejection::BadQuantity)?;
-        positive_decimal(self.ask_quantity).ok_or(QuoteRejection::BadQuantity)?;
-        let overflow = |_| QuoteRejection::Overflow;
-        if !ReferencePrice::is_ordered(bid, ask).map_err(overflow)? {
-            return Err(QuoteRejection::Crossed);
+    fn midpoint(&self, limits: QuoteLimits) -> Result<ReferencePrice, QuoteRejection> {
+        let bid = positive_decimal(self.bid_price).ok_or(QuoteRejection::BadPrice)?;
+        let ask = positive_decimal(self.ask_price).ok_or(QuoteRejection::BadPrice)?;
+        let bid_quantity =
+            positive_decimal(self.bid_quantity).ok_or(QuoteRejection::BadQuantity)?;
+        let ask_quantity =
+            positive_decimal(self.ask_quantity).ok_or(QuoteRejection::BadQuantity)?;
+        let mid = ReferencePrice::validated_midpoint(bid, ask, limits.max_spread_bps).map_err(
+            |error| match error {
+                MidpointError::Crossed => QuoteRejection::Crossed,
+                MidpointError::TooWide => QuoteRejection::TooWide,
+                MidpointError::Overflow => QuoteRejection::Overflow,
+            },
+        )?;
+        if let Some(minimum) = limits.min_notional {
+            let deep = |quantity, price| {
+                ReferencePrice::notional_at_least(quantity, price, minimum)
+                    .map_err(|_| QuoteRejection::Overflow)
+            };
+            if !deep(bid_quantity, bid)? || !deep(ask_quantity, ask)? {
+                return Err(QuoteRejection::ThinBook);
+            }
         }
-        if !ReferencePrice::spread_within_bps(bid, ask, max_spread_bps).map_err(overflow)? {
-            return Err(QuoteRejection::TooWide);
-        }
-        ReferencePrice::midpoint(bid, ask).map_err(overflow)
+        Ok(mid)
     }
 }
 
-/// Parse one text frame received at `received_at`. A quote whose spread
-/// exceeds `max_spread_bps` (inclusive limit) is unusable.
+/// Parse one text frame received at `received_at`.
 pub(crate) fn parse_frame(
     text: &str,
     markets: &Markets,
-    max_spread_bps: u32,
+    limits: QuoteLimits,
     received_at: Instant,
-) -> Result<Observation, Discard> {
-    let Envelope { stream, data } = serde_json::from_str(text).map_err(|_| Discard::Malformed)?;
-    let symbol = markets.symbol_index(data.s).ok_or(Discard::UnknownSymbol)?;
+) -> Result<Frame, Discard> {
+    let Ok(Envelope { stream, data }) = serde_json::from_str::<Envelope>(text) else {
+        return if is_server_shutdown(text) {
+            Ok(Frame::ServerShutdown)
+        } else {
+            Err(Discard::Malformed)
+        };
+    };
+    let symbol = markets
+        .symbol_index(data.symbol)
+        .ok_or(Discard::UnknownSymbol)?;
     if stream != markets.stream_name(symbol) {
         return Err(Discard::StreamMismatch);
     }
-    Ok(Observation {
+    Ok(Frame::Quote(Observation {
         symbol,
-        update_id: data.u,
+        update_id: data.update_id,
         received_at,
-        mid: data.midpoint(max_spread_bps),
-    })
+        mid: data.midpoint(limits),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::price::binance::market::MarketPlan;
-    use crate::price::binance::test_support::{asset, eth, listing, price, symbol};
+    use crate::price::binance::test_support::{eth_valuation_markets, price};
 
-    const MAX_SPREAD_BPS: u32 = 100;
-
-    /// Subscribed to ETHUSDT only (valuation of an ETH faucet).
-    fn markets() -> Markets {
-        let plan = MarketPlan::new([(eth(), asset("ETH"))], Vec::new(), asset("USDT")).unwrap();
-        let (markets, issues) = plan.resolve(&HashMap::from([(
-            symbol("ETHUSDT"),
-            Some(listing("ETH", "USDT")),
-        )]));
-        assert!(issues.is_empty());
-        markets
-    }
+    const LIMITS: QuoteLimits = QuoteLimits {
+        max_spread_bps: 100,
+        min_notional: None,
+    };
 
     fn frame(data: &str) -> String {
         format!(r#"{{"stream":"ethusdt@bookTicker","data":{data}}}"#)
@@ -145,8 +221,15 @@ mod tests {
         frame(&format!(r#"{{"u":5,"s":"ETHUSDT",{fields}}}"#))
     }
 
+    fn parse_with(text: &str, limits: QuoteLimits) -> Result<Observation, Discard> {
+        match parse_frame(text, &eth_valuation_markets(), limits, Instant::now())? {
+            Frame::Quote(observation) => Ok(observation),
+            Frame::ServerShutdown => panic!("not a quote: {text}"),
+        }
+    }
+
     fn parse(text: &str) -> Result<Observation, Discard> {
-        parse_frame(text, &markets(), MAX_SPREAD_BPS, Instant::now())
+        parse_with(text, LIMITS)
     }
 
     #[test]
@@ -213,6 +296,36 @@ mod tests {
             .is_ok());
     }
 
+    /// With a minimum notional, a one-lot side makes the quote invalid.
+    #[test]
+    fn thin_sides_are_rejected_under_a_minimum_notional() {
+        let limits = QuoteLimits {
+            max_spread_bps: 100,
+            min_notional: Some(price("5000")),
+        };
+        // 2 × 2500 = 5000 on each side: exactly the floor is accepted.
+        let deep = quote(r#""b":"2500","B":"2","a":"2501","A":"2""#);
+        assert_eq!(parse_with(&deep, limits).unwrap().mid, Ok(price("2500.5")));
+        let thin_bid = quote(r#""b":"2500","B":"1.999","a":"2501","A":"2""#);
+        assert_eq!(
+            parse_with(&thin_bid, limits).unwrap().mid,
+            Err(QuoteRejection::ThinBook)
+        );
+        let thin_ask = quote(r#""b":"2500","B":"2","a":"2501","A":"0.001""#);
+        assert_eq!(
+            parse_with(&thin_ask, limits).unwrap().mid,
+            Err(QuoteRejection::ThinBook)
+        );
+        // Spread and order are checked before depth.
+        let crossed = quote(r#""b":"2501","B":"0.001","a":"2500","A":"0.001""#);
+        assert_eq!(
+            parse_with(&crossed, limits).unwrap().mid,
+            Err(QuoteRejection::Crossed)
+        );
+        // Without a floor the same thin quote is valid.
+        assert!(parse(&thin_ask).unwrap().mid.is_ok());
+    }
+
     #[test]
     fn unidentifiable_frames_are_discarded() {
         let cases = [
@@ -233,5 +346,27 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(parse(&text).unwrap_err(), expected, "{text}");
         }
+    }
+
+    #[test]
+    fn server_shutdown_is_recognized_in_either_form() {
+        for text in [
+            r#"{"e":"serverShutdown","E":1770123456789}"#,
+            r#"{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1770123456789}}"#,
+            r#"{"stream":"ethusdt@bookTicker","data":{"e":"serverShutdown","E":1}}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_frame(text, &eth_valuation_markets(), LIMITS, Instant::now()),
+                    Ok(Frame::ServerShutdown)
+                ),
+                "{text}"
+            );
+        }
+        // Other events stay malformed.
+        assert_eq!(
+            parse(r#"{"stream":"!other","data":{"e":"other"}}"#).unwrap_err(),
+            Discard::Malformed
+        );
     }
 }

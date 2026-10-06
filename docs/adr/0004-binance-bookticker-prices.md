@@ -2,12 +2,12 @@
 
 - **Status:** Accepted; implementation in progress
 - **Date:** 2026-10-06
-- **Scope:** Internal PSWAP batch clearing, swap guidance, and wallet token valuation in the 0.17 solver. Binance is the only price source; CoinGecko is removed.
+- **Scope:** Internal PSWAP batch clearing, swap guidance, and wallet token valuation in the 0.17 solver. Binance is the only price source.
 - **Related:** [Binance Spot WebSocket streams](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md), [market-data-only endpoints](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md), [exchange information](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#exchange-information), [price API](../price-api.md)
 
 ## Context
 
-The current solver polls CoinGecko-compatible token prices in a common currency, then derives a pair price for batch clearing. At launch the Miden book may be thin or one-sided, so its own orders may not provide a useful clearing reference. The solver needs a current external reference for each supported direct pair without making a remote request on every matching tick.
+Batch clearing needs a reference price for each supported direct pair. At launch the Miden book may be thin or one-sided, so its own orders may not provide a useful clearing reference. The solver needs a current external reference for each supported direct pair without making a remote request on every matching tick.
 
 The matcher and current price task are spawned on the same single-threaded Tokio `LocalSet` in `pipeline.rs`. Pair clearing performs synchronous computation. While that computation runs, another task on the same thread cannot read a socket or answer its ping. The price feed must remain responsive independently of matching work.
 
@@ -104,7 +104,7 @@ Keep price state in memory. The pricing thread needs no database handle, quote t
 
 ### One price source
 
-Binance is the solver's only price source. CoinGecko is removed everywhere: the clearing path, the wallet price endpoints, the admin token symbol (and its database column), and the CoinGecko mock service. Wallet valuation (`/v1/price`, `/v1/prices`) prices each mapped token by the midpoint of `<ASSET><VALUATION_QUOTE>` (default quote `USDT`, e.g. `ETHUSDT`), validated through `exchangeInfo` like any other market; the valuation quote asset itself is worth exactly one. Responses report `vs_currency` as the quote asset (`usdt`) and `source` as `binance`. Valuation markets use the same readers, publisher, and TTL, but they never price a clearing pair: a pair without its own approved direct symbol does not clear. Devnet, localnet, and tests run the same code against a local mock Binance server (`exchangeInfo` plus the combined `bookTicker` stream) instead of a CoinGecko mock.
+Binance is the solver's only price source: the clearing path, swap guidance, and the wallet price endpoints all read it. Wallet valuation (`/v1/price`, `/v1/prices`) prices each mapped token by the midpoint of `<ASSET><VALUATION_QUOTE>` (default quote `USDT`, e.g. `ETHUSDT`), validated through `exchangeInfo` like any other market; the valuation quote asset itself is worth exactly one. Responses report `vs_currency` as the quote asset (`usdt`) and `source` as `binance`. Valuation markets use the same readers, publisher, and TTL, but they never price a clearing pair: a pair without its own approved direct symbol does not clear. Devnet, localnet, and tests run the same code against a local mock Binance server (`exchangeInfo` plus the combined `bookTicker` stream).
 
 Reuse `tokio-tungstenite` for WebSocket transport, `reqwest` for public metadata HTTP, Tokio timers and task supervision, the solver's cancellation token, Serde, and existing exact arithmetic. Use a retry strategy helper (`backon`'s exponential builder, used only as a delay iterator) for backoff and jitter, while the feed owns error classification and Binance cooldown policy. Do not nest retry engines. The reviewed Binance Rust SDK introduces callback/runtime and reconnect behavior that would still need our own supervision; for these public endpoints the existing transport libraries make a smaller adapter.
 

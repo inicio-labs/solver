@@ -5,6 +5,7 @@
 //! symbol's base and quote assets and trading status; the pair's orientation
 //! follows from that listing, never from a separate flag or from token names.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
@@ -100,12 +101,23 @@ impl fmt::Display for Symbol {
     }
 }
 
+/// Lets a `HashMap<Symbol, _>` be queried with the `&str` a frame carries.
+impl Borrow<str> for Symbol {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A symbol's public `exchangeInfo` entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Listing {
     pub(crate) base_asset: AssetCode,
     pub(crate) quote_asset: AssetCode,
+    /// `TRADING`, or a temporary state such as `BREAK` or `HALT`.
     pub(crate) status: String,
+    /// `isSpotTradingAllowed`: false once a symbol is restricted ahead of a
+    /// delisting, while its book may still stream.
+    pub(crate) spot_trading_allowed: bool,
 }
 
 impl Listing {
@@ -144,7 +156,8 @@ pub struct ClearingMarket {
 /// The markets the configuration asks for, before Binance has confirmed them.
 #[derive(Clone, Debug)]
 pub struct MarketPlan {
-    assets: HashMap<TokenId, AssetCode>,
+    /// Ordered, so valuation markets resolve in a stable order.
+    assets: BTreeMap<TokenId, AssetCode>,
     clearing: Vec<ClearingMarket>,
     valuation_quote: AssetCode,
 }
@@ -158,7 +171,7 @@ impl MarketPlan {
         clearing: Vec<ClearingMarket>,
         valuation_quote: AssetCode,
     ) -> Result<Self, MarketError> {
-        let mut mapped: HashMap<TokenId, AssetCode> = HashMap::new();
+        let mut mapped: BTreeMap<TokenId, AssetCode> = BTreeMap::new();
         for (token, asset) in assets {
             match mapped.get(&token) {
                 Some(first) if *first != asset => {
@@ -220,37 +233,52 @@ impl MarketPlan {
     }
 
     /// Keep each use whose listing matches. `listings` holds every symbol from
-    /// [`Self::symbols`]; `None` means Binance did not confirm it. Every
-    /// rejected use is reported on its own; the other markets are unaffected.
+    /// [`Self::symbols`]; `None` means Binance did not confirm it. Every issue
+    /// is reported on its own; the other markets are unaffected. A market in a
+    /// temporary non-`TRADING` state is still subscribed (its book sends
+    /// nothing until trading resumes, so the TTL pauses it) and reported as a
+    /// warning; see [`MarketIssue::rejects`].
     pub(crate) fn resolve(
         &self,
         listings: &HashMap<Symbol, Option<Listing>>,
     ) -> (Markets, Vec<MarketIssue>) {
         let mut markets = Markets::default();
         let mut issues = Vec::new();
-        // The listing's orientation for `base`/`quote`, if it is tradable and
-        // lists exactly those assets.
+        // The listing's orientation for `base`/`quote`, if it lists exactly
+        // those assets and spot trading is allowed, plus a status warning.
         let check = |symbol: &Symbol, base: &AssetCode, quote: &AssetCode| {
             let listing = listings
                 .get(symbol)
                 .and_then(Option::as_ref)
                 .ok_or(IssueKind::UnknownSymbol)?;
-            if listing.status != "TRADING" {
-                return Err(IssueKind::NotTrading {
-                    status: listing.status.clone(),
-                });
+            let orientation =
+                listing
+                    .orientation(base, quote)
+                    .ok_or_else(|| IssueKind::AssetMismatch {
+                        base: listing.base_asset.clone(),
+                        quote: listing.quote_asset.clone(),
+                    })?;
+            if !listing.spot_trading_allowed {
+                return Err(IssueKind::SpotTradingNotAllowed);
             }
-            listing
-                .orientation(base, quote)
-                .ok_or_else(|| IssueKind::AssetMismatch {
-                    listed: (listing.base_asset.clone(), listing.quote_asset.clone()),
-                })
+            let warning = (listing.status != "TRADING").then(|| IssueKind::NotTrading {
+                status: listing.status.clone(),
+            });
+            Ok((orientation, warning))
+        };
+        let mut report = |symbol: &Symbol, use_: MarketUse, kind: IssueKind| {
+            issues.push(MarketIssue {
+                symbol: symbol.clone(),
+                use_,
+                kind,
+            });
         };
         for market in &self.clearing {
             // `new` guarantees both assets are mapped.
             let (base, quote) = (&self.assets[&market.base], &self.assets[&market.quote]);
+            let use_ = || MarketUse::Clearing(market.name.clone());
             match check(&market.symbol, base, quote) {
-                Ok(orientation) => {
+                Ok((orientation, warning)) => {
                     let symbol = markets.add_symbol(&market.symbol);
                     markets.pairs.insert(
                         (market.base, market.quote),
@@ -259,47 +287,45 @@ impl MarketPlan {
                             orientation,
                         },
                     );
+                    if let Some(kind) = warning {
+                        report(&market.symbol, use_(), kind);
+                    }
                 }
-                Err(kind) => issues.push(MarketIssue {
-                    symbol: market.symbol.clone(),
-                    use_: MarketUse::Clearing(market.name.clone()),
-                    kind,
-                }),
+                Err(kind) => report(&market.symbol, use_(), kind),
             }
         }
-        let mut tokens: Vec<_> = self.assets.iter().collect();
-        tokens.sort();
-        for (&token, asset) in tokens {
+        for (&token, asset) in &self.assets {
             let Some(symbol) = self.valuation_symbol(asset) else {
                 markets.valuation.insert(token, Valuation::Unit);
                 continue;
             };
             // A valuation market quotes the token in the valuation asset.
-            let checked = check(&symbol, asset, &self.valuation_quote).and_then(|orientation| {
-                match orientation {
-                    Orientation::Direct => Ok(()),
-                    Orientation::Reverse => Err(IssueKind::AssetMismatch {
-                        listed: (self.valuation_quote.clone(), asset.clone()),
-                    }),
-                }
-            });
+            let checked =
+                check(&symbol, asset, &self.valuation_quote).and_then(|(orientation, warning)| {
+                    match orientation {
+                        Orientation::Direct => Ok(warning),
+                        Orientation::Reverse => Err(IssueKind::AssetMismatch {
+                            base: self.valuation_quote.clone(),
+                            quote: asset.clone(),
+                        }),
+                    }
+                });
             match checked {
-                Ok(()) => {
+                Ok(warning) => {
                     let index = markets.add_symbol(&symbol);
                     markets.valuation.insert(token, Valuation::Market(index));
+                    if let Some(kind) = warning {
+                        report(&symbol, MarketUse::Valuation(token), kind);
+                    }
                 }
-                Err(kind) => issues.push(MarketIssue {
-                    symbol,
-                    use_: MarketUse::Valuation(token),
-                    kind,
-                }),
+                Err(kind) => report(&symbol, MarketUse::Valuation(token), kind),
             }
         }
         (markets, issues)
     }
 }
 
-/// What a rejected symbol was meant for.
+/// What a symbol was meant for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MarketUse {
     /// Internal clearing of the named pair.
@@ -308,41 +334,41 @@ pub(crate) enum MarketUse {
     Valuation(TokenId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IssueKind {
-    UnknownSymbol,
-    NotTrading { status: String },
-    AssetMismatch { listed: (AssetCode, AssetCode) },
+impl fmt::Display for MarketUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clearing(pair) => write!(f, "pair {pair}"),
+            Self::Valuation(token) => write!(f, "valuation of {token}"),
+        }
+    }
 }
 
-/// One configured market that Binance's listing does not support.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum IssueKind {
+    #[error("Binance did not confirm this symbol")]
+    UnknownSymbol,
+    #[error("symbol status is {status}, not TRADING; subscribed, paused until it trades")]
+    NotTrading { status: String },
+    #[error("spot trading is not allowed on this symbol")]
+    SpotTradingNotAllowed,
+    #[error("listed as {base}/{quote}, which is not the configured market")]
+    AssetMismatch { base: AssetCode, quote: AssetCode },
+}
+
+/// One configured market that Binance's listing does not fully support.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{use_} (symbol {symbol}): {kind}")]
 pub(crate) struct MarketIssue {
     pub(crate) symbol: Symbol,
     pub(crate) use_: MarketUse,
     pub(crate) kind: IssueKind,
 }
 
-impl fmt::Display for MarketIssue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.use_ {
-            MarketUse::Clearing(pair) => write!(f, "pair {pair} (symbol {}): ", self.symbol)?,
-            MarketUse::Valuation(token) => {
-                write!(f, "valuation of {token} (symbol {}): ", self.symbol)?
-            }
-        }
-        match &self.kind {
-            IssueKind::UnknownSymbol => f.write_str("Binance did not confirm this symbol"),
-            IssueKind::NotTrading { status } => write!(f, "symbol status is {status}, not TRADING"),
-            IssueKind::AssetMismatch {
-                listed: (base, quote),
-            } => {
-                write!(
-                    f,
-                    "listed as {base}/{quote}, which is not the configured market"
-                )
-            }
-        }
+impl MarketIssue {
+    /// Whether the market was left out of [`Markets`]. A non-`TRADING` status
+    /// is only a warning: the symbol is subscribed and resumes on its own.
+    pub(crate) fn rejects(&self) -> bool {
+        !matches!(self.kind, IssueKind::NotTrading { .. })
     }
 }
 
@@ -366,7 +392,7 @@ pub(crate) struct Markets {
     symbols: Vec<Symbol>,
     /// Each symbol's combined-stream name, by index.
     streams: Vec<String>,
-    index: HashMap<String, usize>,
+    index: HashMap<Symbol, usize>,
     /// Ordered, so the matcher clears pairs in a stable order.
     pairs: BTreeMap<(TokenId, TokenId), PairSource>,
     valuation: HashMap<TokenId, Valuation>,
@@ -374,13 +400,13 @@ pub(crate) struct Markets {
 
 impl Markets {
     fn add_symbol(&mut self, symbol: &Symbol) -> usize {
-        if let Some(&index) = self.index.get(symbol.as_str()) {
+        if let Some(&index) = self.index.get(symbol) {
             return index;
         }
         let index = self.symbols.len();
         self.symbols.push(symbol.clone());
         self.streams.push(symbol.stream_name());
-        self.index.insert(symbol.as_str().to_owned(), index);
+        self.index.insert(symbol.clone(), index);
         index
     }
 
@@ -411,29 +437,9 @@ impl Markets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::price::binance::test_support::{asset, btc, eth, listing, symbol, usdt};
-
-    fn market(name: &str, base: TokenId, quote: TokenId, symbol_name: &str) -> ClearingMarket {
-        ClearingMarket {
-            name: name.into(),
-            base,
-            quote,
-            symbol: symbol(symbol_name),
-        }
-    }
-
-    fn plan(clearing: Vec<ClearingMarket>) -> MarketPlan {
-        MarketPlan::new(
-            [
-                (eth(), asset("ETH")),
-                (usdt(), asset("USDT")),
-                (btc(), asset("BTC")),
-            ],
-            clearing,
-            asset("USDT"),
-        )
-        .unwrap()
-    }
+    use crate::price::binance::test_support::{
+        asset, btc, eth, listing, market, plan, symbol, usdt,
+    };
 
     #[test]
     fn names_are_normalized_and_checked() {
@@ -535,13 +541,13 @@ mod tests {
             market("ETH-USDT", eth(), usdt(), "ETHUSDT"),
             market("BTC-ETH", btc(), eth(), "BTCETH"),
         ]);
-        let mut halted = listing("BTC", "USDT");
-        halted.status = "BREAK".into();
+        let mut restricted = listing("BTC", "USDT");
+        restricted.spot_trading_allowed = false;
         let listings = HashMap::from([
             (symbol("ETHUSDT"), Some(listing("ETH", "USDT"))),
             // A listing for other assets under the configured name.
             (symbol("BTCETH"), Some(listing("BTC", "WETH"))),
-            (symbol("BTCUSDT"), Some(halted)),
+            (symbol("BTCUSDT"), Some(restricted)),
         ]);
         let (markets, issues) = plan.resolve(&listings);
         assert!(markets.pair(eth(), usdt()).is_some());
@@ -549,6 +555,7 @@ mod tests {
         assert_eq!(markets.valuation(btc()), None);
         assert_eq!(markets.symbols(), &[symbol("ETHUSDT")]);
         assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().all(MarketIssue::rejects));
         assert!(issues
             .iter()
             .any(|issue| issue.use_ == MarketUse::Clearing("BTC-ETH".into())
@@ -556,12 +563,45 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.use_ == MarketUse::Valuation(btc())
-                && matches!(issue.kind, IssueKind::NotTrading { .. })));
+                && issue.kind == IssueKind::SpotTradingNotAllowed));
+        assert_eq!(
+            issues[0].to_string(),
+            "pair BTC-ETH (symbol BTCETH): listed as BTC/WETH, which is not the configured market"
+        );
         let (_, unknown) = plan.resolve(&HashMap::new());
         assert!(unknown
             .iter()
             .all(|issue| issue.kind == IssueKind::UnknownSymbol));
         assert_eq!(unknown.len(), 4);
+    }
+
+    /// A halt is temporary: the symbol is subscribed and reported as a
+    /// warning, so trading resumes without a restart.
+    #[test]
+    fn a_halted_market_is_subscribed_with_a_warning() {
+        let plan = plan(vec![market("BTC-USDT", btc(), usdt(), "BTCUSDT")]);
+        let mut halted = listing("BTC", "USDT");
+        halted.status = "BREAK".into();
+        let listings = HashMap::from([
+            (symbol("BTCUSDT"), Some(halted)),
+            (symbol("ETHUSDT"), Some(listing("ETH", "USDT"))),
+        ]);
+        let (markets, issues) = plan.resolve(&listings);
+        let btc_usdt = markets.symbol_index("BTCUSDT").unwrap();
+        assert_eq!(markets.pair(btc(), usdt()).unwrap().symbol, btc_usdt);
+        assert_eq!(markets.valuation(btc()), Some(Valuation::Market(btc_usdt)));
+        // One warning per use of the symbol, neither of them a rejection.
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().all(|issue| !issue.rejects()
+            && issue.kind
+                == IssueKind::NotTrading {
+                    status: "BREAK".into()
+                }));
+        assert_eq!(
+            issues[0].to_string(),
+            "pair BTC-USDT (symbol BTCUSDT): symbol status is BREAK, not TRADING; \
+             subscribed, paused until it trades"
+        );
     }
 
     #[test]

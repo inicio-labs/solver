@@ -80,6 +80,23 @@ pub(crate) fn ppm_floor(gross: U256, rate_ppm: u32) -> Result<U256, ClearingErro
     mul_div_floor(gross, rate_ppm, PPM_DENOMINATOR)
 }
 
+/// Why a bid/ask quote has no valid midpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MidpointError {
+    /// `bid > ask`.
+    Crossed,
+    /// The spread exceeds the limit.
+    TooWide,
+    /// Exact arithmetic overflowed.
+    Overflow,
+}
+
+impl From<ClearingError> for MidpointError {
+    fn from(_: ClearingError) -> Self {
+        Self::Overflow
+    }
+}
+
 impl ReferencePrice {
     pub fn from_ratio(numerator: u64, denominator: u64) -> Result<Self, ClearingError> {
         Self::new(U256::from(numerator), U256::from(denominator))
@@ -98,32 +115,40 @@ impl ReferencePrice {
 
     /// Parse a provider's decimal string exactly, e.g. Binance's
     /// `"123.45000000"`. Exponents, signs, and zero are rejected.
+    ///
+    /// A decimal with `places` digits after the point is an integer over
+    /// `10^places`: `"123.45"` is `12345 / 100`. So the fraction is
+    /// `(whole_part × 10^places + fractional_part) / 10^places`, built from
+    /// two integers and never rounded; [`Self::new`] then reduces it
+    /// (`12345 / 100` becomes `2469 / 20`).
     pub fn from_decimal(raw: &str) -> Result<Self, ClearingError> {
-        let (whole, fraction) = match raw.split_once('.') {
+        let (whole_text, fraction_text) = match raw.split_once('.') {
             Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
             Some(_) => return Err(ClearingError::InvalidOraclePrice),
             None => (raw, ""),
         };
-        if whole.is_empty()
-            || !whole.bytes().all(|character| character.is_ascii_digit())
-            || !fraction.bytes().all(|character| character.is_ascii_digit())
-        {
+        let all_digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+        if whole_text.is_empty() || !all_digits(whole_text) || !all_digits(fraction_text) {
             return Err(ClearingError::InvalidOraclePrice);
         }
         fn invalid<E>(_: E) -> ClearingError {
             ClearingError::InvalidOraclePrice
         }
-        let decimals = u8::try_from(fraction.len()).map_err(invalid)?;
-        let denominator = power_of_ten(decimals).map_err(invalid)?;
-        let parse = |digits: &str| match digits {
-            "" => Ok(U256::ZERO),
-            digits => U256::from_str_radix(digits, 10).map_err(invalid),
+        // An empty fractional part ("123") is zero; otherwise base 10.
+        let integer_of = |text: &str| {
+            if text.is_empty() {
+                Ok(U256::ZERO)
+            } else {
+                U256::from_str_radix(text, 10).map_err(invalid)
+            }
         };
-        let numerator = checked_mul(parse(whole)?, denominator)
+        let places = u8::try_from(fraction_text.len()).map_err(invalid)?;
+        let scale = power_of_ten(places).map_err(invalid)?;
+        let numerator = checked_mul(integer_of(whole_text)?, scale)
             .map_err(invalid)?
-            .checked_add(parse(fraction)?)
+            .checked_add(integer_of(fraction_text)?)
             .ok_or(ClearingError::InvalidOraclePrice)?;
-        Self::new(numerator, denominator)
+        Self::new(numerator, scale)
     }
 
     /// Parse a JSON number without a floating-point round trip. Providers may
@@ -155,6 +180,8 @@ impl ReferencePrice {
         .map_err(|_| ClearingError::InvalidOraclePrice)
     }
 
+    /// Exactly one. The price API values the valuation quote asset itself
+    /// (USDT in USDT) at this price.
     pub(crate) const ONE: Self = Self {
         numerator: U256::ONE,
         denominator: U256::ONE,
@@ -162,17 +189,60 @@ impl ReferencePrice {
 
     /// Exact `(bid + ask) / 2`.
     pub fn midpoint(bid: Self, ask: Self) -> Result<Self, ClearingError> {
-        let (bid_scaled, ask_scaled) = Self::common_numerators(bid, ask)?;
-        let sum = bid_scaled
-            .checked_add(ask_scaled)
+        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
+        Self::midpoint_of(bid, ask, bid_numerator, ask_numerator)
+    }
+
+    /// The midpoint from the two prices' numerators over their common
+    /// denominator. With `bid = a/b` and `ask = c/d`, those numerators are
+    /// `a·d` and `c·b` over `b·d`, so
+    /// `(bid + ask) / 2 = (a·d + c·b) / (2·b·d)`: the numerators' sum over
+    /// twice the common denominator. [`Self::new`] reduces the result.
+    fn midpoint_of(
+        bid: Self,
+        ask: Self,
+        bid_numerator: U256,
+        ask_numerator: U256,
+    ) -> Result<Self, ClearingError> {
+        let numerator_sum = bid_numerator
+            .checked_add(ask_numerator)
             .ok_or(ClearingError::ArithmeticOverflow)?;
-        let denominator = checked_mul(checked_mul(bid.denominator, ask.denominator)?, 2u32)?;
-        Self::new(sum, denominator)
+        let twice_common_denominator =
+            checked_mul(checked_mul(bid.denominator, ask.denominator)?, 2u32)?;
+        Self::new(numerator_sum, twice_common_denominator)
+    }
+
+    /// The midpoint of a quote that is not crossed and whose spread is within
+    /// `max_bps` (inclusive). Both prices are brought over one common
+    /// denominator once, and the order check, the spread check and the
+    /// midpoint all use those two numerators. This is the per-frame
+    /// validation of the price feed.
+    pub(crate) fn validated_midpoint(
+        bid: Self,
+        ask: Self,
+        max_bps: u32,
+    ) -> Result<Self, MidpointError> {
+        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
+        // Over the same denominator, the larger numerator is the larger price.
+        let spread_numerator = ask_numerator
+            .checked_sub(bid_numerator)
+            .ok_or(MidpointError::Crossed)?;
+        let numerator_sum = bid_numerator
+            .checked_add(ask_numerator)
+            .ok_or(ClearingError::ArithmeticOverflow)?;
+        // spread in bps = 10_000 × (ask − bid) / mid, with mid = (ask + bid) / 2.
+        // Over the common denominator this is 20_000 × spread_numerator /
+        // numerator_sum, so `<= max_bps` is checked without dividing:
+        // 20_000 × spread_numerator <= max_bps × numerator_sum.
+        if checked_mul(spread_numerator, 20_000u32)? > checked_mul(numerator_sum, max_bps)? {
+            return Err(MidpointError::TooWide);
+        }
+        Ok(Self::midpoint_of(bid, ask, bid_numerator, ask_numerator)?)
     }
 
     /// The same market quoted the other way round, `1 / self`.
     #[must_use]
-    pub fn reciprocal(self) -> Self {
+    pub(crate) fn reciprocal(self) -> Self {
         Self {
             numerator: self.denominator,
             denominator: self.numerator,
@@ -181,26 +251,43 @@ impl ReferencePrice {
 
     /// Whether `bid <= ask`, compared exactly.
     pub fn is_ordered(bid: Self, ask: Self) -> Result<bool, ClearingError> {
-        let (bid_scaled, ask_scaled) = Self::common_numerators(bid, ask)?;
-        Ok(bid_scaled <= ask_scaled)
+        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
+        Ok(bid_numerator <= ask_numerator)
     }
 
     /// Whether `10_000 × (ask - bid) / ((bid + ask) / 2) <= max_bps`, without
     /// rounding the spread. A crossed quote (`bid > ask`) is never within.
     pub fn spread_within_bps(bid: Self, ask: Self, max_bps: u32) -> Result<bool, ClearingError> {
-        let (bid_scaled, ask_scaled) = Self::common_numerators(bid, ask)?;
-        let Some(spread) = ask_scaled.checked_sub(bid_scaled) else {
-            return Ok(false);
-        };
-        let sum = bid_scaled
-            .checked_add(ask_scaled)
-            .ok_or(ClearingError::ArithmeticOverflow)?;
-        // Both sides share the denominator bid.denominator × ask.denominator.
-        Ok(checked_mul(spread, 20_000u32)? <= checked_mul(sum, max_bps)?)
+        match Self::validated_midpoint(bid, ask, max_bps) {
+            Ok(_) => Ok(true),
+            Err(MidpointError::Crossed | MidpointError::TooWide) => Ok(false),
+            Err(MidpointError::Overflow) => Err(ClearingError::ArithmeticOverflow),
+        }
     }
 
-    /// Both prices' numerators over their common denominator.
-    fn common_numerators(left: Self, right: Self) -> Result<(U256, U256), ClearingError> {
+    /// Whether `quantity × price >= minimum`, compared exactly: the displayed
+    /// notional of one side of a quote against a configured floor.
+    pub(crate) fn notional_at_least(
+        quantity: Self,
+        price: Self,
+        minimum: Self,
+    ) -> Result<bool, ClearingError> {
+        let notional = checked_mul(
+            checked_mul(quantity.numerator, price.numerator)?,
+            minimum.denominator,
+        )?;
+        let floor = checked_mul(
+            checked_mul(quantity.denominator, price.denominator)?,
+            minimum.numerator,
+        )?;
+        Ok(notional >= floor)
+    }
+
+    /// The two prices rewritten over one common denominator, returning only
+    /// their new numerators. `a/b` and `c/d` become `(a·d)/(b·d)` and
+    /// `(c·b)/(b·d)`; with the denominator `b·d` shared, the numerators
+    /// `a·d` and `c·b` can be compared, added and subtracted as integers.
+    fn over_common_denominator(left: Self, right: Self) -> Result<(U256, U256), ClearingError> {
         Ok((
             checked_mul(left.numerator, right.denominator)?,
             checked_mul(right.numerator, left.denominator)?,
@@ -317,9 +404,74 @@ mod tests {
         let price = ReferencePrice::from_decimal("0.00012500").unwrap();
         assert_eq!(price.numerator, U256::ONE);
         assert_eq!(price.denominator, U256::from(8_000u64));
-        for invalid in ["0", "-1", "1e4", "1.", ".1", "1.2.3"] {
-            assert!(ReferencePrice::from_decimal(invalid).is_err(), "{invalid}");
+        assert_eq!(
+            ReferencePrice::from_decimal("00.10").unwrap(),
+            decimal("0.1")
+        );
+        let too_many_places = format!("1.{}", "0".repeat(78));
+        for invalid in [
+            "0",
+            "0.0",
+            "-1",
+            "+1",
+            "",
+            " 1",
+            "1 ",
+            "1e4",
+            "1.",
+            ".1",
+            "1.2.3",
+            "１",
+            "0x10",
+            too_many_places.as_str(),
+        ] {
+            assert!(
+                ReferencePrice::from_decimal(invalid).is_err(),
+                "{invalid:?}"
+            );
         }
+    }
+
+    #[test]
+    fn validated_midpoint_checks_order_and_spread_once() {
+        let (bid, ask) = (decimal("99"), decimal("101"));
+        assert_eq!(
+            ReferencePrice::validated_midpoint(bid, ask, 200),
+            Ok(decimal("100"))
+        );
+        assert_eq!(
+            ReferencePrice::validated_midpoint(bid, ask, 199),
+            Err(MidpointError::TooWide)
+        );
+        assert_eq!(
+            ReferencePrice::validated_midpoint(ask, bid, u32::MAX),
+            Err(MidpointError::Crossed)
+        );
+        assert_eq!(
+            ReferencePrice::validated_midpoint(bid, bid, 0),
+            Ok(decimal("99"))
+        );
+        let huge = decimal(&format!("1{}", "0".repeat(60)));
+        let tiny = decimal("0.000000000000000001");
+        assert_eq!(
+            ReferencePrice::validated_midpoint(tiny, huge, 1),
+            Err(MidpointError::Overflow)
+        );
+    }
+
+    #[test]
+    fn notional_floor_is_exact() {
+        // 0.002 ETH × 2500 USDT = 5 USDT.
+        let (quantity, price) = (decimal("0.002"), decimal("2500"));
+        assert!(ReferencePrice::notional_at_least(quantity, price, decimal("5")).unwrap());
+        assert!(
+            !ReferencePrice::notional_at_least(quantity, price, decimal("5.000000001")).unwrap()
+        );
+        let huge = decimal(&format!("1{}", "0".repeat(70)));
+        assert!(matches!(
+            ReferencePrice::notional_at_least(huge, huge, decimal("1")),
+            Err(ClearingError::ArithmeticOverflow)
+        ));
     }
 
     #[test]
@@ -409,6 +561,14 @@ mod tests {
         let two_thirds = ReferencePrice::from_ratio(2, 3).unwrap();
         assert_eq!(two_thirds.to_fixed_decimal(2).unwrap(), "0.67");
         assert_eq!(decimal("0.004").to_trimmed_decimal(2).unwrap(), "0");
+        // Half-up carries through a run of nines into the whole part.
+        assert_eq!(decimal("9.995").to_fixed_decimal(2).unwrap(), "10.00");
+        assert_eq!(decimal("9.995").to_trimmed_decimal(2).unwrap(), "10");
+        assert_eq!(
+            decimal("0.9999995").to_fixed_decimal(6).unwrap(),
+            "1.000000"
+        );
+        assert_eq!(decimal("99.5").to_fixed_decimal(0).unwrap(), "100");
     }
 
     mod properties {
@@ -483,6 +643,48 @@ mod tests {
             fn trimmed_decimal_round_trips_terminating_prices(price in price()) {
                 let text = price.to_trimmed_decimal(18).unwrap();
                 prop_assert_eq!(ReferencePrice::from_decimal(&text).unwrap(), price);
+            }
+
+            /// Against an integer oracle: `n/d` at `p` places, rounded half up,
+            /// is `(2·n·10^p + d) / (2·d)` scaled units.
+            #[test]
+            fn fixed_decimal_matches_an_integer_oracle(
+                numerator in 1u64..1_000_000_000_000,
+                denominator in 1u64..1_000_000_000,
+                places in 0u8..=12,
+            ) {
+                let price = ReferencePrice::from_ratio(numerator, denominator).unwrap();
+                let text = price.to_fixed_decimal(places).unwrap();
+                let scale = 10u128.pow(u32::from(places));
+                let units = (2 * u128::from(numerator) * scale + u128::from(denominator))
+                    / (2 * u128::from(denominator));
+                let expected = if places == 0 {
+                    units.to_string()
+                } else {
+                    format!("{}.{:0>width$}", units / scale, units % scale, width = usize::from(places))
+                };
+                prop_assert_eq!(text, expected);
+            }
+
+            /// The validated midpoint agrees with the separate checks.
+            #[test]
+            fn validated_midpoint_agrees_with_separate_checks(
+                first in price(),
+                second in price(),
+                max_bps in 0u32..=20_000,
+            ) {
+                let validated = ReferencePrice::validated_midpoint(first, second, max_bps);
+                let ordered = ReferencePrice::is_ordered(first, second).unwrap();
+                let within = ReferencePrice::spread_within_bps(first, second, max_bps).unwrap();
+                match validated {
+                    Ok(mid) => {
+                        prop_assert!(ordered && within);
+                        prop_assert_eq!(mid, ReferencePrice::midpoint(first, second).unwrap());
+                    }
+                    Err(MidpointError::Crossed) => prop_assert!(!ordered),
+                    Err(MidpointError::TooWide) => prop_assert!(ordered && !within),
+                    Err(MidpointError::Overflow) => prop_assert!(false, "overflow on small inputs"),
+                }
             }
         }
     }

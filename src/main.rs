@@ -121,29 +121,7 @@ async fn run(matches: clap::ArgMatches) -> Result<()> {
         }
     });
 
-    // Price source: the solver always uses its real `HttpPriceClient`; only the
-    // base URL varies. `[engine].price_api_base_url` lets devnet/local point it
-    // at a self-hosted or mock CoinGecko-compatible service (default: public
-    // CoinGecko). Resolved up front so the injected closure has a single type.
-    let price_base = config
-        .engine
-        .price_api_base_url
-        .clone()
-        .unwrap_or_else(|| solver::price::COINGECKO_BASE.to_string());
-    if config.engine.price_api_base_url.is_some() {
-        tracing::info!(base = %price_base, "price feed pointed at custom base URL");
-    }
-    let price_vs_currency = config.engine.price_vs_currency.clone();
-    let make_price_client = move |symbol_map, api_key| {
-        solver::price::build_http_price_client_with_base(
-            symbol_map,
-            api_key,
-            price_base,
-            price_vs_currency,
-        )
-    };
-
-    solver::start(factory, make_price_client, solver_id, config, cancel).await
+    solver::start(factory, solver_id, config, cancel).await
 }
 
 fn main() -> anyhow::Result<()> {

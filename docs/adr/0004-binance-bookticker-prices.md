@@ -1,6 +1,6 @@
 # 4. Binance bookTicker prices for PSWAP batch clearing
 
-- **Status:** Accepted; implementation in progress
+- **Status:** Accepted; implemented (rollout checks pending)
 - **Date:** 2026-10-06
 - **Scope:** Internal PSWAP batch clearing, swap guidance, and wallet token valuation in the 0.17 solver. Binance is the only price source.
 - **Related:** [Binance Spot WebSocket streams](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md), [market-data-only endpoints](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md), [exchange information](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#exchange-information), [price API](../price-api.md)
@@ -65,7 +65,7 @@ Reader A ─┐
 Reader B ─┘                                        └─> swap guidance API
 ```
 
-Use one combined stream per reader rather than a connection per symbol. Default both connections to the public market-data endpoint `wss://data-stream.binance.vision:443`; allow separately configured endpoints, including `wss://stream.binance.com:443`. This uses no Binance account, user-data stream, or API key. Two sockets improve tolerance to an individual connection failure; they do not imply independent provider infrastructure, network paths, processes, or machines.
+Use one combined stream per reader rather than a connection per symbol. By default reader A uses the public market-data endpoint `wss://data-stream.binance.vision:443` and reader B the main endpoint `wss://stream.binance.com:443`; both are configurable. The two hostnames resolve to separate front-end addresses and carry the same `bookTicker` update IDs, so one endpoint failing or being blocked does not take out both readers. This uses no Binance account, user-data stream, or API key. Two sockets improve tolerance to an individual connection failure; they do not imply independent provider infrastructure, network paths, processes, or machines.
 
 Each reader publishes its latest observation per configured symbol, including the original local receipt time and an unusable marker when a newer identifiable quote fails validation. A bounded latest-value `watch` snapshot avoids a historical tick queue. The publisher owns one per-symbol high-water update ID and one output `watch::Sender<Arc<PriceSnapshot>>`:
 
@@ -92,7 +92,7 @@ On socket disconnect, keep the last valid quote with its original expiry. Discon
 
 ### Recovery and failure ownership
 
-The feed uses public REST only to validate configured markets, not for each quote or batch. The pricing worker can report runtime and channel readiness with an empty price snapshot; an unavailable Binance endpoint does not hold the whole solver's startup hostage. Temporary DNS, HTTP, and WebSocket failures are retried inside the feed with cancellable, capped exponential backoff and jitter. HTTP 429 or 418 respects `Retry-After` as a minimum wait. The two readers share a connection-attempt budget, and planned renewals are staggered. A successful TCP handshake alone does not reset retry delay; require a useful subscription or valid update.
+The feed uses public REST only to validate configured markets, not for each quote or batch. The pricing worker can report runtime and channel readiness with an empty price snapshot; an unavailable Binance endpoint does not hold the whole solver's startup hostage. Temporary DNS, HTTP, and WebSocket failures are retried inside the feed with cancellable, capped exponential backoff and jitter. HTTP 429 or 418 respects `Retry-After` as a minimum wait. The two readers share a connection-attempt budget, which configuration must keep below Binance's 300 attempts per 5 minutes per IP, and planned renewals are spread apart: each connection lasts a random 50–100% of the configured lifetime. A successful TCP handshake alone does not reset retry delay; only a connection that delivered valid quotes for a stable minute does, so a flapping endpoint cannot drain the shared budget.
 
 A reader close, returned error, unexpected exit, or ordinary unwinding task panic restarts only that reader. Its sibling continues to publish. The supervisor observes and finishes old tasks before replacement; dropping a Tokio `JoinHandle` alone would detach a live task. An irrecoverable feed runtime, publisher, or critical output-channel failure is reported to the solver supervisor for coordinated shutdown. Cancellation interrupts socket reads, metadata requests, and retry waits, and close/join work is bounded.
 
@@ -138,3 +138,15 @@ Use bounded frames, HTTP bodies, and connection/close timeouts. Keep the WebSock
 7. Check startup with no quote, per-pair pauses, connection rotation, frame limits, bounded memory, and a sustained run before enabling all launch pairs.
 
 The isolated price-feed design tests performed before this ADR exercised arithmetic, ordering, TTL, local WebSocket/HTTP recovery, and ordinary Tokio reader-task isolation. They did not run the production dual-reader worker or a Miden settlement. Integration and rollout checks above remain required.
+
+## Implementation status
+
+Implemented in `crates/solver/src/price/binance` (markets, parsing, snapshot, feed), wired into the matcher, the price API, `/metrics`, and startup; `crates/mock-binance` replaces the CoinGecko mock. The snapshot carries the quote TTL, so the matcher and the price API cannot apply different freshness rules, and the matcher clears exactly the pairs whose markets Binance confirmed. Coverage of the checks above:
+
+1. Market validation and orientation: `market` tests (direct, reversed, mismatched assets, non-trading, unknown, valuation needing the token as base), feed tests for an unknown symbol and for a lookup that cannot succeed (each rejecting only its symbol), `exchangeInfo` error handling against wiremock, config tests on `solver.toml.example`, and integration tests (a reversed `ETHUSDC` market clears USDC/ETH at its exact surplus; an unlisted `FOOETH` never clears).
+2. Exact arithmetic: midpoint, spread boundary and overflow tests, property tests against independent oracles (integer tick counts for the spread, ratio preservation for base-unit conversion), and a reversed pair priced at `1 / mid` rather than the average of the reciprocal bid and ask.
+3. TTL and ordering: `snapshot` tests (exact TTL boundary, future receipt, duplicate and lower IDs, newer invalid quote over an older good one); a feed test that a disconnected quote keeps its original receipt time and expires at it; discarded frames change nothing.
+4. Two readers: mock tests for both readers publishing with at most one connection each, reconnects, a failing endpoint recovering while the other publishes, rate-limited handshakes, idle reconnects, and randomized immediate renewals; an ignored live test connects to `data-stream.binance.vision` and `stream.binance.com` and checks that no frame is discarded or rejected.
+5. Blocked caller: on a single-threaded test runtime blocked for three seconds, the feed thread keeps receiving quotes and answering pings. A matcher test clears only the pair whose quote is fresh in a tick with one stale pair.
+6. Failures: HTTP 503, 418 and 429 with `Retry-After` on lookups and handshakes, socket closure, oversized frames, cancellation during backoff, a panicking reader restarted, the backoff cap, a closed output reported as `OutputClosed`, and the feed thread stopping the solver when it ends.
+7. Still required at rollout: sustained runs with the launch pairs, memory over time, connection rotation against Binance, comparing update IDs across the two public endpoints under load, and the deployment values of TTL, spread limit, and retry budget.

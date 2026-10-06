@@ -1375,6 +1375,7 @@ dependencies = [
  "miden-client-sqlite-store",
  "miden-protocol",
  "miden-standards",
+ "mock-binance",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -3592,21 +3593,6 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mock-price"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]

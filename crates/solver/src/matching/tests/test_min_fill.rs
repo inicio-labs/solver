@@ -10,10 +10,10 @@ use super::{eth, make_note_id, usdc, NoteIdGen};
 use crate::matching::direct_matching::{plan_pair, run_direct_matching, MAX_PAIR_RETRIES};
 use crate::matching::order_book::OrderBook;
 use crate::matching::types::{Amount, Order, OrderId, TokenId};
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 
-fn feed() -> WatchPriceFeed {
-    let mut feed = WatchPriceFeed::new();
+fn feed() -> FixedPriceFeed {
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed
@@ -24,11 +24,11 @@ fn order(id: OrderId, offered_token: TokenId, requested_token: TokenId, offered:
     Order { id, offered_token, requested_token, offered, requested, requested_remaining: requested }
 }
 
-fn filled(book: &OrderBook<WatchPriceFeed>, id: OrderId) -> Amount {
+fn filled(book: &OrderBook<FixedPriceFeed>, id: OrderId) -> Amount {
     book.orders.get(&id).map_or(0, |o| o.requested_filled())
 }
 
-fn is_complete(book: &OrderBook<WatchPriceFeed>, id: OrderId) -> bool {
+fn is_complete(book: &OrderBook<FixedPriceFeed>, id: OrderId) -> bool {
     book.orders.get(&id).is_some_and(|o| o.requested_remaining == 0)
 }
 

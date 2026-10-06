@@ -40,16 +40,15 @@ pub fn operator_keystore() -> String {
     format!("{E2E_DIR}/operator_keystore")
 }
 
-/// A single tradable token: its faucet id + decimals + an external price symbol
-/// (only meaningful for the production HttpPriceClient; `run` injects fixed
-/// prices and ignores it).
+/// A single tradable token: its faucet id + decimals + the Binance asset it is
+/// priced as.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub faucet_id: String,
     pub symbol: String,
     pub decimals: u8,
-    /// Price symbol the solver maps this token to (e.g. "tether").
-    pub external_symbol: String,
+    /// Binance asset code the solver prices this token as (e.g. "USDT").
+    pub binance_asset: String,
 }
 
 /// Everything `provision` produces. Consumed by `fund`, `load`, and `run`.
@@ -59,6 +58,8 @@ pub struct Artifacts {
     pub solver_account_id: String,
     pub token_a: TokenInfo,
     pub token_b: TokenInfo,
+    /// Binance symbol of the direct market between the two assets.
+    pub binance_symbol: String,
     /// Solver keystore + store paths (so `run` configures the runtime identically).
     pub solver_keystore_path: String,
     pub solver_executor_store_path: String,
@@ -101,20 +102,27 @@ read_pool_size = 4
 [[pairs]]
 name = "{sym_a}-{sym_b}"
 asset_x_faucet_id = "{faucet_a}"
-asset_x_external_symbol = "{ext_a}"
+asset_x_binance_asset = "{asset_a}"
 asset_y_faucet_id = "{faucet_b}"
-asset_y_external_symbol = "{ext_b}"
+asset_y_binance_asset = "{asset_b}"
+binance_symbol = "{binance_symbol}"
 
 [engine]
 pulse_interval_ms = 5000
 fetch_interval_ms = 3000
-price_interval_ms = 5000
 clearing_fee_ppm = 0
 admin_port = 3001
 obs_port = 9090
-# Devnet test tokens aren't on public CoinGecko, so point the price client at
-# the local mock service: run `cargo run -p mock-price` in another terminal first.
-price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
+
+# Devnet test tokens have no Binance market of their own, so point the feed at
+# the local mock, e.g. in another terminal:
+#   cargo run -p mock-binance -- --market {binance_symbol}={asset_b}/{asset_a}:1/1
+# (`e2e run` starts its own mock and overrides these endpoints.)
+[binance]
+stream_endpoints = ["ws://127.0.0.1:8089", "ws://127.0.0.1:8089"]
+rest_endpoint = "http://127.0.0.1:8089"
+quote_ttl_ms = 30000
+max_spread_bps = 100
 "#,
             rpc = self.rpc_endpoint,
             solver = self.solver_account_id,
@@ -124,9 +132,10 @@ price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
             sym_a = self.token_a.symbol,
             sym_b = self.token_b.symbol,
             faucet_a = self.token_a.faucet_id,
-            ext_a = self.token_a.external_symbol,
+            asset_a = self.token_a.binance_asset,
             faucet_b = self.token_b.faucet_id,
-            ext_b = self.token_b.external_symbol,
+            asset_b = self.token_b.binance_asset,
+            binance_symbol = self.binance_symbol,
         )
     }
 

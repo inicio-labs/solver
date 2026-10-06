@@ -37,3 +37,28 @@ pub trait PriceFeed {
         offered_value >= requested_value
     }
 }
+
+/// Fixed USD-cent prices for exercising the engine in tests.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Debug, Default)]
+pub struct FixedPriceFeed {
+    prices: std::collections::HashMap<TokenId, UsdCents>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl FixedPriceFeed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_price_cents(&mut self, token: TokenId, price: UsdCents) {
+        self.prices.insert(token, price);
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl PriceFeed for FixedPriceFeed {
+    fn price_cents(&self, token: TokenId) -> Option<UsdCents> {
+        self.prices.get(&token).copied()
+    }
+}

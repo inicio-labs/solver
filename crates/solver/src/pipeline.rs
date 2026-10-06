@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use miden_protocol::crypto::utils::Serializable;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -14,7 +13,7 @@ use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::{self, PreciseSnapshot, PriceClient, SharedTokenMap};
+use crate::price::PriceSnapshot;
 use crate::router::{QuotesSnapshot, RouteBatch};
 use crate::swap_eta::SettlementStats;
 use crate::types::{BookUpdate, ExecutionBatch, TokenId};
@@ -32,22 +31,14 @@ const SUBSCRIBE_CHANNEL_BUF: usize = 100;
 
 /// Configuration for the pipeline.
 pub struct PipelineConfig {
-    /// Pre-initialised DB pool. Caller owns construction so the same pool can
-    /// be shared with `HttpPriceClient` (which hydrates the symbol cache from
-    /// it at boot).
+    /// Pre-initialised DB pool, owned by the caller and shared with the
+    /// executor and the price API.
     pub db_pool: db::DbPool,
-    pub price_interval: Duration,
     pub match_interval: Duration,
-    /// Tokens to register at boot, each with an optional CoinGecko-style
-    /// external symbol for price-feed lookups. Seeded from `solver.toml`
-    /// `[[pairs]]` entries.
-    pub initial_tokens: Vec<(TokenId, Option<String>)>,
+    /// Tokens to register at boot, from `solver.toml` `[[pairs]]` entries.
+    pub initial_tokens: Vec<TokenId>,
     pub admin_port: u16,
     pub admin_token: Option<String>,
-    /// Shared in-memory faucet-id → external-symbol cache. Hydrated from DB
-    /// at boot and mutated by admin handlers. Pass the same Arc as the one
-    /// used to construct the `HttpPriceClient` so both see the latest mapping.
-    pub token_map: SharedTokenMap,
     /// Cancellation signal for graceful shutdown. Triggered by the binary
     /// on Ctrl-C (or any external shutdown event). Each pipeline task watches
     /// this token via `tokio::select!` and exits cleanly between iterations.
@@ -60,23 +51,19 @@ impl PipelineConfig {
     /// conversions so that unit mapping lives in exactly one place; every
     /// field stays mandatory (the struct has no defaults), so a forgotten
     /// argument is still a compile error at the call site.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: &EngineConfig,
         db_pool: db::DbPool,
-        initial_tokens: Vec<(TokenId, Option<String>)>,
+        initial_tokens: Vec<TokenId>,
         admin_token: Option<String>,
-        token_map: SharedTokenMap,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             db_pool,
-            price_interval: Duration::from_millis(engine.price_interval_ms),
             match_interval: Duration::from_millis(engine.pulse_interval_ms),
             initial_tokens,
             admin_port: engine.admin_port,
             admin_token,
-            token_map,
             cancel,
         }
     }
@@ -178,9 +165,9 @@ pub struct PipelineChannels {
     pub route_rx: mpsc::Receiver<RouteBatch>,
     pub book_tx: mpsc::Sender<BookUpdate>,
     pub book_rx: mpsc::Receiver<BookUpdate>,
-    /// Exact references for clearing and f64 values for the price API.
-    pub precise_tx: watch::Sender<PreciseSnapshot>,
-    pub precise_rx: watch::Receiver<PreciseSnapshot>,
+    /// Binance quotes (price feed → matcher, price API, metrics), latest-wins.
+    pub prices_tx: watch::Sender<Arc<PriceSnapshot>>,
+    pub prices_rx: watch::Receiver<Arc<PriceSnapshot>>,
     /// Top-of-book snapshot (matcher → swap-eta API), latest-wins.
     pub swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     pub swap_snapshot_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
@@ -195,7 +182,7 @@ pub struct PipelineChannels {
 
 pub fn create_channels() -> PipelineChannels {
     let (book_tx, book_rx) = mpsc::channel::<BookUpdate>(PIPELINE_CHANNEL_BUF);
-    let (precise_tx, precise_rx) = watch::channel::<PreciseSnapshot>(HashMap::new());
+    let (prices_tx, prices_rx) = watch::channel(Arc::new(PriceSnapshot::default()));
     // Two separate swap-eta feeds, NOT one combined channel: they have two
     // independent producers on two threads — the matcher publishes the live
     // top-of-book each tick (fillability), the executor publishes settlement
@@ -219,8 +206,8 @@ pub fn create_channels() -> PipelineChannels {
         route_rx,
         book_tx,
         book_rx,
-        precise_tx,
-        precise_rx,
+        prices_tx,
+        prices_rx,
         swap_snapshot_tx,
         swap_snapshot_rx,
         stats_tx,
@@ -232,58 +219,34 @@ pub fn create_channels() -> PipelineChannels {
     }
 }
 
-/// Token seed + symbol-map hydrate. Outstanding settlements stay reserved
-/// until the executor reconciles them; resetting them could rematch a consumed parent.
+/// Seed the configured tokens. Outstanding settlements stay reserved until
+/// the executor reconciles them; resetting them could rematch a consumed parent.
 pub async fn prepare_db(config: &PipelineConfig) -> Result<()> {
     let initial_tokens = config.initial_tokens.clone();
     config
         .db_pool
         .write(move |conn| db::postgres_db::seed_tokens_from_config_tx(conn, &initial_tokens))
         .await?;
-    {
-        let loaded = config
-            .db_pool
-            .read(db::postgres_db::load_token_symbols_tx)
-            .await?;
-        let mut map = crate::price::write_token_map(&config.token_map);
-        *map = loaded;
-    }
     Ok(())
 }
 
 /// Handles for the `Send` services spawned on the main coordination thread.
 pub struct CoreHandles {
     pub matcher_handle: JoinHandle<()>,
-    pub price_handle: JoinHandle<()>,
     pub admin_handle: JoinHandle<()>,
 }
 
-/// Spawn the `Send` services (price feed, matcher, admin HTTP) on the
-/// CALLER's LocalSet (the main coordination thread). None of these touch a
-/// miden client. `prepare_db` must have been called first.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_core_services<P: PriceClient + 'static>(
+/// Spawn the `Send` services (matcher, admin HTTP) on the CALLER's LocalSet
+/// (the main coordination thread). None of these touch a miden client. The
+/// price feed runs on its own thread. `prepare_db` must have been called first.
+pub fn spawn_core_services(
     config: &PipelineConfig,
-    price_client: P,
     book_rx: mpsc::Receiver<BookUpdate>,
-    precise_tx: watch::Sender<PreciseSnapshot>,
-    last_price_update: Arc<AtomicI64>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     clearing: matcher::ClearingRuntime,
 ) -> CoreHandles {
-    // Price feed — publishes exact snapshots for clearing and the price API.
-    let price_token_map = config.token_map.clone();
-    let price_interval = config.price_interval;
-    let price_cancel = config.cancel.clone();
-    let price_handle = tokio::task::spawn_local(async move {
-        tokio::select! {
-            _ = price::run_price_feed(price_client, price_token_map, precise_tx, last_price_update, price_interval) => {}
-            _ = price_cancel.cancelled() => {}
-        }
-    });
-
     // Matcher.
     let match_interval = config.match_interval;
     let matcher_cancel = config.cancel.clone();
@@ -304,11 +267,7 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
     });
 
     // Admin HTTP server.
-    let admin_state = Arc::new(AdminState::new(
-        config.db_pool.clone(),
-        subscribe_tx,
-        config.token_map.clone(),
-    ));
+    let admin_state = Arc::new(AdminState::new(config.db_pool.clone(), subscribe_tx));
     let admin_router = admin_state.router(config.admin_token.clone().map(Arc::new));
     let admin_port = config.admin_port;
     let admin_cancel = config.cancel.clone();
@@ -338,7 +297,6 @@ pub fn spawn_core_services<P: PriceClient + 'static>(
 
     CoreHandles {
         matcher_handle,
-        price_handle,
         admin_handle,
     }
 }
@@ -453,7 +411,6 @@ mod tests {
     use super::*;
     use miden_protocol::note::Note;
     use miden_protocol::note::NoteId;
-    use std::collections::HashMap;
 
     use miden_protocol::account::AccountId;
     use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
@@ -466,9 +423,7 @@ mod tests {
     use crate::db::postgres_test::TestDb;
     use crate::ingest::tests::MockMidenClient;
     use crate::ingest::MidenClient;
-    use crate::matching::price_feed::PriceFeed;
-    use crate::price::{MockPriceClient, PriceClient, PriceSnapshot, WatchPriceFeed};
-    use std::sync::Arc;
+    use crate::matching::price_feed::{FixedPriceFeed, PriceFeed};
 
     fn test_token_a() -> TokenId {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()
@@ -514,7 +469,7 @@ mod tests {
         }
         pool.write(move |conn| {
             for token in [test_token_a(), test_token_b()] {
-                db::postgres_db::register_token_tx(conn, token, None)?;
+                db::postgres_db::register_token_tx(conn, token)?;
                 db::postgres_db::set_token_metadata_tx(conn, token, Some(6), None)?;
             }
             db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
@@ -570,38 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn watch_price_feed_new_returns_empty() {
-        let feed = WatchPriceFeed::new();
-        assert_eq!(feed.price_cents(test_token_a()), None);
-    }
-
-    #[test]
-    fn watch_price_feed_set_price_cents() {
-        let mut feed = WatchPriceFeed::new();
-        let token = test_token_a();
-        feed.set_price_cents(token, 200_000);
-        assert_eq!(feed.price_cents(token), Some(200_000));
-    }
-
-    #[test]
-    fn watch_price_feed_from_map() {
-        let token_a = test_token_a();
-        let token_b = test_token_b();
-
-        let mut prices: PriceSnapshot = HashMap::new();
-        prices.insert(token_a, 200_000);
-        prices.insert(token_b, 100);
-
-        let feed = WatchPriceFeed::from_map(prices);
-        assert_eq!(feed.price_cents(token_a), Some(200_000));
-        assert_eq!(feed.price_cents(token_b), Some(100));
-    }
-
-    #[test]
     fn is_order_profitable_excludes_unpriced_token() {
         let token_a = test_token_a();
         let token_b = test_token_b();
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(token_a, 100);
 
         // requested side unpriced ⇒ excluded regardless of amounts.
@@ -615,74 +542,12 @@ mod tests {
         assert!(!feed.is_order_profitable(token_a, 1, token_b, 10));
     }
 
-    #[test]
-    fn watch_price_feed_default_same_as_new() {
-        let a = WatchPriceFeed::new();
-        let b = WatchPriceFeed::default();
-        let token = test_token_a();
-        assert_eq!(a.price_cents(token), b.price_cents(token));
-    }
-
-    #[test]
-    fn watch_price_feed_implements_price_feed_trait() {
-        let token_a = test_token_a();
-        let token_b = test_token_b();
-
-        let mut feed = WatchPriceFeed::new();
-        feed.set_price_cents(token_a, 200_000);
-        feed.set_price_cents(token_b, 100);
-
-        assert!(feed.is_order_profitable(token_a, 1, token_b, 1500));
-        assert!(!feed.is_order_profitable(token_a, 1, token_b, 2500));
-        assert!(feed.is_order_profitable(token_a, 1, token_b, 2000));
-    }
-
-    #[test]
-    fn watch_price_feed_from_watch_channel() {
-        let token = test_token_a();
-        let mut prices: PriceSnapshot = HashMap::new();
-        prices.insert(token, 42_00);
-
-        let (_tx, rx) = tokio::sync::watch::channel(prices);
-        let feed = WatchPriceFeed::from_watch(&rx);
-        assert_eq!(feed.price_cents(token), Some(42_00));
-    }
-
-    #[tokio::test]
-    async fn mock_price_client_returns_expected_prices() {
-        let token_a = test_token_a();
-        let token_b = test_token_b();
-
-        let mut prices: PriceSnapshot = HashMap::new();
-        prices.insert(token_a, 200_000);
-        prices.insert(token_b, 100);
-
-        let client = MockPriceClient::new(prices.clone());
-        let result = client.fetch_prices(&[token_a, token_b]).await.unwrap();
-        assert_eq!(result.len(), 2);
-        // MockPriceClient stores cents as full-precision USD (cents / 100).
-        assert_eq!(result[&token_a].usd, 2000.0);
-        assert_eq!(result[&token_b].usd, 1.0);
-    }
-
-    #[tokio::test]
-    async fn mock_price_client_ignores_token_filter() {
-        let token_a = test_token_a();
-
-        let mut prices: PriceSnapshot = HashMap::new();
-        prices.insert(token_a, 500);
-
-        let client = MockPriceClient::new(prices);
-        let result = client.fetch_prices(&[]).await.unwrap();
-        assert_eq!(result[&token_a].usd, 5.0);
-    }
-
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn seed_tokens_from_config_inserts_tokens() {
         let test_db = TestDb::new().await.unwrap();
         let pool = &test_db.pool;
-        let tokens = vec![(test_token_a(), None), (test_token_b(), None)];
+        let tokens = vec![test_token_a(), test_token_b()];
 
         pool.write(move |conn| db::postgres_db::seed_tokens_from_config_tx(conn, &tokens))
             .await
@@ -700,7 +565,7 @@ mod tests {
     async fn seed_tokens_from_config_is_idempotent() {
         let test_db = TestDb::new().await.unwrap();
         let pool = &test_db.pool;
-        let tokens = vec![(test_token_a(), None)];
+        let tokens = vec![test_token_a()];
 
         for _ in 0..2 {
             let tokens = tokens.clone();
@@ -719,21 +584,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn load_tokens_from_db_round_trips() {
-        use std::sync::RwLock;
         let test_db = TestDb::new().await.unwrap();
         let pool = test_db.pool.clone();
         let token_a = test_token_a();
         let token_b = test_token_b();
 
         pool.write(move |conn| {
-            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[token_a, token_b])
         })
         .await
         .unwrap();
 
         let (subscribe_tx, _rx) = mpsc::channel::<(TokenId, TokenId)>(8);
-        let token_map = Arc::new(RwLock::new(HashMap::new()));
-        let state = AdminState::new(pool, subscribe_tx, token_map);
+        let state = AdminState::new(pool, subscribe_tx);
 
         let loaded = state.load_tokens_from_db().await.unwrap();
         assert_eq!(loaded.len(), 2);
@@ -796,7 +659,7 @@ mod tests {
         let token_b = test_token_b();
 
         pool.write(move |conn| {
-            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[token_a, token_b])
         })
         .await
         .unwrap();
@@ -816,7 +679,7 @@ mod tests {
         let token_a = test_token_a();
         let token_b = test_token_b();
         pool.write(move |conn| {
-            db::postgres_db::seed_tokens_from_config_tx(conn, &[(token_a, None), (token_b, None)])
+            db::postgres_db::seed_tokens_from_config_tx(conn, &[token_a, token_b])
         })
         .await
         .unwrap();

@@ -1,5 +1,5 @@
 use crate::matching::order_book::OrderBook;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use crate::matching::direct_matching::run_direct_matching;
 use std::collections::HashSet;
 use super::{eth, usdc, NoteIdGen};
@@ -32,7 +32,7 @@ fn settlement_solvency_check() {
     let mut total_matched = 0u64;
 
     for _trial in 0..10_000 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(eth(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 

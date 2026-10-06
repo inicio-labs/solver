@@ -330,3 +330,129 @@ pub fn vault_balance(chain: &MockChain, account_id: AccountId, faucet: AccountId
         })
         .unwrap_or(0)
 }
+
+/// A mock Binance server on its own thread and runtime, so a test thread busy
+/// driving the mock chain cannot stall its quotes. Stops when dropped.
+pub struct BinanceStub {
+    ws_url: String,
+    rest_url: String,
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl BinanceStub {
+    /// Serve `markets` (`SYMBOL`, base asset, quote asset, mid price) with a
+    /// zero spread.
+    pub fn start(markets: &[(&str, &str, &str, &str)]) -> Self {
+        let markets: Vec<_> = markets
+            .iter()
+            .map(|(symbol, base, quote, mid)| {
+                mock_binance::Market::new(symbol, base, quote, mid, mid)
+            })
+            .collect();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("mock Binance runtime");
+            runtime.block_on(async move {
+                let server = mock_binance::MockBinance::start(markets, Default::default())
+                    .await
+                    .expect("bind mock Binance");
+                ready_tx
+                    .send((server.ws_url(), server.rest_url()))
+                    .expect("test waits for the mock");
+                let _ = stop_rx.await;
+            });
+        });
+        let (ws_url, rest_url) = ready_rx.recv().expect("mock Binance started");
+        Self {
+            ws_url,
+            rest_url,
+            _stop: stop_tx,
+        }
+    }
+
+    /// A `[binance]` section pointing both readers at this server. Quotes
+    /// stay usable for ten minutes: the mock chain can hold the test thread.
+    pub fn config(&self) -> solver::config::BinanceConfig {
+        solver::config::BinanceConfig {
+            stream_endpoints: [self.ws_url.clone(), self.ws_url.clone()],
+            rest_endpoint: self.rest_url.clone(),
+            quote_ttl_ms: 600_000,
+            max_spread_bps: 100,
+            retry_min_ms: 50,
+            retry_max_ms: 500,
+            ..Default::default()
+        }
+    }
+}
+
+/// The `[engine]` section the solver integration tests run with.
+pub fn engine_config() -> solver::config::EngineConfig {
+    solver::config::EngineConfig {
+        pulse_interval_ms: 200,
+        fetch_interval_ms: 100,
+        clearing_fee_ppm: 0,
+        admin_port: 0,
+        debug_mode: false,
+        obs_port: 0,
+        readiness_freshness_secs: 60,
+        verify_interval_ms: 5_000,
+        // Any free port: a fixed one fails startup when something else holds it.
+        price_query_port: 0,
+        price_query_bind: "127.0.0.1".to_string(),
+        price_query_max_inflight: 128,
+        price_query_max_batch: 50,
+        price_query_timeout_ms: 3000,
+        price_precision: "full".to_string(),
+        swap_proving_estimate_ms: 2000,
+        swap_block_time_ms: 6000,
+        swap_offmarket_tolerance_bps: 50,
+        router_enabled: false,
+        router_bind: "127.0.0.1".to_string(),
+        router_port: 0,
+        router_max_connections: 64,
+        router_max_msg_bytes: 16384,
+        router_quote_ttl_ms: 20_000,
+        router_inflight_ttl_ms: 30_000,
+    }
+}
+
+/// A pair priced by the Binance market `symbol` between `x_asset` and `y_asset`.
+pub fn pair_config(
+    name: &str,
+    x: AccountId,
+    x_asset: &str,
+    y: AccountId,
+    y_asset: &str,
+    symbol: &str,
+) -> solver::config::AssetPairConfig {
+    let asset = |code: &str| solver::price::AssetCode::parse(code).expect("valid asset code");
+    solver::config::AssetPairConfig {
+        name: name.to_string(),
+        asset_x_faucet_id: x.to_hex(),
+        asset_x_binance_asset: Some(asset(x_asset)),
+        asset_y_faucet_id: y.to_hex(),
+        asset_y_binance_asset: Some(asset(y_asset)),
+        binance_symbol: Some(solver::price::Symbol::parse(symbol).expect("valid symbol")),
+    }
+}
+
+/// Orders in the solver's database with `status`.
+pub async fn count_orders(db_url: &str, status: &'static str) -> i64 {
+    let url = db_url.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use solver::db::postgres_schema::orders;
+        let mut conn = solver::db::postgres_migrations::connect(&url).expect("connect");
+        orders::table
+            .filter(orders::status.eq(status))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .expect("count orders")
+    })
+    .await
+    .expect("count task")
+}

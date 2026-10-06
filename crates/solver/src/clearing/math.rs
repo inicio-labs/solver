@@ -134,35 +134,6 @@ impl ReferencePrice {
             .ok_or(ClearingError::InvalidOraclePrice)?;
         Self::new(numerator, scale)
     }
-
-    /// Parse a JSON number without a floating-point round trip. Providers may
-    /// emit small prices in scientific notation even when `precision=full`.
-    pub fn from_json_number(raw: &str) -> Result<Self, ClearingError> {
-        let exponent_at = raw.bytes().position(|byte| byte == b'e' || byte == b'E');
-        let Some(index) = exponent_at else {
-            return Self::from_decimal(raw);
-        };
-        let price = Self::from_decimal(&raw[..index])?;
-        let exponent = &raw[index + 1..];
-        let (negative, digits) = if let Some(digits) = exponent.strip_prefix('-') {
-            (true, digits)
-        } else {
-            (false, exponent.strip_prefix('+').unwrap_or(exponent))
-        };
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(ClearingError::InvalidOraclePrice);
-        }
-        let magnitude = digits
-            .parse::<u8>()
-            .map_err(|_| ClearingError::InvalidOraclePrice)?;
-        let factor = power_of_ten(magnitude).map_err(|_| ClearingError::InvalidOraclePrice)?;
-        if negative {
-            Self::new(price.numerator, checked_mul(price.denominator, factor)?)
-        } else {
-            Self::new(checked_mul(price.numerator, factor)?, price.denominator)
-        }
-        .map_err(|_| ClearingError::InvalidOraclePrice)
-    }
 }
 
 impl BatchPrice {
@@ -179,25 +150,6 @@ impl BatchPrice {
             quote_units: quote_units / common,
             base_units: base_units / common,
         })
-    }
-
-    /// Both reference prices refer to one whole token. Convert them to quote
-    /// base units per base base unit with the on-chain token decimals.
-    pub fn from_reference_prices(
-        base_price: ReferencePrice,
-        quote_price: ReferencePrice,
-        base_decimals: u8,
-        quote_decimals: u8,
-    ) -> Result<Self, ClearingError> {
-        let quote_units = checked_mul(
-            checked_mul(base_price.numerator, quote_price.denominator)?,
-            power_of_ten(quote_decimals)?,
-        )?;
-        let base_units = checked_mul(
-            checked_mul(base_price.denominator, quote_price.numerator)?,
-            power_of_ten(base_decimals)?,
-        )?;
-        Self::new(quote_units, base_units)
     }
 
     /// `price` whole quote tokens per whole base token, in base units:
@@ -226,6 +178,21 @@ impl BatchPrice {
         }
     }
 
+    /// Whether `requested` quote units are worth more than `offered` base
+    /// units at this price, by more than `tolerance_bps`:
+    /// `requested > offered × price × (1 + tolerance_bps / 10_000)`, exactly.
+    pub(crate) fn exceeds(
+        self,
+        offered: u64,
+        requested: u64,
+        tolerance_bps: u64,
+    ) -> Result<bool, ClearingError> {
+        let requested = checked_mul(checked_mul(requested, self.base_units)?, 10_000u32)?;
+        let tolerance = U256::from(10_000u64) + U256::from(tolerance_bps);
+        let offered = checked_mul(checked_mul(offered, self.quote_units)?, tolerance)?;
+        Ok(requested > offered)
+    }
+
     pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
         mul_div_floor(base, self.quote_units, self.base_units)
     }
@@ -238,8 +205,7 @@ mod tests {
     #[test]
     fn pair_price_uses_token_decimals() {
         let btc = ReferencePrice::from_decimal("100000.00000000").unwrap();
-        let usdt = ReferencePrice::from_decimal("1").unwrap();
-        let price = BatchPrice::from_reference_prices(btc, usdt, 8, 6).unwrap();
+        let price = BatchPrice::from_pair_price(btc, 8, 6).unwrap();
         assert_eq!(price.quote_units, U256::from(1_000u64));
         assert_eq!(price.base_units, U256::ONE);
     }
@@ -273,22 +239,6 @@ mod tests {
             assert!(
                 ReferencePrice::from_decimal(invalid).is_err(),
                 "{invalid:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn json_scientific_price_is_exact() {
-        let price = ReferencePrice::from_json_number("1.2500e-4").unwrap();
-        assert_eq!(price.numerator, U256::ONE);
-        assert_eq!(price.denominator, U256::from(8_000u64));
-        let price = ReferencePrice::from_json_number("1.25E+4").unwrap();
-        assert_eq!(price.numerator, U256::from(12_500u64));
-        assert_eq!(price.denominator, U256::ONE);
-        for invalid in ["1e", "1e-", "1e999", "1e2e3", "-1e2"] {
-            assert!(
-                ReferencePrice::from_json_number(invalid).is_err(),
-                "{invalid}"
             );
         }
     }

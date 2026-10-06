@@ -3,16 +3,44 @@
 //! Living in the library so both `solver::start` and `main.rs` can read the
 //! same struct without a reverse dependency from library → binary.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use miden_protocol::account::AccountId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::price::{AssetCode, ClearingMarket, FeedConfig, MarketPlan, RetryPolicy, Symbol};
+use crate::types::TokenId;
+
+/// Binance pings every stream connection this often.
+const BINANCE_PING_INTERVAL_MS: u64 = 20_000;
+/// Binance's limit on stream connection attempts per 5 minutes per client IP;
+/// exceeding it gets the IP rate limited, then banned.
+const BINANCE_CONNECTION_ATTEMPT_LIMIT: usize = 300;
 
 #[derive(Debug, Error)]
 enum ConfigError {
     #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
     InvalidPricePrecision(String),
-    #[error("engine.price_vs_currency must be non-empty")]
-    EmptyPriceCurrency,
+    #[error("binance.{0} must be set to a positive value")]
+    ZeroBinanceSetting(&'static str),
+    #[error("binance.{name} {url:?} must be a {scheme} URL")]
+    InvalidEndpoint {
+        name: &'static str,
+        url: String,
+        scheme: &'static str,
+    },
+    #[error("binance.idle_timeout_ms must exceed Binance's 20 s ping interval")]
+    IdleTimeoutTooShort,
+    #[error("binance.max_spread_bps must be at most 10000, got {0}")]
+    SpreadTooWide(u32),
+    #[error("binance.retry_min_ms must not exceed binance.retry_max_ms")]
+    RetryRange,
+    #[error("binance.connection_lifetime_secs must be below Binance's 24-hour limit")]
+    LifetimeTooLong,
+    #[error("binance.max_connection_attempts must be below Binance's per-IP limit of {limit}, got {value}")]
+    TooManyConnectionAttempts { value: usize, limit: usize },
     #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
     InvalidClearingFee { fee: u32, maximum: u32 },
 }
@@ -23,6 +51,7 @@ pub struct SolverConfig {
     pub solver: SolverAccountConfig,
     pub pairs: Vec<AssetPairConfig>,
     pub engine: EngineConfig,
+    pub binance: BinanceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,36 +92,44 @@ fn default_read_pool_size() -> u32 {
 pub struct AssetPairConfig {
     pub name: String,
     pub asset_x_faucet_id: String,
-    /// Optional CoinGecko-style ID (e.g. `"tether"`, `"ethereum"`) for the
-    /// `asset_x` faucet's underlying token. Used by the production price
-    /// client to look up USD prices. Tokens without a mapping fall back to
-    /// the 1-cent default in matching.
+    /// Binance asset code of the `asset_x` token (e.g. `"ETH"`). The price API
+    /// values the token by the `<ASSET><binance.valuation_quote_asset>` market;
+    /// without a code the token has no price.
     #[serde(default)]
-    pub asset_x_external_symbol: Option<String>,
+    pub asset_x_binance_asset: Option<AssetCode>,
     pub asset_y_faucet_id: String,
-    /// See `asset_x_external_symbol`.
+    /// See `asset_x_binance_asset`.
     #[serde(default)]
-    pub asset_y_external_symbol: Option<String>,
+    pub asset_y_binance_asset: Option<AssetCode>,
+    /// Approved Binance Spot symbol of the direct market between the two
+    /// assets (e.g. `"ETHUSDT"`); both asset codes are then required. Without
+    /// it the pair does not clear internally. Which asset is Binance's base
+    /// comes from `exchangeInfo`, so either pair orientation works.
+    #[serde(default)]
+    pub binance_symbol: Option<Symbol>,
+}
+
+impl AssetPairConfig {
+    /// The pair's faucets, `(asset_x, asset_y)`.
+    pub fn faucets(&self) -> Result<(TokenId, TokenId)> {
+        let parse = |hex: &str, side: &str| {
+            AccountId::from_hex(hex)
+                .with_context(|| format!("invalid {side}_faucet_id for pair {}", self.name))
+        };
+        Ok((
+            parse(&self.asset_x_faucet_id, "asset_x")?,
+            parse(&self.asset_y_faucet_id, "asset_y")?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineConfig {
     pub pulse_interval_ms: u64,
     pub fetch_interval_ms: u64,
-    /// How often the price feed task polls upstream (CoinGecko) for new
-    /// prices. Matcher reads from a watch channel on every pulse regardless,
-    /// so this only affects how stale the prices can get, not the matcher's
-    /// tick rate.
-    pub price_interval_ms: u64,
     /// Protocol fee and minimum eligibility edge in ppm. Zero disables fees.
     #[serde(default)]
     pub clearing_fee_ppm: u32,
-    /// Maximum age of each provider's own price timestamp when clearing.
-    #[serde(default = "default_clearing_source_age_secs")]
-    pub clearing_max_source_age_secs: u64,
-    /// Maximum difference between the two provider price timestamps.
-    #[serde(default = "default_clearing_source_skew_secs")]
-    pub clearing_max_source_skew_secs: u64,
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
@@ -116,18 +153,10 @@ pub struct EngineConfig {
     /// keeps orders live meanwhile. Defaults to 5000.
     #[serde(default = "default_verify_interval_ms")]
     pub verify_interval_ms: u64,
-    /// Override the price-API base URL. Defaults to the public CoinGecko
-    /// endpoint. Point this at a self-hosted or **mock** CoinGecko-compatible
-    /// service (e.g. `http://127.0.0.1:8089/api/v3/simple/price`) for devnet /
-    /// local runs where the faucet tokens aren't listed and no key is available.
-    /// The solver uses its normal `HttpPriceClient` either way — only the URL
-    /// changes. Pairs still map tokens → ids via `asset_*_external_symbol`.
-    #[serde(default)]
-    pub price_api_base_url: Option<String>,
 
     // ── Public price-query HTTP API (wallets fetch token prices) ──────────────
-    // Distinct from `price_api_base_url` above, which is the UPSTREAM source we
-    // call; these configure the endpoint we SERVE. It runs on its own OS thread.
+    // The endpoint we SERVE, from the Binance snapshot. It runs on its own OS
+    // thread.
     /// Port the price-query API binds. Default 8080.
     #[serde(default = "default_price_query_port")]
     pub price_query_port: u16,
@@ -144,20 +173,11 @@ pub struct EngineConfig {
     /// Per-request timeout in ms. Default 3000.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
-    /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`
-    /// (mirrors CoinGecko's `precision`). One value applied to the price; distinct
-    /// from a token's on-chain decimals. Default `"full"`. Overridable per request.
+    /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`.
+    /// One value applied to the price; distinct from a token's on-chain
+    /// decimals. Default `"full"` (exact, up to 18 places). Overridable per request.
     #[serde(default = "default_price_precision")]
     pub price_precision: String,
-    /// Quote currency (CoinGecko `vs_currencies`). Default `"usd"`. Must be a
-    /// CoinGecko-supported vs_currency (usd/eur/btc/…), NOT a coin like `"usdt"`.
-    #[serde(default = "default_price_vs_currency")]
-    pub price_vs_currency: String,
-    /// Max age (secs) of the last SUCCESSFUL price refresh before the price-query
-    /// API treats prices as stale (→ `503` unless `?allow_stale=true`). Default 30.
-    /// Set ≥ 2 × (price_interval_ms / 1000).
-    #[serde(default = "default_price_staleness_secs")]
-    pub price_staleness_secs: u64,
 
     // ── Swap time-estimation API (`/v1/swap-eta`) ─────────────────────────────
     /// Estimated proof-generation time (ms) for a settlement tx — a term of the
@@ -167,7 +187,7 @@ pub struct EngineConfig {
     /// Estimated chain block time (ms) — a term of the next-batch ETA. Default 6000.
     #[serde(default = "default_swap_block_time_ms")]
     pub swap_block_time_ms: u64,
-    /// Slack (bps) before an order is flagged `offMarket` vs the oracle mid.
+    /// Slack (bps) before an order is flagged `offMarket` vs the Binance mid.
     /// Default 50 (0.5%).
     #[serde(default = "default_swap_offmarket_tolerance_bps")]
     pub swap_offmarket_tolerance_bps: u64,
@@ -199,7 +219,7 @@ pub struct EngineConfig {
 }
 
 /// Resolved price precision (decimal places of the price NUMBER): `Full` or a
-/// fixed `0..=18`. Mirrors CoinGecko's `precision`.
+/// fixed `0..=18`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PricePrecision {
     Full,
@@ -214,14 +234,6 @@ impl PricePrecision {
         }
         s.parse::<u8>().ok().filter(|n| *n <= 18).map(Self::Fixed)
     }
-}
-
-fn default_clearing_source_age_secs() -> u64 {
-    60
-}
-
-fn default_clearing_source_skew_secs() -> u64 {
-    30
 }
 
 fn default_admin_port() -> u16 {
@@ -258,12 +270,6 @@ fn default_price_query_timeout_ms() -> u64 {
 fn default_price_precision() -> String {
     "full".to_string()
 }
-fn default_price_vs_currency() -> String {
-    "usd".to_string()
-}
-fn default_price_staleness_secs() -> u64 {
-    30
-}
 fn default_swap_proving_estimate_ms() -> u64 {
     2000
 }
@@ -292,6 +298,147 @@ fn default_router_inflight_ttl_ms() -> u64 {
     30_000
 }
 
+/// Binance Spot public market data: endpoints, quote validity, and the feed's
+/// connection and retry budget (ADR 0004). Every field but `quote_ttl_ms` and
+/// `max_spread_bps` has a default; those two must be chosen per deployment.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BinanceConfig {
+    /// Stream base URLs of reader A and reader B. By default reader A uses the
+    /// market-data-only endpoint and reader B the main one: separate front
+    /// ends, so one endpoint failing does not take out both readers.
+    pub stream_endpoints: [String; 2],
+    /// REST base URL for `exchangeInfo` checks at startup.
+    pub rest_endpoint: String,
+    /// A quote is usable while `now - received_at < quote_ttl_ms`, measured
+    /// from local receipt.
+    pub quote_ttl_ms: u64,
+    /// Widest accepted spread, `10_000 × (ask - bid) / mid`, inclusive. A
+    /// wider quote makes its market unusable until the next valid one.
+    pub max_spread_bps: u32,
+    /// Asset the price API values tokens in (`<ASSET><QUOTE>` markets).
+    pub valuation_quote_asset: AssetCode,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    /// Reconnect a stream that delivers no frame, not even a ping, this long.
+    pub idle_timeout_ms: u64,
+    /// Longest planned connection, below Binance's 24-hour limit; each lasts
+    /// a random 50–100% of it, so the two readers renew apart.
+    pub connection_lifetime_secs: u64,
+    pub retry_min_ms: u64,
+    pub retry_max_ms: u64,
+    /// Connection attempts per 5 minutes, shared by both readers. Must stay
+    /// below Binance's 300 per IP; staying far below leaves room for other
+    /// processes on the same IP.
+    pub max_connection_attempts: usize,
+}
+
+impl Default for BinanceConfig {
+    fn default() -> Self {
+        Self {
+            stream_endpoints: [
+                "wss://data-stream.binance.vision:443".to_string(),
+                "wss://stream.binance.com:443".to_string(),
+            ],
+            rest_endpoint: "https://data-api.binance.vision".to_string(),
+            quote_ttl_ms: 0,
+            max_spread_bps: 0,
+            valuation_quote_asset: AssetCode::parse("USDT").expect("valid asset code"),
+            connect_timeout_ms: 10_000,
+            request_timeout_ms: 10_000,
+            idle_timeout_ms: 3 * BINANCE_PING_INTERVAL_MS,
+            connection_lifetime_secs: 23 * 60 * 60,
+            retry_min_ms: 500,
+            retry_max_ms: 60_000,
+            max_connection_attempts: 30,
+        }
+    }
+}
+
+/// `url` parses and uses one of `schemes`.
+fn check_endpoint(
+    name: &'static str,
+    url: &str,
+    schemes: [&'static str; 2],
+) -> std::result::Result<(), ConfigError> {
+    let valid = reqwest::Url::parse(url)
+        .is_ok_and(|parsed| schemes.contains(&parsed.scheme()) && parsed.has_host());
+    if valid {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidEndpoint {
+        name,
+        url: url.to_string(),
+        scheme: if schemes[0] == "ws" {
+            "ws/wss"
+        } else {
+            "http/https"
+        },
+    })
+}
+
+impl BinanceConfig {
+    fn validate(&self) -> std::result::Result<(), ConfigError> {
+        for (name, value) in [
+            ("quote_ttl_ms", self.quote_ttl_ms),
+            ("max_spread_bps", u64::from(self.max_spread_bps)),
+            ("connect_timeout_ms", self.connect_timeout_ms),
+            ("request_timeout_ms", self.request_timeout_ms),
+            ("connection_lifetime_secs", self.connection_lifetime_secs),
+            ("retry_min_ms", self.retry_min_ms),
+            (
+                "max_connection_attempts",
+                self.max_connection_attempts as u64,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::ZeroBinanceSetting(name));
+            }
+        }
+        for endpoint in &self.stream_endpoints {
+            check_endpoint("stream_endpoints", endpoint, ["ws", "wss"])?;
+        }
+        check_endpoint("rest_endpoint", &self.rest_endpoint, ["http", "https"])?;
+        if self.idle_timeout_ms <= BINANCE_PING_INTERVAL_MS {
+            return Err(ConfigError::IdleTimeoutTooShort);
+        }
+        if self.max_spread_bps > 10_000 {
+            return Err(ConfigError::SpreadTooWide(self.max_spread_bps));
+        }
+        if self.retry_min_ms > self.retry_max_ms {
+            return Err(ConfigError::RetryRange);
+        }
+        if self.connection_lifetime_secs >= 24 * 60 * 60 {
+            return Err(ConfigError::LifetimeTooLong);
+        }
+        if self.max_connection_attempts >= BINANCE_CONNECTION_ATTEMPT_LIMIT {
+            return Err(ConfigError::TooManyConnectionAttempts {
+                value: self.max_connection_attempts,
+                limit: BINANCE_CONNECTION_ATTEMPT_LIMIT,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn feed_config(&self) -> FeedConfig {
+        FeedConfig {
+            stream_endpoints: self.stream_endpoints.clone(),
+            rest_endpoint: self.rest_endpoint.clone(),
+            max_spread_bps: self.max_spread_bps,
+            quote_ttl: Duration::from_millis(self.quote_ttl_ms),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            request_timeout: Duration::from_millis(self.request_timeout_ms),
+            idle_timeout: Duration::from_millis(self.idle_timeout_ms),
+            connection_lifetime: Duration::from_secs(self.connection_lifetime_secs),
+            retry: RetryPolicy {
+                min_delay: Duration::from_millis(self.retry_min_ms),
+                max_delay: Duration::from_millis(self.retry_max_ms),
+            },
+            max_connection_attempts: self.max_connection_attempts,
+        }
+    }
+}
+
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -310,16 +457,46 @@ impl SolverConfig {
                 self.engine.price_precision.clone(),
             ));
         }
-        if self.engine.price_vs_currency.trim().is_empty() {
-            return Err(ConfigError::EmptyPriceCurrency);
-        }
         if self.engine.clearing_fee_ppm >= crate::clearing::PPM_DENOMINATOR {
             return Err(ConfigError::InvalidClearingFee {
                 fee: self.engine.clearing_fee_ppm,
                 maximum: crate::clearing::PPM_DENOMINATOR,
             });
         }
-        Ok(())
+        self.binance.validate()
+    }
+
+    /// The Binance markets the configuration asks for: each faucet's asset
+    /// code, each pair with an approved symbol, and the valuation quote.
+    pub fn market_plan(&self) -> Result<MarketPlan> {
+        let mut assets = Vec::new();
+        let mut clearing = Vec::new();
+        for pair in &self.pairs {
+            let (x, y) = pair.faucets()?;
+            let codes = [
+                (x, &pair.asset_x_binance_asset),
+                (y, &pair.asset_y_binance_asset),
+            ];
+            assets.extend(
+                codes
+                    .into_iter()
+                    .filter_map(|(token, code)| Some((token, code.clone()?))),
+            );
+            match &pair.binance_symbol {
+                Some(symbol) => clearing.push(ClearingMarket {
+                    name: pair.name.clone(),
+                    base: x,
+                    quote: y,
+                    symbol: symbol.clone(),
+                }),
+                None => tracing::warn!(
+                    pair = %pair.name,
+                    "pair has no binance_symbol; it will not clear internally"
+                ),
+            }
+        }
+        let quote = self.binance.valuation_quote_asset.clone();
+        Ok(MarketPlan::new(assets, clearing, quote)?)
     }
 
     /// The Miden client no longer exposes debug mode.
@@ -333,5 +510,146 @@ impl SolverConfig {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write config file: {}", path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::price::MarketError;
+
+    const EXAMPLE: &str = include_str!("../../../solver.toml.example");
+
+    fn example() -> SolverConfig {
+        let mut config: SolverConfig = toml::from_str(EXAMPLE).expect("solver.toml.example parses");
+        // Replace the placeholders with valid faucet ids.
+        config.pairs[0].asset_x_faucet_id = "0x9f0c6ec13c4ed2b1076a2990a9fc29".into();
+        config.pairs[0].asset_y_faucet_id = "0x3ae73d7f166f723132e3acbba75e75".into();
+        config
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        let config = example();
+        config.validate().unwrap();
+        let feed = config.binance.feed_config();
+        assert_eq!(feed.quote_ttl, Duration::from_secs(2));
+        assert_eq!(feed.max_spread_bps, 50);
+        let defaults = BinanceConfig::default();
+        assert_eq!(feed.stream_endpoints, defaults.stream_endpoints);
+        assert_ne!(
+            defaults.stream_endpoints[0], defaults.stream_endpoints[1],
+            "the readers default to different endpoints"
+        );
+        assert_eq!(
+            feed.connection_lifetime,
+            Duration::from_secs(defaults.connection_lifetime_secs)
+        );
+    }
+
+    #[test]
+    fn example_pair_maps_to_its_binance_market() {
+        let plan = example().market_plan().unwrap();
+        let symbols: Vec<_> = plan.symbols().into_iter().map(|s| s.to_string()).collect();
+        // The clearing market also values ETH; USDT is the valuation quote.
+        assert_eq!(symbols, ["ETHUSDT"]);
+    }
+
+    #[test]
+    fn binance_codes_are_checked_at_load() {
+        let lowercase = EXAMPLE.replace(
+            r#"binance_symbol = "ETHUSDT""#,
+            r#"binance_symbol = "ethusdt""#,
+        );
+        let config: SolverConfig = toml::from_str(&lowercase).unwrap();
+        assert_eq!(
+            config.pairs[0].binance_symbol,
+            Some(Symbol::parse("ETHUSDT").unwrap())
+        );
+        let invalid = EXAMPLE.replace(
+            r#"asset_y_binance_asset = "ETH""#,
+            r#"asset_y_binance_asset = "E-TH""#,
+        );
+        let error = toml::from_str::<SolverConfig>(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("asset_y_binance_asset"), "{error}");
+    }
+
+    #[test]
+    fn pair_mappings_are_checked() {
+        let mut config = example();
+        config.pairs[0].asset_x_binance_asset = None;
+        let error = config.market_plan().unwrap_err();
+        assert!(
+            matches!(error.downcast_ref(), Some(MarketError::MissingAsset { .. })),
+            "{error}"
+        );
+        let mut config = example();
+        config.pairs[0].asset_x_faucet_id = "0xnot-hex".into();
+        let error = config.market_plan().unwrap_err().to_string();
+        assert!(error.contains("asset_x_faucet_id"), "{error}");
+    }
+
+    #[test]
+    fn binance_settings_are_checked() {
+        type Change = fn(&mut BinanceConfig);
+        let check = |change: Change| {
+            let mut config = example();
+            change(&mut config.binance);
+            config.validate().unwrap_err().to_string()
+        };
+        let zero: [(&str, Change); 7] = [
+            ("quote_ttl_ms", |binance| binance.quote_ttl_ms = 0),
+            ("max_spread_bps", |binance| binance.max_spread_bps = 0),
+            ("connect_timeout_ms", |binance| {
+                binance.connect_timeout_ms = 0
+            }),
+            ("request_timeout_ms", |binance| {
+                binance.request_timeout_ms = 0
+            }),
+            ("connection_lifetime_secs", |binance| {
+                binance.connection_lifetime_secs = 0
+            }),
+            ("retry_min_ms", |binance| binance.retry_min_ms = 0),
+            ("max_connection_attempts", |binance| {
+                binance.max_connection_attempts = 0
+            }),
+        ];
+        for (name, change) in zero {
+            assert!(check(change).contains(name), "{name}");
+        }
+        assert!(
+            check(|binance| binance.stream_endpoints[1] = "https://example.com".into())
+                .contains("stream_endpoints")
+        );
+        assert!(
+            check(|binance| binance.rest_endpoint = "wss://example.com".into())
+                .contains("rest_endpoint")
+        );
+        assert!(check(|binance| binance.rest_endpoint = String::new()).contains("rest_endpoint"));
+        assert!(check(|binance| binance.idle_timeout_ms = 20_000).contains("idle_timeout_ms"));
+        assert!(check(|binance| binance.max_spread_bps = 10_001).contains("at most 10000"));
+        assert!(
+            check(|binance| binance.retry_min_ms = binance.retry_max_ms + 1)
+                .contains("retry_min_ms")
+        );
+        assert!(
+            check(|binance| binance.connection_lifetime_secs = 24 * 60 * 60).contains("24-hour")
+        );
+        assert!(
+            check(|binance| binance.max_connection_attempts = 300).contains("per-IP limit of 300")
+        );
+        let mut config = example();
+        config.binance.max_connection_attempts = 299;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_binance_section_is_required() {
+        let mut table: toml::Table = toml::from_str(EXAMPLE).unwrap();
+        table.remove("binance");
+        let error = toml::from_str::<SolverConfig>(&table.to_string()).unwrap_err();
+        assert!(error.to_string().contains("binance"), "{error}");
     }
 }

@@ -6,9 +6,6 @@
 //! freshness-checked price lookups; [`feed`] runs the readers and publisher on
 //! their own thread.
 
-// The solver uses these once the feed is wired in.
-#![cfg_attr(not(test), allow(dead_code))]
-
 pub(crate) mod feed;
 pub(crate) mod market;
 mod reader;
@@ -17,3 +14,9 @@ pub(crate) mod snapshot;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod ticker;
+
+pub(crate) use feed::{spawn_price_feed_thread, READER_NAMES};
+pub use feed::{FeedConfig, FeedMetrics, RetryPolicy};
+pub use market::{AssetCode, ClearingMarket, MarketError, MarketPlan, Symbol};
+pub use snapshot::{PriceSnapshot, PriceUnavailable};
+pub(crate) use snapshot::{SymbolQuote, Valued};

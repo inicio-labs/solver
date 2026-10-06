@@ -1,9 +1,8 @@
 //! `e2e run` — boot the real solver pipeline in-process against devnet with a
-//! deterministic fixed-price feed (no CoinGecko), let it ingest + match + settle
-//! the PSWAPs created by `load`, then report the solver's balance delta (the
-//! spread it captured = proof of settlement).
+//! deterministic price from an in-process mock Binance, let it ingest + match +
+//! settle the PSWAPs created by `load`, then report the solver's balance delta
+//! (the spread it captured = proof of settlement).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,17 +16,17 @@ use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
 use tokio_util::sync::CancellationToken;
 
+use mock_binance::{Market, MockBinance};
 use solver::config::SolverConfig;
-use solver::price::{MockPriceClient, PriceClient, PriceSnapshot};
 
 use crate::accounts;
 use crate::artifacts::{self, Artifacts};
 use crate::devnet::{self, DEVNET_RPC};
 
-/// Fixed USD price (cents) the matcher sees for both test tokens. Equal prices
-/// keep the crossing condition simple: each opposing order offers more than the
-/// other requests, so there is positive surplus for the solver.
-const PRICE_CENTS: u64 = 100;
+/// Fixed mid price of the pair's Binance market: both test tokens are worth the
+/// same, which keeps the crossing condition simple: each opposing order offers
+/// more than the other requests, so there is positive surplus for the solver.
+const MID_PRICE: &str = "1";
 
 /// e2e [`solver::ClientFactory`] — same shape as the production `ProdClientFactory`,
 /// but built with `for_devnet()` so the executor uses the remote prover.
@@ -66,7 +65,7 @@ impl solver::ClientFactory for E2eFactory {
 
 pub async fn run(secs: u64) -> Result<()> {
     let art = Artifacts::load(&artifacts::artifacts_path())?;
-    let config =
+    let mut config =
         SolverConfig::load(&artifacts::solver_config_path()).context("load generated solver config")?;
     let solver_id =
         AccountId::from_hex(&art.solver_account_id).map_err(|e| anyhow!("solver id: {e}"))?;
@@ -76,13 +75,20 @@ pub async fn run(secs: u64) -> Result<()> {
     // Pre-run balances (best-effort).
     let (pre_a, pre_b) = read_solver_balances(&art, solver_id, token_a, token_b).await;
 
-    // Deterministic price feed: both tokens at the same USD price.
-    let mut prices: PriceSnapshot = HashMap::new();
-    prices.insert(token_a, PRICE_CENTS);
-    prices.insert(token_b, PRICE_CENTS);
-    let make_price = move |_token_map, _api_key| {
-        Ok(Box::new(MockPriceClient::new(prices)) as Box<dyn PriceClient + Send + Sync>)
-    };
+    // Deterministic prices: an in-process mock Binance quoting the pair's
+    // market, with the generated config's endpoints pointed at it.
+    let market = Market::new(
+        &art.binance_symbol,
+        &art.token_b.binance_asset,
+        &art.token_a.binance_asset,
+        MID_PRICE,
+        MID_PRICE,
+    );
+    let binance = MockBinance::start(vec![market], Default::default())
+        .await
+        .context("start mock Binance")?;
+    config.binance.stream_endpoints = [binance.ws_url(), binance.ws_url()];
+    config.binance.rest_endpoint = binance.rest_url();
 
     let factory: Arc<dyn solver::ClientFactory> = Arc::new(E2eFactory {
         ingest_store: art.solver_ingest_store_path.clone(),
@@ -106,7 +112,7 @@ pub async fn run(secs: u64) -> Result<()> {
     });
 
     tracing::info!(%solver_id, secs, "starting solver in-process against devnet (fixed prices)…");
-    let result = solver::start(factory, make_price, solver_id, config, cancel).await;
+    let result = solver::start(factory, solver_id, config, cancel).await;
 
     // Post-run balances → delta = spread captured = settlement proof.
     let (post_a, post_b) = read_solver_balances(&art, solver_id, token_a, token_b).await;

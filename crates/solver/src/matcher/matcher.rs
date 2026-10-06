@@ -1,60 +1,45 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use strum::{EnumCount, IntoEnumIterator};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
-use crate::clearing::{
-    self, ClearingConfig, ClearingError, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
-};
+use crate::clearing::{self, ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::PreciseSnapshot;
+use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
+    [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
 }
 
-/// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
-/// oracle prices pause clearing, but do not disable fixed-limit RFQ selection.
-pub struct ClearingRuntime {
-    pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
-    pub prices: watch::Receiver<PreciseSnapshot>,
-    pub pairs: Vec<(TokenId, TokenId)>,
-    pub config: ClearingConfig,
-    pub max_price_age_ms: u64,
-    pub max_source_age_ms: u64,
-    pub max_source_skew_ms: u64,
-    pub routing: Option<crate::router::Routing>,
+/// Pairs skipped for want of a usable price, per reason.
+pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
+    PriceUnavailable::iter().map(|reason| {
+        (
+            reason.into(),
+            PRICE_SKIPS[reason as usize].load(Ordering::Relaxed),
+        )
+    })
 }
 
-impl ClearingRuntime {
-    /// An order belongs to one unordered pair. Reject duplicate markets once,
-    /// so clearing needs no per-tick set to prevent double selection.
-    fn validate(&self) -> Result<(), ClearingError> {
-        self.config.validate()?;
-        let mut pairs = HashSet::with_capacity(self.pairs.len());
-        for &(base, quote) in &self.pairs {
-            if base == quote {
-                return Err(ClearingError::IdenticalPairAssets);
-            }
-            let pair = if base < quote {
-                (base, quote)
-            } else {
-                (quote, base)
-            };
-            if !pairs.insert(pair) {
-                return Err(ClearingError::DuplicatePair);
-            }
-        }
-        Ok(())
-    }
+/// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
+/// covers the pairs with a confirmed Binance market; a pair without a fresh
+/// price pauses alone. RFQ selection uses fixed note limits and needs no price.
+pub struct ClearingRuntime {
+    pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
+    pub prices: watch::Receiver<Arc<PriceSnapshot>>,
+    pub config: ClearingConfig,
+    pub routing: Option<crate::router::Routing>,
 }
 
 /// Apply lifecycle updates immediately; match the active book on timer ticks.
@@ -83,7 +68,7 @@ pub(super) async fn run_worker(
     mut runtime: ClearingRuntime,
 ) -> Result<(), MatcherError> {
     // Configuration is frozen for this worker; validate before admitting orders.
-    runtime.validate()?;
+    runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
     let mut book = ClearingBook::default();
     for order in &bootstrap.orders {
@@ -107,7 +92,7 @@ pub(super) async fn run_worker(
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
                 if executor_accepting(&exec_tx)? {
-                    internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now)?;
+                    internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
@@ -137,50 +122,19 @@ pub(super) fn executor_accepting(
     Ok(accepting)
 }
 
-fn fresh_reference_prices(
-    prices: &PreciseSnapshot,
-    base: TokenId,
-    quote: TokenId,
-    now_ms: u64,
-    max_observation_age_ms: u64,
-    max_source_age_ms: u64,
-    max_source_skew_ms: u64,
-) -> Option<(ReferencePrice, ReferencePrice)> {
-    let base_price = prices.get(&base)?;
-    let quote_price = prices.get(&quote)?;
-    let observed = base_price.observed_at_unix_ms;
-    if observed == 0
-        || observed != quote_price.observed_at_unix_ms
-        || now_ms.saturating_sub(observed) > max_observation_age_ms
-    {
-        return None;
-    }
-    let base_source = base_price.source_updated_at_unix_ms?;
-    let quote_source = quote_price.source_updated_at_unix_ms?;
-    if base_source == 0
-        || quote_source == 0
-        || base_source > now_ms
-        || quote_source > now_ms
-        || now_ms - base_source > max_source_age_ms
-        || now_ms - quote_source > max_source_age_ms
-        || base_source.abs_diff(quote_source) > max_source_skew_ms
-    {
-        return None;
-    }
-    Some((base_price.exact_reference?, quote_price.exact_reference?))
-}
-
 /// Solve all pairs from the live book using one frozen price snapshot and
-/// send the combined batch to the executor. A pair that fails to clear is
-/// logged and skipped; an empty batch sends nothing.
+/// send the combined batch to the executor. A pair without a usable price or
+/// that fails to clear is logged and skipped; an empty batch sends nothing.
 pub(super) fn internal_clear(
     book: &mut ClearingBook,
     decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
-    now_ms: u64,
 ) -> Result<(), MatcherError> {
+    // One snapshot and one clock reading for the whole tick: a later quote
+    // cannot reprice fills selected here or an in-flight settlement.
     let prices = runtime.prices.borrow().clone();
+    let now = Instant::now();
 
     // Each independently solvent pair stays indivisible when the executor
     // splits the combined tick into protocol-sized transactions.
@@ -189,30 +143,25 @@ pub(super) fn internal_clear(
         group_ends: Vec::new(),
     };
     let mut included_pairs = 0usize;
-    for &(base, quote) in &runtime.pairs {
-        let Some((base_price, quote_price)) = fresh_reference_prices(
-            &prices,
-            base,
-            quote,
-            now_ms,
-            runtime.max_price_age_ms,
-            runtime.max_source_age_ms,
-            runtime.max_source_skew_ms,
-        ) else {
-            continue;
+    // Each configured pair is one unordered market (checked when the plan was
+    // built), so no order can be selected twice in a tick.
+    for (base, quote) in prices.markets().clearing_pairs() {
+        let price = match prices.pair_price(base, quote, now) {
+            Ok(price) => price,
+            Err(reason) => {
+                PRICE_SKIPS[reason as usize].fetch_add(1, Ordering::Relaxed);
+                let reason: &'static str = reason.into();
+                tracing::debug!(%base, %quote, reason, "no usable Binance price; pair skipped");
+                continue;
+            }
         };
         let (Some(&base_decimals), Some(&quote_decimals)) =
             (decimals.get(&base), decimals.get(&quote))
         else {
             continue;
         };
-        let batch = clearing::BatchPrice::from_reference_prices(
-            base_price,
-            quote_price,
-            base_decimals,
-            quote_decimals,
-        )
-        .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config));
+        let batch = clearing::BatchPrice::from_pair_price(price, base_decimals, quote_decimals)
+            .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config));
         let batch = match batch {
             Ok(batch) => batch,
             Err(error) => {
@@ -299,7 +248,6 @@ pub(super) fn internal_clear(
 mod tests {
     use super::*;
     use crate::db;
-    use crate::price::PriceData;
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -314,49 +262,6 @@ mod tests {
     }
     fn ieth() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap()
-    }
-
-    #[test]
-    fn clearing_requires_one_fresh_exact_price_snapshot() {
-        let exact = ReferencePrice::from_decimal("2.01").unwrap();
-        let mut prices = PreciseSnapshot::new();
-        prices.insert(
-            imiden(),
-            PriceData {
-                usd: 2.01,
-                exact_reference: Some(exact),
-                source_updated_at_unix_ms: Some(1_000),
-                observed_at_unix_ms: 1_000,
-            },
-        );
-        prices.insert(
-            iusdt(),
-            PriceData {
-                usd: 1.0,
-                exact_reference: Some(ReferencePrice::from_decimal("1").unwrap()),
-                source_updated_at_unix_ms: Some(1_000),
-                observed_at_unix_ms: 1_000,
-            },
-        );
-        assert_eq!(
-            fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0),
-            Some((exact, ReferencePrice::from_decimal("1").unwrap()))
-        );
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_501, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().observed_at_unix_ms = 1_001;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().observed_at_unix_ms = 1_000;
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = Some(1_001);
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = None;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = Some(1_000);
-        prices.get_mut(&iusdt()).unwrap().exact_reference = None;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().exact_reference =
-            Some(ReferencePrice::from_decimal("1").unwrap());
-        prices.get_mut(&imiden()).unwrap().source_updated_at_unix_ms = Some(999);
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 1).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -416,7 +321,7 @@ mod tests {
         ];
         pool.write(move |conn| {
             for token in [imiden(), iusdt(), ieth()] {
-                db::postgres_db::register_token_tx(conn, token, None)?;
+                db::postgres_db::register_token_tx(conn, token)?;
                 db::postgres_db::set_token_metadata_tx(conn, token, Some(0), None)?;
             }
             let order_rows: Vec<_> = notes
@@ -439,36 +344,33 @@ mod tests {
         let decimals = [(imiden(), 0), (iusdt(), 0), (ieth(), 0)]
             .into_iter()
             .collect();
-        let mut prices = PreciseSnapshot::new();
-        for (token, decimal) in [(imiden(), "2"), (iusdt(), "1"), (ieth(), "2")] {
-            prices.insert(
-                token,
-                PriceData {
-                    usd: decimal.parse().unwrap(),
-                    exact_reference: Some(ReferencePrice::from_decimal(decimal).unwrap()),
-                    source_updated_at_unix_ms: Some(1_000),
-                    observed_at_unix_ms: 1_000,
-                },
-            );
-        }
-        let (_prices_tx, prices_rx) = watch::channel(prices);
+        // Both pairs at 2 quote per base, each quote received at its time.
+        let ttl = Duration::from_secs(30);
+        let prices = |miden_at: Instant, eth_at: Instant| {
+            Arc::new(PriceSnapshot::for_tests(
+                &[
+                    (imiden(), iusdt(), "2", miden_at),
+                    (ieth(), iusdt(), "2", eth_at),
+                ],
+                &[],
+                ttl,
+            ))
+        };
+        // A quote received a full TTL ago is stale.
+        let stale = Instant::now().checked_sub(ttl).unwrap();
+        let (prices_tx, prices_rx) = watch::channel(prices(stale, stale));
         let runtime = ClearingRuntime {
             bootstrap: oneshot::channel().1,
             prices: prices_rx,
-            pairs: vec![(imiden(), iusdt()), (ieth(), iusdt())],
             config: ClearingConfig::default(),
-            max_price_age_ms: 1_000,
-            max_source_age_ms: 1_000,
-            max_source_skew_ms: 0,
             routing: None,
         };
-        runtime.validate().unwrap();
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let clear = |book: &mut ClearingBook, exec_tx: &mpsc::Sender<ExecutionBatch>| {
             if executor_accepting(exec_tx).unwrap() {
-                internal_clear(book, &decimals, &runtime, exec_tx, 1_500).unwrap();
+                internal_clear(book, &decimals, &runtime, exec_tx).unwrap();
             }
         };
         assert!(matches!(
@@ -494,31 +396,54 @@ mod tests {
         );
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
+        let stale_skips = PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed);
         clear(&mut book, &exec_tx);
-        let execution = exec_rx.try_recv().unwrap();
-        assert_eq!(execution.filled_notes.len(), 4);
-        assert_eq!(execution.group_ends, vec![2, 4]);
-        for filled in &execution.filled_notes {
+        assert!(exec_rx.try_recv().is_err(), "a stale price must not clear");
+        assert_eq!(book.best_levels_snapshot().len(), 4);
+        assert!(
+            PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed)
+                >= stale_skips + 2
+        );
+
+        // Only the pair with a fresh quote clears; the other keeps its orders.
+        prices_tx.send_replace(prices(Instant::now(), stale));
+        clear(&mut book, &exec_tx);
+        let miden = exec_rx.try_recv().unwrap();
+        assert_eq!(miden.group_ends, vec![2]);
+        assert_eq!(book.best_levels_snapshot().len(), 2);
+        prices_tx.send_replace(prices(Instant::now(), Instant::now()));
+        clear(&mut book, &exec_tx);
+        let eth = exec_rx.try_recv().unwrap();
+        assert_eq!(eth.group_ends, vec![2]);
+        let sent: HashMap<_, _> = miden
+            .filled_notes
+            .iter()
+            .chain(&eth.filled_notes)
+            .map(|filled| (filled.note_id, filled))
+            .collect();
+        assert_eq!(sent.len(), 4);
+        for filled in sent.values() {
             let source = persisted
                 .iter()
                 .find(|order| order.id() == filled.note_id)
                 .unwrap();
             assert!(Arc::ptr_eq(&filled.note, &source.note));
         }
-        assert!(exec_rx.try_recv().is_err());
         assert!(book.best_levels_snapshot().is_empty());
         clear(&mut book, &exec_tx);
         assert!(
             exec_rx.try_recv().is_err(),
             "pending orders must not be dispatched twice"
         );
+        // Reactivated orders clear again, both pairs in one batch.
         for order in &persisted {
             book.insert(order).unwrap();
         }
         clear(&mut book, &exec_tx);
         let retried = exec_rx.try_recv().unwrap();
-        for (first, next) in execution.filled_notes.iter().zip(&retried.filled_notes) {
-            assert_eq!(first.note_id, next.note_id);
+        assert_eq!(retried.group_ends, vec![2, 4]);
+        for next in &retried.filled_notes {
+            let first = sent[&next.note_id];
             assert_eq!(first.arrival_unix, next.arrival_unix);
             assert!(Arc::ptr_eq(&first.note, &next.note));
         }
@@ -526,13 +451,8 @@ mod tests {
         // A full executor queue must not stop the worker from receiving a
         // committed book update. Once capacity returns, the next tick clears
         // only against the updated book.
-        let mut fresh_prices = runtime.prices.borrow().clone();
-        let observed_at = now_millis();
-        for data in fresh_prices.values_mut() {
-            data.observed_at_unix_ms = observed_at;
-            data.source_updated_at_unix_ms = Some(observed_at);
-        }
-        let (_fresh_prices_tx, fresh_prices_rx) = watch::channel(fresh_prices);
+        let (_fresh_prices_tx, fresh_prices_rx) =
+            watch::channel(prices(Instant::now(), Instant::now()));
         let (bootstrap_tx, bootstrap_rx) = oneshot::channel();
         let (book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -546,11 +466,7 @@ mod tests {
         let worker_runtime = ClearingRuntime {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
-            pairs: runtime.pairs.clone(),
             config: runtime.config,
-            max_price_age_ms: 30_000,
-            max_source_age_ms: 30_000,
-            max_source_skew_ms: 0,
             routing: None,
         };
         let removed_id = persisted[0].id();

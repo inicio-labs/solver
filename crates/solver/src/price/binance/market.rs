@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::clearing::BatchPrice;
@@ -54,7 +55,8 @@ fn validate_name(raw: &str, max_len: usize) -> Option<String> {
 }
 
 /// A Binance asset code such as `ETH`, `USDT` or `1000SATS` (upper case).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct AssetCode(String);
 
 impl AssetCode {
@@ -62,6 +64,20 @@ impl AssetCode {
         validate_name(raw, MAX_ASSET_LEN)
             .map(Self)
             .ok_or_else(|| MarketError::InvalidAssetCode(raw.to_owned()))
+    }
+}
+
+impl TryFrom<String> for AssetCode {
+    type Error = MarketError;
+
+    fn try_from(raw: String) -> Result<Self, MarketError> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<AssetCode> for String {
+    fn from(code: AssetCode) -> Self {
+        code.0
     }
 }
 
@@ -73,7 +89,8 @@ impl fmt::Display for AssetCode {
 
 /// A Binance Spot symbol such as `ETHUSDT` (upper case, as `bookTicker` and
 /// `exchangeInfo` spell it).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -96,6 +113,20 @@ impl Symbol {
     /// This symbol's stream in a combined-stream subscription.
     pub(crate) fn stream_name(&self) -> String {
         format!("{}@bookTicker", self.0.to_ascii_lowercase())
+    }
+}
+
+impl TryFrom<String> for Symbol {
+    type Error = MarketError;
+
+    fn try_from(raw: String) -> Result<Self, MarketError> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<Symbol> for String {
+    fn from(symbol: Symbol) -> Self {
+        symbol.0
     }
 }
 
@@ -478,6 +509,11 @@ impl Markets {
     /// Index of a subscribed symbol, spelled as `bookTicker` sends it.
     pub(crate) fn symbol_index(&self, name: &str) -> Option<usize> {
         self.index.get(name).copied()
+    }
+
+    /// Confirmed clearing pairs as configured, `(base, quote)`, in a stable order.
+    pub(crate) fn clearing_pairs(&self) -> impl Iterator<Item = (TokenId, TokenId)> + '_ {
+        self.pairs.keys().copied()
     }
 
     pub(crate) fn pair(&self, base: TokenId, quote: TokenId) -> Option<PairSource> {

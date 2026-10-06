@@ -1,11 +1,11 @@
 use crate::matching::direct_matching::run_direct_matching;
 use crate::matching::order_book::OrderBook;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use std::collections::HashSet;
 use super::{eth, usdc, sol, NoteIdGen};
 
-fn make_feed() -> WatchPriceFeed {
-    let mut feed = WatchPriceFeed::new();
+fn make_feed() -> FixedPriceFeed {
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed
@@ -97,7 +97,7 @@ fn surplus_to_protocol_balance() {
 
 #[test]
 fn multiple_pairs() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed.set_price_cents(sol(), 150);

@@ -291,9 +291,9 @@ impl PriceSnapshot {
 #[cfg(test)]
 impl PriceSnapshot {
     /// A snapshot as the feed would publish it, with quote TTL `ttl`. Each
-    /// clearing pair
-    /// `(base, quote, price, received_at)` gets a direct market quoting
-    /// `price` whole quote tokens per whole base token. Each valuation
+    /// clearing pair `(base, quote, price, received_at)` gets a direct market
+    /// quoting `price` whole quote tokens per whole base token; its tokens
+    /// have 0 decimals, so a base unit is a whole token. Each valuation
     /// `(token, Some((price, received_at)))` values a token in the valuation
     /// quote; `None` makes the token that quote asset itself, which may also
     /// appear in pairs.
@@ -302,23 +302,30 @@ impl PriceSnapshot {
         valuations: &[(TokenId, Option<(&str, Instant)>)],
         ttl: Duration,
     ) -> Self {
-        Self::build_for_tests(pairs, valuations, ttl, false)
+        let decimals = pairs
+            .iter()
+            .flat_map(|(base, quote, ..)| [(*base, 0), (*quote, 0)])
+            .collect();
+        Self::build_for_tests(pairs, valuations, decimals, ttl, false)
     }
 
-    /// Like [`Self::for_tests`], but every pair's symbol is listed the other
-    /// way round (Binance's base is the pair's quote), as `ETHUSDC` prices a
-    /// USDC/ETH pair. `price` is still whole quote tokens per whole base
-    /// token; the stream carries its reciprocal.
+    /// Like [`Self::for_tests`] with the tokens' `decimals`, but every pair's
+    /// symbol is listed the other way round (Binance's base is the pair's
+    /// quote), as `ETHUSDC` prices a USDC/ETH pair. `price` is still whole
+    /// quote tokens per whole base token; the stream carries `1 / price`.
     pub(crate) fn for_tests_reversed(
         pairs: &[(TokenId, TokenId, &str, Instant)],
+        decimals: &[(TokenId, u8)],
         ttl: Duration,
     ) -> Self {
-        Self::build_for_tests(pairs, &[], ttl, true)
+        let decimals = decimals.iter().copied().collect();
+        Self::build_for_tests(pairs, &[], decimals, ttl, true)
     }
 
     fn build_for_tests(
         pairs: &[(TokenId, TokenId, &str, Instant)],
         valuations: &[(TokenId, Option<(&str, Instant)>)],
+        decimals: std::collections::HashMap<TokenId, u8>,
         ttl: Duration,
         reversed: bool,
     ) -> Self {
@@ -343,7 +350,7 @@ impl PriceSnapshot {
         }
         let mut listings = HashMap::new();
         let mut quotes = Vec::new();
-        let mut list = |base: &AssetCode, quote: &AssetCode, mid: ReferencePrice, received_at| {
+        let mut list = |base: &AssetCode, quote: &AssetCode, mid: Decimal, received_at| {
             let symbol = Symbol::of_assets(base, quote);
             let listed = listing(&base.to_string(), &quote.to_string());
             assert!(
@@ -363,7 +370,7 @@ impl PriceSnapshot {
                     list(
                         &codes[quote],
                         &codes[base],
-                        price(mid).reciprocal(),
+                        Decimal::ONE / price(mid),
                         *received_at,
                     )
                 } else {
@@ -376,7 +383,9 @@ impl PriceSnapshot {
                 list(&codes[token], &quote_asset, price(mid), *received_at);
             }
         }
-        let plan = MarketPlan::new(codes, clearing, quote_asset).expect("valid test markets");
+        let plan = MarketPlan::new(codes, clearing, quote_asset)
+            .expect("valid test markets")
+            .with_decimals(decimals);
         let (markets, issues) = plan.resolve(&listings);
         // Tokens without a valuation have no valuation market listed.
         let unasked = |issue: &MarketIssue| match issue.use_ {

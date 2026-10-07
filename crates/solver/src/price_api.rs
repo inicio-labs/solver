@@ -35,7 +35,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::clearing::ReferencePrice;
 use crate::config::PricePrecision;
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::db::{self, DbPool};
@@ -183,15 +182,6 @@ fn precision_label(p: PricePrecision) -> String {
     }
 }
 
-/// The price at `p` decimal places; `Full` is exact up to 18 places.
-fn format_price(price: ReferencePrice, p: PricePrecision) -> Option<String> {
-    match p {
-        PricePrecision::Full => price.to_trimmed_decimal(18),
-        PricePrecision::Fixed(n) => price.to_fixed_decimal(n),
-    }
-    .ok()
-}
-
 fn resolve_precision(
     state: &PriceApiState,
     q: &HashMap<String, String>,
@@ -244,7 +234,7 @@ fn quote_from_row(
         faucet_id: account_id.to_hex(),
         ticker: row.ticker,
         vs_currency: state.vs_currency.clone(),
-        price: format_price(price, precision).ok_or(ApiError::Internal)?,
+        price: precision.format(price),
         precision: precision_label(precision),
         decimals,
         as_of,

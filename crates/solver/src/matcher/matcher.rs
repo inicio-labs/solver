@@ -1,6 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use strum::{EnumCount, IntoEnumIterator};
 use tokio::sync::mpsc::error::TrySendError;
@@ -9,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
-use crate::clearing::{self, ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
+use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::types::*;
@@ -17,11 +16,6 @@ use crate::types::*;
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
-/// Ticks on which a pair had a price but one of its tokens no on-chain
-/// decimals yet, so it could not clear.
-static MISSING_DECIMALS_SKIPS: AtomicU64 = AtomicU64::new(0);
-/// Pairs already reported for missing decimals, so the warning is logged once.
-static MISSING_DECIMALS_WARNED: Mutex<BTreeSet<(TokenId, TokenId)>> = Mutex::new(BTreeSet::new());
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
@@ -35,10 +29,6 @@ pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
             PRICE_SKIPS[reason as usize].load(Ordering::Relaxed),
         )
     })
-}
-
-pub(crate) fn missing_decimals_skips() -> u64 {
-    MISSING_DECIMALS_SKIPS.load(Ordering::Relaxed)
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
@@ -102,7 +92,7 @@ pub(super) async fn run_worker(
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
                 if executor_accepting(&exec_tx)? {
-                    internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx)?;
+                    internal_clear(&mut book, &runtime, &exec_tx)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
@@ -137,7 +127,6 @@ pub(super) fn executor_accepting(
 /// that fails to clear is logged and skipped; an empty batch sends nothing.
 pub(super) fn internal_clear(
     book: &mut ClearingBook,
-    decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
 ) -> Result<(), MatcherError> {
@@ -165,27 +154,9 @@ pub(super) fn internal_clear(
                 continue;
             }
         };
-        let (Some(&base_decimals), Some(&quote_decimals)) =
-            (decimals.get(&base), decimals.get(&quote))
-        else {
-            MISSING_DECIMALS_SKIPS.fetch_add(1, Ordering::Relaxed);
-            let first = MISSING_DECIMALS_WARNED
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert((base, quote));
-            if first {
-                tracing::warn!(
-                    %base,
-                    %quote,
-                    "pair has a price but a token without on-chain decimals; it cannot clear until \
-                     the metadata is fetched (restart after the node answers)"
-                );
-            }
-            continue;
-        };
-        let batch = clearing::BatchPrice::from_pair_price(price, base_decimals, quote_decimals)
-            .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config));
-        let batch = match batch {
+        // The price is already in base units: the market plan knows both
+        // tokens' decimals.
+        let batch = match book.build_pair_batch(base, quote, price, &runtime.config) {
             Ok(batch) => batch,
             Err(error) => {
                 tracing::error!(%base, %quote, %error, "clearing admission failed");
@@ -269,6 +240,8 @@ pub(super) fn internal_clear(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::db;
     use miden_protocol::account::AccountId;
@@ -364,9 +337,6 @@ mod tests {
         for order in &persisted {
             book.insert(order).unwrap();
         }
-        let decimals = [(imiden(), 0), (iusdt(), 0), (ieth(), 0)]
-            .into_iter()
-            .collect();
         // Both pairs at 2 quote per base, each quote received at its time.
         let ttl = Duration::from_secs(30);
         let prices = |miden_at: Instant, eth_at: Instant| {
@@ -393,7 +363,7 @@ mod tests {
         drop(closed_rx);
         let clear = |book: &mut ClearingBook, exec_tx: &mpsc::Sender<ExecutionBatch>| {
             if executor_accepting(exec_tx).unwrap() {
-                internal_clear(book, &decimals, &runtime, exec_tx).unwrap();
+                internal_clear(book, &runtime, exec_tx).unwrap();
             }
         };
         assert!(matches!(
@@ -504,10 +474,7 @@ mod tests {
                     worker_runtime,
                 ));
                 assert!(bootstrap_tx
-                    .send(ClearingBootstrap {
-                        orders: persisted,
-                        decimals,
-                    })
+                    .send(ClearingBootstrap { orders: persisted })
                     .is_ok());
                 snapshot_rx.changed().await.unwrap();
                 assert_eq!(snapshot_rx.borrow().len(), 4);
@@ -603,9 +570,8 @@ mod tests {
         let seller_id = notes[0].id();
         let buyer_id = notes[1].id();
         pool.write(move |conn| {
-            for (token, decimals) in [(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)] {
+            for token in [usdc, eth] {
                 db::postgres_db::register_token_tx(conn, token)?;
-                db::postgres_db::set_token_metadata_tx(conn, token, Some(decimals), None)?;
             }
             let order_rows: Vec<_> = notes
                 .iter()
@@ -627,13 +593,15 @@ mod tests {
             }
             book
         };
-        let (_prices_tx, prices_rx) = watch::channel(Arc::new(PriceSnapshot::for_tests_reversed(
-            &[(usdc, eth, "0.0004", Instant::now())],
-            Duration::from_secs(30),
-        )));
-        let runtime = ClearingRuntime {
+        // The market plan carries the tokens' decimals.
+        let runtime = |decimals: &[(TokenId, u8)]| ClearingRuntime {
             bootstrap: oneshot::channel().1,
-            prices: prices_rx,
+            prices: watch::channel(Arc::new(PriceSnapshot::for_tests_reversed(
+                &[(usdc, eth, "0.0004", Instant::now())],
+                decimals,
+                Duration::from_secs(30),
+            )))
+            .1,
             config: ClearingConfig::default(),
             routing: None,
         };
@@ -641,11 +609,9 @@ mod tests {
 
         // Right decimals: both orders cross within 0.1% of the market, so each
         // receives at least what it asked and at most the market's value.
-        let decimals = [(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)]
-            .into_iter()
-            .collect();
+        let right_decimals = runtime(&[(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)]);
         let mut right = book();
-        internal_clear(&mut right, &decimals, &runtime, &exec_tx).unwrap();
+        internal_clear(&mut right, &right_decimals, &exec_tx).unwrap();
         let batch = exec_rx.try_recv().expect("the pair clears");
         assert_eq!(batch.group_ends, vec![2]);
         let filled: HashMap<_, _> = batch
@@ -665,11 +631,9 @@ mod tests {
         );
 
         // Swapped decimals: the price is wrong by 10^24 and nothing is eligible.
-        let swapped = [(usdc, ETH_DECIMALS), (eth, USDC_DECIMALS)]
-            .into_iter()
-            .collect();
+        let swapped = runtime(&[(usdc, ETH_DECIMALS), (eth, USDC_DECIMALS)]);
         let mut wrong = book();
-        internal_clear(&mut wrong, &swapped, &runtime, &exec_tx).unwrap();
+        internal_clear(&mut wrong, &swapped, &exec_tx).unwrap();
         assert!(
             exec_rx.try_recv().is_err(),
             "swapped decimals must not produce a batch"

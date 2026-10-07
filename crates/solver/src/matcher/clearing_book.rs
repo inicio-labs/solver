@@ -12,7 +12,6 @@ use crate::types::{BookOrder, BookUpdate, TokenId};
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
     pub orders: Vec<BookOrder>,
-    pub decimals: HashMap<TokenId, u8>,
 }
 
 /// Live ingestion and startup hydration reject zero amounts before admission.
@@ -421,7 +420,6 @@ mod tests {
         assert!(bootstrap_tx
             .send(ClearingBootstrap {
                 orders: vec![order.clone()],
-                decimals: HashMap::new(),
             })
             .is_ok());
         // No price snapshot: direct clearing cannot match, but RFQ still can.
@@ -478,7 +476,6 @@ mod tests {
         assert!(bootstrap_tx
             .send(ClearingBootstrap {
                 orders: vec![seller.clone(), buyer.clone()],
-                decimals: [(pair.0, 0), (pair.1, 0)].into_iter().collect(),
             })
             .is_ok());
         let (_, prices_rx) = watch::channel(Arc::new(crate::price::PriceSnapshot::for_tests(
@@ -695,10 +692,7 @@ mod tests {
     async fn clearer_propagates_closed_update_channel() {
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
         assert!(bootstrap_tx
-            .send(ClearingBootstrap {
-                orders: Vec::new(),
-                decimals: HashMap::new(),
-            })
+            .send(ClearingBootstrap { orders: Vec::new() })
             .is_ok());
         let (_price_tx, prices) = watch::channel(Arc::new(crate::price::PriceSnapshot::default()));
         let runtime = ClearingRuntime {
@@ -814,7 +808,6 @@ mod tests {
         assert!(bootstrap_tx
             .send(ClearingBootstrap {
                 orders: vec![seller.clone()],
-                decimals: [(base, 0), (quote, 0)].into_iter().collect(),
             })
             .is_ok());
         let first = tokio::time::timeout(Duration::from_secs(1), exec_rx.recv())

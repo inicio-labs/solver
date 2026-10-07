@@ -3,7 +3,7 @@ use ruint::aliases::U256;
 use rust_decimal::Decimal;
 
 use super::config::PPM_DENOMINATOR;
-use super::types::{BatchPrice, ClearingError, ReferencePrice};
+use super::types::{BatchPrice, ClearingError};
 
 pub(crate) trait WideOperand {
     fn wide(self) -> U256;
@@ -81,61 +81,6 @@ pub(crate) fn ppm_floor(gross: U256, rate_ppm: u32) -> Result<U256, ClearingErro
     mul_div_floor(gross, rate_ppm, PPM_DENOMINATOR)
 }
 
-impl ReferencePrice {
-    pub fn from_ratio(numerator: u64, denominator: u64) -> Result<Self, ClearingError> {
-        Self::new(U256::from(numerator), U256::from(denominator))
-    }
-
-    fn new(numerator: U256, denominator: U256) -> Result<Self, ClearingError> {
-        if numerator == U256::ZERO || denominator == U256::ZERO {
-            return Err(ClearingError::InvalidOraclePrice);
-        }
-        let common = numerator.gcd(denominator);
-        Ok(Self {
-            numerator: numerator / common,
-            denominator: denominator / common,
-        })
-    }
-
-    /// Parse a provider's decimal string exactly, e.g. Binance's
-    /// `"123.45000000"`. Exponents, signs, and zero are rejected.
-    ///
-    /// A decimal with `places` digits after the point is an integer over
-    /// `10^places`: `"123.45"` is `12345 / 100`. So the fraction is
-    /// `(whole_part × 10^places + fractional_part) / 10^places`, built from
-    /// two integers and never rounded; [`Self::new`] then reduces it
-    /// (`12345 / 100` becomes `2469 / 20`).
-    pub fn from_decimal(raw: &str) -> Result<Self, ClearingError> {
-        let (whole_text, fraction_text) = match raw.split_once('.') {
-            Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
-            Some(_) => return Err(ClearingError::InvalidOraclePrice),
-            None => (raw, ""),
-        };
-        let all_digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
-        if whole_text.is_empty() || !all_digits(whole_text) || !all_digits(fraction_text) {
-            return Err(ClearingError::InvalidOraclePrice);
-        }
-        fn invalid<E>(_: E) -> ClearingError {
-            ClearingError::InvalidOraclePrice
-        }
-        // An empty fractional part ("123") is zero; otherwise base 10.
-        let integer_of = |text: &str| {
-            if text.is_empty() {
-                Ok(U256::ZERO)
-            } else {
-                U256::from_str_radix(text, 10).map_err(invalid)
-            }
-        };
-        let places = u8::try_from(fraction_text.len()).map_err(invalid)?;
-        let scale = power_of_ten(places).map_err(invalid)?;
-        let numerator = checked_mul(integer_of(whole_text)?, scale)
-            .map_err(invalid)?
-            .checked_add(integer_of(fraction_text)?)
-            .ok_or(ClearingError::InvalidOraclePrice)?;
-        Self::new(numerator, scale)
-    }
-}
-
 impl BatchPrice {
     pub fn from_ratio(quote_units: u64, base_units: u64) -> Result<Self, ClearingError> {
         Self::new(U256::from(quote_units), U256::from(base_units))
@@ -202,53 +147,17 @@ impl BatchPrice {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pair_price_uses_token_decimals() {
-        let btc = ReferencePrice::from_decimal("100000.00000000").unwrap();
-        let price = BatchPrice::from_pair_price(btc, 8, 6).unwrap();
-        assert_eq!(price.quote_units, U256::from(1_000u64));
-        assert_eq!(price.base_units, U256::ONE);
-    }
-
-    #[test]
-    fn decimal_input_is_exact() {
-        let price = ReferencePrice::from_decimal("0.00012500").unwrap();
-        assert_eq!(price.numerator, U256::ONE);
-        assert_eq!(price.denominator, U256::from(8_000u64));
-        assert_eq!(
-            ReferencePrice::from_decimal("00.10").unwrap(),
-            decimal("0.1")
-        );
-        let too_many_places = format!("1.{}", "0".repeat(78));
-        for invalid in [
-            "0",
-            "0.0",
-            "-1",
-            "+1",
-            "",
-            " 1",
-            "1 ",
-            "1e4",
-            "1.",
-            ".1",
-            "1.2.3",
-            "１",
-            "0x10",
-            too_many_places.as_str(),
-        ] {
-            assert!(
-                ReferencePrice::from_decimal(invalid).is_err(),
-                "{invalid:?}"
-            );
-        }
-    }
-
-    fn decimal(raw: &str) -> ReferencePrice {
-        ReferencePrice::from_decimal(raw).unwrap()
-    }
-
     fn dec(raw: &str) -> Decimal {
         Decimal::from_str_exact(raw).unwrap()
+    }
+
+    #[test]
+    fn whole_price_uses_token_decimals() {
+        // 100000 USDT (6 decimals) per BTC (8 decimals): 1000 USDT units per
+        // BTC unit.
+        let price = BatchPrice::from_whole_price(dec("100000.00000000"), 8, 6).unwrap();
+        assert_eq!(price.quote_units, U256::from(1_000u64));
+        assert_eq!(price.base_units, U256::ONE);
     }
 
     #[test]

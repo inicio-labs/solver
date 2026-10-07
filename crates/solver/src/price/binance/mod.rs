@@ -21,4 +21,4 @@ pub use market::{AssetCode, MarketError, Symbol};
 pub(crate) use market::{ClearingMarket, MarketPlan};
 pub use snapshot::PriceSnapshot;
 pub(crate) use snapshot::{PriceUnavailable, Valued};
-pub(crate) use ticker::QuoteLimits;
+pub(crate) use ticker::{parse_positive_decimal, QuoteLimits};

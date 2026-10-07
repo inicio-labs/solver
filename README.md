@@ -222,7 +222,10 @@ does not list, lists with other assets, or lists with spot trading disallowed
 is rejected and logged; it stays unavailable until the configuration changes.
 A symbol in a temporary state (`BREAK`, `HALT`) is subscribed and reported as a
 warning: its book sends nothing until trading resumes, so the TTL pauses the
-pair, and it resumes on its own. Any other answer (a network failure, a rate
+pair, and it resumes on its own. A clearing pair also needs both tokens'
+on-chain decimals, which startup reads from the database once ingest has
+fetched them: a pair whose token has none yet is rejected and logged, and
+clears after a restart. Any other answer (a network failure, a rate
 limit, a server error, a 404 from a wrong path, a maintenance page) is retried.
 When the validation timeout passes with at least one market confirmed, the
 readers start with the confirmed set and the rest keep being retried in the
@@ -324,7 +327,7 @@ clears crossing orders between the two tokens automatically.
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
 - `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if a PostgreSQL read answers, the writer still holds its ownership lock, and the last sync is recent; otherwise 503. The schema is verified once at startup.
-- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="a"|"b"}`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_lookup_failures_total`, `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_markets{state="confirmed"|"pending"|"rejected"|"halted"}`, `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`) and `solver_matcher_missing_decimals_skips_total`.
+- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="a"|"b"}`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_lookup_failures_total`, `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_markets{state="confirmed"|"pending"|"rejected"|"halted"}`, `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`).
   Suggested alerts: `solver_price_quote_fresh == 0` for a configured symbol longer than a few TTLs; `solver_price_feed_connected == 0` on both readers; `solver_price_feed_markets{state="rejected"} > 0` (configuration); `solver_price_feed_conflicting_updates_total` rising (endpoint divergence); `rate(solver_matcher_price_skips_total{reason="stale"})` while orders wait.
 
 ---

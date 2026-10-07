@@ -7,7 +7,7 @@ mod binance;
 #[cfg(test)]
 pub(crate) use binance::test_support;
 pub(crate) use binance::{
-    spawn_price_feed_thread, ClearingMarket, FeedConfig, MarketPlan, PriceUnavailable, QuoteLimits,
-    RetryPolicy, Valued,
+    parse_positive_decimal, spawn_price_feed_thread, ClearingMarket, FeedConfig, MarketPlan,
+    PriceUnavailable, QuoteLimits, RetryPolicy, Valued,
 };
 pub use binance::{AssetCode, FeedMetrics, MarketError, PriceSnapshot, Symbol};

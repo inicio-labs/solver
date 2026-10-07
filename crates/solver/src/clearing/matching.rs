@@ -180,7 +180,7 @@ mod tests {
     use ruint::aliases::U256;
     use std::sync::Arc;
 
-    use crate::clearing::{PairAmounts, ReferencePrice};
+    use crate::clearing::PairAmounts;
     use crate::matching::types::RateKey;
     use crate::types::BookOrder;
 
@@ -318,8 +318,7 @@ mod tests {
                 .priority_sequence(),
             7
         );
-        let price =
-            BatchPrice::from_pair_price(ReferencePrice::from_decimal("2").unwrap(), 0, 0).unwrap();
+        let price = BatchPrice::from_ratio(2, 1).unwrap();
         let orders = vec![Order::from_book_order(&ingested).unwrap()];
         let input = batch(price, &orders);
         assert_eq!(input.orders().count(), 1);
@@ -745,8 +744,7 @@ mod tests {
                 }
             })
             .collect();
-        let price =
-            BatchPrice::from_pair_price(ReferencePrice::from_decimal("2").unwrap(), 0, 0).unwrap();
+        let price = BatchPrice::from_ratio(2, 1).unwrap();
         let parsed = ingested
             .iter()
             .map(Order::from_book_order)

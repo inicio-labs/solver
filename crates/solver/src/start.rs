@@ -370,10 +370,20 @@ pub async fn start(
     // 12a. PRICE-FEED THREAD: Binance readers and publisher on their own
     //      runtime. Every pair stays paused until markets are confirmed and
     //      fresh quotes arrive. The thread cancels `cancel` when it ends, so a
-    //      feed failure stops the solver.
+    //      feed failure stops the solver. Pair prices are in base units, so
+    //      the plan takes the tokens' on-chain decimals, which ingest startup
+    //      has just recorded; a pair whose token has none is reported and
+    //      stays paused until a restart.
+    let decimals = match db_pool.read(db::postgres_db::load_token_decimals_tx).await {
+        Ok(decimals) => decimals,
+        Err(error) => {
+            let error = anyhow::Error::from(error).context("load token decimals");
+            return Err(abort_startup(&cancel, threads, error).await);
+        }
+    };
     let spawned = spawn_price_feed_thread(
         config.binance.feed_config(),
-        market_plan,
+        market_plan.with_decimals(decimals),
         channels.prices_tx,
         feed_metrics,
         cancel.clone(),

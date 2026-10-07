@@ -11,7 +11,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::clearing::{BatchPrice, ReferencePrice};
+use rust_decimal::Decimal;
+
+use crate::clearing::BatchPrice;
+use crate::config::PricePrecision;
 use crate::matching::types::BestLevel;
 use crate::types::{TokenId, UnixSecs};
 
@@ -123,18 +126,18 @@ pub fn eval_off_market(
     d_a: Option<u8>,
     requested_b: u64,
     d_b: Option<u8>,
-    market: Option<ReferencePrice>,
+    market: Option<Decimal>,
     tol_bps: u64,
 ) -> (Option<bool>, Option<String>) {
     let Some(market) = market else {
         return (None, None);
     };
-    let market_price = market.to_trimmed_decimal(18).ok();
+    let market_price = Some(PricePrecision::Full.format(market));
     let (Some(d_a), Some(d_b)) = (d_a, d_b) else {
         return (None, market_price);
     };
     // On overflow → unknown (conservative).
-    let off = BatchPrice::from_pair_price(market, d_a, d_b)
+    let off = BatchPrice::from_whole_price(market, d_a, d_b)
         .and_then(|price| price.exceeds(offered_a, requested_b, tol_bps))
         .ok();
     (off, market_price)
@@ -226,8 +229,8 @@ mod tests {
 
     // ── eval_off_market (asymmetric decimals) ─────────────────────────────
     // 1 A (8 decimals) = 2 B (6 decimals) at the market midpoint.
-    fn two() -> Option<ReferencePrice> {
-        Some(ReferencePrice::from_decimal("2").unwrap())
+    fn two() -> Option<Decimal> {
+        Some(Decimal::TWO)
     }
 
     #[test]
@@ -278,8 +281,8 @@ mod tests {
     }
 
     #[test]
-    fn market_price_is_rounded_to_eight_places() {
-        let third = ReferencePrice::from_ratio(1, 3).ok();
+    fn market_price_is_rounded_to_eighteen_places() {
+        let third = Some(Decimal::ONE / Decimal::from(3));
         let (_, mkt) = eval_off_market(1, Some(0), 1, Some(0), third, 0);
         assert_eq!(mkt.as_deref(), Some("0.333333333333333333"));
     }

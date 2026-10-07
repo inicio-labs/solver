@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use miden_protocol::account::AccountId;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::clearing::ReferencePrice;
 use crate::price::{
-    AssetCode, ClearingMarket, FeedConfig, MarketError, MarketPlan, QuoteLimits, RetryPolicy,
-    Symbol,
+    parse_positive_decimal, AssetCode, ClearingMarket, FeedConfig, MarketError, MarketPlan,
+    QuoteLimits, RetryPolicy, Symbol,
 };
 use crate::types::TokenId;
 
@@ -296,6 +296,22 @@ impl PricePrecision {
         }
         s.parse::<u8>().ok().filter(|n| *n <= 18).map(Self::Fixed)
     }
+
+    /// `price` as a decimal string, rounded half up: `Full` keeps up to 18
+    /// places without trailing zeros, `Fixed(n)` exactly `n` places.
+    pub fn format(self, price: Decimal) -> String {
+        let places = match self {
+            Self::Full => 18,
+            Self::Fixed(places) => u32::from(places),
+        };
+        let mut rounded =
+            price.round_dp_with_strategy(places, RoundingStrategy::MidpointAwayFromZero);
+        match self {
+            Self::Full => rounded = rounded.normalize(),
+            Self::Fixed(_) => rounded.rescale(places),
+        }
+        rounded.to_string()
+    }
 }
 
 fn default_admin_port() -> u16 {
@@ -506,8 +522,8 @@ impl BinanceConfig {
             return Err(ConfigError::SpreadTooWide(self.max_spread_bps));
         }
         if let Some(raw) = &self.min_notional {
-            ReferencePrice::from_decimal(raw)
-                .map_err(|_| ConfigError::InvalidMinNotional(raw.clone()))?;
+            parse_positive_decimal(raw)
+                .ok_or_else(|| ConfigError::InvalidMinNotional(raw.clone()))?;
         }
         if self.idle_timeout_ms < 2 * BINANCE_PING_INTERVAL_MS {
             return Err(ConfigError::IdleTimeoutTooShort {
@@ -551,7 +567,7 @@ impl BinanceConfig {
                 min_notional: self
                     .min_notional
                     .as_deref()
-                    .and_then(|raw| ReferencePrice::from_decimal(raw).ok()),
+                    .and_then(parse_positive_decimal),
             },
             quote_ttl: Duration::from_millis(self.quote_ttl_ms),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
@@ -888,7 +904,7 @@ mod tests {
         config.binance.min_notional = Some("5000".into());
         assert_eq!(
             config.binance.feed_config().limits.min_notional,
-            Some(ReferencePrice::from_decimal("5000").unwrap())
+            Some(Decimal::from(5000))
         );
     }
 

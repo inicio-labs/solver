@@ -380,13 +380,7 @@ async fn reconcile_clearing_book(
     pool: &db::DbPool,
     client: &mut dyn MidenClient,
 ) -> Result<matcher::ClearingBootstrap> {
-    let (mut orders, decimals) = pool
-        .read(|conn| {
-            let orders = db::postgres_db::load_active_orders_tx(conn)?;
-            let decimals = db::postgres_db::load_token_decimals_tx(conn)?;
-            Ok((orders, decimals))
-        })
-        .await?;
+    let mut orders = pool.read(db::postgres_db::load_active_orders_tx).await?;
     let notes: Vec<_> = orders
         .iter()
         .map(|order| order.note.as_ref().clone())
@@ -403,7 +397,7 @@ async fn reconcile_clearing_book(
         .await?;
         orders.retain(|order| !consumed.contains(&order.id()));
     }
-    Ok(matcher::ClearingBootstrap { orders, decimals })
+    Ok(matcher::ClearingBootstrap { orders })
 }
 
 #[cfg(test)]
@@ -482,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn clearing_bootstrap_removes_consumed_notes_and_preserves_fifo_and_decimals() {
+    async fn clearing_bootstrap_removes_consumed_notes_and_preserves_fifo() {
         let test_db = TestDb::new().await.unwrap();
         let pool = &test_db.pool;
         let ids = persist_clearing_notes(pool).await;
@@ -496,7 +490,6 @@ mod tests {
         assert_eq!(bootstrap.orders.len(), 1);
         assert_eq!(bootstrap.orders[0].id(), ids[1]);
         assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
-        assert_eq!(bootstrap.decimals.get(&test_token_a()), Some(&6));
         assert_eq!(
             pool.read(db::postgres_db::load_active_orders_tx)
                 .await
@@ -704,5 +697,11 @@ mod tests {
             .unwrap();
         assert_eq!(row.decimals, Some(8));
         assert_eq!(row.ticker.as_deref(), Some("MTA"));
+        // Startup hands these decimals to the Binance market plan.
+        let decimals = pool
+            .read(db::postgres_db::load_token_decimals_tx)
+            .await
+            .unwrap();
+        assert_eq!(decimals.get(&token_a), Some(&8));
     }
 }

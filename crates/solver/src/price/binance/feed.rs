@@ -158,6 +158,8 @@ pub(crate) enum FeedError {
         "Binance did not answer for {pending} symbol(s) within the validation timeout: {error}"
     )]
     BinanceUnreachable { pending: usize, error: String },
+    #[error("exchangeInfo lookup for {symbol} cannot succeed: {error}")]
+    LookupFailed { symbol: Symbol, error: String },
     #[error("every price receiver is gone")]
     OutputClosed,
     #[error("a reader channel closed")]
@@ -321,8 +323,11 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, FeedError> {
 }
 
 /// Look every configured symbol up through `exchangeInfo` and resolve the
-/// markets. A failed lookup is retried with backoff, respecting Binance's
-/// cooldowns, until the validation timeout. Binance's own answers are final:
+/// markets. A lookup that failed for a temporary reason (network, timeout,
+/// rate limit, Binance 5xx) is retried with backoff, respecting Binance's
+/// cooldowns, until the validation timeout; any other failure (a wrong path,
+/// a bad request, an unreadable answer) fails startup at once. Binance's own
+/// answers are final:
 /// any rejected market fails startup, listed with all the others. A market
 /// that is temporarily not trading is subscribed with a warning. `None` when
 /// cancelled.
@@ -366,6 +371,12 @@ async fn confirm_markets(
                 }
                 Ok(Some(Err(error))) => {
                     metrics.lookup_failures.fetch_add(1, Ordering::Relaxed);
+                    if !error.is_transient() {
+                        return Err(FeedError::LookupFailed {
+                            symbol,
+                            error: error.to_string(),
+                        });
+                    }
                     if error.is_rate_limited() {
                         gate.cool_down(error.retry_after().unwrap_or_else(|| backoff.next()));
                     }

@@ -51,7 +51,7 @@ fn quoted(text: &str) -> String {
     }
 }
 
-/// A failed lookup. Startup retries every kind until its timeout.
+/// A failed lookup; startup retries it only if [`LookupError::is_transient`].
 #[derive(Debug, Error)]
 pub(super) enum LookupError {
     #[error("exchangeInfo request failed: {0}")]
@@ -87,6 +87,22 @@ impl LookupError {
     pub(super) fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited { .. })
             || matches!(self, Self::Status(status) if *status == StatusCode::FORBIDDEN)
+    }
+
+    /// Whether a retry can help: the network or Binance is temporarily
+    /// unwell (a network failure or timeout, a rate limit after its wait,
+    /// Binance's WAF, 408, or a server error). Anything else, such as a wrong
+    /// path (404), a bad request or an unreadable body, will not change.
+    pub(super) fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(_) | Self::RateLimited { .. } => true,
+            Self::Status(status) => {
+                status.is_server_error()
+                    || *status == StatusCode::FORBIDDEN
+                    || *status == StatusCode::REQUEST_TIMEOUT
+            }
+            Self::InvalidRequest { .. } | Self::TooLarge(_) | Self::Malformed(_) => false,
+        }
     }
 }
 
@@ -288,6 +304,7 @@ mod tests {
             let error = lookup(ResponseTemplate::new(status).insert_header("Retry-After", "7"))
                 .await
                 .unwrap_err();
+            assert!(error.is_transient(), "{error}");
             assert!(error.is_rate_limited());
             assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
         }
@@ -307,11 +324,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unusable_answers_are_lookup_errors() {
+    async fn only_a_temporary_failure_is_transient() {
         for status in [403, 408, 500, 503] {
-            assert!(lookup(ResponseTemplate::new(status)).await.is_err());
+            let error = lookup(ResponseTemplate::new(status)).await.unwrap_err();
+            assert!(error.is_transient(), "{error}");
         }
-        let unusable = [
+        let permanent = [
             ResponseTemplate::new(404),
             ResponseTemplate::new(200).set_body_string("not json"),
             listed(vec![]),
@@ -320,8 +338,9 @@ mod tests {
             listed(vec![entry("ETHUSDT", "ETH-2")]),
             ResponseTemplate::new(200).set_body_string("x".repeat(MAX_BODY_BYTES + 1)),
         ];
-        for response in unusable {
-            assert!(lookup(response).await.is_err());
+        for response in permanent {
+            let error = lookup(response).await.unwrap_err();
+            assert!(!error.is_transient(), "{error}");
         }
         // A status that is not an upper-case word cannot reach the logs.
         let mut forged = entry("ETHUSDT", "ETH");

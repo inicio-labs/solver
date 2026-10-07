@@ -322,20 +322,21 @@ async fn lookups_retry_transient_failures_and_honour_retry_after() {
     feed.stop().await;
 }
 
-/// A wrong answer from the endpoint (a 404 here, or a maintenance page) is
-/// retried; only Binance's own answer about a symbol rejects a market.
+/// A failure a retry cannot fix (a 404 from a wrong path here) fails startup
+/// at once instead of waiting out the validation timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_endpoint_error_is_retried_not_treated_as_a_rejection() {
+async fn a_lookup_that_cannot_succeed_fails_startup_at_once() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
-    mock.fail_rest(Failure {
-        status: 404,
-        retry_after_secs: None,
-    });
-    let mut feed = Running::start(config(&mock));
-    feed.until(|snapshot| eth_usdt(snapshot).is_ok() && btc_value(snapshot).is_ok())
-        .await;
-    assert_eq!(feed.counter(|m| &m.lookup_failures), 1);
-    feed.stop().await;
+    let mut config = config_for(&mock.ws_url(), &format!("{}/nowhere", mock.rest_url()));
+    config.validation_timeout = Duration::from_secs(600);
+    let started = Instant::now();
+    let error = Running::start(config).startup_error().await;
+    assert!(matches!(error, FeedError::LookupFailed { .. }), "{error:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited for the timeout"
+    );
+    assert_eq!(mock.connections_total(), 0);
 }
 
 /// A lookup that still fails at the validation timeout fails startup.
@@ -359,16 +360,6 @@ async fn a_symbol_without_an_answer_fails_startup_at_the_timeout() {
         "{error:?}"
     );
     assert_eq!(mock.connections_total(), 0);
-
-    // A wrong REST path answers nothing useful for any symbol.
-    let mock = MockBinance::start(markets(), fast()).await.unwrap();
-    let mut config = config_for(&mock.ws_url(), &format!("{}/nowhere", mock.rest_url()));
-    config.validation_timeout = Duration::from_millis(300);
-    let error = Running::start(config).startup_error().await;
-    assert!(
-        matches!(error, FeedError::BinanceUnreachable { pending: 2, .. }),
-        "{error:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

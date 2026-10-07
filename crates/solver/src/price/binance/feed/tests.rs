@@ -1228,3 +1228,22 @@ async fn live_binance_endpoints_publish_exact_prices() {
     assert_eq!(metrics.conflicting_updates.load(Ordering::Relaxed), 0);
     feed.stop().await;
 }
+
+/// With no market configured there is nothing to subscribe: the feed reports
+/// ready, opens no connection, and stays up until cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_market_configured_the_feed_idles_without_connecting() {
+    let mock = MockBinance::start(Vec::new(), fast()).await.unwrap();
+    let plan = MarketPlan::new(
+        Vec::new(),
+        Vec::new(),
+        crate::price::binance::test_support::asset("USDT"),
+    )
+    .unwrap();
+    let feed = Running::start_with_plan(config(&mock), plan);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!feed.task.is_finished());
+    assert_eq!(mock.connections_total(), 0);
+    assert_eq!(feed.latest().quotes().count(), 0);
+    feed.stop().await;
+}

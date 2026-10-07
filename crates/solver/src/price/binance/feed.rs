@@ -617,6 +617,12 @@ pub(super) async fn run_feed(
     output
         .send(Arc::new(book.clone()))
         .map_err(|_| FeedError::OutputClosed)?;
+    if markets.symbols().is_empty() {
+        // Nothing to subscribe: connecting would only spend the budget.
+        tracing::warn!("no Binance market configured; every pair stays unpriced");
+        cancel.cancelled().await;
+        return Ok(());
+    }
 
     // Stopping one task stops the others; the solver's token stops them all.
     let stop = cancel.child_token();

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use mock_binance::{Failure, Market, MockBinance, MockThread, Settings, Updates};
 use rust_decimal::Decimal;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -70,6 +70,7 @@ fn config(mock: &MockBinance) -> FeedConfig {
 
 struct Running {
     snapshots: watch::Receiver<Arc<PriceSnapshot>>,
+    ready: oneshot::Receiver<Result<(), String>>,
     metrics: Arc<FeedMetrics>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), FeedError>>,
@@ -84,15 +85,18 @@ impl Running {
         let (output, snapshots) = watch::channel(Arc::new(PriceSnapshot::default()));
         let metrics = Arc::new(FeedMetrics::default());
         let cancel = CancellationToken::new();
+        let (ready_tx, ready) = oneshot::channel();
         let task = tokio::spawn(run_feed(
             config,
             plan,
             output,
             metrics.clone(),
             cancel.clone(),
+            ready_tx,
         ));
         Self {
             snapshots,
+            ready,
             metrics,
             cancel,
             task,
@@ -115,6 +119,21 @@ impl Running {
 
     fn counter(&self, counter: impl Fn(&FeedMetrics) -> &AtomicU64) -> u64 {
         counter(&self.metrics).load(Ordering::Relaxed)
+    }
+
+    /// The startup error: the outcome sent on `ready` and the feed's result.
+    async fn startup_error(self) -> FeedError {
+        let ready = tokio::time::timeout(WAIT, self.ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(WAIT, self.task)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = result.expect_err("startup must fail");
+        assert_eq!(ready, Err(error.to_string()));
+        error
     }
 
     async fn stop(self) {
@@ -182,9 +201,7 @@ async fn publishes_validated_quotes_from_both_readers() {
                 .all(|frames| frames.load(Ordering::Relaxed) > 0)
     })
     .await;
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 0);
     assert_eq!(feed.counter(|m| &m.markets_confirmed), 2);
-    assert_eq!(feed.counter(|m| &m.markets_pending), 0);
     // A quote change reaches the snapshot exactly.
     mock.set_quote("ETHUSDT", "3000", "3000.02");
     feed.until(|snapshot| eth_usdt(snapshot) == Ok(price("3000.01")))
@@ -229,28 +246,39 @@ async fn each_reader_alone_supplies_prices_and_the_highest_id_wins() {
     feed.stop().await;
 }
 
+/// Every market Binance rejects is listed in one startup error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_symbol_is_reported_alone() {
+async fn rejected_markets_fail_startup_with_the_full_list() {
+    // BTCUSDT is unknown: BTC's valuation is rejected.
     let mock = MockBinance::start(vec![markets().remove(0)], fast())
         .await
         .unwrap();
-    let mut feed = Running::start(config(&mock));
-    let snapshot = feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
-    assert_eq!(btc_value(&snapshot), Err(PriceUnavailable::NoMarket));
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 1);
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 1);
-    feed.stop().await;
+    let error = Running::start(config(&mock)).startup_error().await;
+    let FeedError::MarketsRejected(list) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(list.contains("BTCUSDT"), "{list}");
+    assert_eq!(mock.connections_total(), 0);
+
+    // Nothing listed: ETHUSDT for clearing and for ETH's valuation, BTCUSDT
+    // for BTC's, all in one error.
+    let mock = MockBinance::start(Vec::new(), fast()).await.unwrap();
+    let error = Running::start(config(&mock)).startup_error().await;
+    let FeedError::MarketsRejected(list) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(list.matches("; ").count(), 2, "{list}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_spot_restricted_symbol_is_rejected_and_a_halted_one_subscribed() {
+async fn a_spot_restricted_symbol_fails_startup_and_a_halted_one_is_subscribed() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
     mock.set_spot_trading_allowed("BTCUSDT", false);
-    let mut feed = Running::start(config(&mock));
-    let snapshot = feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
-    assert_eq!(btc_value(&snapshot), Err(PriceUnavailable::NoMarket));
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 1);
-    feed.stop().await;
+    let error = Running::start(config(&mock)).startup_error().await;
+    assert!(
+        matches!(&error, FeedError::MarketsRejected(list) if list.contains("BTCUSDT")),
+        "{error:?}"
+    );
 
     // A halt is temporary: the symbol is subscribed and resumes on its own.
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
@@ -258,7 +286,6 @@ async fn a_spot_restricted_symbol_is_rejected_and_a_halted_one_subscribed() {
     let mut feed = Running::start(config(&mock));
     let snapshot = feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
     assert_eq!(btc_value(&snapshot), Err(PriceUnavailable::NoQuote));
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 0);
     assert_eq!(feed.counter(|m| &m.halted_markets), 1);
     assert_eq!(feed.counter(|m| &m.markets_confirmed), 2);
     mock.set_status("BTCUSDT", "TRADING");
@@ -292,7 +319,6 @@ async fn lookups_retry_transient_failures_and_honour_retry_after() {
         "Retry-After ignored"
     );
     assert_eq!(feed.counter(|m| &m.lookup_failures), 2);
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 0);
     feed.stop().await;
 }
 
@@ -309,18 +335,14 @@ async fn an_endpoint_error_is_retried_not_treated_as_a_rejection() {
     feed.until(|snapshot| eth_usdt(snapshot).is_ok() && btc_value(snapshot).is_ok())
         .await;
     assert_eq!(feed.counter(|m| &m.lookup_failures), 1);
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 0);
     feed.stop().await;
 }
 
-/// After the validation timeout the readers start with what is confirmed; a
-/// symbol confirmed later is added by restarting them, without losing the
-/// quotes already published.
+/// A lookup that still fails at the validation timeout fails startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_market_confirmed_late_is_added_without_a_restart_of_the_solver() {
+async fn a_symbol_without_an_answer_fails_startup_at_the_timeout() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
-    // BTCUSDT's lookups fail for a while; ETHUSDT's succeed at once.
-    for _ in 0..12 {
+    for _ in 0..100 {
         mock.fail_rest_for(
             "BTCUSDT",
             Failure {
@@ -331,59 +353,22 @@ async fn a_market_confirmed_late_is_added_without_a_restart_of_the_solver() {
     }
     let mut config = config(&mock);
     config.validation_timeout = Duration::from_millis(300);
-    let mut feed = Running::start(config);
-    let snapshot = feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
-    assert_eq!(btc_value(&snapshot), Err(PriceUnavailable::NoMarket));
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 1);
-    assert_eq!(feed.counter(|m| &m.markets_pending), 1);
-    let connections = mock.connections_total();
-    let snapshot = feed.until(|snapshot| btc_value(snapshot).is_ok()).await;
-    // The restart carried ETH's quote over.
-    assert!(eth_usdt(&snapshot).is_ok());
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 2);
-    assert_eq!(feed.counter(|m| &m.markets_pending), 0);
-    assert!(mock.connections_total() >= connections + 2);
-    eventually(|| mock.open_connections() == 2).await;
-    feed.stop().await;
-}
-
-/// When nothing can be confirmed and every failure is one a retry cannot
-/// change (a wrong path here), the feed stops the solver instead of running
-/// without prices forever.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nothing_confirmed_for_a_permanent_reason_is_a_feed_error() {
-    let mock = MockBinance::start(markets(), fast()).await.unwrap();
-    let mut config = config(&mock);
-    config.rest_endpoint = format!("{}/nowhere", mock.rest_url());
-    config.validation_timeout = Duration::from_millis(300);
-    let feed = Running::start(config);
-    let result = tokio::time::timeout(WAIT, feed.task)
-        .await
-        .unwrap()
-        .unwrap();
+    let error = Running::start(config).startup_error().await;
     assert!(
-        matches!(result, Err(FeedError::NoMarketConfirmed(_))),
-        "{result:?}"
+        matches!(error, FeedError::BinanceUnreachable { pending: 1, .. }),
+        "{error:?}"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_confirmed_market_the_feed_idles() {
-    let mock = MockBinance::start(Vec::new(), fast()).await.unwrap();
-    let mut feed = Running::start(config(&mock));
-    tokio::time::timeout(WAIT, feed.snapshots.changed())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(feed.latest().quotes().count(), 0);
-    // ETHUSDT for clearing and for ETH's valuation, BTCUSDT for BTC's.
-    assert_eq!(feed.counter(|m| &m.rejected_markets), 3);
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 0);
-    // The feed stays alive (an exit would stop the solver) and opens nothing.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!feed.task.is_finished());
     assert_eq!(mock.connections_total(), 0);
-    feed.stop().await;
+
+    // A wrong REST path answers nothing useful for any symbol.
+    let mock = MockBinance::start(markets(), fast()).await.unwrap();
+    let mut config = config_for(&mock.ws_url(), &format!("{}/nowhere", mock.rest_url()));
+    config.validation_timeout = Duration::from_millis(300);
+    let error = Running::start(config).startup_error().await;
+    assert!(
+        matches!(error, FeedError::BinanceUnreachable { pending: 2, .. }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -745,7 +730,7 @@ async fn a_blocked_thread_does_not_starve_the_readers() {
     );
     let (output, mut snapshots) = watch::channel(Arc::new(PriceSnapshot::default()));
     let cancel = CancellationToken::new();
-    let thread = spawn_price_feed_thread(
+    let (thread, _ready) = spawn_price_feed_thread(
         config(&mock),
         eth_usdt_plan(),
         output,
@@ -802,6 +787,8 @@ async fn cancellation_interrupts_a_retry_wait() {
         min_delay: Duration::from_secs(60),
         max_delay: Duration::from_secs(60),
     };
+    // Long enough that the feed waits out the retry instead of failing.
+    config.validation_timeout = Duration::from_secs(600);
     let feed = Running::start(config);
     let metrics = feed.metrics.clone();
     eventually(|| metrics.lookup_failures.load(Ordering::Relaxed) == 1).await;
@@ -852,6 +839,7 @@ async fn a_closed_output_is_a_feed_error() {
             output,
             Arc::new(FeedMetrics::default()),
             CancellationToken::new(),
+            oneshot::channel().0,
         ),
     )
     .await
@@ -865,7 +853,7 @@ async fn the_feed_thread_stops_the_solver_when_it_ends() {
     let (output, snapshots) = watch::channel(Arc::new(PriceSnapshot::default()));
     drop(snapshots);
     let cancel = CancellationToken::new();
-    let thread = spawn_price_feed_thread(
+    let (thread, _ready) = spawn_price_feed_thread(
         config(&mock),
         eth_usdt_plan(),
         output,
@@ -891,7 +879,7 @@ async fn the_feed_thread_stops_the_solver_when_it_panics() {
     *PANIC_ON_ENDPOINT.lock().unwrap() = Some(config.rest_endpoint.clone());
     let (output, _snapshots) = watch::channel(Arc::new(PriceSnapshot::default()));
     let cancel = CancellationToken::new();
-    let thread = spawn_price_feed_thread(
+    let (thread, _ready) = spawn_price_feed_thread(
         config,
         eth_usdt_plan(),
         output,

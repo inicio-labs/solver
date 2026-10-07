@@ -6,18 +6,16 @@
 //! Reader B ─┘                                          └─> price API
 //! ```
 //!
-//! Startup confirms the configured markets through `exchangeInfo`. Until the
-//! first market is confirmed the published snapshot is empty and every pair is
-//! paused, but the solver runs. Once every symbol is resolved, or the
-//! validation timeout passes with at least one confirmed, two supervised
-//! readers keep their own connections to the confirmed symbols and the
-//! publisher merges their observations. Symbols still unresolved keep being
-//! retried in the background; when one is confirmed the readers restart with
-//! the larger set, carrying the published quotes over. A reader that fails or
-//! panics restarts alone; any other failure of the feed, including a panic,
-//! stops the solver.
+//! Startup checks every configured market once through `exchangeInfo`. A
+//! market Binance rejects, or a lookup that still fails at the validation
+//! timeout, fails startup with the full list, so the configuration is fixed
+//! before the solver runs. Then two supervised readers keep their own
+//! connections to the markets and the publisher merges their observations. A
+//! reader that fails or panics restarts alone; any other failure of the feed,
+//! including a panic, stops the solver.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,14 +24,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::market::{Listing, MarketIssue, MarketPlan, Markets, Symbol};
+use super::market::{Listing, MarketPlan, Markets, Symbol};
 use super::reader::{run_connection, stream_url, Exit, ReaderContext, ReaderLatest};
-use super::rest::{fetch_listing, MAX_RETRY_AFTER};
+use super::rest::{fetch_listing, LookupError, MAX_RETRY_AFTER};
 use super::snapshot::{Offer, PriceSnapshot};
 use super::ticker::QuoteLimits;
 
@@ -105,9 +103,8 @@ pub struct FeedConfig {
     pub retry: RetryPolicy,
     /// Connection attempts per five minutes, both readers together; positive.
     pub max_connection_attempts: usize,
-    /// At startup, how long to wait for `exchangeInfo` to answer about every
-    /// symbol. After it, the readers start with the symbols already confirmed
-    /// and the rest keep being checked in the background.
+    /// At startup, how long failed `exchangeInfo` lookups are retried before
+    /// startup fails.
     pub validation_timeout: Duration,
     /// A connection that delivered a valid quote and lasted this long resets
     /// its reader's backoff; one that drops sooner keeps backing off, so a
@@ -144,10 +141,6 @@ pub struct FeedMetrics {
     pub(crate) budget_waits: AtomicU64,
     /// Symbols the readers subscribe.
     pub(crate) markets_confirmed: AtomicU64,
-    /// Symbols `exchangeInfo` has not answered for yet.
-    pub(crate) markets_pending: AtomicU64,
-    /// Configured uses of a symbol Binance rejected.
-    pub(crate) rejected_markets: AtomicU64,
     /// Configured uses of a symbol that is subscribed but not trading.
     pub(crate) halted_markets: AtomicU64,
 }
@@ -159,8 +152,12 @@ pub(crate) enum FeedError {
     Tls(#[from] rustls::Error),
     #[error("HTTP client: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("no Binance market could be confirmed within the validation timeout: {0}")]
-    NoMarketConfirmed(String),
+    #[error("Binance rejected configured markets: {0}")]
+    MarketsRejected(String),
+    #[error(
+        "Binance did not answer for {pending} symbol(s) within the validation timeout: {error}"
+    )]
+    BinanceUnreachable { pending: usize, error: String },
     #[error("every price receiver is gone")]
     OutputClosed,
     #[error("a reader channel closed")]
@@ -323,155 +320,99 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, FeedError> {
     Ok(Arc::new(config))
 }
 
-/// Confirms the planned symbols through `exchangeInfo`, a pass at a time.
-/// Only Binance's own answer about a symbol (unknown, or a listing that does
-/// not match) is final; every failed request is retried, so a maintenance
-/// page, a wrong path or an outage never rejects a market for good.
-struct Validator<'a> {
-    plan: &'a MarketPlan,
-    http: reqwest::Client,
-    rest_endpoint: &'a str,
-    gate: Arc<Gate>,
-    metrics: Arc<FeedMetrics>,
-    listings: HashMap<Symbol, Option<Listing>>,
-    /// Symbols without an answer yet.
-    pending: Vec<Symbol>,
-    backoff: Backoff,
-    log: LogLimiter,
-    /// Whether every failure of the last pass was one a retry cannot change.
-    permanent_only: bool,
-    last_error: Option<String>,
-}
-
-impl<'a> Validator<'a> {
-    fn new(
-        plan: &'a MarketPlan,
-        http: reqwest::Client,
-        config: &'a FeedConfig,
-        gate: Arc<Gate>,
-        metrics: Arc<FeedMetrics>,
-    ) -> Self {
-        let pending: Vec<Symbol> = plan.symbols().into_iter().collect();
-        metrics
-            .markets_pending
-            .store(pending.len() as u64, Ordering::Relaxed);
-        Self {
-            plan,
-            http,
-            rest_endpoint: &config.rest_endpoint,
-            gate,
-            metrics,
-            listings: HashMap::new(),
-            pending,
-            backoff: Backoff::new(config.retry),
-            log: LogLimiter::new(config.log_interval),
-            permanent_only: false,
-            last_error: None,
-        }
-    }
-
-    /// Symbols Binance listed.
-    fn confirmed(&self) -> usize {
-        self.listings
-            .values()
-            .filter(|listing| listing.is_some())
-            .count()
-    }
-
-    /// Look every pending symbol up once. `Some(true)` when a symbol got its
-    /// answer, `None` when cancelled. A rate limit ends the pass early.
-    async fn pass(&mut self, cancel: &CancellationToken) -> Option<bool> {
-        let mut symbols = std::mem::take(&mut self.pending).into_iter();
-        let mut retry = Vec::new();
-        let mut progress = false;
-        let mut permanent_only = true;
-        let mut last_error = None;
+/// Look every configured symbol up through `exchangeInfo` and resolve the
+/// markets. A failed lookup is retried with backoff, respecting Binance's
+/// cooldowns, until the validation timeout. Binance's own answers are final:
+/// any rejected market fails startup, listed with all the others. A market
+/// that is temporarily not trading is subscribed with a warning. `None` when
+/// cancelled.
+async fn confirm_markets(
+    plan: &MarketPlan,
+    http: &reqwest::Client,
+    config: &FeedConfig,
+    gate: &Gate,
+    metrics: &FeedMetrics,
+    cancel: &CancellationToken,
+) -> Result<Option<Markets>, FeedError> {
+    let deadline = tokio::time::Instant::now() + config.validation_timeout;
+    let mut backoff = Backoff::new(config.retry);
+    let mut listings: HashMap<Symbol, Option<Listing>> = HashMap::new();
+    let mut pending: Vec<Symbol> = plan.symbols().into_iter().collect();
+    let unreachable = |pending: usize, error: Option<LookupError>| FeedError::BinanceUnreachable {
+        pending,
+        error: error.map_or_else(|| "no answer".to_string(), |error| error.to_string()),
+    };
+    let mut last_error = None;
+    while !pending.is_empty() {
+        let mut failed = Vec::new();
+        let mut symbols = pending.into_iter();
         while let Some(symbol) = symbols.next() {
-            if !self.gate.wait_cooldown(cancel).await {
-                return None;
-            }
-            let lookup = tokio::select! {
-                _ = cancel.cancelled() => return None,
-                lookup = fetch_listing(&self.http, self.rest_endpoint, &symbol) => lookup,
-            };
-            let error = match lookup {
-                Ok(listing) => {
-                    self.listings.insert(symbol, listing);
-                    progress = true;
-                    continue;
+            let lookup = async {
+                if !gate.wait_cooldown(cancel).await {
+                    return None;
                 }
-                Err(error) => error,
+                cancel
+                    .run_until_cancelled(fetch_listing(http, &config.rest_endpoint, &symbol))
+                    .await
             };
-            self.metrics.lookup_failures.fetch_add(1, Ordering::Relaxed);
-            permanent_only &= !error.is_transient();
-            retry.push(symbol);
-            let rate_limited = error.is_rate_limited();
-            if rate_limited {
-                // Stop sending for this pass; Binance escalates to a ban.
-                let wait = error.retry_after().unwrap_or_else(|| self.backoff.next());
-                self.gate.cool_down(wait);
-                retry.extend(symbols.by_ref());
-            }
-            last_error = Some(error);
-            if rate_limited {
-                break;
-            }
-        }
-        self.pending = retry;
-        self.metrics
-            .markets_pending
-            .store(self.pending.len() as u64, Ordering::Relaxed);
-        if self.pending.is_empty() {
-            self.backoff.reset();
-        }
-        self.permanent_only = permanent_only && !self.pending.is_empty();
-        if let Some(error) = last_error {
-            if let Some(suppressed) = self.log.allow() {
-                tracing::warn!(
-                    %error,
-                    pending = self.pending.len(),
-                    suppressed,
-                    "Binance exchangeInfo lookups failed; retrying"
-                );
-            }
-            self.last_error = Some(error.to_string());
-        }
-        Some(progress)
-    }
-
-    /// Sleep the next backoff; `false` when cancelled.
-    async fn sleep(&mut self, cancel: &CancellationToken) -> bool {
-        sleep_unless_cancelled(self.backoff.next(), cancel).await
-    }
-
-    /// Keep retrying the pending symbols until one gets its answer; `false`
-    /// when cancelled. Pends forever once nothing is pending.
-    async fn run_until_progress(&mut self, cancel: &CancellationToken) -> bool {
-        loop {
-            if self.pending.is_empty() {
-                std::future::pending::<()>().await;
-            }
-            if !self.sleep(cancel).await {
-                return false;
-            }
-            match self.pass(cancel).await {
-                None => return false,
-                Some(true) => return true,
-                Some(false) => {}
+            match tokio::time::timeout_at(deadline, lookup).await {
+                Err(_) => {
+                    let pending = failed.len() + 1 + symbols.len();
+                    return Err(unreachable(pending, last_error));
+                }
+                Ok(None) => return Ok(None),
+                Ok(Some(Ok(listing))) => {
+                    listings.insert(symbol, listing);
+                }
+                Ok(Some(Err(error))) => {
+                    metrics.lookup_failures.fetch_add(1, Ordering::Relaxed);
+                    if error.is_rate_limited() {
+                        gate.cool_down(error.retry_after().unwrap_or_else(|| backoff.next()));
+                    }
+                    failed.push(symbol);
+                    last_error = Some(error);
+                }
             }
         }
+        pending = failed;
+        if pending.is_empty() {
+            break;
+        }
+        let wait = backoff.next();
+        if tokio::time::Instant::now() + wait >= deadline {
+            return Err(unreachable(pending.len(), last_error));
+        }
+        if let Some(error) = &last_error {
+            tracing::warn!(%error, pending = pending.len(), ?wait, "Binance exchangeInfo lookups failed; retrying");
+        }
+        if !sleep_unless_cancelled(wait, cancel).await {
+            return Ok(None);
+        }
     }
-
-    /// The confirmed markets and every issue with the configured ones;
-    /// pending symbols are left out of both.
-    fn resolve(&self) -> (Markets, Vec<MarketIssue>) {
-        let (markets, issues) = self.plan.resolve(&self.listings);
-        let issues = issues
-            .into_iter()
-            .filter(|issue| !self.pending.contains(&issue.symbol))
-            .collect();
-        (markets, issues)
+    let (markets, issues) = plan.resolve(&listings);
+    let (rejected, halted): (Vec<_>, Vec<_>) = issues.iter().partition(|issue| issue.rejects());
+    if !rejected.is_empty() {
+        let mut list = String::new();
+        for issue in &rejected {
+            let _ = write!(list, "{}{issue}", if list.is_empty() { "" } else { "; " });
+        }
+        return Err(FeedError::MarketsRejected(list));
     }
+    for issue in &halted {
+        tracing::warn!(%issue, "Binance market not trading; subscribed, paused until it trades");
+    }
+    metrics
+        .markets_confirmed
+        .store(markets.symbols().len() as u64, Ordering::Relaxed);
+    metrics
+        .halted_markets
+        .store(halted.len() as u64, Ordering::Relaxed);
+    tracing::info!(
+        symbols = markets.symbols().len(),
+        halted = halted.len(),
+        "Binance markets confirmed"
+    );
+    Ok(Some(markets))
 }
 
 /// Merge both readers' latest observations and publish on every change.
@@ -621,51 +562,20 @@ async fn supervise_reader<F, Fut>(
     }
 }
 
-/// Log and count the issues of one resolution.
-fn report_markets(
-    markets: &Markets,
-    issues: &[MarketIssue],
-    pending: usize,
-    metrics: &FeedMetrics,
-) {
-    let (rejected, halted): (Vec<_>, Vec<_>) = issues.iter().partition(|issue| issue.rejects());
-    for issue in &rejected {
-        tracing::error!(%issue, "Binance market rejected; it stays unavailable until the configuration changes");
-    }
-    for issue in &halted {
-        tracing::warn!(%issue, "Binance market not trading");
-    }
-    metrics
-        .markets_confirmed
-        .store(markets.symbols().len() as u64, Ordering::Relaxed);
-    metrics
-        .rejected_markets
-        .store(rejected.len() as u64, Ordering::Relaxed);
-    metrics
-        .halted_markets
-        .store(halted.len() as u64, Ordering::Relaxed);
-    tracing::info!(
-        symbols = markets.symbols().len(),
-        rejected = rejected.len(),
-        halted = halted.len(),
-        pending,
-        "Binance markets confirmed"
-    );
-}
-
 /// Test hook: a feed configured with this REST endpoint panics at start, so a
 /// test can check what a panic on the feed thread does to the solver.
 #[cfg(test)]
 pub(super) static PANIC_ON_ENDPOINT: Mutex<Option<String>> = Mutex::new(None);
 
-/// Run the feed until `cancel`. An error is irrecoverable: the caller stops
-/// the solver.
+/// Run the feed until `cancel`. `ready` gets the outcome of the startup
+/// market check. An error is irrecoverable: the caller stops the solver.
 pub(super) async fn run_feed(
     config: FeedConfig,
     plan: MarketPlan,
     output: watch::Sender<Arc<PriceSnapshot>>,
     metrics: Arc<FeedMetrics>,
     cancel: CancellationToken,
+    ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), FeedError> {
     #[cfg(test)]
     if PANIC_ON_ENDPOINT
@@ -683,137 +593,89 @@ pub(super) async fn run_feed(
         .timeout(config.request_timeout)
         .build()?;
     let gate = Arc::new(Gate::new(config.max_connection_attempts, ATTEMPT_WINDOW));
-    let mut validator = Validator::new(&plan, http, &config, gate.clone(), metrics.clone());
+    let markets = match confirm_markets(&plan, &http, &config, &gate, &metrics, &cancel).await {
+        Ok(Some(markets)) => Arc::new(markets),
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return Err(error);
+        }
+    };
+    let _ = ready.send(Ok(()));
+    let book = PriceSnapshot::new(markets.clone(), config.quote_ttl);
+    output
+        .send(Arc::new(book.clone()))
+        .map_err(|_| FeedError::OutputClosed)?;
 
-    // Startup: resolve every symbol, or as many as the timeout allows.
-    let deadline = tokio::time::Instant::now() + config.validation_timeout;
-    loop {
-        let Some(_progress) = validator.pass(&cancel).await else {
-            return Ok(());
-        };
-        if validator.pending.is_empty() {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            if validator.confirmed() > 0 {
-                tracing::warn!(
-                    pending = validator.pending.len(),
-                    "starting with the confirmed Binance markets; still resolving the rest"
-                );
-                break;
-            }
-            if validator.permanent_only {
-                let reason = validator.last_error.take().unwrap_or_default();
-                return Err(FeedError::NoMarketConfirmed(reason));
-            }
-        }
-        if !validator.sleep(&cancel).await {
-            return Ok(());
-        }
+    // Stopping one task stops the others; the solver's token stops them all.
+    let stop = cancel.child_token();
+    let mut tasks: JoinSet<Result<(), FeedError>> = JoinSet::new();
+    let mut names = HashMap::new();
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..READERS)
+        .map(|_| watch::channel(vec![None; markets.symbols().len()]))
+        .unzip();
+    for (index, latest) in senders.into_iter().enumerate() {
+        let endpoint = config.stream_endpoints[index].clone();
+        let context = Arc::new(ReaderContext {
+            index,
+            endpoint: endpoint.clone(),
+            url: stream_url(&endpoint, &markets),
+            markets: markets.clone(),
+            limits: config.limits,
+            tls: tls.clone(),
+            connect_timeout: config.connect_timeout,
+            idle_timeout: config.idle_timeout,
+            data_idle_timeout: config.data_idle_timeout,
+            stable_after: config.stable_connection,
+            log_interval: config.log_interval,
+            latest,
+            metrics: metrics.clone(),
+            cancel: stop.clone(),
+        });
+        let task = format!("Binance reader for {endpoint}");
+        let supervisor = supervise_reader(
+            endpoint,
+            move |lifetime| run_connection(context.clone(), lifetime),
+            gate.clone(),
+            config.retry,
+            config.connection_lifetime,
+            config.log_interval,
+            metrics.clone(),
+            stop.clone(),
+        );
+        let id = tasks
+            .spawn(async move {
+                supervisor.await;
+                Ok(())
+            })
+            .id();
+        names.insert(id, task);
     }
+    let receivers: [watch::Receiver<ReaderLatest>; READERS] = receivers
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("one receiver per reader"));
+    let publisher = publish(book, receivers, output, metrics, stop.clone());
+    names.insert(tasks.spawn(publisher).id(), "price publisher".to_string());
 
-    // One generation of readers per confirmed market set.
-    let mut previous: Option<Arc<PriceSnapshot>> = None;
-    loop {
-        let (markets, issues) = validator.resolve();
-        report_markets(&markets, &issues, validator.pending.len(), &metrics);
-        let markets = Arc::new(markets);
-        let mut book = PriceSnapshot::new(markets.clone(), config.quote_ttl);
-        if let Some(previous) = &previous {
-            book.inherit(previous);
-        }
-        output
-            .send(Arc::new(book.clone()))
-            .map_err(|_| FeedError::OutputClosed)?;
-
-        // Stopping one task stops the others; the solver's token stops them all.
-        let generation = cancel.child_token();
-        let mut tasks: JoinSet<Result<(), FeedError>> = JoinSet::new();
-        let mut names = HashMap::new();
-        if markets.symbols().is_empty() {
-            tracing::warn!("no Binance market confirmed; every pair stays paused");
-        } else {
-            let (senders, receivers): (Vec<_>, Vec<_>) = (0..READERS)
-                .map(|_| watch::channel(vec![None; markets.symbols().len()]))
-                .unzip();
-            for (index, latest) in senders.into_iter().enumerate() {
-                let context = Arc::new(ReaderContext {
-                    index,
-                    endpoint: config.stream_endpoints[index].clone(),
-                    url: stream_url(&config.stream_endpoints[index], &markets),
-                    markets: markets.clone(),
-                    limits: config.limits,
-                    tls: tls.clone(),
-                    connect_timeout: config.connect_timeout,
-                    idle_timeout: config.idle_timeout,
-                    data_idle_timeout: config.data_idle_timeout,
-                    stable_after: config.stable_connection,
-                    log_interval: config.log_interval,
-                    latest,
-                    metrics: metrics.clone(),
-                    cancel: generation.clone(),
-                });
-                let endpoint = config.stream_endpoints[index].clone();
-                let task = format!("Binance reader for {endpoint}");
-                let supervisor = supervise_reader(
-                    endpoint,
-                    move |lifetime| run_connection(context.clone(), lifetime),
-                    gate.clone(),
-                    config.retry,
-                    config.connection_lifetime,
-                    config.log_interval,
-                    metrics.clone(),
-                    generation.clone(),
-                );
-                let id = tasks
-                    .spawn(async move {
-                        supervisor.await;
-                        Ok(())
-                    })
-                    .id();
-                names.insert(id, task);
-            }
-            let receivers: [watch::Receiver<ReaderLatest>; READERS] = receivers
-                .try_into()
-                .unwrap_or_else(|_| unreachable!("one receiver per reader"));
-            let publisher = publish(
-                book,
-                receivers,
-                output.clone(),
-                metrics.clone(),
-                generation.clone(),
-            );
-            names.insert(tasks.spawn(publisher).id(), "price publisher".to_string());
-        }
-
-        let outcome = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Ok(false),
-            Some(joined) = tasks.join_next_with_id(), if !tasks.is_empty() => Err(match joined {
-                Ok((_, Err(error))) => error,
-                Ok((id, Ok(()))) => FeedError::TaskStopped(task_name(&names, &id)),
-                Err(error) => FeedError::TaskPanicked(task_name(&names, &error.id())),
-            }),
-            progress = validator.run_until_progress(&cancel) => Ok(progress),
-        };
-        generation.cancel();
-        let drain = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(config.shutdown_timeout, drain)
-            .await
-            .is_err()
-        {
-            tracing::warn!("price feed tasks did not stop in time; aborting them");
-            tasks.abort_all();
-        }
-        match outcome {
-            Err(error) => return Err(error),
-            Ok(false) => return Ok(()),
-            Ok(true) => {
-                tracing::info!("a Binance market was confirmed late; restarting the readers");
-                previous = Some(output.borrow().clone());
-            }
-        }
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(()),
+        Some(joined) = tasks.join_next_with_id() => Err(match joined {
+            Ok((_, Err(error))) => error,
+            Ok((id, Ok(()))) => FeedError::TaskStopped(task_name(&names, &id)),
+            Err(error) => FeedError::TaskPanicked(task_name(&names, &error.id())),
+        }),
+    };
+    stop.cancel();
+    let drain = async { while tasks.join_next().await.is_some() {} };
+    if tokio::time::timeout(config.shutdown_timeout, drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("price feed tasks did not stop in time; aborting them");
+        tasks.abort_all();
     }
+    outcome
 }
 
 fn task_name(names: &HashMap<tokio::task::Id, String>, id: &tokio::task::Id) -> String {
@@ -823,9 +685,12 @@ fn task_name(names: &HashMap<tokio::task::Id, String>, id: &tokio::task::Id) -> 
         .unwrap_or_else(|| "price feed task".to_string())
 }
 
-/// Start the feed on its own OS thread. Markets are confirmed in the
-/// background, and the snapshot stays empty (every pair paused) until they
-/// are. However the thread ends — an irrecoverable error, a panic, or after
+/// The outcome of the feed's startup market check; `Err` lists what to fix.
+pub(crate) type FeedReady = oneshot::Receiver<Result<(), String>>;
+
+/// Start the feed on its own OS thread. The receiver gets the outcome of the
+/// startup market check: `Err` lists what to fix in the configuration.
+/// However the thread ends — an irrecoverable error, a panic, or after
 /// `cancel` — it cancels `cancel`, so a failed feed stops the solver.
 pub(crate) fn spawn_price_feed_thread(
     config: FeedConfig,
@@ -833,8 +698,9 @@ pub(crate) fn spawn_price_feed_thread(
     output: watch::Sender<Arc<PriceSnapshot>>,
     metrics: Arc<FeedMetrics>,
     cancel: CancellationToken,
-) -> anyhow::Result<thread::JoinHandle<()>> {
+) -> anyhow::Result<(thread::JoinHandle<()>, FeedReady)> {
     let shutdown_timeout = config.shutdown_timeout;
+    let (ready, ready_rx) = oneshot::channel();
     thread::Builder::new()
         .name("price-feed".into())
         .spawn(move || {
@@ -851,13 +717,15 @@ pub(crate) fn spawn_price_feed_thread(
                     return;
                 }
             };
-            if let Err(error) = runtime.block_on(run_feed(config, plan, output, metrics, cancel)) {
+            let feed = run_feed(config, plan, output, metrics, cancel, ready);
+            if let Err(error) = runtime.block_on(feed) {
                 tracing::error!(%error, "price feed failed; stopping the solver");
             }
             // Bounded even if a DNS lookup is stuck on a blocking thread.
             runtime.shutdown_timeout(shutdown_timeout);
         })
         .context("spawn price-feed thread")
+        .map(|thread| (thread, ready_rx))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use miden_protocol::asset::AssetAmount;
 use ruint::aliases::U256;
+use rust_decimal::Decimal;
 
 use super::config::PPM_DENOMINATOR;
 use super::types::{BatchPrice, ClearingError, ReferencePrice};
@@ -78,23 +79,6 @@ pub(crate) fn to_asset_amount(value: U256) -> Result<AssetAmount, ClearingError>
 
 pub(crate) fn ppm_floor(gross: U256, rate_ppm: u32) -> Result<U256, ClearingError> {
     mul_div_floor(gross, rate_ppm, PPM_DENOMINATOR)
-}
-
-/// Why a bid/ask quote has no valid midpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MidpointError {
-    /// `bid > ask`.
-    Crossed,
-    /// The spread exceeds the limit.
-    TooWide,
-    /// Exact arithmetic overflowed.
-    Overflow,
-}
-
-impl From<ClearingError> for MidpointError {
-    fn from(_: ClearingError) -> Self {
-        Self::Overflow
-    }
 }
 
 impl ReferencePrice {
@@ -179,157 +163,6 @@ impl ReferencePrice {
         }
         .map_err(|_| ClearingError::InvalidOraclePrice)
     }
-
-    /// Exactly one. The price API values the valuation quote asset itself
-    /// (USDT in USDT) at this price.
-    pub(crate) const ONE: Self = Self {
-        numerator: U256::ONE,
-        denominator: U256::ONE,
-    };
-
-    /// Exact `(bid + ask) / 2`.
-    pub fn midpoint(bid: Self, ask: Self) -> Result<Self, ClearingError> {
-        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
-        Self::midpoint_of(bid, ask, bid_numerator, ask_numerator)
-    }
-
-    /// The midpoint from the two prices' numerators over their common
-    /// denominator. With `bid = a/b` and `ask = c/d`, those numerators are
-    /// `a·d` and `c·b` over `b·d`, so
-    /// `(bid + ask) / 2 = (a·d + c·b) / (2·b·d)`: the numerators' sum over
-    /// twice the common denominator. [`Self::new`] reduces the result.
-    fn midpoint_of(
-        bid: Self,
-        ask: Self,
-        bid_numerator: U256,
-        ask_numerator: U256,
-    ) -> Result<Self, ClearingError> {
-        let numerator_sum = bid_numerator
-            .checked_add(ask_numerator)
-            .ok_or(ClearingError::ArithmeticOverflow)?;
-        let twice_common_denominator =
-            checked_mul(checked_mul(bid.denominator, ask.denominator)?, 2u32)?;
-        Self::new(numerator_sum, twice_common_denominator)
-    }
-
-    /// The midpoint of a quote that is not crossed and whose spread is within
-    /// `max_bps` (inclusive). Both prices are brought over one common
-    /// denominator once, and the order check, the spread check and the
-    /// midpoint all use those two numerators. This is the per-frame
-    /// validation of the price feed.
-    pub(crate) fn validated_midpoint(
-        bid: Self,
-        ask: Self,
-        max_bps: u32,
-    ) -> Result<Self, MidpointError> {
-        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
-        // Over the same denominator, the larger numerator is the larger price.
-        let spread_numerator = ask_numerator
-            .checked_sub(bid_numerator)
-            .ok_or(MidpointError::Crossed)?;
-        let numerator_sum = bid_numerator
-            .checked_add(ask_numerator)
-            .ok_or(ClearingError::ArithmeticOverflow)?;
-        // spread in bps = 10_000 × (ask − bid) / mid, with mid = (ask + bid) / 2.
-        // Over the common denominator this is 20_000 × spread_numerator /
-        // numerator_sum, so `<= max_bps` is checked without dividing:
-        // 20_000 × spread_numerator <= max_bps × numerator_sum.
-        if checked_mul(spread_numerator, 20_000u32)? > checked_mul(numerator_sum, max_bps)? {
-            return Err(MidpointError::TooWide);
-        }
-        Ok(Self::midpoint_of(bid, ask, bid_numerator, ask_numerator)?)
-    }
-
-    /// The same market quoted the other way round, `1 / self`.
-    #[must_use]
-    pub(crate) fn reciprocal(self) -> Self {
-        Self {
-            numerator: self.denominator,
-            denominator: self.numerator,
-        }
-    }
-
-    /// Whether `bid <= ask`, compared exactly.
-    pub fn is_ordered(bid: Self, ask: Self) -> Result<bool, ClearingError> {
-        let (bid_numerator, ask_numerator) = Self::over_common_denominator(bid, ask)?;
-        Ok(bid_numerator <= ask_numerator)
-    }
-
-    /// Whether `10_000 × (ask - bid) / ((bid + ask) / 2) <= max_bps`, without
-    /// rounding the spread. A crossed quote (`bid > ask`) is never within.
-    pub fn spread_within_bps(bid: Self, ask: Self, max_bps: u32) -> Result<bool, ClearingError> {
-        match Self::validated_midpoint(bid, ask, max_bps) {
-            Ok(_) => Ok(true),
-            Err(MidpointError::Crossed | MidpointError::TooWide) => Ok(false),
-            Err(MidpointError::Overflow) => Err(ClearingError::ArithmeticOverflow),
-        }
-    }
-
-    /// Whether `quantity × price >= minimum`, compared exactly: the displayed
-    /// notional of one side of a quote against a configured floor.
-    pub(crate) fn notional_at_least(
-        quantity: Self,
-        price: Self,
-        minimum: Self,
-    ) -> Result<bool, ClearingError> {
-        let notional = checked_mul(
-            checked_mul(quantity.numerator, price.numerator)?,
-            minimum.denominator,
-        )?;
-        let floor = checked_mul(
-            checked_mul(quantity.denominator, price.denominator)?,
-            minimum.numerator,
-        )?;
-        Ok(notional >= floor)
-    }
-
-    /// The two prices rewritten over one common denominator, returning only
-    /// their new numerators. `a/b` and `c/d` become `(a·d)/(b·d)` and
-    /// `(c·b)/(b·d)`; with the denominator `b·d` shared, the numerators
-    /// `a·d` and `c·b` can be compared, added and subtracted as integers.
-    fn over_common_denominator(left: Self, right: Self) -> Result<(U256, U256), ClearingError> {
-        Ok((
-            checked_mul(left.numerator, right.denominator)?,
-            checked_mul(right.numerator, left.denominator)?,
-        ))
-    }
-
-    /// Decimal string with exactly `places` fractional digits, rounded half up.
-    pub fn to_fixed_decimal(self, places: u8) -> Result<String, ClearingError> {
-        let (whole, fraction) = self.round_half_up(places)?;
-        Ok(match fraction {
-            Some(fraction) => format!("{whole}.{fraction}"),
-            None => whole.to_string(),
-        })
-    }
-
-    /// Like [`Self::to_fixed_decimal`] without trailing fractional zeros, so a
-    /// price with at most `places` decimals prints exactly.
-    pub fn to_trimmed_decimal(self, places: u8) -> Result<String, ClearingError> {
-        let (whole, fraction) = self.round_half_up(places)?;
-        Ok(
-            match fraction
-                .as_deref()
-                .map(|digits| digits.trim_end_matches('0'))
-            {
-                Some(digits) if !digits.is_empty() => format!("{whole}.{digits}"),
-                _ => whole.to_string(),
-            },
-        )
-    }
-
-    /// Whole part and zero-padded fractional digits (`None` for no places).
-    fn round_half_up(self, places: u8) -> Result<(U256, Option<String>), ClearingError> {
-        let scale = power_of_ten(places)?;
-        let scaled = checked_mul(self.numerator, scale)?;
-        let mut units = scaled / self.denominator;
-        if checked_mul(scaled % self.denominator, 2u32)? >= self.denominator {
-            units += U256::ONE;
-        }
-        let fraction = (places > 0)
-            .then(|| format!("{:0>width$}", units % scale, width = usize::from(places)));
-        Ok((units / scale, fraction))
-    }
 }
 
 impl BatchPrice {
@@ -367,18 +200,30 @@ impl BatchPrice {
         Self::new(quote_units, base_units)
     }
 
-    /// `price` is whole quote tokens per whole base token. Convert it to quote
-    /// base units per base base unit with the on-chain token decimals:
-    /// `price × 10^quote_decimals / 10^base_decimals`.
-    pub fn from_pair_price(
-        price: ReferencePrice,
+    /// `price` whole quote tokens per whole base token, in base units:
+    /// `price × 10^quote_decimals` quote units per `10^base_decimals` base
+    /// units. A `Decimal` is `mantissa / 10^scale`, so both sides are whole
+    /// numbers and nothing is rounded.
+    pub fn from_whole_price(
+        price: Decimal,
         base_decimals: u8,
         quote_decimals: u8,
     ) -> Result<Self, ClearingError> {
+        let mantissa = u128::try_from(price.mantissa()).map_err(|_| ClearingError::InvalidPrice)?;
+        let scale = u8::try_from(price.scale()).map_err(|_| ClearingError::InvalidPrice)?;
         Self::new(
-            checked_mul(price.numerator, power_of_ten(quote_decimals)?)?,
-            checked_mul(price.denominator, power_of_ten(base_decimals)?)?,
+            checked_mul(U256::from(mantissa), power_of_ten(quote_decimals)?)?,
+            checked_mul(power_of_ten(scale)?, power_of_ten(base_decimals)?)?,
         )
+    }
+
+    /// The same price seen from the other token: base and quote swap.
+    #[must_use]
+    pub fn inverse(self) -> Self {
+        Self {
+            quote_units: self.base_units,
+            base_units: self.quote_units,
+        }
     }
 
     pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
@@ -433,48 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn validated_midpoint_checks_order_and_spread_once() {
-        let (bid, ask) = (decimal("99"), decimal("101"));
-        assert_eq!(
-            ReferencePrice::validated_midpoint(bid, ask, 200),
-            Ok(decimal("100"))
-        );
-        assert_eq!(
-            ReferencePrice::validated_midpoint(bid, ask, 199),
-            Err(MidpointError::TooWide)
-        );
-        assert_eq!(
-            ReferencePrice::validated_midpoint(ask, bid, u32::MAX),
-            Err(MidpointError::Crossed)
-        );
-        assert_eq!(
-            ReferencePrice::validated_midpoint(bid, bid, 0),
-            Ok(decimal("99"))
-        );
-        let huge = decimal(&format!("1{}", "0".repeat(60)));
-        let tiny = decimal("0.000000000000000001");
-        assert_eq!(
-            ReferencePrice::validated_midpoint(tiny, huge, 1),
-            Err(MidpointError::Overflow)
-        );
-    }
-
-    #[test]
-    fn notional_floor_is_exact() {
-        // 0.002 ETH × 2500 USDT = 5 USDT.
-        let (quantity, price) = (decimal("0.002"), decimal("2500"));
-        assert!(ReferencePrice::notional_at_least(quantity, price, decimal("5")).unwrap());
-        assert!(
-            !ReferencePrice::notional_at_least(quantity, price, decimal("5.000000001")).unwrap()
-        );
-        let huge = decimal(&format!("1{}", "0".repeat(70)));
-        assert!(matches!(
-            ReferencePrice::notional_at_least(huge, huge, decimal("1")),
-            Err(ClearingError::ArithmeticOverflow)
-        ));
-    }
-
-    #[test]
     fn json_scientific_price_is_exact() {
         let price = ReferencePrice::from_json_number("1.2500e-4").unwrap();
         assert_eq!(price.numerator, U256::ONE);
@@ -494,81 +297,36 @@ mod tests {
         ReferencePrice::from_decimal(raw).unwrap()
     }
 
-    #[test]
-    fn midpoint_is_exact() {
-        let mid = ReferencePrice::midpoint(decimal("2718.65"), decimal("2718.66")).unwrap();
-        assert_eq!(mid, decimal("2718.655"));
-        let mid = ReferencePrice::midpoint(decimal("0.00000001"), decimal("0.00000002")).unwrap();
-        assert_eq!(mid, decimal("0.000000015"));
-        assert_eq!(
-            ReferencePrice::midpoint(decimal("7"), decimal("7")).unwrap(),
-            decimal("7")
-        );
+    fn dec(raw: &str) -> Decimal {
+        Decimal::from_str_exact(raw).unwrap()
     }
 
     #[test]
-    fn spread_limit_is_inclusive_and_unrounded() {
-        // mid 100, spread 2: exactly 200 bps.
-        let (bid, ask) = (decimal("99"), decimal("101"));
-        assert!(ReferencePrice::spread_within_bps(bid, ask, 200).unwrap());
-        assert!(!ReferencePrice::spread_within_bps(bid, ask, 199).unwrap());
-        // 200.0000001 bps must not round down to 200.
-        let ask = decimal("101.00000001");
-        assert!(!ReferencePrice::spread_within_bps(bid, ask, 200).unwrap());
-        assert!(ReferencePrice::spread_within_bps(bid, bid, 0).unwrap());
-        assert!(!ReferencePrice::spread_within_bps(ask, bid, u32::MAX).unwrap());
-        assert!(ReferencePrice::is_ordered(bid, bid).unwrap());
-        assert!(!ReferencePrice::is_ordered(ask, bid).unwrap());
-    }
-
-    #[test]
-    fn overflow_is_an_error_not_a_panic() {
-        let huge = decimal(&format!("1{}", "0".repeat(60)));
-        let tiny = decimal("0.000000000000000001");
-        fn overflow<T>(result: Result<T, ClearingError>) -> bool {
-            matches!(result, Err(ClearingError::ArithmeticOverflow))
-        }
-        assert!(overflow(ReferencePrice::midpoint(tiny, huge)));
-        assert!(overflow(ReferencePrice::is_ordered(tiny, huge)));
-        assert!(overflow(ReferencePrice::spread_within_bps(tiny, huge, 1)));
-        assert!(overflow(BatchPrice::from_pair_price(huge, 0, 78)));
-        assert!(overflow(huge.to_fixed_decimal(18)));
-    }
-
-    #[test]
-    fn pair_price_conversion_uses_unequal_decimals() {
+    fn whole_price_converts_with_unequal_decimals() {
         // 1 whole base token (18 decimals) = 2718.655 quote tokens (6 decimals):
         // 2_718_655 / 10^15, reduced by their common factor 5.
-        let price = BatchPrice::from_pair_price(decimal("2718.655"), 18, 6).unwrap();
+        let price = BatchPrice::from_whole_price(dec("2718.655"), 18, 6).unwrap();
         assert_eq!(price.quote_units, U256::from(543_731u64));
         assert_eq!(price.base_units, U256::from(200_000_000_000_000u64));
+        // Trailing zeros change nothing.
+        assert_eq!(
+            BatchPrice::from_whole_price(dec("2718.65500000"), 18, 6).unwrap(),
+            price
+        );
+        // Seen from the other token, the two numbers swap.
+        let inverse = price.inverse();
+        assert_eq!(inverse.quote_units, price.base_units);
+        assert_eq!(inverse.base_units, price.quote_units);
     }
 
     #[test]
-    fn decimal_formatting_rounds_half_up() {
-        let price = decimal("2718.655");
-        assert_eq!(price.to_trimmed_decimal(18).unwrap(), "2718.655");
-        assert_eq!(price.to_fixed_decimal(2).unwrap(), "2718.66");
-        assert_eq!(price.to_fixed_decimal(0).unwrap(), "2719");
-        assert_eq!(price.to_fixed_decimal(4).unwrap(), "2718.6550");
-        assert_eq!(decimal("10").to_trimmed_decimal(18).unwrap(), "10");
-        assert_eq!(decimal("10").to_fixed_decimal(2).unwrap(), "10.00");
-        let third = ReferencePrice::from_ratio(1, 3).unwrap();
-        assert_eq!(
-            third.to_trimmed_decimal(18).unwrap(),
-            "0.333333333333333333"
-        );
-        let two_thirds = ReferencePrice::from_ratio(2, 3).unwrap();
-        assert_eq!(two_thirds.to_fixed_decimal(2).unwrap(), "0.67");
-        assert_eq!(decimal("0.004").to_trimmed_decimal(2).unwrap(), "0");
-        // Half-up carries through a run of nines into the whole part.
-        assert_eq!(decimal("9.995").to_fixed_decimal(2).unwrap(), "10.00");
-        assert_eq!(decimal("9.995").to_trimmed_decimal(2).unwrap(), "10");
-        assert_eq!(
-            decimal("0.9999995").to_fixed_decimal(6).unwrap(),
-            "1.000000"
-        );
-        assert_eq!(decimal("99.5").to_fixed_decimal(0).unwrap(), "100");
+    fn whole_price_rejects_zero_negative_and_overflow() {
+        assert!(BatchPrice::from_whole_price(Decimal::ZERO, 6, 6).is_err());
+        assert!(BatchPrice::from_whole_price(dec("-1"), 6, 6).is_err());
+        assert!(matches!(
+            BatchPrice::from_whole_price(Decimal::MAX, 0, 78),
+            Err(ClearingError::ArithmeticOverflow)
+        ));
     }
 
     mod properties {
@@ -576,115 +334,28 @@ mod tests {
         use proptest::prelude::*;
 
         /// A positive decimal with up to eight fractional digits, as Binance sends.
-        fn price() -> impl Strategy<Value = ReferencePrice> {
-            (1u64..1_000_000_000_000_000, 0u32..=8).prop_map(|(units, digits)| {
-                ReferencePrice::from_ratio(units, 10u64.pow(digits)).unwrap()
-            })
+        fn price() -> impl Strategy<Value = Decimal> {
+            (1i64..1_000_000_000_000_000, 0u32..=8)
+                .prop_map(|(units, places)| Decimal::new(units, places))
         }
 
         proptest! {
-            #[test]
-            fn midpoint_lies_between_and_is_exact(first in price(), second in price()) {
-                let (bid, ask) = if ReferencePrice::is_ordered(first, second).unwrap() {
-                    (first, second)
-                } else {
-                    (second, first)
-                };
-                let mid = ReferencePrice::midpoint(bid, ask).unwrap();
-                prop_assert!(ReferencePrice::is_ordered(bid, mid).unwrap());
-                prop_assert!(ReferencePrice::is_ordered(mid, ask).unwrap());
-                // 2 × mid = bid + ask, cross-multiplied.
-                let sum_numerator = bid.numerator * ask.denominator + ask.numerator * bid.denominator;
-                let sum_denominator = bid.denominator * ask.denominator;
-                prop_assert_eq!(
-                    U256::from(2u8) * mid.numerator * sum_denominator,
-                    sum_numerator * mid.denominator
-                );
-            }
-
             /// The base-unit price is the whole-token price scaled by the
             /// decimals, in lowest terms.
             #[test]
-            fn pair_price_conversion_preserves_the_ratio(
+            fn whole_price_conversion_preserves_the_ratio(
                 price in price(),
                 base_decimals in 0u8..=18,
                 quote_decimals in 0u8..=18,
             ) {
-                let batch = BatchPrice::from_pair_price(price, base_decimals, quote_decimals).unwrap();
-                let ten = |power: u8| U256::from(10u8).pow(U256::from(power));
+                let batch = BatchPrice::from_whole_price(price, base_decimals, quote_decimals).unwrap();
+                let ten = |power: u32| U256::from(10u8).pow(U256::from(power));
+                let mantissa = U256::from(u128::try_from(price.mantissa()).unwrap());
                 prop_assert_eq!(
-                    batch.quote_units * price.denominator * ten(base_decimals),
-                    batch.base_units * price.numerator * ten(quote_decimals)
+                    batch.quote_units * ten(price.scale()) * ten(base_decimals.into()),
+                    batch.base_units * mantissa * ten(quote_decimals.into())
                 );
                 prop_assert_eq!(batch.quote_units.gcd(batch.base_units), U256::ONE);
-            }
-
-            /// Against integer arithmetic on tick counts: `ask = bid + k` ticks
-            /// of 10^-8, so the exact spread is `20_000·k / (2·bid + k)` bps.
-            #[test]
-            fn spread_limit_matches_an_integer_oracle(
-                bid_ticks in 1u64..1_000_000_000_000,
-                spread_ticks in 0u64..1_000_000_000,
-            ) {
-                let ticks = |count: u64| ReferencePrice::from_ratio(count, 100_000_000).unwrap();
-                let (bid, ask) = (ticks(bid_ticks), ticks(bid_ticks + spread_ticks));
-                let numerator = 20_000 * u128::from(spread_ticks);
-                let denominator = 2 * u128::from(bid_ticks) + u128::from(spread_ticks);
-                let floor = u32::try_from(numerator / denominator).unwrap();
-                let exact = numerator % denominator == 0;
-                prop_assert_eq!(ReferencePrice::spread_within_bps(bid, ask, floor).unwrap(), exact);
-                prop_assert!(ReferencePrice::spread_within_bps(bid, ask, floor + 1).unwrap());
-                if floor > 0 {
-                    prop_assert!(!ReferencePrice::spread_within_bps(bid, ask, floor - 1).unwrap());
-                }
-            }
-
-            #[test]
-            fn trimmed_decimal_round_trips_terminating_prices(price in price()) {
-                let text = price.to_trimmed_decimal(18).unwrap();
-                prop_assert_eq!(ReferencePrice::from_decimal(&text).unwrap(), price);
-            }
-
-            /// Against an integer oracle: `n/d` at `p` places, rounded half up,
-            /// is `(2·n·10^p + d) / (2·d)` scaled units.
-            #[test]
-            fn fixed_decimal_matches_an_integer_oracle(
-                numerator in 1u64..1_000_000_000_000,
-                denominator in 1u64..1_000_000_000,
-                places in 0u8..=12,
-            ) {
-                let price = ReferencePrice::from_ratio(numerator, denominator).unwrap();
-                let text = price.to_fixed_decimal(places).unwrap();
-                let scale = 10u128.pow(u32::from(places));
-                let units = (2 * u128::from(numerator) * scale + u128::from(denominator))
-                    / (2 * u128::from(denominator));
-                let expected = if places == 0 {
-                    units.to_string()
-                } else {
-                    format!("{}.{:0>width$}", units / scale, units % scale, width = usize::from(places))
-                };
-                prop_assert_eq!(text, expected);
-            }
-
-            /// The validated midpoint agrees with the separate checks.
-            #[test]
-            fn validated_midpoint_agrees_with_separate_checks(
-                first in price(),
-                second in price(),
-                max_bps in 0u32..=20_000,
-            ) {
-                let validated = ReferencePrice::validated_midpoint(first, second, max_bps);
-                let ordered = ReferencePrice::is_ordered(first, second).unwrap();
-                let within = ReferencePrice::spread_within_bps(first, second, max_bps).unwrap();
-                match validated {
-                    Ok(mid) => {
-                        prop_assert!(ordered && within);
-                        prop_assert_eq!(mid, ReferencePrice::midpoint(first, second).unwrap());
-                    }
-                    Err(MidpointError::Crossed) => prop_assert!(!ordered),
-                    Err(MidpointError::TooWide) => prop_assert!(ordered && !within),
-                    Err(MidpointError::Overflow) => prop_assert!(false, "overflow on small inputs"),
-                }
             }
         }
     }

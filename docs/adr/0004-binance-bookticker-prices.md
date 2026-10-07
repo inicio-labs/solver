@@ -29,7 +29,7 @@ Compute this midpoint once. If the solver's pair uses the reverse orientation, u
 quote base units per base base unit = P × 10^quote_decimals / 10^base_decimals
 ```
 
-Keep the arithmetic exact and checked. Reuse `ReferencePrice` parsing and the existing `BatchPrice` arithmetic, adding only the direct-pair conversion helpers that are missing. Do not turn the pair price into two fictitious USD token prices or pass it through floating point.
+Keep the arithmetic exact and checked. Read the price strings as exact decimals (`rust_decimal`), compute `P` from them, and convert `P` once into the existing `BatchPrice` ratio of base units. A reversed pair uses that ratio with its two sides swapped, so `1 / P` is never rounded. Do not turn the pair price into two fictitious USD token prices or pass it through floating point.
 
 The operator configures each Binance symbol against its Miden faucet pair. On startup, validate the symbol, its base and quote assets, and trading status through public `exchangeInfo`. Derive direct or reverse orientation from that mapping; there is no separate operator-supplied orientation flag. Token names alone do not establish the mapping. Only directly listed and approved markets are supported. A pair without a valid direct market remains unavailable for internal clearing while other pairs continue.
 

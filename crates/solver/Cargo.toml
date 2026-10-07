@@ -41,6 +41,8 @@ ruint = "1.18"
 range-set-blaze = "0.7"
 thiserror = "2"
 strum = { version = "0.28", features = ["derive"] }
+# Exact decimal arithmetic for Binance prices (ADR 0004).
+rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 miden-crypto.workspace = true

@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use rust_decimal::Decimal;
+
 use miden_protocol::account::AccountId;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -9,7 +11,6 @@ use miden_protocol::testing::account_id::{
 };
 
 use super::market::{AssetCode, ClearingMarket, IssueKind, Listing, MarketPlan, Markets, Symbol};
-use crate::clearing::ReferencePrice;
 use crate::types::TokenId;
 
 pub(crate) fn eth() -> TokenId {
@@ -24,8 +25,13 @@ pub(crate) fn btc() -> TokenId {
     AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap()
 }
 
-pub(crate) fn price(raw: &str) -> ReferencePrice {
-    ReferencePrice::from_decimal(raw).unwrap()
+/// On-chain decimals of the test tokens: ETH 18, USDT 6, BTC 8.
+pub(crate) fn decimals() -> HashMap<TokenId, u8> {
+    HashMap::from([(eth(), 18), (usdt(), 6), (btc(), 8)])
+}
+
+pub(crate) fn price(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
 }
 
 pub(crate) fn asset(code: &str) -> AssetCode {
@@ -61,8 +67,8 @@ pub(crate) fn market(
     }
 }
 
-/// The ETH, USDT and BTC faucets mapped to their Binance assets, valued in
-/// USDT, clearing `clearing`.
+/// The ETH, USDT and BTC faucets mapped to their Binance assets, with their
+/// decimals, valued in USDT, clearing `clearing`.
 pub(crate) fn plan(clearing: Vec<ClearingMarket>) -> MarketPlan {
     MarketPlan::new(
         [
@@ -74,6 +80,7 @@ pub(crate) fn plan(clearing: Vec<ClearingMarket>) -> MarketPlan {
         asset("USDT"),
     )
     .unwrap()
+    .with_decimals(decimals())
 }
 
 /// `plan` resolved against `TRADING` listings `(symbol, base, quote)`. Symbols
@@ -108,6 +115,7 @@ pub(crate) fn reversed_eth_markets() -> Markets {
         vec![market("USDT-ETH", usdt(), eth(), "ETHUSDT")],
         asset("USDT"),
     )
-    .unwrap();
+    .unwrap()
+    .with_decimals(decimals());
     confirmed(&plan, &[("ETHUSDT", "ETH", "USDT")])
 }

@@ -10,7 +10,6 @@ mod types;
 
 pub use config::{ClearingConfig, PPM_DENOMINATOR};
 pub use matching::{PairBatch, PairMatcher};
-pub(crate) use math::MidpointError;
 pub use order::Order;
 pub(crate) use order::{MatchOrder, OrderKey, OrderSide};
 pub use types::{

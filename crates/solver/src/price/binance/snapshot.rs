@@ -16,9 +16,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rust_decimal::Decimal;
+
 use super::market::{Markets, Orientation, Symbol, Valuation};
 use super::ticker::QuoteRejection;
-use crate::clearing::ReferencePrice;
+use crate::clearing::BatchPrice;
 use crate::types::TokenId;
 
 /// One reader's parsed `bookTicker` update for a subscribed symbol.
@@ -29,15 +31,15 @@ pub(crate) struct Observation {
     pub(crate) update_id: u64,
     /// Monotonic local time the socket delivered the frame.
     pub(crate) received_at: Instant,
-    /// The exact midpoint, or why this quote is invalid.
-    pub(crate) mid: Result<ReferencePrice, QuoteRejection>,
+    /// The midpoint, or why this quote is invalid.
+    pub(crate) mid: Result<Decimal, QuoteRejection>,
 }
 
 /// A validated quote: Binance's `quote per base` midpoint for one symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Quote {
     pub(crate) update_id: u64,
-    pub(crate) mid: ReferencePrice,
+    pub(crate) mid: Decimal,
     pub(crate) received_at: Instant,
 }
 
@@ -73,7 +75,8 @@ pub enum PriceUnavailable {
     NoMarket,
     /// The market has had no update yet.
     NoQuote,
-    /// The newest update failed validation.
+    /// The newest update failed validation, or its price does not fit the
+    /// pair's token decimals.
     Invalid,
     /// The quote is at least the TTL old.
     Stale,
@@ -96,7 +99,7 @@ pub(crate) enum Offer {
 /// A wallet valuation: one whole token in the valuation quote asset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Valued {
-    pub(crate) price: ReferencePrice,
+    pub(crate) price: Decimal,
     /// When the quote was received; `None` for the quote asset itself.
     pub(crate) received_at: Option<Instant>,
     /// Whether the quote is younger than the TTL.
@@ -187,41 +190,56 @@ impl PriceSnapshot {
         }
     }
 
-    /// Whole `quote` tokens per whole `base` token for a confirmed clearing
-    /// pair, as configured, while its quote is fresh at `now`.
+    /// A confirmed clearing pair's price in base units, `quote` units per
+    /// `base` unit, while its quote is fresh at `now`.
     pub(crate) fn pair_price(
         &self,
         base: TokenId,
         quote: TokenId,
         now: Instant,
-    ) -> Result<ReferencePrice, PriceUnavailable> {
-        let source = self
+    ) -> Result<BatchPrice, PriceUnavailable> {
+        let pair = self
             .markets
             .pair(base, quote)
             .ok_or(PriceUnavailable::NoMarket)?;
-        let (latest, fresh) = self.quote(source.symbol, now)?;
+        let (latest, fresh) = self.quote(pair.symbol, now)?;
         if !fresh {
             return Err(PriceUnavailable::Stale);
         }
-        Ok(match source.orientation {
-            Orientation::Direct => latest.mid,
-            Orientation::Reverse => latest.mid.reciprocal(),
-        })
+        pair.in_base_units(latest.mid)
+            .ok_or(PriceUnavailable::Invalid)
     }
 
-    /// Like [`Self::pair_price`] for a clearing pair configured in either
-    /// direction: whole `requested` tokens per whole `offered` token.
+    /// Whole `requested` tokens per whole `offered` token, for a clearing pair
+    /// configured in either direction, while its quote is fresh at `now`.
+    /// Where Binance quotes the other way round the price is `1 / mid`,
+    /// rounded to the 28 significant digits a `Decimal` holds.
     pub(crate) fn market_price(
         &self,
         offered: TokenId,
         requested: TokenId,
         now: Instant,
-    ) -> Result<ReferencePrice, PriceUnavailable> {
-        match self.pair_price(offered, requested, now) {
-            Err(PriceUnavailable::NoMarket) => self
-                .pair_price(requested, offered, now)
-                .map(ReferencePrice::reciprocal),
-            result => result,
+    ) -> Result<Decimal, PriceUnavailable> {
+        let (pair, flipped) = match self.markets.pair(offered, requested) {
+            Some(pair) => (pair, false),
+            None => (
+                self.markets
+                    .pair(requested, offered)
+                    .ok_or(PriceUnavailable::NoMarket)?,
+                true,
+            ),
+        };
+        let (latest, fresh) = self.quote(pair.symbol, now)?;
+        if !fresh {
+            return Err(PriceUnavailable::Stale);
+        }
+        // The midpoint prices Binance's base asset; is that `offered`?
+        if (pair.orientation == Orientation::Direct) != flipped {
+            Ok(latest.mid)
+        } else {
+            Decimal::ONE
+                .checked_div(latest.mid)
+                .ok_or(PriceUnavailable::Invalid)
         }
     }
 
@@ -239,7 +257,7 @@ impl PriceSnapshot {
             .ok_or(PriceUnavailable::NoMarket)?
         {
             Valuation::Unit => Ok(Valued {
-                price: ReferencePrice::ONE,
+                price: Decimal::ONE,
                 received_at: None,
                 fresh: true,
             }),
@@ -258,7 +276,9 @@ impl PriceSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::price::binance::test_support::{btc, eth, price, reversed_eth_markets, usdt};
+    use crate::price::binance::test_support::{
+        btc, confirmed, eth, market, plan, price, reversed_eth_markets, usdt,
+    };
     use crate::price::binance::ticker::{parse_frame, Frame, QuoteLimits};
 
     const TTL: Duration = Duration::from_secs(2);
@@ -266,6 +286,13 @@ mod tests {
     /// USDT/ETH configured with USDT as base, priced by ETHUSDT (reversed).
     fn book() -> PriceSnapshot {
         PriceSnapshot::new(Arc::new(reversed_eth_markets()), TTL)
+    }
+
+    /// USDT/ETH in base units at an ETHUSDT midpoint of `usdt_per_eth`:
+    /// ETH has 18 decimals and USDT 6, so one USDT unit buys
+    /// `10^18 / (usdt_per_eth × 10^6)` ETH units.
+    fn usdt_eth(usdt_per_eth: u64) -> BatchPrice {
+        BatchPrice::from_ratio(1_000_000_000_000, usdt_per_eth).unwrap()
     }
 
     fn observe(update_id: u64, received_at: Instant, mid: Option<&str>) -> Observation {
@@ -323,10 +350,7 @@ mod tests {
         book.offer(&observe(10, now, Some("2000")));
         assert_eq!(book.offer(&observe(10, now, Some("2001"))), Offer::Conflict);
         assert_eq!(book.offer(&observe(10, now, None)), Offer::Conflict);
-        assert_eq!(
-            book.pair_price(usdt(), eth(), now),
-            Ok(price("2000").reciprocal())
-        );
+        assert_eq!(book.pair_price(usdt(), eth(), now), Ok(usdt_eth(2000)));
         book.offer(&observe(11, now, None));
         assert_eq!(book.offer(&observe(11, now, Some("2000"))), Offer::Conflict);
         assert_eq!(book.offer(&observe(11, now, None)), Offer::NotNewer);
@@ -345,10 +369,7 @@ mod tests {
         );
         // Only a newer valid quote restores the pair.
         assert_eq!(book.offer(&observe(12, now, Some("2500"))), Offer::Accepted);
-        assert_eq!(
-            book.pair_price(usdt(), eth(), now),
-            Ok(price("2500").reciprocal())
-        );
+        assert_eq!(book.pair_price(usdt(), eth(), now), Ok(usdt_eth(2500)));
     }
 
     #[test]
@@ -395,7 +416,7 @@ mod tests {
         assert_eq!(snapshot.market_price(eth(), usdt(), now), Ok(price("2000")));
         assert_eq!(
             snapshot.market_price(usdt(), eth(), now),
-            Ok(price("2000").reciprocal())
+            Ok(price("0.0005"))
         );
         assert_eq!(
             snapshot.market_price(eth(), btc(), now),
@@ -404,7 +425,7 @@ mod tests {
         assert_eq!(
             snapshot.valuation(usdt(), now),
             Ok(Valued {
-                price: ReferencePrice::ONE,
+                price: Decimal::ONE,
                 received_at: None,
                 fresh: true
             })
@@ -420,10 +441,10 @@ mod tests {
         );
     }
 
-    /// A reversed pair is priced at `1 / mid`, not at the midpoint of the
-    /// reciprocal bid and ask.
+    /// A reversed pair is priced at `1 / mid` exactly, not at the midpoint of
+    /// the reciprocal bid and ask: the midpoint's ratio is flipped.
     #[test]
-    fn reversed_pair_uses_the_reciprocal_of_the_midpoint() {
+    fn reversed_pair_flips_the_midpoint() {
         let mut book = book();
         let now = Instant::now();
         let frame = r#"{"stream":"ethusdt@bookTicker","data":{"u":1,"s":"ETHUSDT","b":"2000","B":"1","a":"2002","A":"1"}}"#;
@@ -435,11 +456,23 @@ mod tests {
             panic!("a quote frame");
         };
         book.offer(&observation);
-        let usdt_in_eth = book.pair_price(usdt(), eth(), now).unwrap();
-        assert_eq!(usdt_in_eth, price("2001").reciprocal());
-        let averaged_reciprocals =
-            ReferencePrice::midpoint(price("2002").reciprocal(), price("2000").reciprocal())
-                .unwrap();
-        assert_ne!(usdt_in_eth, averaged_reciprocals);
+        assert_eq!(book.pair_price(usdt(), eth(), now), Ok(usdt_eth(2001)));
+    }
+
+    /// The same midpoint in the configured direction: ETH/USDT on ETHUSDT.
+    #[test]
+    fn direct_pair_uses_the_midpoint_in_base_units() {
+        let markets = confirmed(
+            &plan(vec![market("ETH-USDT", eth(), usdt(), "ETHUSDT")]),
+            &[("ETHUSDT", "ETH", "USDT")],
+        );
+        let mut book = PriceSnapshot::new(Arc::new(markets), TTL);
+        let now = Instant::now();
+        book.offer(&observe(1, now, Some("2001")));
+        // 2001 × 10^6 USDT units per 10^18 ETH units.
+        assert_eq!(
+            book.pair_price(eth(), usdt(), now),
+            Ok(usdt_eth(2001).inverse())
+        );
     }
 }

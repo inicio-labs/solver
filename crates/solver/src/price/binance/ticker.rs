@@ -8,7 +8,8 @@
 //! A frame whose subscribed symbol or update ID cannot be identified is
 //! discarded without touching published state. An identifiable frame becomes an
 //! [`Observation`]; if its quote fails validation, the observation marks the
-//! symbol invalid. Prices are parsed exactly; nothing passes through `f64`.
+//! symbol invalid. Prices are read as exact decimals; nothing passes through
+//! `f64`.
 //! Binance's `serverShutdown` event, which precedes a disconnect, is reported
 //! so the reader can reconnect before the server closes the socket.
 
@@ -17,9 +18,10 @@ use std::time::Instant;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use rust_decimal::Decimal;
+
 use super::market::Markets;
 use super::snapshot::Observation;
-use crate::clearing::{MidpointError, ReferencePrice};
 
 /// Why an identifiable quote is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
@@ -40,7 +42,8 @@ pub(crate) enum QuoteRejection {
     TooWide,
     /// A side's displayed notional is below the configured minimum.
     ThinBook,
-    /// Exact arithmetic overflowed.
+    /// A value is too large or too precise for exact decimal arithmetic
+    /// (28 significant digits).
     Overflow,
 }
 
@@ -63,7 +66,7 @@ pub(crate) struct QuoteLimits {
     pub(crate) max_spread_bps: u32,
     /// Least displayed notional (`quantity × price`, in the symbol's quote
     /// asset) on each side; `None` accepts any positive quantity.
-    pub(crate) min_notional: Option<ReferencePrice>,
+    pub(crate) min_notional: Option<Decimal>,
 }
 
 /// A parsed text frame.
@@ -139,36 +142,50 @@ fn is_server_shutdown(text: &str) -> bool {
     })
 }
 
-/// A positive decimal sent as a JSON string, parsed exactly. Binance never
-/// escapes digits, so a string that needs unescaping is rejected.
-fn positive_decimal(raw: Option<&RawValue>) -> Option<ReferencePrice> {
+/// A positive decimal sent as a JSON string, read exactly: digits with one
+/// decimal point at most, no sign, exponent or escape.
+fn positive_decimal(raw: Option<&RawValue>) -> Option<Decimal> {
     let text: &str = serde_json::from_str(raw?.get()).ok()?;
-    ReferencePrice::from_decimal(text).ok()
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let value = Decimal::from_str_exact(text).ok()?;
+    (value > Decimal::ZERO).then(|| value.normalize())
 }
 
 impl BookTicker<'_> {
-    /// The exact midpoint of a valid quote.
-    fn midpoint(&self, limits: QuoteLimits) -> Result<ReferencePrice, QuoteRejection> {
-        let bid = positive_decimal(self.bid_price).ok_or(QuoteRejection::BadPrice)?;
-        let ask = positive_decimal(self.ask_price).ok_or(QuoteRejection::BadPrice)?;
-        let bid_quantity =
-            positive_decimal(self.bid_quantity).ok_or(QuoteRejection::BadQuantity)?;
-        let ask_quantity =
-            positive_decimal(self.ask_quantity).ok_or(QuoteRejection::BadQuantity)?;
-        let mid = ReferencePrice::validated_midpoint(bid, ask, limits.max_spread_bps).map_err(
-            |error| match error {
-                MidpointError::Crossed => QuoteRejection::Crossed,
-                MidpointError::TooWide => QuoteRejection::TooWide,
-                MidpointError::Overflow => QuoteRejection::Overflow,
-            },
-        )?;
+    /// The midpoint `(bid + ask) / 2` of a valid quote.
+    fn midpoint(&self, limits: QuoteLimits) -> Result<Decimal, QuoteRejection> {
+        use QuoteRejection::{BadPrice, BadQuantity, Crossed, Overflow, ThinBook, TooWide};
+        let bid = positive_decimal(self.bid_price).ok_or(BadPrice)?;
+        let ask = positive_decimal(self.ask_price).ok_or(BadPrice)?;
+        let bid_quantity = positive_decimal(self.bid_quantity).ok_or(BadQuantity)?;
+        let ask_quantity = positive_decimal(self.ask_quantity).ok_or(BadQuantity)?;
+        if bid > ask {
+            return Err(Crossed);
+        }
+        let sum = bid.checked_add(ask).ok_or(Overflow)?;
+        let mid = sum.checked_div(Decimal::TWO).ok_or(Overflow)?;
+        // Halving adds one decimal place. A `Decimal` holds 28 significant
+        // digits, so refuse the rare sum whose half would be rounded.
+        if mid.checked_mul(Decimal::TWO) != Some(sum) {
+            return Err(Overflow);
+        }
+        // Spread in basis points is `10_000 × (ask − bid) / mid`; compare it
+        // with the limit without dividing.
+        let spread = (ask - bid).checked_mul(Decimal::from(10_000u32));
+        let limit = Decimal::from(limits.max_spread_bps).checked_mul(mid);
+        if spread.ok_or(Overflow)? > limit.ok_or(Overflow)? {
+            return Err(TooWide);
+        }
         if let Some(minimum) = limits.min_notional {
-            let deep = |quantity, price| {
-                ReferencePrice::notional_at_least(quantity, price, minimum)
-                    .map_err(|_| QuoteRejection::Overflow)
-            };
-            if !deep(bid_quantity, bid)? || !deep(ask_quantity, ask)? {
-                return Err(QuoteRejection::ThinBook);
+            let notional =
+                |quantity: Decimal, price: Decimal| quantity.checked_mul(price).ok_or(Overflow);
+            if notional(bid_quantity, bid)? < minimum || notional(ask_quantity, ask)? < minimum {
+                return Err(ThinBook);
             }
         }
         Ok(mid)
@@ -245,8 +262,13 @@ mod tests {
 
     #[test]
     fn identifiable_bad_quotes_are_rejected() {
-        let huge = format!("1{}", "0".repeat(60));
-        let overflowing = format!(r#""b":"0.000000000000000001","B":"1","a":"{huge}","A":"1""#);
+        // More digits than a `Decimal` holds cannot be read exactly.
+        let too_long = format!(r#""b":"1","B":"1","a":"1{}","A":"1""#, "0".repeat(60));
+        // The largest `Decimal`: the sum of bid and ask overflows.
+        let max = "79228162514264337593543950335";
+        let overflowing = format!(r#""b":"{max}","B":"1","a":"{max}","A":"1""#);
+        // 28 decimal places: the midpoint would need a 29th.
+        let too_precise = r#""b":"0.0000000000000000000000000001","B":"1","a":"0.0000000000000000000000000002","A":"1""#;
         let cases = [
             (
                 r#""b":"0.00000000","B":"1","a":"2","A":"1""#,
@@ -282,7 +304,9 @@ mod tests {
                 r#""b":"99","B":"1","a":"101","A":"1""#,
                 QuoteRejection::TooWide,
             ),
+            (too_long.as_str(), QuoteRejection::BadPrice),
             (overflowing.as_str(), QuoteRejection::Overflow),
+            (too_precise, QuoteRejection::Overflow),
         ];
         for (fields, expected) in cases {
             let observation = parse(&quote(fields)).unwrap();
@@ -368,5 +392,70 @@ mod tests {
             parse(r#"{"stream":"!other","data":{"e":"other"}}"#).unwrap_err(),
             Discard::Malformed
         );
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// `ticks` × 10^-8 as Binance writes it, with eight decimal places.
+        fn binance_text(ticks: u64) -> String {
+            format!("{}.{:08}", ticks / 100_000_000, ticks % 100_000_000)
+        }
+
+        fn mid_of(
+            bid_ticks: u64,
+            ask_ticks: u64,
+            max_spread_bps: u32,
+        ) -> Result<Decimal, QuoteRejection> {
+            let fields = format!(
+                r#""b":"{}","B":"1","a":"{}","A":"1""#,
+                binance_text(bid_ticks),
+                binance_text(ask_ticks)
+            );
+            let limits = QuoteLimits {
+                max_spread_bps,
+                min_notional: None,
+            };
+            parse_with(&quote(&fields), limits).unwrap().mid
+        }
+
+        proptest! {
+            /// The midpoint lies between bid and ask and is exactly half their sum.
+            #[test]
+            fn midpoint_is_exact(
+                bid_ticks in 1u64..1_000_000_000_000_000,
+                spread_ticks in 0u64..1_000_000_000,
+            ) {
+                let ask_ticks = bid_ticks + spread_ticks;
+                let mid = mid_of(bid_ticks, ask_ticks, 10_000).unwrap();
+                let (bid, ask) = (Decimal::new(bid_ticks as i64, 8), Decimal::new(ask_ticks as i64, 8));
+                prop_assert!(bid <= mid && mid <= ask);
+                prop_assert_eq!(mid * Decimal::TWO, bid + ask);
+            }
+
+            /// Against integer arithmetic on tick counts: with `ask = bid + k`
+            /// ticks, the exact spread is `20_000·k / (2·bid + k)` bps, and a
+            /// spread equal to the limit is accepted.
+            #[test]
+            fn spread_limit_matches_an_integer_oracle(
+                bid_ticks in 1u64..1_000_000_000_000,
+                spread_ticks in 0u64..1_000_000_000,
+            ) {
+                let ask_ticks = bid_ticks + spread_ticks;
+                let numerator = 20_000 * u128::from(spread_ticks);
+                let denominator = 2 * u128::from(bid_ticks) + u128::from(spread_ticks);
+                let floor = u32::try_from(numerator / denominator).unwrap();
+                let exact = numerator % denominator == 0;
+                prop_assert_eq!(mid_of(bid_ticks, ask_ticks, floor).is_ok(), exact);
+                prop_assert!(mid_of(bid_ticks, ask_ticks, floor + 1).is_ok());
+                if floor > 0 {
+                    prop_assert_eq!(
+                        mid_of(bid_ticks, ask_ticks, floor - 1),
+                        Err(QuoteRejection::TooWide)
+                    );
+                }
+            }
+        }
     }
 }

@@ -4,13 +4,17 @@
 //! direct symbol per clearing pair. Public `exchangeInfo` then confirms each
 //! symbol's base and quote assets and trading status; the pair's orientation
 //! follows from that listing, never from a separate flag or from token names.
+//! Each clearing pair also needs both tokens' on-chain decimals, to express its
+//! price in base units.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use rust_decimal::Decimal;
 use thiserror::Error;
 
+use crate::clearing::BatchPrice;
 use crate::types::TokenId;
 
 /// Longest accepted asset code; two codes always form a valid symbol.
@@ -160,6 +164,8 @@ pub struct MarketPlan {
     assets: BTreeMap<TokenId, AssetCode>,
     clearing: Vec<ClearingMarket>,
     valuation_quote: AssetCode,
+    /// On-chain decimals per token, for pricing clearing pairs in base units.
+    decimals: HashMap<TokenId, u8>,
 }
 
 impl MarketPlan {
@@ -214,7 +220,16 @@ impl MarketPlan {
             assets: mapped,
             clearing,
             valuation_quote,
+            decimals: HashMap::new(),
         })
+    }
+
+    /// The tokens' on-chain decimals. A clearing pair whose token has none is
+    /// reported and left out; wallet valuation does not need them.
+    #[must_use]
+    pub fn with_decimals(mut self, decimals: HashMap<TokenId, u8>) -> Self {
+        self.decimals = decimals;
+        self
     }
 
     /// The valuation symbol for `asset`; `None` for the valuation quote itself.
@@ -273,18 +288,34 @@ impl MarketPlan {
                 kind,
             });
         };
+        let decimals_of = |token: TokenId| {
+            self.decimals
+                .get(&token)
+                .copied()
+                .ok_or(IssueKind::NoDecimals { token })
+        };
         for market in &self.clearing {
             // `new` guarantees both assets are mapped.
             let (base, quote) = (&self.assets[&market.base], &self.assets[&market.quote]);
             let use_ = || MarketUse::Clearing(market.name.clone());
-            match check(&market.symbol, base, quote) {
-                Ok((orientation, warning)) => {
+            let checked = check(&market.symbol, base, quote).and_then(|(orientation, warning)| {
+                Ok((
+                    orientation,
+                    warning,
+                    decimals_of(market.base)?,
+                    decimals_of(market.quote)?,
+                ))
+            });
+            match checked {
+                Ok((orientation, warning, base_decimals, quote_decimals)) => {
                     let symbol = markets.add_symbol(&market.symbol);
                     markets.pairs.insert(
                         (market.base, market.quote),
                         PairSource {
                             symbol,
                             orientation,
+                            base_decimals,
+                            quote_decimals,
                         },
                     );
                     if let Some(kind) = warning {
@@ -353,6 +384,8 @@ pub(crate) enum IssueKind {
     SpotTradingNotAllowed,
     #[error("listed as {base}/{quote}, which is not the configured market")]
     AssetMismatch { base: AssetCode, quote: AssetCode },
+    #[error("token {token} has no on-chain decimals yet; restart once they are fetched")]
+    NoDecimals { token: TokenId },
 }
 
 /// One configured market that Binance's listing does not fully support.
@@ -372,10 +405,32 @@ impl MarketIssue {
     }
 }
 
+/// How a confirmed clearing pair is priced: the symbol, which way round
+/// Binance quotes it, and the two tokens' on-chain decimals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PairSource {
     pub(crate) symbol: usize,
     pub(crate) orientation: Orientation,
+    pub(crate) base_decimals: u8,
+    pub(crate) quote_decimals: u8,
+}
+
+impl PairSource {
+    /// The pair's price in base units from the symbol's midpoint (whole
+    /// Binance-quote tokens per whole Binance-base token). A reversed market
+    /// is the same ratio seen from the other token, so nothing is rounded.
+    pub(crate) fn in_base_units(&self, mid: Decimal) -> Option<BatchPrice> {
+        match self.orientation {
+            Orientation::Direct => {
+                BatchPrice::from_whole_price(mid, self.base_decimals, self.quote_decimals).ok()
+            }
+            Orientation::Reverse => {
+                BatchPrice::from_whole_price(mid, self.quote_decimals, self.base_decimals)
+                    .ok()
+                    .map(BatchPrice::inverse)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,7 +493,7 @@ impl Markets {
 mod tests {
     use super::*;
     use crate::price::binance::test_support::{
-        asset, btc, eth, listing, market, plan, symbol, usdt,
+        asset, btc, decimals, eth, listing, market, plan, symbol, usdt,
     };
 
     #[test]
@@ -520,7 +575,9 @@ mod tests {
             markets.pair(usdt(), eth()),
             Some(PairSource {
                 symbol: eth_usdt,
-                orientation: Orientation::Reverse
+                orientation: Orientation::Reverse,
+                base_decimals: 6,
+                quote_decimals: 18,
             })
         );
         assert_eq!(markets.pair(eth(), usdt()), None);
@@ -533,6 +590,35 @@ mod tests {
         assert_eq!(markets.stream_name(eth_usdt), "ethusdt@bookTicker");
         assert_eq!(markets.valuation(eth()), Some(Valuation::Market(eth_usdt)));
         assert_eq!(markets.valuation(usdt()), Some(Valuation::Unit));
+    }
+
+    /// A clearing pair needs both tokens' decimals; valuation does not.
+    #[test]
+    fn a_pair_without_decimals_is_reported_and_left_out() {
+        let mut decimals = decimals();
+        decimals.remove(&btc());
+        let plan = plan(vec![
+            market("ETH-USDT", eth(), usdt(), "ETHUSDT"),
+            market("BTC-USDT", btc(), usdt(), "BTCUSDT"),
+        ])
+        .with_decimals(decimals);
+        let listings = HashMap::from([
+            (symbol("ETHUSDT"), Some(listing("ETH", "USDT"))),
+            (symbol("BTCUSDT"), Some(listing("BTC", "USDT"))),
+        ]);
+        let (markets, issues) = plan.resolve(&listings);
+        assert!(markets.pair(eth(), usdt()).is_some());
+        assert_eq!(markets.pair(btc(), usdt()), None);
+        assert!(markets.valuation(btc()).is_some());
+        assert_eq!(
+            issues,
+            vec![MarketIssue {
+                symbol: symbol("BTCUSDT"),
+                use_: MarketUse::Clearing("BTC-USDT".into()),
+                kind: IssueKind::NoDecimals { token: btc() },
+            }]
+        );
+        assert!(issues[0].rejects());
     }
 
     #[test]

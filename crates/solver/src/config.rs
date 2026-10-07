@@ -383,8 +383,9 @@ fn default_router_inflight_ttl_ms() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BinanceConfig {
-    /// Stream base URLs of reader A and reader B. By default reader A uses the
-    /// market-data-only endpoint and reader B the main one: separate front
+    /// Stream base URLs of the two readers, which logs and metrics name the
+    /// readers by. By default one uses the market-data-only endpoint and the
+    /// other the main one: separate front
     /// ends, so one endpoint failing does not take out both readers. Binance
     /// refuses some regions on the main endpoint (observed for the US); point
     /// both readers at the market-data endpoint there.
@@ -422,9 +423,18 @@ pub struct BinanceConfig {
     /// allows 300 per IP, counted over every process behind that IP, so the
     /// sum across processes must stay below 300.
     pub max_connection_attempts: usize,
-    /// How long startup keeps waiting for every configured symbol to be
-    /// confirmed before the readers start with the confirmed ones.
+    /// Startup checks every configured market once through `exchangeInfo`;
+    /// a failed lookup is retried for this long, then startup fails.
     pub validation_timeout_secs: u64,
+    /// A connection that delivered a quote and lasted this long resets its
+    /// reader's backoff, so a flapping endpoint keeps backing off.
+    pub stable_connection_secs: u64,
+    /// How long the feed's tasks get to stop at shutdown before they are
+    /// aborted, so a stuck DNS lookup cannot hold the process.
+    pub shutdown_timeout_ms: u64,
+    /// Repeated feed warnings are logged at most once per this interval, with
+    /// a count of the ones skipped.
+    pub log_interval_secs: u64,
 }
 
 impl Default for BinanceConfig {
@@ -448,6 +458,9 @@ impl Default for BinanceConfig {
             retry_max_ms: 60_000,
             max_connection_attempts: 30,
             validation_timeout_secs: 60,
+            stable_connection_secs: 60,
+            shutdown_timeout_ms: 5_000,
+            log_interval_secs: 10,
         }
     }
 }
@@ -506,6 +519,7 @@ impl BinanceConfig {
                 self.max_connection_attempts as u64,
             ),
             ("validation_timeout_secs", self.validation_timeout_secs),
+            ("stable_connection_secs", self.stable_connection_secs),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroBinanceSetting(name));
@@ -581,6 +595,9 @@ impl BinanceConfig {
             },
             max_connection_attempts: self.max_connection_attempts,
             validation_timeout: Duration::from_secs(self.validation_timeout_secs),
+            stable_connection: Duration::from_secs(self.stable_connection_secs),
+            shutdown_timeout: Duration::from_millis(self.shutdown_timeout_ms),
+            log_interval: Duration::from_secs(self.log_interval_secs),
         }
     }
 }
@@ -613,6 +630,23 @@ impl SolverConfig {
         self.binance.validate()?;
         self.market_plan()?;
         Ok(())
+    }
+
+    /// Faucets mapped to a Binance asset code: the only tokens the admin API
+    /// may register, since Binance markets come from this file alone.
+    pub(crate) fn binance_tokens(
+        &self,
+    ) -> std::result::Result<std::collections::HashSet<TokenId>, ConfigError> {
+        let mut tokens = std::collections::HashSet::new();
+        for (pair, (x, y)) in self.pairs.iter().zip(self.faucet_pairs()?) {
+            if pair.asset_x_binance_asset.is_some() {
+                tokens.insert(x);
+            }
+            if pair.asset_y_binance_asset.is_some() {
+                tokens.insert(y);
+            }
+        }
+        Ok(tokens)
     }
 
     /// Every pair's faucets, `(asset_x, asset_y)`, in configuration order.
@@ -807,7 +841,7 @@ mod tests {
     fn binance_settings_are_checked() {
         type Change = fn(&mut BinanceConfig);
         let check = |change: Change| check(|config| change(&mut config.binance));
-        let zero: [(&str, Change); 11] = [
+        let zero: [(&str, Change); 12] = [
             ("quote_ttl_ms", |b| b.quote_ttl_ms = 0),
             ("max_spread_bps", |b| b.max_spread_bps = 0),
             ("connect_timeout_ms", |b| b.connect_timeout_ms = 0),
@@ -821,6 +855,7 @@ mod tests {
             ("retry_max_ms", |b| b.retry_max_ms = 0),
             ("max_connection_attempts", |b| b.max_connection_attempts = 0),
             ("validation_timeout_secs", |b| b.validation_timeout_secs = 0),
+            ("stable_connection_secs", |b| b.stable_connection_secs = 0),
         ];
         for (name, change) in zero {
             assert!(check(change).contains(name), "{name}");

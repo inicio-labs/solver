@@ -1,10 +1,11 @@
 //! Regression-lock for audit finding **C2**: the solver must refuse to settle
 //! a trade on a pair with **no usable price**.
 //!
-//! Scenario: alice⇄bob form a raw-balanced reciprocal FOO/ETH pair. The pair's
-//! approved Binance symbol `FOOETH` is not listed (the mock Binance knows only
-//! `ETHUSDT`), so the market is rejected at startup and the pair has no price:
-//! the solver must NOT settle it.
+//! Scenario: alice⇄bob form a raw-balanced reciprocal FOO/ETH pair. FOO has
+//! no Binance market (the mock Binance knows only `ETHUSDT`):
+//! - configured with the unlisted symbol `FOOETH`, startup fails and names it;
+//! - configured without a Binance market, the solver runs, but the pair has no
+//!   price and the solver must NOT settle it.
 
 mod common;
 
@@ -134,9 +135,8 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 executor_store: solver_store_path,
                 keystore: solver_keystore_path.clone(),
             });
-            // FOOETH is not listed: the FOO/ETH market is rejected.
             let binance = common::BinanceStub::start(&[("ETHUSDT", "ETH", "USDT", "1")]);
-            let config = SolverConfig {
+            let config_with = |pairs: Vec<solver::config::AssetPairConfig>| SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
                     timeout_ms: 1_000,
@@ -145,16 +145,39 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    executor_store_path,
-                    ingest_store_path,
+                    executor_store_path: executor_store_path.clone(),
+                    ingest_store_path: ingest_store_path.clone(),
                     read_pool_size: 2,
                 },
-                pairs: vec![common::pair_config(
-                    "FOO-ETH", foo_id, "FOO", eth_id, "ETH", "FOOETH",
-                )],
+                pairs,
                 engine: common::engine_config(),
                 binance: binance.config(),
             };
+
+            // FOOETH is not listed: startup fails and names the market.
+            let listed_nowhere = config_with(vec![common::pair_config(
+                "FOO-ETH", foo_id, "FOO", eth_id, "ETH", "FOOETH",
+            )]);
+            let started = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                solver::start(
+                    factory.clone(),
+                    solver_id,
+                    listed_nowhere,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("startup must fail promptly");
+            match started {
+                Err(error) if format!("{error:#}").contains("FOOETH") => {}
+                other => panic!("startup must fail on the unlisted FOOETH: {other:?}"),
+            }
+
+            // Without a Binance market for FOO the solver runs, unpriced.
+            let config = config_with(vec![common::unpriced_pair_config(
+                "FOO-ETH", foo_id, eth_id, "ETH",
+            )]);
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();

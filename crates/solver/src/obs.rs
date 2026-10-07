@@ -213,11 +213,11 @@ mod tests {
     /// `fresh` see a stalled feed.
     #[test]
     fn price_metrics_report_feed_health_and_quote_freshness() {
-        let feed = FeedMetrics::default();
+        let feed = FeedMetrics::new(["wss://a.test".into(), "wss://a.test".into()]);
         feed.connected[1].store(true, Ordering::Relaxed);
         feed.connections[1].store(3, Ordering::Relaxed);
         feed.frames[0].store(7, Ordering::Relaxed);
-        feed.rejected_markets.store(2, Ordering::Relaxed);
+        feed.halted_markets.store(2, Ordering::Relaxed);
         feed.markets_confirmed.store(1, Ordering::Relaxed);
         feed.conflicting_updates.store(4, Ordering::Relaxed);
         feed.last_publish_delay_us.store(1_500, Ordering::Relaxed);
@@ -231,11 +231,13 @@ mod tests {
         let mut body = String::new();
         append_price_metrics(&mut body, &feed, &snapshot);
         for line in [
-            "solver_price_feed_connected{reader=\"a\"} 0".to_string(),
-            "solver_price_feed_connected{reader=\"b\"} 1".to_string(),
-            "solver_price_feed_connections_total{reader=\"b\"} 3".to_string(),
-            "solver_price_feed_frames_total{reader=\"a\"} 7".to_string(),
-            "solver_price_feed_markets{state=\"rejected\"} 2".to_string(),
+            // Two readers on one endpoint stay apart by position.
+            "solver_price_feed_connected{reader=\"0\",endpoint=\"wss://a.test\"} 0".to_string(),
+            "solver_price_feed_connected{reader=\"1\",endpoint=\"wss://a.test\"} 1".to_string(),
+            "solver_price_feed_connections_total{reader=\"1\",endpoint=\"wss://a.test\"} 3"
+                .to_string(),
+            "solver_price_feed_frames_total{reader=\"0\",endpoint=\"wss://a.test\"} 7".to_string(),
+            "solver_price_feed_markets{state=\"halted\"} 2".to_string(),
             "solver_price_feed_markets{state=\"confirmed\"} 1".to_string(),
             "solver_price_feed_conflicting_updates_total 4".to_string(),
             "solver_price_feed_publish_delay_seconds 0.0015".to_string(),

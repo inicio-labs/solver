@@ -206,7 +206,7 @@ than `quote_ttl_ms`; the price API applies the same TTL.
 | `quote_ttl_ms` | ✅ | — | A quote is usable — for clearing, swap guidance and wallet prices alike — while `now − received_at < quote_ttl_ms` (local receipt time). At most `60000`: the TTL is what pauses clearing when both readers stall. |
 | `max_spread_bps` | ✅ | — | Widest accepted spread `10_000 × (ask − bid) / mid`, inclusive (1..=10000). A wider or crossed quote makes the symbol invalid until a newer valid one. |
 | `min_notional` | — | unset | Least displayed notional (`quantity × price`, in the symbol's quote asset, e.g. `"5000"`) on each side of a quote; a thinner side makes the quote invalid, so a one-lot top of book cannot set the price. Unset accepts any positive size. |
-| `stream_endpoints` | — | A: `wss://data-stream.binance.vision:443`, B: `wss://stream.binance.com:443` | Stream base URLs (scheme and host only) of reader A and reader B. Different endpoints by default, so one endpoint failing does not take out both readers. Binance refuses some regions on the main endpoint (observed for the US); there, point both readers at the market-data endpoint. Plaintext `ws://` is accepted for loopback hosts only. |
+| `stream_endpoints` | — | `["wss://data-stream.binance.vision:443", "wss://stream.binance.com:443"]` | Stream base URLs (scheme and host only) of the two readers; logs and metrics name each reader by its endpoint. Different endpoints by default, so one endpoint failing does not take out both readers. Binance refuses some regions on the main endpoint (observed for the US); there, point both readers at the market-data endpoint. Plaintext `ws://` is accepted for loopback hosts only. |
 | `rest_endpoint` | — | `https://data-api.binance.vision` | `exchangeInfo` checks (scheme and host only), one request per symbol. |
 | `valuation_quote_asset` | — | `"USDT"` | The price API values each token by `<ASSET><QUOTE>`; the quote asset itself is worth 1. |
 | `connect_timeout_ms` / `request_timeout_ms` | — | `10000` | Handshake and HTTP timeouts. |
@@ -215,27 +215,31 @@ than `quote_ttl_ms`; the price API applies the same TTL.
 | `connection_lifetime_secs` | — | `82800` | Longest connection, between 1 h and Binance's 24 h limit; each lasts a random 50–100% of it, so the readers renew apart. |
 | `retry_min_ms` / `retry_max_ms` | — | `500` / `60000` | Jittered exponential backoff (each delay a random 50–100% of its step, capped) for reconnects and `exchangeInfo` retries; `retry_max_ms` at most `600000`. |
 | `max_connection_attempts` | — | `30` | Connection attempts per 5 minutes, both readers together. Binance allows 300 per IP counted over every process behind that IP, so the sum across your processes must stay below 300. |
-| `validation_timeout_secs` | — | `60` | How long startup waits for every symbol's `exchangeInfo` answer before the readers start with the confirmed ones. |
+| `validation_timeout_secs` | — | `60` | How long startup retries failed `exchangeInfo` lookups before it fails. |
+| `stable_connection_secs` | — | `60` | A connection that delivered a quote and lasted this long resets its reader's backoff, so a flapping endpoint keeps backing off. |
+| `shutdown_timeout_ms` | — | `5000` | How long the feed's tasks get to stop at shutdown before they are aborted, so a stuck DNS lookup cannot hold the process. |
+| `log_interval_secs` | — | `10` | Repeated feed warnings (rejected quotes, reconnects) are logged at most once per interval, with a count of the skipped ones. |
 
-At startup each symbol is checked through `exchangeInfo`. A symbol Binance
-does not list, lists with other assets, or lists with spot trading disallowed
-is rejected and logged; it stays unavailable until the configuration changes.
-A symbol in a temporary state (`BREAK`, `HALT`) is subscribed and reported as a
-warning: its book sends nothing until trading resumes, so the TTL pauses the
-pair, and it resumes on its own. A clearing pair also needs both tokens'
-on-chain decimals, which startup reads from the database once ingest has
-fetched them: a pair whose token has none yet is rejected and logged, and
-clears after a restart. Any other answer (a network failure, a rate
-limit, a server error, a 404 from a wrong path, a maintenance page) is retried.
-When the validation timeout passes with at least one market confirmed, the
-readers start with the confirmed set and the rest keep being retried in the
-background; a symbol confirmed later is added by restarting the readers with
-the quotes carried over. If nothing is confirmed by the timeout and every
-failure is one a retry cannot change (a wrong path), the solver stops with
-`NoMarketConfirmed` instead of running without prices. Until the markets are
-confirmed, every pair is paused but the solver runs. Markets are static
-configuration: a token registered at runtime through the admin API has no
-price until it is added to `solver.toml`.
+At startup every configured market is checked once through `exchangeInfo`,
+and startup fails on any problem, with all of them listed, so the
+configuration is fixed before the solver runs:
+
+- a symbol Binance does not list, lists with other assets, or lists with spot
+  trading disallowed. This includes the wallet-valuation market of every
+  token with a Binance asset code, `<ASSET><valuation_quote_asset>` (e.g.
+  `USDCUSDT`);
+- a clearing pair whose token has no on-chain decimals yet (startup reads them
+  from the database once ingest has fetched them);
+- a lookup that cannot succeed (a wrong REST path, another bad request, an
+  unreadable answer): startup fails at once;
+- a lookup still failing for a temporary reason (a network failure or
+  timeout, a rate limit, a Binance server error) at `validation_timeout_secs`:
+  such lookups are retried with backoff until then.
+
+A symbol in a temporary state (`BREAK`, `HALT`) is subscribed with a warning
+instead: its book sends nothing until trading resumes, so the TTL pauses the
+pair, and it resumes on its own. Markets are static configuration: a new market
+means a change to `solver.toml` and a restart.
 
 Binance's `serverShutdown` event, which precedes a disconnect, reconnects at
 once; a connection that keeps answering pings but delivers no quote is replaced
@@ -307,8 +311,9 @@ binance_symbol = "ETHUSDC"
 ```
 
 The admin API (requires `SOLVER_ADMIN_TOKEN`) registers a token at runtime, which
-**subscribes ingest** to its notes; it does **not** add a Binance market, so the
-token has no price and no internal clearing until it is configured:
+**subscribes ingest** to its notes. It accepts only a token mapped to a Binance
+asset in `solver.toml` (others get `422`), since prices come from that file
+alone:
 ```bash
 curl -X POST http://127.0.0.1:3001/admin/tokens \
   -H "Authorization: Bearer $SOLVER_ADMIN_TOKEN" \
@@ -327,8 +332,8 @@ clears crossing orders between the two tokens automatically.
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
 - `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if a PostgreSQL read answers, the writer still holds its ownership lock, and the last sync is recent; otherwise 503. The schema is verified once at startup.
-- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="a"|"b"}`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_lookup_failures_total`, `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_markets{state="confirmed"|"pending"|"rejected"|"halted"}`, `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`).
-  Suggested alerts: `solver_price_quote_fresh == 0` for a configured symbol longer than a few TTLs; `solver_price_feed_connected == 0` on both readers; `solver_price_feed_markets{state="rejected"} > 0` (configuration); `solver_price_feed_conflicting_updates_total` rising (endpoint divergence); `rate(solver_matcher_price_skips_total{reason="stale"})` while orders wait.
+- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="0"|"1",endpoint="…"}`, the position and endpoint in `stream_endpoints`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_lookup_failures_total`, `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_markets{state="confirmed"|"halted"}`, `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`).
+  Suggested alerts: `solver_price_quote_fresh == 0` for a configured symbol longer than a few TTLs; `solver_price_feed_connected == 0` on both readers; `solver_price_feed_conflicting_updates_total` rising (endpoint divergence); `rate(solver_matcher_price_skips_total{reason="stale"})` while orders wait.
 
 ---
 

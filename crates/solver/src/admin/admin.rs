@@ -6,6 +6,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
@@ -31,11 +32,22 @@ pub struct AdminState {
     /// order. Failures only log — admin call still succeeds since the DB row
     /// is the source of truth, and a restart subscribes every registered pair.
     subscribe_tx: SubscribeSender,
+    /// Tokens with a Binance market in `solver.toml`. Prices come only from
+    /// that file, so registering any other token would leave it unpriced.
+    binance_tokens: HashSet<TokenId>,
 }
 
 impl AdminState {
-    pub fn new(pool: DbPool, subscribe_tx: SubscribeSender) -> Self {
-        Self { pool, subscribe_tx }
+    pub fn new(
+        pool: DbPool,
+        subscribe_tx: SubscribeSender,
+        binance_tokens: HashSet<TokenId>,
+    ) -> Self {
+        Self {
+            pool,
+            subscribe_tx,
+            binance_tokens,
+        }
     }
 
     /// Build the admin router.
@@ -160,6 +172,12 @@ async fn add_token(
     Json(req): Json<TokenRequest>,
 ) -> Result<(StatusCode, &'static str), StatusCode> {
     let token = parse_token(&req.token_id)?;
+    if !state.binance_tokens.contains(&token) {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "token has no Binance market in solver.toml; add it there and restart",
+        ));
+    }
     let inserted = state
         .register_token(token)
         .await
@@ -208,6 +226,7 @@ mod tests {
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
     };
     use serde_json::json;
 
@@ -228,7 +247,12 @@ mod tests {
     async fn make_state() -> (Arc<AdminState>, TestDb, Subscriptions) {
         let test_db = TestDb::new().await.unwrap();
         let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(8);
-        let state = Arc::new(AdminState::new(test_db.pool.clone(), subscribe_tx));
+        let binance_tokens = HashSet::from([test_token_a(), test_token_b()]);
+        let state = Arc::new(AdminState::new(
+            test_db.pool.clone(),
+            subscribe_tx,
+            binance_tokens,
+        ));
         (state, test_db, subscribe_rx)
     }
 
@@ -392,6 +416,23 @@ mod tests {
         let mut expected = vec![(a, b), (b, a)];
         expected.sort();
         assert_eq!(received, expected);
+    }
+
+    /// A token without a Binance market in the configuration is refused and
+    /// not registered: it could never be priced.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_token_without_a_binance_market_is_rejected() {
+        let (server, _db, _subscriptions) = test_server().await;
+        let unmapped = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap();
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(unmapped) }))
+            .await;
+        res.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(res.text().contains("solver.toml"));
+        let listed = server.get("/admin/tokens").await;
+        assert_eq!(listed.json::<Vec<TokenResponse>>().len(), 0);
     }
 
     /// A request carrying a field this API does not know is refused instead of

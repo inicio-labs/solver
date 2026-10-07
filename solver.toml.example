@@ -112,7 +112,7 @@ quote_ttl_ms = 2000
 # Widest accepted spread, 10_000 × (ask − bid) / mid, inclusive. Required.
 max_spread_bps = 50
 # min_notional = "5000"              # least displayed quantity × price per side, in the quote asset
-# Reader A on the market-data-only endpoint, reader B on the main one: separate
+# One reader on the market-data-only endpoint, one on the main one: separate
 # front ends, so one endpoint failing does not take out both readers. Binance
 # refuses some regions on the main endpoint (observed for the US): there, use
 # the market-data endpoint for both readers. Scheme and host only; plaintext
@@ -128,4 +128,7 @@ max_spread_bps = 50
 # retry_min_ms = 500
 # retry_max_ms = 60000               # at most 600000
 # max_connection_attempts = 30       # per 5 minutes, both readers; Binance's 300 per IP counts every process on it
-# validation_timeout_secs = 60       # startup waits this long for every symbol before starting with the confirmed ones
+# validation_timeout_secs = 60       # startup retries failed exchangeInfo lookups this long, then fails
+# stable_connection_secs = 60        # a connection lasting this long (with a quote) resets the backoff
+# shutdown_timeout_ms = 5000         # the feed's tasks get this long to stop at shutdown
+# log_interval_secs = 10             # repeated feed warnings: at most one line per interval

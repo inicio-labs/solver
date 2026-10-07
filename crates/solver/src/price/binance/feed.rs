@@ -121,6 +121,8 @@ pub struct FeedConfig {
 /// [`FeedConfig::stream_endpoints`].
 #[derive(Debug, Default)]
 pub struct FeedMetrics {
+    /// Each reader's stream endpoint, the label of its metrics.
+    pub(crate) endpoints: [String; READERS],
     pub(crate) connected: [AtomicBool; READERS],
     /// Successful handshakes per reader.
     pub(crate) connections: [AtomicU64; READERS],
@@ -154,12 +156,11 @@ impl FeedMetrics {
         use std::fmt::Write;
 
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        for (index, reader) in READER_NAMES.into_iter().enumerate() {
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            // The position keeps two readers on one endpoint apart.
+            let reader = format!("reader=\"{index}\",endpoint=\"{endpoint}\"");
             let connected = u8::from(self.connected[index].load(Ordering::Relaxed));
-            let _ = writeln!(
-                body,
-                "solver_price_feed_connected{{reader=\"{reader}\"}} {connected}"
-            );
+            let _ = writeln!(body, "solver_price_feed_connected{{{reader}}} {connected}");
             for (metric, counters) in [
                 ("solver_price_feed_connections_total", &self.connections),
                 ("solver_price_feed_frames_total", &self.frames),
@@ -172,11 +173,7 @@ impl FeedMetrics {
                     &self.rejected_quotes,
                 ),
             ] {
-                let _ = writeln!(
-                    body,
-                    "{metric}{{reader=\"{reader}\"}} {}",
-                    load(&counters[index])
-                );
+                let _ = writeln!(body, "{metric}{{{reader}}} {}", load(&counters[index]));
             }
         }
         for (metric, counter) in [
@@ -200,8 +197,6 @@ impl FeedMetrics {
         }
         for (state, gauge) in [
             ("confirmed", &self.markets_confirmed),
-            ("pending", &self.markets_pending),
-            ("rejected", &self.rejected_markets),
             ("halted", &self.halted_markets),
         ] {
             let _ = writeln!(
@@ -239,6 +234,16 @@ impl FeedMetrics {
                     "solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} {age}"
                 );
             }
+        }
+    }
+}
+
+impl FeedMetrics {
+    /// Counters for readers on `endpoints`.
+    pub fn new(endpoints: [String; READERS]) -> Self {
+        Self {
+            endpoints,
+            ..Self::default()
         }
     }
 }

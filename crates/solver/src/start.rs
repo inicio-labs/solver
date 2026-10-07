@@ -244,7 +244,7 @@ pub async fn start(
     //    initialised to `now()` here so /readyz is healthy during the boot
     //    grace period before the first sync completes.
     let channels = pipeline::create_channels();
-    let feed_metrics = Arc::new(FeedMetrics::default());
+    let feed_metrics = Arc::new(FeedMetrics::new(config.binance.stream_endpoints.clone()));
     let obs_state = crate::obs::ObsState::new(
         db_pool.clone(),
         config.engine.readiness_freshness_secs,
@@ -256,10 +256,12 @@ pub async fn start(
     let last_sync_handle = obs_state.last_sync_handle();
 
     // 7. Build the PipelineConfig.
+    let binance_tokens = config.binance_tokens().context("invalid pair faucet ids")?;
     let pipeline_config = PipelineConfig::new(
         &config.engine,
         db_pool.clone(),
         initial_tokens,
+        binance_tokens,
         admin_token,
         cancel.clone(),
     );
@@ -388,9 +390,26 @@ pub async fn start(
         feed_metrics,
         cancel.clone(),
     );
-    match spawned {
-        Ok(thread) => threads.push(("price-feed", thread)),
+    let feed_ready = match spawned {
+        Ok((thread, ready)) => {
+            threads.push(("price-feed", thread));
+            ready
+        }
         Err(error) => return Err(abort_startup(&cancel, threads, error).await),
+    };
+    // The feed checks every configured Binance market once. A market Binance
+    // rejects, or one it does not answer for within the validation timeout,
+    // fails startup here with the full list, to be fixed in solver.toml.
+    match feed_ready.await {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            let error = anyhow!("Binance market check failed: {message}");
+            return Err(abort_startup(&cancel, threads, error).await);
+        }
+        Err(_) => {
+            let error = anyhow!("price feed stopped during the Binance market check");
+            return Err(abort_startup(&cancel, threads, error).await);
+        }
     }
 
     // 12b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +

@@ -178,7 +178,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    no reciprocal order → the solver tracks it but can never
             //    match/settle it. No race.
             let solver_db_path = pg.url.clone();
-            let binance = common::BinanceStub::start(&[("ETHUSDC", "ETH", "USDC", "1")]);
+            // ETHUSDT and USDCUSDT value the two tokens; startup checks them too.
+            let binance = common::BinanceStub::start(&[
+                ("ETHUSDC", "ETH", "USDC", "1"),
+                ("ETHUSDT", "ETH", "USDT", "1"),
+                ("USDCUSDT", "USDC", "USDT", "1"),
+            ]);
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),

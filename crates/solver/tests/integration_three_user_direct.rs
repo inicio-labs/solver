@@ -301,7 +301,12 @@ async fn three_user_direct_matching() -> Result<()> {
             // has USDC as base, so it clears at the reciprocal, 100 USDC/ETH:
             // Alice and Bob execute, leaving 20 USDC. Both faucets have the
             // same decimals.
-            let binance = common::BinanceStub::start(&[("ETHUSDC", "ETH", "USDC", "100")]);
+            // ETHUSDT and USDCUSDT value the two tokens; startup checks them too.
+            let binance = common::BinanceStub::start(&[
+                ("ETHUSDC", "ETH", "USDC", "100"),
+                ("ETHUSDT", "ETH", "USDT", "100"),
+                ("USDCUSDT", "USDC", "USDT", "1"),
+            ]);
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),

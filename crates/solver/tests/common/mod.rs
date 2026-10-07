@@ -423,6 +423,25 @@ pub fn pair_config(
     }
 }
 
+/// A pair whose `x` token has no Binance market: it never clears internally.
+pub fn unpriced_pair_config(
+    name: &str,
+    x: AccountId,
+    y: AccountId,
+    y_asset: &str,
+) -> solver::config::AssetPairConfig {
+    solver::config::AssetPairConfig {
+        name: name.to_string(),
+        asset_x_faucet_id: x.to_hex(),
+        asset_x_binance_asset: None,
+        asset_y_faucet_id: y.to_hex(),
+        asset_y_binance_asset: Some(
+            solver::price::AssetCode::parse(y_asset).expect("valid asset code"),
+        ),
+        binance_symbol: None,
+    }
+}
+
 /// Orders in the solver's database with `status`.
 pub async fn count_orders(db_url: &str, status: &'static str) -> i64 {
     let url = db_url.to_owned();

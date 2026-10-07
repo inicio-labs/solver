@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use miden_protocol::crypto::utils::Serializable;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,9 @@ pub struct PipelineConfig {
     pub match_interval: Duration,
     /// Tokens to register at boot, from `solver.toml` `[[pairs]]` entries.
     pub initial_tokens: Vec<TokenId>,
+    /// Tokens with a Binance market in `solver.toml`; the admin API registers
+    /// no other.
+    pub binance_tokens: HashSet<TokenId>,
     pub admin_port: u16,
     pub admin_token: Option<String>,
     /// Cancellation signal for graceful shutdown. Triggered by the binary
@@ -55,6 +59,7 @@ impl PipelineConfig {
         engine: &EngineConfig,
         db_pool: db::DbPool,
         initial_tokens: Vec<TokenId>,
+        binance_tokens: HashSet<TokenId>,
         admin_token: Option<String>,
         cancel: CancellationToken,
     ) -> Self {
@@ -62,6 +67,7 @@ impl PipelineConfig {
             db_pool,
             match_interval: Duration::from_millis(engine.pulse_interval_ms),
             initial_tokens,
+            binance_tokens,
             admin_port: engine.admin_port,
             admin_token,
             cancel,
@@ -267,7 +273,11 @@ pub fn spawn_core_services(
     });
 
     // Admin HTTP server.
-    let admin_state = Arc::new(AdminState::new(config.db_pool.clone(), subscribe_tx));
+    let admin_state = Arc::new(AdminState::new(
+        config.db_pool.clone(),
+        subscribe_tx,
+        config.binance_tokens.clone(),
+    ));
     let admin_router = admin_state.router(config.admin_token.clone().map(Arc::new));
     let admin_port = config.admin_port;
     let admin_cancel = config.cancel.clone();
@@ -589,7 +599,7 @@ mod tests {
         .unwrap();
 
         let (subscribe_tx, _rx) = mpsc::channel::<(TokenId, TokenId)>(8);
-        let state = AdminState::new(pool, subscribe_tx);
+        let state = AdminState::new(pool, subscribe_tx, HashSet::new());
 
         let loaded = state.load_tokens_from_db().await.unwrap();
         assert_eq!(loaded.len(), 2);

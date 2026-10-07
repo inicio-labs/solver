@@ -398,19 +398,17 @@ pub async fn start(
         Err(error) => return Err(abort_startup(&cancel, threads, error).await),
     };
     // The feed checks every configured Binance market once. A market Binance
-    // rejects, or one it does not answer for within the validation timeout,
-    // fails startup here with the full list, to be fixed in solver.toml.
-    match feed_ready.await {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => {
-            let error = anyhow!("Binance market check failed: {message}");
-            return Err(abort_startup(&cancel, threads, error).await);
+    // rejects, or a lookup that cannot succeed, fails startup at the gate
+    // below with the full list, to be fixed in solver.toml.
+    let feed_ready = async move {
+        match feed_ready.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(anyhow!("Binance market check failed: {message}")),
+            Err(_) => Err(anyhow!(
+                "price feed stopped during the Binance market check"
+            )),
         }
-        Err(_) => {
-            let error = anyhow!("price feed stopped during the Binance market check");
-            return Err(abort_startup(&cancel, threads, error).await);
-        }
-    }
+    };
 
     // 12b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +
     //      multi-thread runtime so wallet traffic can't starve settlement. Reads
@@ -492,20 +490,30 @@ pub async fn start(
         None
     };
 
-    // 13. Startup gate: both client threads must report ready (client built +
-    //     tasks spawned) before startup is considered successful. Any build /
-    //     subscribe failure -> cancel everything, join, return the error. A
-    //     worker that stops meanwhile (the feed thread cancels `cancel` when
-    //     it ends) fails startup at once instead of being masked by a later
-    //     "solver running".
-    let startup: Result<()> = tokio::select! {
-      result = async {
-        ready(exec_ready_rx, "executor").await?;
-        ready(price_api_ready_rx, "price-api").await?;
-        if let Some(rx) = router_ready_rx {
-            ready(rx, "router").await?;
+    // 13. Startup gate: every worker must report ready (client built and
+    //     tasks spawned, the Binance market check passed) before startup is
+    //     considered successful. The first failure cancels everything, joins
+    //     and returns its error. A worker that stops meanwhile (the feed
+    //     thread cancels `cancel` when it ends) fails startup at once instead
+    //     of being masked by a later "solver running". A failing worker
+    //     reports before it stops, so the readiness results are checked first
+    //     (`biased`): the real error wins over the generic one.
+    let router_ready = async move {
+        match router_ready_rx {
+            Some(rx) => ready(rx, "router").await,
+            None => Ok(()),
         }
-        Ok(())
+    };
+    let startup: Result<()> = tokio::select! {
+      biased;
+      result = async {
+        tokio::try_join!(
+            ready(exec_ready_rx, "executor"),
+            feed_ready,
+            ready(price_api_ready_rx, "price-api"),
+            router_ready,
+        )
+        .map(|_| ())
       } => result,
       _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during startup")),
       _ = cancel.cancelled() => Err(anyhow!("a solver worker stopped during startup")),

@@ -40,8 +40,7 @@ use crate::config::PricePrecision;
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::db::{self, DbPool};
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::binance::Valued;
-use crate::price::{PriceSnapshot, PriceUnavailable};
+use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{eval_can_fill, eval_off_market, SettlementStats};
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -114,6 +113,9 @@ enum ApiError {
     BadAmount(String),
     BadRequest(String),
     UnknownFaucet,
+    /// Registered, but no Binance market values it: nothing to wait for.
+    NoMarket,
+    /// Has a market, but no valid quote right now.
     NoPrice,
     Stale(i64),
     BadPrecision(String),
@@ -132,10 +134,17 @@ impl IntoResponse for ApiError {
                 "unknown_faucet",
                 "faucet not registered".into(),
             ),
+            ApiError::NoMarket => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_market",
+                "no Binance market is configured for this token; it has no price until the \
+                 solver's configuration changes"
+                    .into(),
+            ),
             ApiError::NoPrice => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_price",
-                "no price for this token yet".into(),
+                "no valid price for this token right now".into(),
             ),
             ApiError::Stale(as_of) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -201,8 +210,9 @@ fn wants_stale(q: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-/// One token's price from `snapshot`. `NoPrice` when it has none; `Stale`
-/// when its quote is at least the TTL old and the caller did not allow that.
+/// One token's price from `snapshot`. `NoMarket` when nothing values it,
+/// `NoPrice` when its market has no valid quote; `Stale` when its quote is at
+/// least the TTL old and the caller did not allow that.
 fn quote_from_row(
     state: &PriceApiState,
     snapshot: &PriceSnapshot,
@@ -211,21 +221,21 @@ fn quote_from_row(
     precision: PricePrecision,
     allow_stale: bool,
 ) -> Result<PriceResponse, ApiError> {
+    // One clock reading: freshness and `as_of` describe the same instant.
+    let now = Instant::now();
     let Valued {
         price,
         received_at,
         fresh,
-    } = snapshot
-        .valuation(account_id, Instant::now())
-        .map_err(|reason: PriceUnavailable| {
-            let reason: &'static str = reason.into();
-            tracing::debug!(faucet = %account_id, reason, "no price for token");
-            ApiError::NoPrice
-        })?;
-    let age = received_at.map_or(0, |at| {
-        i64::try_from(at.elapsed().as_secs()).unwrap_or(i64::MAX)
-    });
-    let as_of = now_secs().saturating_sub(age);
+    } = snapshot.valuation(account_id, now).map_err(|reason| {
+        tracing::debug!(faucet = %account_id, %reason, "no price for token");
+        match reason {
+            PriceUnavailable::NoMarket => ApiError::NoMarket,
+            _ => ApiError::NoPrice,
+        }
+    })?;
+    let age = received_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+    let as_of = now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
     if !fresh && !allow_stale {
         return Err(ApiError::Stale(as_of));
     }

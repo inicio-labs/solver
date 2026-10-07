@@ -51,11 +51,11 @@ jobs:
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \
             crates/solver/tests/common/mod.rs \
             crates/solver/tests/integration_{already_consumed,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
-            crates/e2e/src/{artifacts,provision}.rs src/main.rs crates/solver/build.rs
+            crates/e2e/src/{artifacts,provision,run}.rs src/main.rs crates/solver/build.rs
       - name: Compile workspace
         run: cargo check --workspace --locked
       - name: Lint solver packages
-        run: cargo clippy -p solver -p solver-bin --locked
+        run: cargo clippy -p solver -p solver-bin -p mock-binance -p e2e --locked
       - name: Pure solver tests
         run: cargo test -p solver --locked
       # The live Binance test is skipped: Binance's main endpoints refuse
@@ -71,8 +71,9 @@ jobs:
         run: |
           cargo test -p solver --test integration_three_user_direct --locked -- --ignored
           cargo test -p solver --test integration_partial_fill --locked -- --ignored
-      # integration_unpriced_direct is a pre-existing, intentionally red audit
-      # regression for C2 and is outside the PostgreSQL migration release gate.
+      # Audit finding C2: a pair without a confirmed Binance market never settles.
+      - name: Unpriced pair integration
+        run: cargo test -p solver --test integration_unpriced_direct --locked -- --ignored
 
   production-binary:
     runs-on: ubuntu-latest

@@ -50,7 +50,10 @@ impl SettlementStats {
     /// length at [`MAX_SAMPLES_PER_PAIR`].
     pub fn record(&mut self, pair: (TokenId, TokenId), now_unix: UnixSecs, duration_secs: u64) {
         let q = self.by_pair.entry(pair).or_default();
-        q.push_back(Sample { at_unix: now_unix, duration_secs });
+        q.push_back(Sample {
+            at_unix: now_unix,
+            duration_secs,
+        });
 
         let cutoff = now_unix.saturating_sub(WINDOW_SECS);
         while q.front().map_or(false, |s| s.at_unix < cutoff) {
@@ -66,8 +69,11 @@ impl SettlementStats {
     pub fn median_secs(&self, pair: (TokenId, TokenId), now_unix: UnixSecs) -> Option<u64> {
         let q = self.by_pair.get(&pair)?;
         let cutoff = now_unix.saturating_sub(WINDOW_SECS);
-        let mut durs: Vec<u64> =
-            q.iter().filter(|s| s.at_unix >= cutoff).map(|s| s.duration_secs).collect();
+        let mut durs: Vec<u64> = q
+            .iter()
+            .filter(|s| s.at_unix >= cutoff)
+            .map(|s| s.duration_secs)
+            .collect();
         median_of(&mut durs)
     }
 }
@@ -110,7 +116,8 @@ pub fn eval_can_fill(offered_a: u64, requested_b: u64, best: Option<BestLevel>) 
 /// `(off_market, market_price)`. `off_market = Some(true)` when the order asks
 /// for more B than its A is worth at `market`, by more than `tol_bps`.
 /// `off_market` is `None` without a market price or either token's decimals;
-/// `market_price` (B per A, 8 decimal places) is present whenever `market` is.
+/// `market_price` (B per A, exact up to 18 decimal places, like the price
+/// API's `full` precision) is present whenever `market` is.
 pub fn eval_off_market(
     offered_a: u64,
     d_a: Option<u8>,
@@ -122,7 +129,7 @@ pub fn eval_off_market(
     let Some(market) = market else {
         return (None, None);
     };
-    let market_price = market.to_trimmed_decimal(8).ok();
+    let market_price = market.to_trimmed_decimal(18).ok();
     let (Some(d_a), Some(d_b)) = (d_a, d_b) else {
         return (None, market_price);
     };
@@ -149,7 +156,10 @@ mod tests {
         AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1).unwrap()
     }
     fn best(requested: u64, offered: u64, volume: u64) -> BestLevel {
-        BestLevel { rate: RateKey::new(requested, offered), volume }
+        BestLevel {
+            rate: RateKey::new(requested, offered),
+            volume,
+        }
     }
 
     // ── median ────────────────────────────────────────────────────────────
@@ -271,7 +281,6 @@ mod tests {
     fn market_price_is_rounded_to_eight_places() {
         let third = ReferencePrice::from_ratio(1, 3).ok();
         let (_, mkt) = eval_off_market(1, Some(0), 1, Some(0), third, 0);
-        assert_eq!(mkt.as_deref(), Some("0.33333333"));
+        assert_eq!(mkt.as_deref(), Some("0.333333333333333333"));
     }
-
 }

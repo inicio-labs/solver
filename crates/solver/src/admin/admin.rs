@@ -67,8 +67,10 @@ impl AdminState {
     ///
     /// Commit and subscriptions run in their own task, so a caller that
     /// disconnects cannot skip the subscriptions (a retry would only answer
-    /// "already registered"). Send failures only log: the database row is the
-    /// source of truth and a restart re-subscribes every registered pair.
+    /// "already registered"). The caller is answered as soon as the commit is
+    /// known; the sends follow without holding the request. Send failures
+    /// only log: the database row is the source of truth and a restart
+    /// re-subscribes every registered pair.
     async fn register_token(&self, token: TokenId) -> DbResult<bool> {
         let (pool, subscribe_tx) = (self.pool.clone(), self.subscribe_tx.clone());
         tokio::spawn(async move {
@@ -83,13 +85,17 @@ impl AdminState {
             let Some(existing) = existing else {
                 return Ok(false);
             };
-            for other in existing.into_iter().filter(|other| *other != token) {
-                for pair in [(token, other), (other, token)] {
-                    if let Err(error) = subscribe_tx.send(pair).await {
-                        tracing::warn!(%error, "admin: subscribe channel send failed");
+            // Detached from the request: the caller is answered now, and a
+            // slow relay cannot hold the response or lose the sends.
+            tokio::spawn(async move {
+                for other in existing.into_iter().filter(|other| *other != token) {
+                    for pair in [(token, other), (other, token)] {
+                        if let Err(error) = subscribe_tx.send(pair).await {
+                            tracing::warn!(%error, "admin: subscribe channel send failed");
+                        }
                     }
                 }
-            }
+            });
             Ok(true)
         })
         .await?
@@ -182,7 +188,10 @@ async fn remove_token(
     })
 }
 
+/// A field this API does not know is rejected rather than accepted and
+/// silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenRequest {
     pub token_id: String,
 }
@@ -214,25 +223,24 @@ mod tests {
 
     const TEST_TOKEN: &str = "test-admin-token";
 
-    async fn make_state() -> (Arc<AdminState>, TestDb) {
+    type Subscriptions = mpsc::Receiver<(TokenId, TokenId)>;
+
+    async fn make_state() -> (Arc<AdminState>, TestDb, Subscriptions) {
         let test_db = TestDb::new().await.unwrap();
-        // Tests don't exercise the subscribe path; create a channel whose
-        // receiver is dropped immediately. Sends will fail but admin handlers
-        // log and continue.
-        let (subscribe_tx, _) = mpsc::channel::<(TokenId, TokenId)>(8);
+        let (subscribe_tx, subscribe_rx) = mpsc::channel::<(TokenId, TokenId)>(8);
         let state = Arc::new(AdminState::new(test_db.pool.clone(), subscribe_tx));
-        (state, test_db)
+        (state, test_db, subscribe_rx)
     }
 
-    async fn test_server() -> (TestServer, TestDb) {
-        let (state, db) = make_state().await;
+    async fn test_server() -> (TestServer, TestDb, Subscriptions) {
+        let (state, db, subscriptions) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
             AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer test-admin-token"),
         );
-        (server, db)
+        (server, db, subscriptions)
     }
 
     fn token_hex(token: TokenId) -> String {
@@ -244,7 +252,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_created_first_time() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -256,7 +264,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_ok_on_duplicate() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.post("/admin/tokens").json(&body).await;
@@ -267,7 +275,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn add_token_returns_bad_request_for_invalid_hex() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         let res = server
             .post("/admin/tokens")
             .json(&json!({ "token_id": "not_hex!" }))
@@ -278,7 +286,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_ok_when_found() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         let body = json!({ "token_id": token_hex(test_token_a()) });
         server.post("/admin/tokens").json(&body).await;
         let res = server.delete("/admin/tokens").json(&body).await;
@@ -288,7 +296,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn remove_token_returns_not_found_when_missing() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         let res = server
             .delete("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -299,7 +307,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_without_bearer_token_return_unauthorized() {
-        let (state, _db) = make_state().await;
+        let (state, _db, _subscriptions) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let server = TestServer::new(state.router(Some(token)));
         let res = server.get("/admin/tokens").await;
@@ -309,7 +317,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn requests_with_wrong_token_return_unauthorized() {
-        let (state, _db) = make_state().await;
+        let (state, _db, _subscriptions) = make_state().await;
         let token = Arc::new(TEST_TOKEN.to_string());
         let mut server = TestServer::new(state.router(Some(token)));
         server.add_header(
@@ -323,7 +331,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn router_with_no_admin_token_returns_404() {
-        let (state, _db) = make_state().await;
+        let (state, _db, _subscriptions) = make_state().await;
         let server = TestServer::new(state.router(None));
         let res = server.get("/admin/tokens").await;
         res.assert_status(StatusCode::NOT_FOUND);
@@ -332,7 +340,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn list_tokens_returns_all_registered() {
-        let (server, _db) = test_server().await;
+        let (server, _db, _subscriptions) = test_server().await;
         server
             .post("/admin/tokens")
             .json(&json!({ "token_id": token_hex(test_token_a()) }))
@@ -349,5 +357,55 @@ mod tests {
         let ids: Vec<_> = body.iter().map(|t| t.token_id.as_str()).collect();
         assert!(ids.contains(&token_hex(test_token_a()).as_str()));
         assert!(ids.contains(&token_hex(test_token_b()).as_str()));
+    }
+    /// A new token is subscribed against every other registered token in both
+    /// directions, after the caller has already been answered.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn registering_subscribes_both_directions() {
+        let (server, _db, mut subscriptions) = test_server().await;
+        let (a, b) = (test_token_a(), test_token_b());
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(a) }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        assert!(
+            subscriptions.try_recv().is_err(),
+            "nothing to pair the first token with"
+        );
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(b) }))
+            .await;
+        res.assert_status(StatusCode::CREATED);
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let pair =
+                tokio::time::timeout(std::time::Duration::from_secs(5), subscriptions.recv())
+                    .await
+                    .expect("subscriptions arrive after the response")
+                    .expect("channel open");
+            received.push(pair);
+        }
+        received.sort();
+        let mut expected = vec![(a, b), (b, a)];
+        expected.sort();
+        assert_eq!(received, expected);
+    }
+
+    /// A request carrying a field this API does not know is refused instead of
+    /// being registered with the field silently dropped.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn unknown_request_fields_are_rejected() {
+        let (server, _db, _subscriptions) = test_server().await;
+        let res = server
+            .post("/admin/tokens")
+            .json(&json!({ "token_id": token_hex(test_token_a()), "ticker": "USDC" }))
+            .await;
+        res.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let listed = server.get("/admin/tokens").await;
+        assert_eq!(listed.json::<Vec<TokenResponse>>().len(), 0);
     }
 }

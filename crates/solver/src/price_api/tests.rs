@@ -278,9 +278,24 @@ async fn stale_fails_closed_unless_allowed() {
     .await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"].as_str().unwrap(), "stale");
     let r2 = h.server.get(&url(faucet_a(), "?allow_stale=true")).await;
     assert_eq!(r2.status_code(), StatusCode::OK);
-    assert!(r2.json::<Value>()["stale"].as_bool().unwrap());
+    let v: Value = r2.json();
+    assert!(v["stale"].as_bool().unwrap());
+    // `as_of` is the receipt time: two TTLs ago.
+    let expected = now() - 2 * TTL.as_secs() as i64;
+    assert!((v["as_of"].as_i64().unwrap() - expected).abs() <= 5, "{v}");
+}
+
+/// A token without any Binance market gets a distinct, non-retryable code.
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn unpriced_token_distinguishes_no_market_from_no_quote() {
+    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
+    let r = h.server.get(&url(faucet_a(), "")).await;
+    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"].as_str().unwrap(), "no_market");
 }
 
 #[tokio::test]

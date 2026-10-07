@@ -101,22 +101,31 @@ admin_port = 3001
 # ── Binance Spot public market data (the only price source) ─────────────────
 # Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.
 # No API key. For devnet/local, run `cargo run -p mock-binance -- --market
-# ETHUSDT=ETH/USDT:2718.65/2718.66` and point both endpoints at it.
+# ETHUSDT=ETH/USDT:2718.65/2718.66` and point the stream and REST endpoints at
+# it. A misspelled key in this section is an error, not a silent default.
 [binance]
-# A quote is usable while younger than this, measured from local receipt.
-# Required: choose it per deployment.
+# A quote is usable while younger than this, measured from local receipt, for
+# clearing, swap guidance and wallet prices alike. Required: choose it per
+# deployment. At most 60000: this is what pauses clearing when both readers
+# stall.
 quote_ttl_ms = 2000
 # Widest accepted spread, 10_000 × (ask − bid) / mid, inclusive. Required.
 max_spread_bps = 50
+# min_notional = "5000"              # least displayed quantity × price per side, in the quote asset
 # Reader A on the market-data-only endpoint, reader B on the main one: separate
-# front ends, so one endpoint failing does not take out both readers.
+# front ends, so one endpoint failing does not take out both readers. Binance
+# refuses some regions on the main endpoint (observed for the US): there, use
+# the market-data endpoint for both readers. Scheme and host only; plaintext
+# ws:// and http:// are accepted for loopback hosts only.
 # stream_endpoints = ["wss://data-stream.binance.vision:443", "wss://stream.binance.com:443"]
-# rest_endpoint = "https://data-api.binance.vision"   # exchangeInfo checks at startup
+# rest_endpoint = "https://data-api.binance.vision"   # exchangeInfo checks
 # valuation_quote_asset = "USDT"     # the price API values tokens in this asset
 # connect_timeout_ms = 10000
 # request_timeout_ms = 10000
-# idle_timeout_ms = 60000            # no frame → reconnect; above Binance's 20 s ping interval
-# connection_lifetime_secs = 82800   # longest connection; each lasts a random 50–100% of it
+# idle_timeout_ms = 60000            # no frame at all → reconnect; ≥ 2 × Binance's 20 s ping interval
+# data_idle_timeout_ms = 60000       # no quote on a live connection → reconnect; ≥ idle timeout and TTL
+# connection_lifetime_secs = 82800   # longest connection (1 h .. 24 h); each lasts a random 50–100% of it
 # retry_min_ms = 500
-# retry_max_ms = 60000
-# max_connection_attempts = 30       # per 5 minutes, both readers; below Binance's 300 per IP
+# retry_max_ms = 60000               # at most 600000
+# max_connection_attempts = 30       # per 5 minutes, both readers; Binance's 300 per IP counts every process on it
+# validation_timeout_secs = 60       # startup waits this long for every symbol before starting with the confirmed ones

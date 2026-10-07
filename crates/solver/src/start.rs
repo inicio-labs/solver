@@ -28,7 +28,7 @@ use crate::config::SolverConfig;
 use crate::db;
 use crate::matcher::ClearingRuntime;
 use crate::pipeline::{self, PipelineConfig};
-use crate::price::binance::{spawn_price_feed_thread, FeedMetrics};
+use crate::price::{spawn_price_feed_thread, FeedMetrics};
 use crate::types::TokenId;
 
 #[derive(Debug, Error)]
@@ -221,19 +221,21 @@ pub async fn start(
     }
 
     // 3. Binance markets from config: faucet asset codes, approved clearing
-    //    symbols, wallet valuation. Configuration errors stop startup here;
-    //    the feed checks the markets against `exchangeInfo` once running.
+    //    symbols, wallet valuation. `SolverConfig::load` already validated the
+    //    mapping; the feed checks the markets against `exchangeInfo` once
+    //    running.
     let market_plan = config
         .market_plan()
         .context("invalid Binance market configuration")?;
 
     // 4. Configured tokens to register. Pairs whose Binance market is
     //    confirmed clear internally; the matcher reads them from the snapshot.
-    let mut initial_tokens: Vec<TokenId> = Vec::new();
-    for pair in &config.pairs {
-        let (x, y) = pair.faucets()?;
-        initial_tokens.extend([x, y]);
-    }
+    let initial_tokens: Vec<TokenId> = config
+        .faucet_pairs()
+        .context("invalid pair faucet ids")?
+        .into_iter()
+        .flat_map(|(x, y)| [x, y])
+        .collect();
 
     // 5. Each Miden client is built on its own OS thread below (a `!Send`
     //    `Client` cannot cross threads); `factory` carries only `Send` config.
@@ -463,7 +465,10 @@ pub async fn start(
 
     // 13. Startup gate: both client threads must report ready (client built +
     //     tasks spawned) before startup is considered successful. Any build /
-    //     subscribe failure -> cancel everything, join, return the error.
+    //     subscribe failure -> cancel everything, join, return the error. A
+    //     worker that stops meanwhile (the feed thread cancels `cancel` when
+    //     it ends) fails startup at once instead of being masked by a later
+    //     "solver running".
     let startup: Result<()> = tokio::select! {
       result = async {
         ready(exec_ready_rx, "executor").await?;
@@ -474,6 +479,7 @@ pub async fn start(
         Ok(())
       } => result,
       _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during startup")),
+      _ = cancel.cancelled() => Err(anyhow!("a solver worker stopped during startup")),
     };
 
     if let Err(error) = startup {

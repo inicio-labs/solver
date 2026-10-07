@@ -4,19 +4,21 @@
 //! them against `exchangeInfo` listings; [`ticker`] parses and validates one
 //! stream frame; [`snapshot`] merges both readers' observations and answers
 //! freshness-checked price lookups; [`feed`] runs the readers and publisher on
-//! their own thread.
+//! their own thread. The crate reaches these through `crate::price`.
 
-pub(crate) mod feed;
-pub(crate) mod market;
+mod feed;
+mod market;
 mod reader;
 mod rest;
-pub(crate) mod snapshot;
+mod snapshot;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod ticker;
+mod ticker;
 
-pub(crate) use feed::{spawn_price_feed_thread, READER_NAMES};
-pub use feed::{FeedConfig, FeedMetrics, RetryPolicy};
-pub use market::{AssetCode, ClearingMarket, MarketError, MarketPlan, Symbol};
-pub use snapshot::{PriceSnapshot, PriceUnavailable};
-pub(crate) use snapshot::{SymbolQuote, Valued};
+pub use feed::FeedMetrics;
+pub(crate) use feed::{spawn_price_feed_thread, FeedConfig, RetryPolicy};
+pub use market::{AssetCode, MarketError, Symbol};
+pub(crate) use market::{ClearingMarket, MarketPlan};
+pub use snapshot::PriceSnapshot;
+pub(crate) use snapshot::{PriceUnavailable, Valued};
+pub(crate) use ticker::QuoteLimits;

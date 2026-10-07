@@ -68,7 +68,7 @@ cargo run -p e2e --release -- fund --amount 50000000
   the pair's market (`ETHUSDT`, MTB as ETH and MTA as USDT) at a mid of 1 and
   points the generated config's `[binance]` endpoints at it, so matching is
   deterministic and exercises the real price feed. To run the real `solver-bin`
-  with the generated `solver.toml`, start `cargo run -p mock-binance --
+  with the generated `solver.devnet.toml`, start `cargo run -p mock-binance --
   --market ETHUSDT=ETH/USDT:1/1` first (it listens on `127.0.0.1:8089`).
 * The solver buffer (provisioned inventory) lets the executor bridge fills
   during settlement.

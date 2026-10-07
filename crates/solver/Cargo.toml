@@ -35,7 +35,7 @@ hex = "0.4"
 subtle = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing = "0.1"
 ruint = "1.18"
 range-set-blaze = "0.7"

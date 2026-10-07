@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use strum::{EnumCount, IntoEnumIterator};
 use tokio::sync::mpsc::error::TrySendError;
@@ -17,6 +17,11 @@ use crate::types::*;
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
+/// Ticks on which a pair had a price but one of its tokens no on-chain
+/// decimals yet, so it could not clear.
+static MISSING_DECIMALS_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// Pairs already reported for missing decimals, so the warning is logged once.
+static MISSING_DECIMALS_WARNED: Mutex<BTreeSet<(TokenId, TokenId)>> = Mutex::new(BTreeSet::new());
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
@@ -32,9 +37,14 @@ pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
     })
 }
 
+pub(crate) fn missing_decimals_skips() -> u64 {
+    MISSING_DECIMALS_SKIPS.load(Ordering::Relaxed)
+}
+
 /// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
-/// covers the pairs with a confirmed Binance market; a pair without a fresh
-/// price pauses alone. RFQ selection uses fixed note limits and needs no price.
+/// visits every configured pair and clears those with a confirmed Binance
+/// market and a fresh price; the others pause alone and are counted. RFQ
+/// selection uses fixed note limits and needs no price.
 pub struct ClearingRuntime {
     pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
     pub prices: watch::Receiver<Arc<PriceSnapshot>>,
@@ -144,20 +154,33 @@ pub(super) fn internal_clear(
     };
     let mut included_pairs = 0usize;
     // Each configured pair is one unordered market (checked when the plan was
-    // built), so no order can be selected twice in a tick.
+    // built), so no order can be selected twice in a tick. Unconfirmed pairs
+    // are visited too, so their skips are counted as `no_market`.
     for (base, quote) in prices.markets().clearing_pairs() {
         let price = match prices.pair_price(base, quote, now) {
             Ok(price) => price,
             Err(reason) => {
                 PRICE_SKIPS[reason as usize].fetch_add(1, Ordering::Relaxed);
-                let reason: &'static str = reason.into();
-                tracing::debug!(%base, %quote, reason, "no usable Binance price; pair skipped");
+                tracing::debug!(%base, %quote, %reason, "no usable Binance price; pair skipped");
                 continue;
             }
         };
         let (Some(&base_decimals), Some(&quote_decimals)) =
             (decimals.get(&base), decimals.get(&quote))
         else {
+            MISSING_DECIMALS_SKIPS.fetch_add(1, Ordering::Relaxed);
+            let first = MISSING_DECIMALS_WARNED
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert((base, quote));
+            if first {
+                tracing::warn!(
+                    %base,
+                    %quote,
+                    "pair has a price but a token without on-chain decimals; it cannot clear until \
+                     the metadata is fetched (restart after the node answers)"
+                );
+            }
             continue;
         };
         let batch = clearing::BatchPrice::from_pair_price(price, base_decimals, quote_decimals)
@@ -509,5 +532,147 @@ mod tests {
                 assert!(worker.await.unwrap_err().is_cancelled());
             })
             .await;
+    }
+    /// A pair listed the other way round on Binance, with unequal token
+    /// decimals, clears at the pair price: USDC (6 decimals) / ETH (18
+    /// decimals), approved on `ETHUSDC`, at 2500 USDC per ETH, i.e. 0.0004 ETH
+    /// per USDC. Both orders are eligible only within 0.1% of that price, so
+    /// any mispricing leaves them in the book. Swapping the two decimals at
+    /// the conversion would misprice by 10^24 and clear nothing, so the second
+    /// half checks that too.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_reversed_market_with_unequal_decimals_clears_at_the_exact_price() {
+        use crate::db::postgres_models::NewOrderRow;
+        use crate::db::postgres_test::TestDb;
+        use miden_protocol::asset::{AssetAmount, FungibleAsset};
+        use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+        use miden_protocol::note::{Note, NoteType};
+        use miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
+        use miden_protocol::Word;
+        use miden_standards::note::{PswapNote, PswapNoteStorage};
+
+        let (usdc, eth) = (iusdt(), ieth());
+        const USDC_DECIMALS: u8 = 6;
+        const ETH_DECIMALS: u8 = 18;
+        // 2.5 USDC is worth 0.001 ETH at the market; the orders' limits sit
+        // 0.1% on either side of it.
+        const USDC_2_5: u64 = 2_500_000;
+        const MILLI_ETH: u64 = 1_000_000_000_000_000;
+        const MILLI_ETH_MINUS: u64 = 999_000_000_000_000;
+        const MILLI_ETH_PLUS: u64 = 1_001_000_000_000_000;
+
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
+        let solver_id =
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let creator =
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+                .try_into()
+                .unwrap();
+        let mut make_note = |offered, requested| -> Note {
+            let storage = PswapNoteStorage::builder()
+                .min_requested_asset(requested)
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build();
+            PswapNote::builder()
+                .sender(solver_id)
+                .storage(storage)
+                .serial_number(rng.draw_word())
+                .note_type(NoteType::Public)
+                .offered_asset(offered)
+                .build()
+                .unwrap()
+                .into()
+        };
+        // Seller of USDC: 2.5 USDC for at least 0.999 milli-ETH (asks 0.1%
+        // below the market). Buyer: 1.001 milli-ETH for at least 2.5 USDC
+        // (pays up to 0.1% above the market).
+        let notes = [
+            make_note(
+                FungibleAsset::new(usdc, USDC_2_5).unwrap(),
+                FungibleAsset::new(eth, MILLI_ETH_MINUS).unwrap(),
+            ),
+            make_note(
+                FungibleAsset::new(eth, MILLI_ETH_PLUS).unwrap(),
+                FungibleAsset::new(usdc, USDC_2_5).unwrap(),
+            ),
+        ];
+        let seller_id = notes[0].id();
+        let buyer_id = notes[1].id();
+        pool.write(move |conn| {
+            for (token, decimals) in [(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)] {
+                db::postgres_db::register_token_tx(conn, token)?;
+                db::postgres_db::set_token_metadata_tx(conn, token, Some(decimals), None)?;
+            }
+            let order_rows: Vec<_> = notes
+                .iter()
+                .map(|note| NewOrderRow::ingested(note, 1).unwrap())
+                .collect();
+            db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let persisted = pool
+            .read(db::postgres_db::load_active_orders_tx)
+            .await
+            .unwrap();
+        let book = || {
+            let mut book = ClearingBook::default();
+            for order in &persisted {
+                book.insert(order).unwrap();
+            }
+            book
+        };
+        let (_prices_tx, prices_rx) = watch::channel(Arc::new(PriceSnapshot::for_tests_reversed(
+            &[(usdc, eth, "0.0004", Instant::now())],
+            Duration::from_secs(30),
+        )));
+        let runtime = ClearingRuntime {
+            bootstrap: oneshot::channel().1,
+            prices: prices_rx,
+            config: ClearingConfig::default(),
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+
+        // Right decimals: both orders cross within 0.1% of the market, so each
+        // receives at least what it asked and at most the market's value.
+        let decimals = [(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)]
+            .into_iter()
+            .collect();
+        let mut right = book();
+        internal_clear(&mut right, &decimals, &runtime, &exec_tx).unwrap();
+        let batch = exec_rx.try_recv().expect("the pair clears");
+        assert_eq!(batch.group_ends, vec![2]);
+        let filled: HashMap<_, _> = batch
+            .filled_notes
+            .iter()
+            .map(|filled| (filled.note_id, filled.requested_filled))
+            .collect();
+        assert!(
+            (MILLI_ETH_MINUS..=MILLI_ETH).contains(&filled[&seller_id]),
+            "seller received {} ETH units",
+            filled[&seller_id]
+        );
+        assert!(
+            (USDC_2_5 - 2_500..=USDC_2_5 + 2_500).contains(&filled[&buyer_id]),
+            "buyer received {} USDC units",
+            filled[&buyer_id]
+        );
+
+        // Swapped decimals: the price is wrong by 10^24 and nothing is eligible.
+        let swapped = [(usdc, ETH_DECIMALS), (eth, USDC_DECIMALS)]
+            .into_iter()
+            .collect();
+        let mut wrong = book();
+        internal_clear(&mut wrong, &swapped, &runtime, &exec_tx).unwrap();
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "swapped decimals must not produce a batch"
+        );
     }
 }

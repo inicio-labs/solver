@@ -141,11 +141,11 @@ SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integrat
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_already_consumed -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_three_user_direct -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_partial_fill -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_unpriced_direct -- --ignored
 ```
 
-The separate `integration_unpriced_direct` test is intentionally red for the
-pre-existing unpriced-token audit finding C2 and is not part of this migration
-gate; running `cargo test -p solver -- --ignored` without `--lib` includes it.
+`integration_unpriced_direct` locks audit finding C2: a pair whose Binance
+market is not confirmed never settles. CI runs all six.
 Deploy and rollback order for later schema changes is in
 [docs/postgres-runbook.md](docs/postgres-runbook.md#schema-migrations).
 
@@ -183,7 +183,7 @@ Deploy and rollback order for later schema changes is in
 | `clearing_fee_ppm` | — | `0` | Protocol fee and minimum eligibility edge in ppm. Clearing always uses a fresh, exact Binance midpoint. |
 | `admin_port` | — | `3001` | Admin HTTP port (binds `127.0.0.1` only). |
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
-| `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
+| `debug_mode` | — | `false` | Ignored since Miden 0.16 (miden-client removed debug mode); a warning is logged if set. |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
 | `verify_interval_ms` | — | `5000` | In verification mode (cannot settle: no fee headroom, RPC or PostgreSQL down), how often the executor re-checks before accepting batches again. |
 | `router_enabled` | — | `false` | Must remain disabled: the clearing matcher does not route notes externally. |
@@ -203,25 +203,40 @@ than `quote_ttl_ms`; the price API applies the same TTL.
 
 | Field | Req | Default | Description |
 |---|---|---|---|
-| `quote_ttl_ms` | ✅ | — | A quote is usable while `now − received_at < quote_ttl_ms` (local receipt time). |
-| `max_spread_bps` | ✅ | — | Widest accepted spread `10_000 × (ask − bid) / mid`, inclusive (1..=10000). A wider or crossed quote makes the symbol unusable until a newer valid one. |
-| `stream_endpoints` | — | A: `wss://data-stream.binance.vision:443`, B: `wss://stream.binance.com:443` | Stream base URLs of reader A and reader B. Different endpoints by default, so one endpoint failing does not take out both readers. |
-| `rest_endpoint` | — | `https://data-api.binance.vision` | `exchangeInfo` checks at startup, one request per symbol. |
+| `quote_ttl_ms` | ✅ | — | A quote is usable — for clearing, swap guidance and wallet prices alike — while `now − received_at < quote_ttl_ms` (local receipt time). At most `60000`: the TTL is what pauses clearing when both readers stall. |
+| `max_spread_bps` | ✅ | — | Widest accepted spread `10_000 × (ask − bid) / mid`, inclusive (1..=10000). A wider or crossed quote makes the symbol invalid until a newer valid one. |
+| `min_notional` | — | unset | Least displayed notional (`quantity × price`, in the symbol's quote asset, e.g. `"5000"`) on each side of a quote; a thinner side makes the quote invalid, so a one-lot top of book cannot set the price. Unset accepts any positive size. |
+| `stream_endpoints` | — | A: `wss://data-stream.binance.vision:443`, B: `wss://stream.binance.com:443` | Stream base URLs (scheme and host only) of reader A and reader B. Different endpoints by default, so one endpoint failing does not take out both readers. Binance refuses some regions on the main endpoint (observed for the US); there, point both readers at the market-data endpoint. Plaintext `ws://` is accepted for loopback hosts only. |
+| `rest_endpoint` | — | `https://data-api.binance.vision` | `exchangeInfo` checks (scheme and host only), one request per symbol. |
 | `valuation_quote_asset` | — | `"USDT"` | The price API values each token by `<ASSET><QUOTE>`; the quote asset itself is worth 1. |
 | `connect_timeout_ms` / `request_timeout_ms` | — | `10000` | Handshake and HTTP timeouts. |
-| `idle_timeout_ms` | — | `60000` | Reconnect a stream with no frame; must exceed Binance's 20 s ping interval. |
-| `connection_lifetime_secs` | — | `82800` | Longest connection, below Binance's 24 h limit; each lasts a random 50–100% of it, so the readers renew apart. |
-| `retry_min_ms` / `retry_max_ms` | — | `500` / `60000` | Jittered exponential backoff for reconnects and `exchangeInfo` retries. |
-| `max_connection_attempts` | — | `30` | Connection attempts per 5 minutes, both readers together. Must be below Binance's limit of 300 per IP, shared by every process on that IP. |
+| `idle_timeout_ms` | — | `60000` | Reconnect a stream with no frame at all; at least twice Binance's 20 s ping interval. |
+| `data_idle_timeout_ms` | — | `60000` | Reconnect a stream that stays up but delivers no quote (a stalled backend keeps pinging); at least `idle_timeout_ms` and `quote_ttl_ms`. |
+| `connection_lifetime_secs` | — | `82800` | Longest connection, between 1 h and Binance's 24 h limit; each lasts a random 50–100% of it, so the readers renew apart. |
+| `retry_min_ms` / `retry_max_ms` | — | `500` / `60000` | Jittered exponential backoff (each delay a random 50–100% of its step, capped) for reconnects and `exchangeInfo` retries; `retry_max_ms` at most `600000`. |
+| `max_connection_attempts` | — | `30` | Connection attempts per 5 minutes, both readers together. Binance allows 300 per IP counted over every process behind that IP, so the sum across your processes must stay below 300. |
+| `validation_timeout_secs` | — | `60` | How long startup waits for every symbol's `exchangeInfo` answer before the readers start with the confirmed ones. |
 
-At startup each symbol must be listed with exactly the configured assets and
-status `TRADING`; a market that is not, or whose lookup cannot succeed (an
-unknown symbol, a malformed answer), is logged and stays unavailable until
-restart while the others run. Network failures, rate limits and server errors
-are retried. Until the markets are confirmed, every pair is
-paused but the solver runs. Markets are static configuration: a token
-registered at runtime through the admin API has no price until it is added to
-`solver.toml`.
+At startup each symbol is checked through `exchangeInfo`. A symbol Binance
+does not list, lists with other assets, or lists with spot trading disallowed
+is rejected and logged; it stays unavailable until the configuration changes.
+A symbol in a temporary state (`BREAK`, `HALT`) is subscribed and reported as a
+warning: its book sends nothing until trading resumes, so the TTL pauses the
+pair, and it resumes on its own. Any other answer (a network failure, a rate
+limit, a server error, a 404 from a wrong path, a maintenance page) is retried.
+When the validation timeout passes with at least one market confirmed, the
+readers start with the confirmed set and the rest keep being retried in the
+background; a symbol confirmed later is added by restarting the readers with
+the quotes carried over. If nothing is confirmed by the timeout and every
+failure is one a retry cannot change (a wrong path), the solver stops with
+`NoMarketConfirmed` instead of running without prices. Until the markets are
+confirmed, every pair is paused but the solver runs. Markets are static
+configuration: a token registered at runtime through the admin API has no
+price until it is added to `solver.toml`.
+
+Binance's `serverShutdown` event, which precedes a disconnect, reconnects at
+once; a connection that keeps answering pings but delivers no quote is replaced
+after `data_idle_timeout_ms`.
 
 **Devnet / local.** Faucet tokens have no Binance market of their own, so run
 the bundled mock (`crates/mock-binance`) and point both endpoints at it:
@@ -309,7 +324,8 @@ clears crossing orders between the two tokens automatically.
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
 - `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if a PostgreSQL read answers, the writer still holds its ownership lock, and the last sync is recent; otherwise 503. The schema is verified once at startup.
-- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure; for the Binance feed, each reader's connection state and reconnects, frames, discarded frames, rejected quotes, rejected markets, `exchangeInfo` retries, publication delay, each symbol's usability and quote age (`solver_price_quote_age_seconds{symbol}`), and pairs skipped per missing-price reason (`solver_matcher_price_skips_total{reason}`).
+- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="a"|"b"}`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_lookup_failures_total`, `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_markets{state="confirmed"|"pending"|"rejected"|"halted"}`, `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`) and `solver_matcher_missing_decimals_skips_total`.
+  Suggested alerts: `solver_price_quote_fresh == 0` for a configured symbol longer than a few TTLs; `solver_price_feed_connected == 0` on both readers; `solver_price_feed_markets{state="rejected"} > 0` (configuration); `solver_price_feed_conflicting_updates_total` rising (endpoint divergence); `rate(solver_matcher_price_skips_total{reason="stale"})` while orders wait.
 
 ---
 
@@ -332,16 +348,19 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
   "decimals":8,          // the TOKEN's on-chain decimals (fetched on-chain; null until known) — distinct from `precision`
   "as_of":1781896971, "stale":false, "source":"binance" }
 ```
-- **404** unknown faucet · **503** registered-but-no-price, or stale (quote at
-  least `quote_ttl_ms` old; pass `?allow_stale=true` to get a 200 with `stale:true`)
-  · **400** bad faucet id / precision / over-`price_query_max_batch`.
+- **404** unknown faucet · **503** `no_market` (no Binance market configured for
+  the token — nothing to retry), `no_price` (its market has no valid quote right
+  now), or `stale` (quote at least `quote_ttl_ms` old; pass
+  `?allow_stale=true` to get a 200 with `stale:true`) · **400** bad faucet id /
+  precision / over-`price_query_max_batch`.
 - A token's price is the exact Binance midpoint of `<ASSET><QUOTE>` (its
   `asset_*_binance_asset` against `[binance].valuation_quote_asset`, default
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   **once, when a token is registered** (config tokens at boot, admin-added tokens
   via the subscribe relay), then cached — never re-polled.
-- `/v1/swap-eta` reports `marketPrice`/`offMarket` from the pair's clearing
-  market under the same TTL the matcher uses (`null` without a fresh quote).
+- `/v1/swap-eta` reports `marketPrice` (exact, up to 18 places) and
+  `offMarket` from the pair's clearing market under the same TTL the matcher
+  uses (`null` without a fresh quote).
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).

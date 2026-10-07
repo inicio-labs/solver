@@ -32,7 +32,7 @@ use tokio_util::task::AbortOnDropHandle;
 use super::market::{Listing, MarketPlan, Markets, Symbol};
 use super::reader::{run_connection, stream_url, Exit, ReaderContext, ReaderLatest};
 use super::rest::{fetch_listing, LookupError, MAX_RETRY_AFTER};
-use super::snapshot::{Offer, PriceSnapshot};
+use super::snapshot::{Offer, PriceSnapshot, SymbolQuote};
 use super::ticker::QuoteLimits;
 
 /// The feed keeps this many readers, each on its own configured endpoint;
@@ -143,6 +143,104 @@ pub struct FeedMetrics {
     pub(crate) markets_confirmed: AtomicU64,
     /// Configured uses of a symbol that is subscribed but not trading.
     pub(crate) halted_markets: AtomicU64,
+}
+
+impl FeedMetrics {
+    /// Append the feed's metrics in Prometheus text format: reader health,
+    /// market confirmation, publication, and each symbol's quote state. A
+    /// quote is `valid` when its newest update passed validation and `fresh`
+    /// when it is also younger than the clearing TTL; alerts belong on `fresh`.
+    pub(crate) fn render(&self, snapshot: &PriceSnapshot, body: &mut String) {
+        use std::fmt::Write;
+
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        for (index, reader) in READER_NAMES.into_iter().enumerate() {
+            let connected = u8::from(self.connected[index].load(Ordering::Relaxed));
+            let _ = writeln!(
+                body,
+                "solver_price_feed_connected{{reader=\"{reader}\"}} {connected}"
+            );
+            for (metric, counters) in [
+                ("solver_price_feed_connections_total", &self.connections),
+                ("solver_price_feed_frames_total", &self.frames),
+                (
+                    "solver_price_feed_discarded_frames_total",
+                    &self.discarded_frames,
+                ),
+                (
+                    "solver_price_feed_rejected_quotes_total",
+                    &self.rejected_quotes,
+                ),
+            ] {
+                let _ = writeln!(
+                    body,
+                    "{metric}{{reader=\"{reader}\"}} {}",
+                    load(&counters[index])
+                );
+            }
+        }
+        for (metric, counter) in [
+            ("solver_price_feed_reader_panics_total", &self.reader_panics),
+            (
+                "solver_price_feed_server_shutdowns_total",
+                &self.server_shutdowns,
+            ),
+            ("solver_price_feed_publications_total", &self.publications),
+            (
+                "solver_price_feed_conflicting_updates_total",
+                &self.conflicting_updates,
+            ),
+            (
+                "solver_price_feed_lookup_failures_total",
+                &self.lookup_failures,
+            ),
+            ("solver_price_feed_budget_waits_total", &self.budget_waits),
+        ] {
+            let _ = writeln!(body, "{metric} {}", load(counter));
+        }
+        for (state, gauge) in [
+            ("confirmed", &self.markets_confirmed),
+            ("pending", &self.markets_pending),
+            ("rejected", &self.rejected_markets),
+            ("halted", &self.halted_markets),
+        ] {
+            let _ = writeln!(
+                body,
+                "solver_price_feed_markets{{state=\"{state}\"}} {}",
+                load(gauge)
+            );
+        }
+        let delay = Duration::from_micros(load(&self.last_publish_delay_us));
+        let _ = writeln!(
+            body,
+            "solver_price_feed_publish_delay_seconds {}",
+            delay.as_secs_f64()
+        );
+        let now = Instant::now();
+        for (symbol, quote) in snapshot.quotes() {
+            let (valid, fresh, age) = match quote {
+                SymbolQuote::Valid(quote) => {
+                    let age = now.saturating_duration_since(quote.received_at);
+                    (1, u8::from(age < snapshot.ttl()), Some(age.as_secs_f64()))
+                }
+                SymbolQuote::Missing | SymbolQuote::Invalid { .. } => (0, 0, None),
+            };
+            let _ = writeln!(
+                body,
+                "solver_price_quote_valid{{symbol=\"{symbol}\"}} {valid}"
+            );
+            let _ = writeln!(
+                body,
+                "solver_price_quote_fresh{{symbol=\"{symbol}\"}} {fresh}"
+            );
+            if let Some(age) = age {
+                let _ = writeln!(
+                    body,
+                    "solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} {age}"
+                );
+            }
+        }
+    }
 }
 
 /// Failures that stop the feed, and with it the solver.

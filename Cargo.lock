@@ -5424,12 +5424,9 @@ dependencies = [
  "miden-standards",
  "miden-testing",
  "rand 0.9.4",
- "serde",
- "serde_json",
  "solver",
  "tokio",
  "tokio-util",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]

@@ -65,12 +65,14 @@ impl solver::ClientFactory for E2eFactory {
 
 pub async fn run(secs: u64) -> Result<()> {
     let art = Artifacts::load(&artifacts::artifacts_path())?;
-    let mut config =
-        SolverConfig::load(&artifacts::solver_config_path()).context("load generated solver config")?;
+    let mut config = SolverConfig::load(&artifacts::solver_config_path())
+        .context("load generated solver config")?;
     let solver_id =
         AccountId::from_hex(&art.solver_account_id).map_err(|e| anyhow!("solver id: {e}"))?;
-    let token_a = AccountId::from_hex(&art.token_a.faucet_id).map_err(|e| anyhow!("token_a: {e}"))?;
-    let token_b = AccountId::from_hex(&art.token_b.faucet_id).map_err(|e| anyhow!("token_b: {e}"))?;
+    let token_a =
+        AccountId::from_hex(&art.token_a.faucet_id).map_err(|e| anyhow!("token_a: {e}"))?;
+    let token_b =
+        AccountId::from_hex(&art.token_b.faucet_id).map_err(|e| anyhow!("token_b: {e}"))?;
 
     // Pre-run balances (best-effort).
     let (pre_a, pre_b) = read_solver_balances(&art, solver_id, token_a, token_b).await;
@@ -144,8 +146,12 @@ async fn read_solver_balances(
     match devnet::build_client(&art.solver_executor_store_path, &art.solver_keystore_path).await {
         Ok((mut cli, _)) => {
             let _ = cli.sync_state().await;
-            let a = accounts::balance(&cli, solver_id, token_a).await.unwrap_or(0);
-            let b = accounts::balance(&cli, solver_id, token_b).await.unwrap_or(0);
+            let a = accounts::balance(&cli, solver_id, token_a)
+                .await
+                .unwrap_or(0);
+            let b = accounts::balance(&cli, solver_id, token_b)
+                .await
+                .unwrap_or(0);
             (a, b)
         }
         Err(e) => {

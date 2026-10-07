@@ -24,7 +24,6 @@
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -35,7 +34,6 @@ use tokio::sync::{mpsc, watch};
 
 use crate::db::postgres_pool::{LatencySnapshot, LATENCY_BUCKET_US};
 use crate::db::DbPool;
-use crate::price::binance::{SymbolQuote, READER_NAMES};
 use crate::price::{FeedMetrics, PriceSnapshot};
 use crate::types::{now_unix, BookUpdate, ExecutionBatch};
 
@@ -109,70 +107,21 @@ fn append_latency(body: &mut String, metric: &str, latency: &LatencySnapshot) {
     let _ = writeln!(body, "{metric}_count {}", latency.buckets[8]);
 }
 
-/// Price feed health, per-symbol quote age, and pairs the matcher skipped for
-/// want of a usable price.
+/// Price feed health and per-symbol quote state (rendered by the feed), and
+/// pairs the matcher skipped for want of a usable price or token decimals.
 fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceSnapshot) {
-    for (index, reader) in READER_NAMES.into_iter().enumerate() {
-        let connected = u8::from(feed.connected[index].load(Ordering::Relaxed));
-        let connections = feed.connections[index].load(Ordering::Relaxed);
-        let _ = writeln!(
-            body,
-            "solver_price_feed_connected{{reader=\"{reader}\"}} {connected}"
-        );
-        let _ = writeln!(
-            body,
-            "solver_price_feed_connections_total{{reader=\"{reader}\"}} {connections}"
-        );
-    }
-    for (metric, value) in [
-        ("solver_price_feed_reader_panics_total", &feed.reader_panics),
-        ("solver_price_feed_frames_total", &feed.frames),
-        (
-            "solver_price_feed_discarded_frames_total",
-            &feed.discarded_frames,
-        ),
-        (
-            "solver_price_feed_rejected_quotes_total",
-            &feed.rejected_quotes,
-        ),
-        ("solver_price_feed_publications_total", &feed.publications),
-        (
-            "solver_price_feed_lookup_failures_total",
-            &feed.lookup_failures,
-        ),
-        ("solver_price_feed_rejected_markets", &feed.rejected_markets),
-    ] {
-        let _ = writeln!(body, "{metric} {}", value.load(Ordering::Relaxed));
-    }
-    let delay_us = feed.last_publish_delay_us.load(Ordering::Relaxed);
-    let _ = writeln!(
-        body,
-        "solver_price_feed_publish_delay_seconds {}",
-        delay_us as f64 / 1_000_000.0
-    );
-    let now = Instant::now();
-    for (symbol, quote) in snapshot.quotes() {
-        let usable = u8::from(matches!(quote, SymbolQuote::Usable(_)));
-        let _ = writeln!(
-            body,
-            "solver_price_quote_usable{{symbol=\"{symbol}\"}} {usable}"
-        );
-        if let SymbolQuote::Usable(quote) = quote {
-            let age = now
-                .saturating_duration_since(quote.received_at)
-                .as_secs_f64();
-            let _ = writeln!(
-                body,
-                "solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} {age}"
-            );
-        }
-    }
+    feed.render(snapshot, body);
     for (reason, count) in crate::matcher::price_skips() {
         let _ = writeln!(
             body,
             "solver_matcher_price_skips_total{{reason=\"{reason}\"}} {count}"
         );
     }
+    let _ = writeln!(
+        body,
+        "solver_matcher_missing_decimals_skips_total {}",
+        crate::matcher::missing_decimals_skips()
+    );
 }
 
 async fn metrics(
@@ -261,16 +210,21 @@ async fn readyz(State(state): State<ObsState>) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use crate::db::postgres_test::TestDb;
-    use crate::price::binance::test_support::{eth, usdt};
+    use crate::price::test_support::{eth, usdt};
     use axum_test::TestServer;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    /// A valid quote older than the TTL is `valid` but not `fresh`: alerts on
+    /// `fresh` see a stalled feed.
     #[test]
-    fn price_metrics_report_feed_health_and_quote_age() {
+    fn price_metrics_report_feed_health_and_quote_freshness() {
         let feed = FeedMetrics::default();
         feed.connected[1].store(true, Ordering::Relaxed);
         feed.connections[1].store(3, Ordering::Relaxed);
+        feed.frames[0].store(7, Ordering::Relaxed);
         feed.rejected_markets.store(2, Ordering::Relaxed);
+        feed.markets_confirmed.store(1, Ordering::Relaxed);
+        feed.conflicting_updates.store(4, Ordering::Relaxed);
         feed.last_publish_delay_us.store(1_500, Ordering::Relaxed);
         let received = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
         let snapshot = PriceSnapshot::for_tests(
@@ -278,22 +232,29 @@ mod tests {
             &[],
             Duration::from_secs(1),
         );
+        let symbol = snapshot.quotes().next().unwrap().0.to_string();
         let mut body = String::new();
         append_price_metrics(&mut body, &feed, &snapshot);
         for line in [
-            "solver_price_feed_connected{reader=\"a\"} 0",
-            "solver_price_feed_connected{reader=\"b\"} 1",
-            "solver_price_feed_connections_total{reader=\"b\"} 3",
-            "solver_price_feed_rejected_markets 2",
-            "solver_price_feed_publish_delay_seconds 0.0015",
-            "solver_price_quote_usable{symbol=\"A0A1\"} 1",
-            "solver_matcher_price_skips_total{reason=\"stale\"} ",
+            "solver_price_feed_connected{reader=\"a\"} 0".to_string(),
+            "solver_price_feed_connected{reader=\"b\"} 1".to_string(),
+            "solver_price_feed_connections_total{reader=\"b\"} 3".to_string(),
+            "solver_price_feed_frames_total{reader=\"a\"} 7".to_string(),
+            "solver_price_feed_markets{state=\"rejected\"} 2".to_string(),
+            "solver_price_feed_markets{state=\"confirmed\"} 1".to_string(),
+            "solver_price_feed_conflicting_updates_total 4".to_string(),
+            "solver_price_feed_publish_delay_seconds 0.0015".to_string(),
+            format!("solver_price_quote_valid{{symbol=\"{symbol}\"}} 1"),
+            format!("solver_price_quote_fresh{{symbol=\"{symbol}\"}} 0"),
+            "solver_matcher_price_skips_total{reason=\"stale\"} ".to_string(),
+            "solver_matcher_missing_decimals_skips_total ".to_string(),
         ] {
-            assert!(body.contains(line), "missing {line:?} in:\n{body}");
+            assert!(body.contains(&line), "missing {line:?} in:\n{body}");
         }
+        let prefix = format!("solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} ");
         let age = body
             .lines()
-            .find_map(|line| line.strip_prefix("solver_price_quote_age_seconds{symbol=\"A0A1\"} "))
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
             .unwrap();
         assert!(age.parse::<f64>().unwrap() >= 5.0);
     }

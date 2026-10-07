@@ -32,7 +32,7 @@ Query params (optional):
 | Param | Values | Meaning |
 |---|---|---|
 | `precision` | `full` (default) \| `0`–`18` | decimal places of the **price number**. `full` = exact. |
-| `allow_stale` | `true` | return `200` + `"stale":true` instead of `503` when the token's quote is stale. |
+| `allow_stale` | `true` | return `200` + `"stale":true` instead of `503` when the token's quote is stale (at least the solver's quote TTL old — the same TTL the solver clears with). |
 
 **200 response:**
 
@@ -58,8 +58,8 @@ Query params (optional):
 | `price` | **string** | price of **ONE WHOLE token** in `vs_currency`. Exact decimal string (no float rounding); USDT itself is `"1"`. |
 | `precision` | string | precision applied to `price` (`full` or `0`–`18`) |
 | `decimals` | number \| null | the token's **on-chain decimals** (here: `8`) |
-| `as_of` | number | unix epoch seconds the solver received this quote |
-| `stale` | bool | `true` if the quote is at least the solver's quote TTL old |
+| `as_of` | number | unix epoch seconds the solver received this quote; for the quote asset itself (`USDT`, always `"1"`) it is the request time |
+| `stale` | bool | `true` if the quote is at least the solver's quote TTL old; never `true` for the quote asset itself |
 | `source` | string | price source label (`binance`) |
 
 > **Valuing an amount.** On-chain amounts are in **base units**.
@@ -85,9 +85,10 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 | `200` | OK |
 | `400` | malformed faucet id, bad `precision`, or too many ids |
 | `404` | faucet not registered with the solver |
-| `503` | registered but no price (no configured Binance market, or no valid quote yet), or price stale (use `?allow_stale=true` to override) |
+| `503` | `no_market`: registered but no Binance market is configured for the token — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, or the newest was crossed, too wide or too thin); `stale`: the quote is at least the quote TTL old (use `?allow_stale=true` to override) |
 
-Error body: `{"error":"unknown_faucet","message":"…"}`.
+Error body: `{"error":"unknown_faucet","message":"…"}`; the `error` codes above are
+stable, the `message` is for people. `allow_stale` does not override `no_price`.
 
 ---
 
@@ -125,14 +126,14 @@ export async function getPrice(faucetIdHex) {
   return r.json(); // { price, decimals, ticker, vs_currency, as_of, stale, ... }
 }
 
-// USDT value of a base-unit amount
-export function usdValue({ price, decimals }, amountBaseUnits) {
+// value of a base-unit amount in the quote currency (USDT)
+export function quoteValue({ price, decimals }, amountBaseUnits) {
   return (Number(amountBaseUnits) / 10 ** decimals) * Number(price);
 }
 
 // example: value of a swap leg
 const ibtc = await getPrice("0xb3722d97036169910fc0eeaccce29b");
-const usd  = usdValue(ibtc, 250000000); // 2.5 IBTC -> 25
+const usdt = quoteValue(ibtc, 250000000); // 2.5 IBTC -> 25
 ```
 
 ---
@@ -141,5 +142,5 @@ const usd  = usdValue(ibtc, 250000000); // 2.5 IBTC -> 25
 
 - **Read-only, public, cached** (`Cache-Control: max-age=1`). Concurrency-limited; excess → `503`.
 - `price` is per **whole token** (not per base unit) — combine with `decimals` as shown.
-- Prices come from Binance Spot `bookTicker` midpoints. On devnet the faucet tokens are priced by a mock Binance server, so the values below are fixed test prices.
+- Prices come from Binance Spot `bookTicker` midpoints. On devnet the faucet tokens are priced by a mock Binance server, so the values in the table above are fixed test prices.
 - Endpoint accepts the **hex** faucet id today. (Bech32 `mdev…` acceptance can be added on request.)

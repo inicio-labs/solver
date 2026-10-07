@@ -334,54 +334,36 @@ pub fn vault_balance(chain: &MockChain, account_id: AccountId, faucet: AccountId
 /// A mock Binance server on its own thread and runtime, so a test thread busy
 /// driving the mock chain cannot stall its quotes. Stops when dropped.
 pub struct BinanceStub {
-    ws_url: String,
-    rest_url: String,
-    _stop: tokio::sync::oneshot::Sender<()>,
+    mock: mock_binance::MockThread,
 }
 
 impl BinanceStub {
-    /// Serve `markets` (`SYMBOL`, base asset, quote asset, mid price) with a
-    /// zero spread.
+    /// Serve `markets` (`SYMBOL`, base asset, quote asset, mid price), each
+    /// quoted with a 10 bps spread around the mid, so a test that passed on
+    /// the bid or the ask instead of the midpoint would notice.
     pub fn start(markets: &[(&str, &str, &str, &str)]) -> Self {
         let markets: Vec<_> = markets
             .iter()
             .map(|(symbol, base, quote, mid)| {
-                mock_binance::Market::new(symbol, base, quote, mid, mid)
+                let mid: f64 = mid.parse().expect("decimal mid");
+                let bid = (mid * 0.9995).to_string();
+                let ask = (mid * 1.0005).to_string();
+                mock_binance::Market::new(symbol, base, quote, &bid, &ask)
             })
             .collect();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .expect("mock Binance runtime");
-            runtime.block_on(async move {
-                let server = mock_binance::MockBinance::start(markets, Default::default())
-                    .await
-                    .expect("bind mock Binance");
-                ready_tx
-                    .send((server.ws_url(), server.rest_url()))
-                    .expect("test waits for the mock");
-                let _ = stop_rx.await;
-            });
-        });
-        let (ws_url, rest_url) = ready_rx.recv().expect("mock Binance started");
         Self {
-            ws_url,
-            rest_url,
-            _stop: stop_tx,
+            mock: mock_binance::MockThread::start(markets, Default::default()),
         }
     }
 
-    /// A `[binance]` section pointing both readers at this server. Quotes
-    /// stay usable for ten minutes: the mock chain can hold the test thread.
+    /// A `[binance]` section pointing both readers at this server. The mock
+    /// republishes every 250 ms, so a 30 s TTL only expires if the feed
+    /// itself stops publishing.
     pub fn config(&self) -> solver::config::BinanceConfig {
         solver::config::BinanceConfig {
-            stream_endpoints: [self.ws_url.clone(), self.ws_url.clone()],
-            rest_endpoint: self.rest_url.clone(),
-            quote_ttl_ms: 600_000,
+            stream_endpoints: [self.mock.ws_url(), self.mock.ws_url()],
+            rest_endpoint: self.mock.rest_url(),
+            quote_ttl_ms: 30_000,
             max_spread_bps: 100,
             retry_min_ms: 50,
             retry_max_ms: 500,

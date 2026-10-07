@@ -3,6 +3,7 @@
 //! Living in the library so both `solver::start` and `main.rs` can read the
 //! same struct without a reverse dependency from library → binary.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,11 @@ use miden_protocol::account::AccountId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::price::{AssetCode, ClearingMarket, FeedConfig, MarketPlan, RetryPolicy, Symbol};
+use crate::clearing::ReferencePrice;
+use crate::price::{
+    AssetCode, ClearingMarket, FeedConfig, MarketError, MarketPlan, QuoteLimits, RetryPolicy,
+    Symbol,
+};
 use crate::types::TokenId;
 
 /// Binance pings every stream connection this often.
@@ -18,31 +23,83 @@ const BINANCE_PING_INTERVAL_MS: u64 = 20_000;
 /// Binance's limit on stream connection attempts per 5 minutes per client IP;
 /// exceeding it gets the IP rate limited, then banned.
 const BINANCE_CONNECTION_ATTEMPT_LIMIT: usize = 300;
+/// Binance closes a stream connection after this long.
+const BINANCE_CONNECTION_LIFETIME_SECS: u64 = 24 * 60 * 60;
+/// The TTL is what pauses clearing when both readers stall; a typo that makes
+/// it minutes long would clear at a frozen price.
+const MAX_QUOTE_TTL_MS: u64 = 60_000;
+/// Longest reconnect backoff: an outage must not keep a reader away for hours.
+const MAX_RETRY_MS: u64 = 10 * 60 * 1000;
+/// Shortest planned connection: every renewal takes a slot of the shared
+/// connection budget.
+const MIN_CONNECTION_LIFETIME_SECS: u64 = 60 * 60;
 
 #[derive(Debug, Error)]
-enum ConfigError {
+pub(crate) enum ConfigError {
     #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
     InvalidPricePrecision(String),
     #[error("binance.{0} must be set to a positive value")]
     ZeroBinanceSetting(&'static str),
-    #[error("binance.{name} {url:?} must be a {scheme} URL")]
+    #[error("binance.{name} {url:?} must be a {}:// or {}:// URL with a host and no path or query", .schemes[0], .schemes[1])]
     InvalidEndpoint {
         name: &'static str,
         url: String,
-        scheme: &'static str,
+        schemes: [&'static str; 2],
     },
-    #[error("binance.idle_timeout_ms must exceed Binance's 20 s ping interval")]
-    IdleTimeoutTooShort,
+    #[error(
+        "binance.{name} {url:?} is plaintext; only loopback hosts may use it, since the listing \
+         decides each pair's orientation and the stream its price"
+    )]
+    PlaintextEndpoint { name: &'static str, url: String },
+    #[error("binance.quote_ttl_ms must be at most {MAX_QUOTE_TTL_MS}, got {0}")]
+    TtlTooLong(u64),
     #[error("binance.max_spread_bps must be at most 10000, got {0}")]
     SpreadTooWide(u32),
+    #[error("binance.min_notional {0:?} must be a positive decimal amount of the quote asset")]
+    InvalidMinNotional(String),
+    #[error(
+        "binance.idle_timeout_ms must be at least twice Binance's 20 s ping interval ({minimum}), got {value}"
+    )]
+    IdleTimeoutTooShort { value: u64, minimum: u64 },
+    #[error("binance.data_idle_timeout_ms must be at least idle_timeout_ms and quote_ttl_ms")]
+    DataIdleTimeoutTooShort,
     #[error("binance.retry_min_ms must not exceed binance.retry_max_ms")]
     RetryRange,
-    #[error("binance.connection_lifetime_secs must be below Binance's 24-hour limit")]
-    LifetimeTooLong,
+    #[error("binance.retry_max_ms must be at most {MAX_RETRY_MS}, got {0}")]
+    RetryMaxTooLong(u64),
+    #[error(
+        "binance.connection_lifetime_secs must be between {MIN_CONNECTION_LIFETIME_SECS} and \
+         Binance's 24-hour limit ({BINANCE_CONNECTION_LIFETIME_SECS}, exclusive), got {0}"
+    )]
+    LifetimeOutOfRange(u64),
     #[error("binance.max_connection_attempts must be below Binance's per-IP limit of {limit}, got {value}")]
     TooManyConnectionAttempts { value: usize, limit: usize },
     #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
     InvalidClearingFee { fee: u32, maximum: u32 },
+    #[error("pair {pair}: invalid {side}_faucet_id: {reason}")]
+    InvalidFaucet {
+        pair: String,
+        side: &'static str,
+        reason: String,
+    },
+    #[error(
+        "pair {pair}: binance_symbol {symbol} is neither {forward} nor {reverse}, the two asset \
+         codes joined in either order"
+    )]
+    SymbolMismatch {
+        pair: String,
+        symbol: Symbol,
+        forward: Symbol,
+        reverse: Symbol,
+    },
+    #[error(transparent)]
+    Market(MarketError),
+}
+
+impl From<MarketError> for ConfigError {
+    fn from(error: MarketError) -> Self {
+        Self::Market(error)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -88,7 +145,9 @@ fn default_read_pool_size() -> u32 {
     4
 }
 
+/// A misspelled key here is an error, not a silently ignored one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetPairConfig {
     pub name: String,
     pub asset_x_faucet_id: String,
@@ -111,10 +170,13 @@ pub struct AssetPairConfig {
 
 impl AssetPairConfig {
     /// The pair's faucets, `(asset_x, asset_y)`.
-    pub fn faucets(&self) -> Result<(TokenId, TokenId)> {
-        let parse = |hex: &str, side: &str| {
-            AccountId::from_hex(hex)
-                .with_context(|| format!("invalid {side}_faucet_id for pair {}", self.name))
+    fn faucets(&self) -> std::result::Result<(TokenId, TokenId), ConfigError> {
+        let parse = |hex: &str, side: &'static str| {
+            AccountId::from_hex(hex).map_err(|error| ConfigError::InvalidFaucet {
+                pair: self.name.clone(),
+                side,
+                reason: error.to_string(),
+            })
         };
         Ok((
             parse(&self.asset_x_faucet_id, "asset_x")?,
@@ -300,37 +362,53 @@ fn default_router_inflight_ttl_ms() -> u64 {
 
 /// Binance Spot public market data: endpoints, quote validity, and the feed's
 /// connection and retry budget (ADR 0004). Every field but `quote_ttl_ms` and
-/// `max_spread_bps` has a default; those two must be chosen per deployment.
+/// `max_spread_bps` has a default; those two must be chosen per deployment. A
+/// misspelled key is an error, not a silent fallback to the default.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BinanceConfig {
     /// Stream base URLs of reader A and reader B. By default reader A uses the
     /// market-data-only endpoint and reader B the main one: separate front
-    /// ends, so one endpoint failing does not take out both readers.
+    /// ends, so one endpoint failing does not take out both readers. Binance
+    /// refuses some regions on the main endpoint (observed for the US); point
+    /// both readers at the market-data endpoint there.
     pub stream_endpoints: [String; 2],
     /// REST base URL for `exchangeInfo` checks at startup.
     pub rest_endpoint: String,
     /// A quote is usable while `now - received_at < quote_ttl_ms`, measured
-    /// from local receipt.
+    /// from local receipt, for clearing, swap guidance and wallet prices
+    /// alike. At most 60 s: this is what pauses clearing when both readers
+    /// stall.
     pub quote_ttl_ms: u64,
     /// Widest accepted spread, `10_000 × (ask - bid) / mid`, inclusive. A
-    /// wider quote makes its market unusable until the next valid one.
+    /// wider quote makes its market invalid until the next valid one.
     pub max_spread_bps: u32,
+    /// Least displayed notional (`quantity × price`) on each side of a quote,
+    /// in the symbol's quote asset, e.g. `"5000"` USDT. A thinner side makes
+    /// the quote invalid, so a one-lot top of book cannot set the price.
+    /// Unset accepts any positive size.
+    pub min_notional: Option<String>,
     /// Asset the price API values tokens in (`<ASSET><QUOTE>` markets).
     pub valuation_quote_asset: AssetCode,
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
     /// Reconnect a stream that delivers no frame, not even a ping, this long.
     pub idle_timeout_ms: u64,
+    /// Reconnect a stream that delivers no quote this long although it stays
+    /// up: a stalled backend keeps pinging. At least the idle timeout and TTL.
+    pub data_idle_timeout_ms: u64,
     /// Longest planned connection, below Binance's 24-hour limit; each lasts
     /// a random 50–100% of it, so the two readers renew apart.
     pub connection_lifetime_secs: u64,
     pub retry_min_ms: u64,
     pub retry_max_ms: u64,
-    /// Connection attempts per 5 minutes, shared by both readers. Must stay
-    /// below Binance's 300 per IP; staying far below leaves room for other
-    /// processes on the same IP.
+    /// Connection attempts per 5 minutes, shared by both readers. Binance
+    /// allows 300 per IP, counted over every process behind that IP, so the
+    /// sum across processes must stay below 300.
     pub max_connection_attempts: usize,
+    /// How long startup keeps waiting for every configured symbol to be
+    /// confirmed before the readers start with the confirmed ones.
+    pub validation_timeout_secs: u64,
 }
 
 impl Default for BinanceConfig {
@@ -343,38 +421,56 @@ impl Default for BinanceConfig {
             rest_endpoint: "https://data-api.binance.vision".to_string(),
             quote_ttl_ms: 0,
             max_spread_bps: 0,
+            min_notional: None,
             valuation_quote_asset: AssetCode::parse("USDT").expect("valid asset code"),
             connect_timeout_ms: 10_000,
             request_timeout_ms: 10_000,
             idle_timeout_ms: 3 * BINANCE_PING_INTERVAL_MS,
+            data_idle_timeout_ms: 60_000,
             connection_lifetime_secs: 23 * 60 * 60,
             retry_min_ms: 500,
             retry_max_ms: 60_000,
             max_connection_attempts: 30,
+            validation_timeout_secs: 60,
         }
     }
 }
 
-/// `url` parses and uses one of `schemes`.
+/// `url` parses, uses one of `schemes` (plaintext first, TLS second), names a
+/// host and nothing more, and is plaintext only for a loopback host.
 fn check_endpoint(
     name: &'static str,
     url: &str,
     schemes: [&'static str; 2],
 ) -> std::result::Result<(), ConfigError> {
-    let valid = reqwest::Url::parse(url)
-        .is_ok_and(|parsed| schemes.contains(&parsed.scheme()) && parsed.has_host());
-    if valid {
-        return Ok(());
-    }
-    Err(ConfigError::InvalidEndpoint {
+    let invalid = || ConfigError::InvalidEndpoint {
         name,
         url: url.to_string(),
-        scheme: if schemes[0] == "ws" {
-            "ws/wss"
-        } else {
-            "http/https"
-        },
-    })
+        schemes,
+    };
+    let parsed = reqwest::Url::parse(url).map_err(|_| invalid())?;
+    let bare = matches!(parsed.path(), "" | "/")
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    let Some(host) = parsed
+        .host_str()
+        .filter(|_| bare && schemes.contains(&parsed.scheme()))
+    else {
+        return Err(invalid());
+    };
+    let loopback = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if parsed.scheme() == schemes[0] && !loopback {
+        return Err(ConfigError::PlaintextEndpoint {
+            name,
+            url: url.to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl BinanceConfig {
@@ -384,12 +480,16 @@ impl BinanceConfig {
             ("max_spread_bps", u64::from(self.max_spread_bps)),
             ("connect_timeout_ms", self.connect_timeout_ms),
             ("request_timeout_ms", self.request_timeout_ms),
+            ("idle_timeout_ms", self.idle_timeout_ms),
+            ("data_idle_timeout_ms", self.data_idle_timeout_ms),
             ("connection_lifetime_secs", self.connection_lifetime_secs),
             ("retry_min_ms", self.retry_min_ms),
+            ("retry_max_ms", self.retry_max_ms),
             (
                 "max_connection_attempts",
                 self.max_connection_attempts as u64,
             ),
+            ("validation_timeout_secs", self.validation_timeout_secs),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroBinanceSetting(name));
@@ -399,17 +499,37 @@ impl BinanceConfig {
             check_endpoint("stream_endpoints", endpoint, ["ws", "wss"])?;
         }
         check_endpoint("rest_endpoint", &self.rest_endpoint, ["http", "https"])?;
-        if self.idle_timeout_ms <= BINANCE_PING_INTERVAL_MS {
-            return Err(ConfigError::IdleTimeoutTooShort);
+        if self.quote_ttl_ms > MAX_QUOTE_TTL_MS {
+            return Err(ConfigError::TtlTooLong(self.quote_ttl_ms));
         }
         if self.max_spread_bps > 10_000 {
             return Err(ConfigError::SpreadTooWide(self.max_spread_bps));
         }
+        if let Some(raw) = &self.min_notional {
+            ReferencePrice::from_decimal(raw)
+                .map_err(|_| ConfigError::InvalidMinNotional(raw.clone()))?;
+        }
+        if self.idle_timeout_ms < 2 * BINANCE_PING_INTERVAL_MS {
+            return Err(ConfigError::IdleTimeoutTooShort {
+                value: self.idle_timeout_ms,
+                minimum: 2 * BINANCE_PING_INTERVAL_MS,
+            });
+        }
+        if self.data_idle_timeout_ms < self.idle_timeout_ms.max(self.quote_ttl_ms) {
+            return Err(ConfigError::DataIdleTimeoutTooShort);
+        }
         if self.retry_min_ms > self.retry_max_ms {
             return Err(ConfigError::RetryRange);
         }
-        if self.connection_lifetime_secs >= 24 * 60 * 60 {
-            return Err(ConfigError::LifetimeTooLong);
+        if self.retry_max_ms > MAX_RETRY_MS {
+            return Err(ConfigError::RetryMaxTooLong(self.retry_max_ms));
+        }
+        if !(MIN_CONNECTION_LIFETIME_SECS..BINANCE_CONNECTION_LIFETIME_SECS)
+            .contains(&self.connection_lifetime_secs)
+        {
+            return Err(ConfigError::LifetimeOutOfRange(
+                self.connection_lifetime_secs,
+            ));
         }
         if self.max_connection_attempts >= BINANCE_CONNECTION_ATTEMPT_LIMIT {
             return Err(ConfigError::TooManyConnectionAttempts {
@@ -420,21 +540,31 @@ impl BinanceConfig {
         Ok(())
     }
 
-    pub fn feed_config(&self) -> FeedConfig {
+    /// The feed's runtime settings; call after [`SolverConfig::load`] has
+    /// validated them.
+    pub(crate) fn feed_config(&self) -> FeedConfig {
         FeedConfig {
             stream_endpoints: self.stream_endpoints.clone(),
             rest_endpoint: self.rest_endpoint.clone(),
-            max_spread_bps: self.max_spread_bps,
+            limits: QuoteLimits {
+                max_spread_bps: self.max_spread_bps,
+                min_notional: self
+                    .min_notional
+                    .as_deref()
+                    .and_then(|raw| ReferencePrice::from_decimal(raw).ok()),
+            },
             quote_ttl: Duration::from_millis(self.quote_ttl_ms),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             idle_timeout: Duration::from_millis(self.idle_timeout_ms),
+            data_idle_timeout: Duration::from_millis(self.data_idle_timeout_ms),
             connection_lifetime: Duration::from_secs(self.connection_lifetime_secs),
             retry: RetryPolicy {
                 min_delay: Duration::from_millis(self.retry_min_ms),
                 max_delay: Duration::from_millis(self.retry_max_ms),
             },
             max_connection_attempts: self.max_connection_attempts,
+            validation_timeout: Duration::from_secs(self.validation_timeout_secs),
         }
     }
 }
@@ -450,7 +580,8 @@ impl SolverConfig {
         Ok(config)
     }
 
-    /// Validate fields that have constrained domains (fail fast at boot).
+    /// Validate fields that have constrained domains (fail fast at boot),
+    /// including the Binance market mapping of the pairs.
     fn validate(&self) -> std::result::Result<(), ConfigError> {
         if PricePrecision::parse(&self.engine.price_precision).is_none() {
             return Err(ConfigError::InvalidPricePrecision(
@@ -463,16 +594,24 @@ impl SolverConfig {
                 maximum: crate::clearing::PPM_DENOMINATOR,
             });
         }
-        self.binance.validate()
+        self.binance.validate()?;
+        self.market_plan()?;
+        Ok(())
+    }
+
+    /// Every pair's faucets, `(asset_x, asset_y)`, in configuration order.
+    pub(crate) fn faucet_pairs(&self) -> std::result::Result<Vec<(TokenId, TokenId)>, ConfigError> {
+        self.pairs.iter().map(AssetPairConfig::faucets).collect()
     }
 
     /// The Binance markets the configuration asks for: each faucet's asset
-    /// code, each pair with an approved symbol, and the valuation quote.
-    pub fn market_plan(&self) -> Result<MarketPlan> {
+    /// code, each pair with an approved symbol, and the valuation quote. A
+    /// clearing symbol must be the pair's two asset codes joined, in either
+    /// order; which order Binance uses comes from `exchangeInfo` at runtime.
+    pub(crate) fn market_plan(&self) -> std::result::Result<MarketPlan, ConfigError> {
         let mut assets = Vec::new();
         let mut clearing = Vec::new();
-        for pair in &self.pairs {
-            let (x, y) = pair.faucets()?;
+        for (pair, (x, y)) in self.pairs.iter().zip(self.faucet_pairs()?) {
             let codes = [
                 (x, &pair.asset_x_binance_asset),
                 (y, &pair.asset_y_binance_asset),
@@ -482,24 +621,39 @@ impl SolverConfig {
                     .into_iter()
                     .filter_map(|(token, code)| Some((token, code.clone()?))),
             );
-            match &pair.binance_symbol {
-                Some(symbol) => clearing.push(ClearingMarket {
-                    name: pair.name.clone(),
-                    base: x,
-                    quote: y,
-                    symbol: symbol.clone(),
-                }),
-                None => tracing::warn!(
+            let Some(symbol) = &pair.binance_symbol else {
+                tracing::warn!(
                     pair = %pair.name,
                     "pair has no binance_symbol; it will not clear internally"
-                ),
+                );
+                continue;
+            };
+            if let (Some(code_x), Some(code_y)) =
+                (&pair.asset_x_binance_asset, &pair.asset_y_binance_asset)
+            {
+                let forward = Symbol::of_assets(code_x, code_y);
+                let reverse = Symbol::of_assets(code_y, code_x);
+                if *symbol != forward && *symbol != reverse {
+                    return Err(ConfigError::SymbolMismatch {
+                        pair: pair.name.clone(),
+                        symbol: symbol.clone(),
+                        forward,
+                        reverse,
+                    });
+                }
             }
+            clearing.push(ClearingMarket {
+                name: pair.name.clone(),
+                base: x,
+                quote: y,
+                symbol: symbol.clone(),
+            });
         }
         let quote = self.binance.valuation_quote_asset.clone();
         Ok(MarketPlan::new(assets, clearing, quote)?)
     }
 
-    /// The Miden client no longer exposes debug mode.
+    /// Settings this binary accepts but does not use.
     fn warn_ignored_settings(&self) {
         if self.engine.debug_mode {
             tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
@@ -516,16 +670,33 @@ impl SolverConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::price::MarketError;
 
     const EXAMPLE: &str = include_str!("../../../solver.toml.example");
 
-    fn example() -> SolverConfig {
-        let mut config: SolverConfig = toml::from_str(EXAMPLE).expect("solver.toml.example parses");
-        // Replace the placeholders with valid faucet ids.
+    /// `text` parsed, with the example's faucet placeholders replaced by
+    /// valid ids.
+    fn parsed(text: &str) -> SolverConfig {
+        let mut config: SolverConfig = toml::from_str(text).expect("config parses");
         config.pairs[0].asset_x_faucet_id = "0x9f0c6ec13c4ed2b1076a2990a9fc29".into();
         config.pairs[0].asset_y_faucet_id = "0x3ae73d7f166f723132e3acbba75e75".into();
         config
+    }
+
+    fn example() -> SolverConfig {
+        parsed(EXAMPLE)
+    }
+
+    /// The validation error of `example()` after `change`.
+    fn check(change: impl FnOnce(&mut SolverConfig)) -> String {
+        let mut config = example();
+        change(&mut config);
+        config.validate().unwrap_err().to_string()
+    }
+
+    fn accepted(change: impl FnOnce(&mut SolverConfig)) {
+        let mut config = example();
+        change(&mut config);
+        config.validate().unwrap();
     }
 
     #[test]
@@ -534,7 +705,9 @@ mod tests {
         config.validate().unwrap();
         let feed = config.binance.feed_config();
         assert_eq!(feed.quote_ttl, Duration::from_secs(2));
-        assert_eq!(feed.max_spread_bps, 50);
+        assert_eq!(feed.limits.max_spread_bps, 50);
+        assert_eq!(feed.limits.min_notional, None);
+        assert_eq!(feed.validation_timeout, Duration::from_secs(60));
         let defaults = BinanceConfig::default();
         assert_eq!(feed.stream_endpoints, defaults.stream_endpoints);
         assert_ne!(
@@ -576,73 +749,147 @@ mod tests {
         assert!(error.contains("asset_y_binance_asset"), "{error}");
     }
 
+    /// A misspelled key must not load as if the setting had been applied.
     #[test]
-    fn pair_mappings_are_checked() {
-        let mut config = example();
-        config.pairs[0].asset_x_binance_asset = None;
-        let error = config.market_plan().unwrap_err();
+    fn misspelled_keys_are_rejected() {
+        let pair_key = EXAMPLE.replace(
+            r#"binance_symbol = "ETHUSDT""#,
+            r#"binance_symbl = "ETHUSDT""#,
+        );
+        let error = toml::from_str::<SolverConfig>(&pair_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("binance_symbl"), "{error}");
+        let binance_key = EXAMPLE.replace(
+            "max_spread_bps = 50",
+            "max_spread_bps = 50\nstream_endpoint = \"wss://x\"",
+        );
+        let error = toml::from_str::<SolverConfig>(&binance_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stream_endpoint"), "{error}");
+    }
+
+    #[test]
+    fn pair_mappings_are_checked_at_load() {
+        let error = check(|config| config.pairs[0].asset_x_binance_asset = None);
+        assert!(error.contains("has no Binance asset code"), "{error}");
+        let error = check(|config| config.pairs[0].asset_x_faucet_id = "0xnot-hex".into());
+        assert!(error.contains("asset_x_faucet_id"), "{error}");
+        let error = check(|config| {
+            config.pairs[0].binance_symbol = Some(Symbol::parse("ETHUSTD").unwrap())
+        });
         assert!(
-            matches!(error.downcast_ref(), Some(MarketError::MissingAsset { .. })),
+            error.contains("ETHUSTD") && error.contains("USDTETH"),
             "{error}"
         );
-        let mut config = example();
-        config.pairs[0].asset_x_faucet_id = "0xnot-hex".into();
-        let error = config.market_plan().unwrap_err().to_string();
-        assert!(error.contains("asset_x_faucet_id"), "{error}");
+        // Either order of the two codes is a valid symbol.
+        accepted(|config| config.pairs[0].binance_symbol = Some(Symbol::parse("USDTETH").unwrap()));
     }
 
     #[test]
     fn binance_settings_are_checked() {
         type Change = fn(&mut BinanceConfig);
-        let check = |change: Change| {
-            let mut config = example();
-            change(&mut config.binance);
-            config.validate().unwrap_err().to_string()
-        };
-        let zero: [(&str, Change); 7] = [
-            ("quote_ttl_ms", |binance| binance.quote_ttl_ms = 0),
-            ("max_spread_bps", |binance| binance.max_spread_bps = 0),
-            ("connect_timeout_ms", |binance| {
-                binance.connect_timeout_ms = 0
+        let check = |change: Change| check(|config| change(&mut config.binance));
+        let zero: [(&str, Change); 11] = [
+            ("quote_ttl_ms", |b| b.quote_ttl_ms = 0),
+            ("max_spread_bps", |b| b.max_spread_bps = 0),
+            ("connect_timeout_ms", |b| b.connect_timeout_ms = 0),
+            ("request_timeout_ms", |b| b.request_timeout_ms = 0),
+            ("idle_timeout_ms", |b| b.idle_timeout_ms = 0),
+            ("data_idle_timeout_ms", |b| b.data_idle_timeout_ms = 0),
+            ("connection_lifetime_secs", |b| {
+                b.connection_lifetime_secs = 0
             }),
-            ("request_timeout_ms", |binance| {
-                binance.request_timeout_ms = 0
-            }),
-            ("connection_lifetime_secs", |binance| {
-                binance.connection_lifetime_secs = 0
-            }),
-            ("retry_min_ms", |binance| binance.retry_min_ms = 0),
-            ("max_connection_attempts", |binance| {
-                binance.max_connection_attempts = 0
-            }),
+            ("retry_min_ms", |b| b.retry_min_ms = 0),
+            ("retry_max_ms", |b| b.retry_max_ms = 0),
+            ("max_connection_attempts", |b| b.max_connection_attempts = 0),
+            ("validation_timeout_secs", |b| b.validation_timeout_secs = 0),
         ];
         for (name, change) in zero {
             assert!(check(change).contains(name), "{name}");
         }
         assert!(
-            check(|binance| binance.stream_endpoints[1] = "https://example.com".into())
+            check(|b| b.stream_endpoints[1] = "https://example.com".into())
                 .contains("stream_endpoints")
         );
+        assert!(check(|b| b.rest_endpoint = "wss://example.com".into()).contains("rest_endpoint"));
+        assert!(check(|b| b.rest_endpoint = String::new()).contains("rest_endpoint"));
+        // A path or query would be mangled when the feed appends its own.
         assert!(
-            check(|binance| binance.rest_endpoint = "wss://example.com".into())
-                .contains("rest_endpoint")
-        );
-        assert!(check(|binance| binance.rest_endpoint = String::new()).contains("rest_endpoint"));
-        assert!(check(|binance| binance.idle_timeout_ms = 20_000).contains("idle_timeout_ms"));
-        assert!(check(|binance| binance.max_spread_bps = 10_001).contains("at most 10000"));
-        assert!(
-            check(|binance| binance.retry_min_ms = binance.retry_max_ms + 1)
-                .contains("retry_min_ms")
+            check(|b| b.stream_endpoints[0] = "wss://stream.binance.com:9443/ws".into())
+                .contains("no path or query")
         );
         assert!(
-            check(|binance| binance.connection_lifetime_secs = 24 * 60 * 60).contains("24-hour")
+            check(|b| b.rest_endpoint = "https://api.binance.com/api/v3".into())
+                .contains("no path or query")
         );
         assert!(
-            check(|binance| binance.max_connection_attempts = 300).contains("per-IP limit of 300")
+            check(|b| b.rest_endpoint = "https://api.binance.com/?x=1".into())
+                .contains("no path or query")
         );
+        // Plaintext only on loopback: a listing over HTTP could invert a pair.
+        assert!(
+            check(|b| b.rest_endpoint = "http://data-api.binance.vision".into())
+                .contains("plaintext")
+        );
+        assert!(
+            check(|b| b.stream_endpoints[0] = "ws://10.0.0.5:8089".into()).contains("plaintext")
+        );
+        for endpoint in [
+            "ws://127.0.0.1:8089",
+            "ws://localhost:8089",
+            "ws://[::1]:8089",
+        ] {
+            let mut config = example();
+            config.binance.stream_endpoints = [endpoint.into(), endpoint.into()];
+            config.validate().unwrap();
+        }
+        assert!(check(|b| b.quote_ttl_ms = MAX_QUOTE_TTL_MS + 1).contains("quote_ttl_ms"));
+        assert!(check(|b| b.max_spread_bps = 10_001).contains("at most 10000"));
+        assert!(check(|b| b.min_notional = Some("0".into())).contains("min_notional"));
+        assert!(check(|b| b.min_notional = Some("5e3".into())).contains("min_notional"));
+        assert!(
+            check(|b| b.idle_timeout_ms = 2 * BINANCE_PING_INTERVAL_MS - 1)
+                .contains("idle_timeout_ms")
+        );
+        assert!(check(|b| b.data_idle_timeout_ms = b.idle_timeout_ms - 1)
+            .contains("data_idle_timeout_ms"));
+        assert!(check(|b| b.retry_min_ms = b.retry_max_ms + 1).contains("retry_min_ms"));
+        assert!(check(|b| b.retry_max_ms = MAX_RETRY_MS + 1).contains("retry_max_ms"));
+        assert!(
+            check(|b| b.connection_lifetime_secs = BINANCE_CONNECTION_LIFETIME_SECS)
+                .contains("24-hour")
+        );
+        assert!(
+            check(|b| b.connection_lifetime_secs = MIN_CONNECTION_LIFETIME_SECS - 1)
+                .contains("connection_lifetime_secs")
+        );
+        assert!(check(|b| b.max_connection_attempts = 300).contains("per-IP limit of 300"));
+    }
+
+    /// The accept side of every boundary.
+    #[test]
+    fn binance_boundaries_are_accepted() {
+        accepted(|c| c.binance.quote_ttl_ms = MAX_QUOTE_TTL_MS);
+        accepted(|c| c.binance.max_spread_bps = 10_000);
+        accepted(|c| c.binance.min_notional = Some("5000".into()));
+        accepted(|c| c.binance.min_notional = Some("0.5".into()));
+        accepted(|c| c.binance.idle_timeout_ms = 2 * BINANCE_PING_INTERVAL_MS);
+        accepted(|c| {
+            c.binance.data_idle_timeout_ms = c.binance.idle_timeout_ms;
+        });
+        accepted(|c| c.binance.retry_min_ms = c.binance.retry_max_ms);
+        accepted(|c| c.binance.retry_max_ms = MAX_RETRY_MS);
+        accepted(|c| c.binance.connection_lifetime_secs = MIN_CONNECTION_LIFETIME_SECS);
+        accepted(|c| c.binance.connection_lifetime_secs = BINANCE_CONNECTION_LIFETIME_SECS - 1);
+        accepted(|c| c.binance.max_connection_attempts = 299);
         let mut config = example();
-        config.binance.max_connection_attempts = 299;
-        config.validate().unwrap();
+        config.binance.min_notional = Some("5000".into());
+        assert_eq!(
+            config.binance.feed_config().limits.min_notional,
+            Some(ReferencePrice::from_decimal("5000").unwrap())
+        );
     }
 
     #[test]

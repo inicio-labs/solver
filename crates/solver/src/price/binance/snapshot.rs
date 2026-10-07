@@ -69,7 +69,14 @@ impl SymbolQuote {
 
 /// Why no price is available.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr, strum::EnumCount,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::IntoStaticStr,
+    strum::EnumCount,
     strum::EnumIter,
 )]
 #[strum(serialize_all = "snake_case")]
@@ -167,6 +174,11 @@ impl PriceSnapshot {
 
     pub(crate) fn markets(&self) -> &Markets {
         &self.markets
+    }
+
+    /// The clearing TTL.
+    pub(crate) fn ttl(&self) -> Duration {
+        self.ttl
     }
 
     /// Every subscribed symbol with its current state.
@@ -279,8 +291,9 @@ impl PriceSnapshot {
 #[cfg(test)]
 impl PriceSnapshot {
     /// A snapshot as the feed would publish it, with quote TTL `ttl`. Each
-    /// clearing pair `(base, quote, price, received_at)` gets a direct market
-    /// quoting `price` whole quote tokens per whole base token. Each valuation
+    /// clearing pair
+    /// `(base, quote, price, received_at)` gets a direct market quoting
+    /// `price` whole quote tokens per whole base token. Each valuation
     /// `(token, Some((price, received_at)))` values a token in the valuation
     /// quote; `None` makes the token that quote asset itself, which may also
     /// appear in pairs.
@@ -288,6 +301,26 @@ impl PriceSnapshot {
         pairs: &[(TokenId, TokenId, &str, Instant)],
         valuations: &[(TokenId, Option<(&str, Instant)>)],
         ttl: Duration,
+    ) -> Self {
+        Self::build_for_tests(pairs, valuations, ttl, false)
+    }
+
+    /// Like [`Self::for_tests`], but every pair's symbol is listed the other
+    /// way round (Binance's base is the pair's quote), as `ETHUSDC` prices a
+    /// USDC/ETH pair. `price` is still whole quote tokens per whole base
+    /// token; the stream carries its reciprocal.
+    pub(crate) fn for_tests_reversed(
+        pairs: &[(TokenId, TokenId, &str, Instant)],
+        ttl: Duration,
+    ) -> Self {
+        Self::build_for_tests(pairs, &[], ttl, true)
+    }
+
+    fn build_for_tests(
+        pairs: &[(TokenId, TokenId, &str, Instant)],
+        valuations: &[(TokenId, Option<(&str, Instant)>)],
+        ttl: Duration,
+        reversed: bool,
     ) -> Self {
         use std::collections::HashMap;
 
@@ -310,11 +343,14 @@ impl PriceSnapshot {
         }
         let mut listings = HashMap::new();
         let mut quotes = Vec::new();
-        let mut list = |base: &AssetCode, quote: &AssetCode, mid: &str, received_at: Instant| {
+        let mut list = |base: &AssetCode, quote: &AssetCode, mid: ReferencePrice, received_at| {
             let symbol = Symbol::of_assets(base, quote);
             let listed = listing(&base.to_string(), &quote.to_string());
-            listings.insert(symbol.clone(), Some(listed));
-            quotes.push((symbol.clone(), price(mid), received_at));
+            assert!(
+                listings.insert(symbol.clone(), Some(listed)).is_none(),
+                "{symbol} listed twice: a pair and a valuation share it"
+            );
+            quotes.push((symbol.clone(), mid, received_at));
             symbol
         };
         let clearing = pairs
@@ -323,12 +359,21 @@ impl PriceSnapshot {
                 name: format!("{base}/{quote}"),
                 base: *base,
                 quote: *quote,
-                symbol: list(&codes[base], &codes[quote], mid, *received_at),
+                symbol: if reversed {
+                    list(
+                        &codes[quote],
+                        &codes[base],
+                        price(mid).reciprocal(),
+                        *received_at,
+                    )
+                } else {
+                    list(&codes[base], &codes[quote], price(mid), *received_at)
+                },
             })
             .collect();
         for (token, valued) in valuations {
             if let Some((mid, received_at)) = valued {
-                list(&codes[token], &quote_asset, mid, *received_at);
+                list(&codes[token], &quote_asset, price(mid), *received_at);
             }
         }
         let plan = MarketPlan::new(codes, clearing, quote_asset).expect("valid test markets");
@@ -339,13 +384,9 @@ impl PriceSnapshot {
             MarketUse::Clearing(_) => false,
         };
         assert!(issues.iter().all(unasked), "{issues:?}");
-        let mut book = QuoteBook::new(Arc::new(markets), ttl);
+        let mut book = PriceSnapshot::new(Arc::new(markets), ttl);
         for (update_id, (symbol, mid, received_at)) in (1..).zip(quotes) {
-            let symbol = book
-                .snapshot
-                .markets
-                .symbol_index(symbol.as_str())
-                .expect("listed");
+            let symbol = book.markets.symbol_index(symbol.as_str()).expect("listed");
             book.offer(&Observation {
                 symbol,
                 update_id,
@@ -353,7 +394,7 @@ impl PriceSnapshot {
                 mid: Ok(mid),
             });
         }
-        book.snapshot()
+        book
     }
 }
 

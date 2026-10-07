@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mock_binance::{Failure, Market, MockBinance, MockThread, Settings, Updates};
+use rust_decimal::Decimal;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::clearing::ReferencePrice;
 use crate::price::binance::reader::MAX_FRAME_BYTES;
 use crate::price::binance::snapshot::{PriceUnavailable, Quote, SymbolQuote};
 use crate::price::binance::test_support::{btc, eth, market, plan, price, usdt};
@@ -123,11 +123,12 @@ impl Running {
     }
 }
 
-fn eth_usdt(snapshot: &PriceSnapshot) -> Result<ReferencePrice, PriceUnavailable> {
-    snapshot.pair_price(eth(), usdt(), Instant::now())
+/// Whole USDT per whole ETH on the ETH/USDT clearing pair.
+fn eth_usdt(snapshot: &PriceSnapshot) -> Result<Decimal, PriceUnavailable> {
+    snapshot.market_price(eth(), usdt(), Instant::now())
 }
 
-fn btc_value(snapshot: &PriceSnapshot) -> Result<ReferencePrice, PriceUnavailable> {
+fn btc_value(snapshot: &PriceSnapshot) -> Result<Decimal, PriceUnavailable> {
     snapshot
         .valuation(btc(), Instant::now())
         .map(|valued| valued.price)
@@ -1209,9 +1210,9 @@ async fn live_binance_endpoints_publish_exact_prices() {
     let btc = btc_value(&snapshot).unwrap();
     println!(
         "ETHUSDT mid {} (update {:?}), BTCUSDT mid {}",
-        eth.to_trimmed_decimal(8).unwrap(),
+        eth,
         eth_update_id(&snapshot),
-        btc.to_trimmed_decimal(8).unwrap()
+        btc
     );
     let metrics = feed.metrics.clone();
     eventually(|| {

@@ -58,6 +58,9 @@ fn config_for(stream: &str, rest: &str) -> FeedConfig {
         },
         max_connection_attempts: 1_000,
         validation_timeout: Duration::from_secs(30),
+        stable_connection: Duration::from_secs(60),
+        shutdown_timeout: Duration::from_secs(5),
+        log_interval: Duration::from_secs(10),
     }
 }
 
@@ -941,11 +944,12 @@ async fn a_panicking_reader_is_restarted() {
     tokio::time::timeout(
         WAIT,
         supervise_reader(
-            0,
+            "reader 0".to_string(),
             connect,
             gate,
             supervisor_retry(),
             Duration::from_secs(60),
+            Duration::from_secs(10),
             metrics.clone(),
             cancel,
         ),
@@ -1014,11 +1018,12 @@ async fn only_a_stable_connection_resets_the_backoff() {
         max_delay: Duration::from_secs(64),
     };
     supervise_reader(
-        0,
+        "reader 0".to_string(),
         connect,
         Arc::new(Gate::new(100, Duration::from_secs(60))),
         retry,
         Duration::from_secs(3600),
+        Duration::from_secs(10),
         Arc::new(FeedMetrics::default()),
         cancel,
     )
@@ -1058,11 +1063,12 @@ async fn the_attempt_budget_is_shared_by_both_readers() {
     let metrics = Arc::new(FeedMetrics::default());
     let supervisors = (0..READERS).map(|index| {
         supervise_reader(
-            index,
+            format!("reader {index}"),
             recording_connect(vec![unstable, unstable], attempts.clone(), cancel.clone()),
             gate.clone(),
             retry,
             Duration::from_secs(3600),
+            Duration::from_secs(10),
             metrics.clone(),
             cancel.clone(),
         )
@@ -1117,11 +1123,12 @@ async fn planned_renewals_are_immediate_and_randomized() {
     };
     let started = tokio::time::Instant::now();
     supervise_reader(
-        1,
+        "reader 1".to_string(),
         connect,
         Arc::new(Gate::new(100, Duration::from_secs(60))),
         retry,
         longest,
+        Duration::from_secs(10),
         Arc::new(FeedMetrics::default()),
         cancel,
     )

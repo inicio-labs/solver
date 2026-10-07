@@ -33,23 +33,15 @@ use tokio_util::task::AbortOnDropHandle;
 
 use super::market::{Listing, MarketIssue, MarketPlan, Markets, Symbol};
 use super::reader::{run_connection, stream_url, Exit, ReaderContext, ReaderLatest};
-use super::rest::fetch_listing;
+use super::rest::{fetch_listing, MAX_RETRY_AFTER};
 use super::snapshot::{Offer, PriceSnapshot};
 use super::ticker::QuoteLimits;
 
-/// The feed keeps this many readers, each with its own endpoint.
+/// The feed keeps this many readers, each on its own configured endpoint;
+/// logs and metrics identify a reader by that endpoint.
 pub(crate) const READERS: usize = 2;
-/// Reader names in logs and metrics, by index.
-pub(crate) const READER_NAMES: [&str; READERS] = ["a", "b"];
-const READER_TASKS: [&str; READERS] = ["Binance reader a", "Binance reader b"];
-/// Connection attempts are counted over this window, as Binance limits them.
+/// Binance counts connection attempts per IP over five minutes.
 const ATTEMPT_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// A connection that delivered a valid quote and lasted this long resets its
-/// reader's backoff; one that drops sooner keeps backing off, so a flapping
-/// endpoint cannot drain the shared connection-attempt budget.
-pub(super) const STABLE_CONNECTION: Duration = Duration::from_secs(60);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Exponential backoff with jitter, never longer than `max_delay`.
 #[derive(Clone, Copy, Debug)]
@@ -72,13 +64,14 @@ impl Backoff {
     }
 
     fn next(&mut self) -> Duration {
-        let factor = 1u32.checked_shl(self.step).unwrap_or(u32::MAX);
+        // The step doubles on every failure: min, 2·min, 4·min, … up to max.
         let step = self
             .policy
             .min_delay
-            .saturating_mul(factor)
+            .saturating_mul(2u32.saturating_pow(self.step))
             .min(self.policy.max_delay);
         self.step = self.step.saturating_add(1);
+        // The random part: wait 50–100% of the step.
         step.mul_f64(0.5 + rand::random::<f64>() / 2.0)
     }
 
@@ -91,7 +84,7 @@ impl Backoff {
 /// value is on the `[binance]` configuration section.
 #[derive(Clone, Debug)]
 pub struct FeedConfig {
-    /// Stream base URL of reader A and of reader B.
+    /// Stream base URL of each reader.
     pub stream_endpoints: [String; READERS],
     pub rest_endpoint: String,
     pub limits: QuoteLimits,
@@ -100,23 +93,35 @@ pub struct FeedConfig {
     pub quote_ttl: Duration,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
-    /// Reconnect when no frame at all, not even a ping, arrives for this long.
+    /// Reconnect when no frame at all, not even a ping, arrives for this long:
+    /// the connection is dead even if the socket has not noticed.
     pub idle_timeout: Duration,
-    /// Reconnect when no quote arrives for this long although the connection
-    /// stays up: a stalled backend keeps pinging.
+    /// Reconnect when no quote arrives for this long although Binance still
+    /// answers pings. A stalled stream server keeps the socket alive but sends
+    /// no prices; a new connection usually lands on a healthy one.
     pub data_idle_timeout: Duration,
     /// Longest planned connection; each lasts a random 50–100% of it.
     pub connection_lifetime: Duration,
     pub retry: RetryPolicy,
     /// Connection attempts per five minutes, both readers together; positive.
     pub max_connection_attempts: usize,
-    /// How long startup keeps waiting for unresolved symbols before the
-    /// readers start with the confirmed ones.
+    /// At startup, how long to wait for `exchangeInfo` to answer about every
+    /// symbol. After it, the readers start with the symbols already confirmed
+    /// and the rest keep being checked in the background.
     pub validation_timeout: Duration,
+    /// A connection that delivered a valid quote and lasted this long resets
+    /// its reader's backoff; one that drops sooner keeps backing off, so a
+    /// flapping endpoint cannot drain the connection-attempt budget.
+    pub stable_connection: Duration,
+    /// How long the feed's tasks get to stop before they are aborted.
+    pub shutdown_timeout: Duration,
+    /// Repeated warnings (rejected quotes, reconnects) are logged at most once
+    /// per this interval, with a count of the ones skipped.
+    pub log_interval: Duration,
 }
 
 /// Feed counters for `/metrics`. Per-reader counters are indexed like
-/// [`READER_NAMES`].
+/// [`FeedConfig::stream_endpoints`].
 #[derive(Debug, Default)]
 pub struct FeedMetrics {
     pub(crate) connected: [AtomicBool; READERS],
@@ -161,25 +166,34 @@ pub(crate) enum FeedError {
     #[error("a reader channel closed")]
     ReaderChannelClosed,
     #[error("{0} stopped unexpectedly")]
-    TaskStopped(&'static str),
+    TaskStopped(String),
     #[error("{0} panicked")]
-    TaskPanicked(&'static str),
+    TaskPanicked(String),
 }
 
-/// Allows one log line per [`LOG_INTERVAL`] and counts the ones it suppressed.
-#[derive(Debug, Default)]
+/// Allows one log line per `interval` and counts the ones it suppressed.
+#[derive(Debug)]
 pub(super) struct LogLimiter {
+    interval: Duration,
     last: Option<Instant>,
     suppressed: u64,
 }
 
 impl LogLimiter {
+    pub(super) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+            suppressed: 0,
+        }
+    }
+
     /// `Some(suppressed since the last line)` when a line may be logged now.
     pub(super) fn allow(&mut self) -> Option<u64> {
         let now = Instant::now();
         if self
             .last
-            .is_some_and(|last| now.duration_since(last) < LOG_INTERVAL)
+            .is_some_and(|last| now.duration_since(last) < self.interval)
         {
             self.suppressed += 1;
             return None;
@@ -189,10 +203,21 @@ impl LogLimiter {
     }
 }
 
+/// Sleep for `wait`; `false` if `cancel` fired first.
+async fn sleep_unless_cancelled(wait: Duration, cancel: &CancellationToken) -> bool {
+    cancel
+        .run_until_cancelled(tokio::time::sleep(wait))
+        .await
+        .is_some()
+}
+
 /// Connection-attempt budget shared by both readers, and the server-imposed
 /// cooldown that also holds back `exchangeInfo` lookups.
 struct Gate {
+    /// Most connection attempts, both readers together, within `window`
+    /// (`binance.max_connection_attempts`).
     limit: usize,
+    /// Binance's counting window for connection attempts: five minutes.
     window: Duration,
     state: Mutex<GateState>,
 }
@@ -240,17 +265,10 @@ impl Gate {
         Err(state.attempts[0] + self.window - now)
     }
 
-    async fn sleep(wait: Duration, cancel: &CancellationToken) -> bool {
-        tokio::select! {
-            _ = cancel.cancelled() => false,
-            _ = tokio::time::sleep(wait) => true,
-        }
-    }
-
     /// Wait out the cooldown; `false` when cancelled.
     async fn wait_cooldown(&self, cancel: &CancellationToken) -> bool {
         while let Some(wait) = self.cooldown_left() {
-            if !Self::sleep(wait, cancel).await {
+            if !sleep_unless_cancelled(wait, cancel).await {
                 return false;
             }
         }
@@ -268,7 +286,7 @@ impl Gate {
                 Err(wait) => {
                     metrics.budget_waits.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(?wait, "Binance connection budget exhausted; waiting");
-                    if !Self::sleep(wait, cancel).await {
+                    if !sleep_unless_cancelled(wait, cancel).await {
                         return false;
                     }
                 }
@@ -277,12 +295,9 @@ impl Gate {
     }
 
     /// Send nothing for at least `wait` (HTTP 429/418 `Retry-After`, or a WAF
-    /// block). Saturates instead of overflowing on an absurd `wait`.
+    /// block), at most Binance's longest ban of three days.
     fn cool_down(&self, wait: Duration) {
-        let now = tokio::time::Instant::now();
-        let until = now
-            .checked_add(wait)
-            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
+        let until = tokio::time::Instant::now() + wait.min(MAX_RETRY_AFTER);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.cooldown_until = Some(
             state
@@ -292,8 +307,11 @@ impl Gate {
     }
 }
 
-/// Explicit Rustls setup: the `ring` provider and the webpki root set, not
-/// whatever another dependency happens to install process-wide.
+/// The TLS setup for the WebSocket readers: Rustls with the `ring` provider
+/// and the webpki root certificates. Libraries such as tokio-tungstenite can
+/// build this themselves, but only from a process-wide default provider, which
+/// fails at runtime as soon as any dependency also compiles in `aws-lc-rs`.
+/// Naming the provider here keeps the readers independent of that.
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, FeedError> {
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -346,7 +364,7 @@ impl<'a> Validator<'a> {
             listings: HashMap::new(),
             pending,
             backoff: Backoff::new(config.retry),
-            log: LogLimiter::default(),
+            log: LogLimiter::new(config.log_interval),
             permanent_only: false,
             last_error: None,
         }
@@ -423,7 +441,7 @@ impl<'a> Validator<'a> {
 
     /// Sleep the next backoff; `false` when cancelled.
     async fn sleep(&mut self, cancel: &CancellationToken) -> bool {
-        Gate::sleep(self.backoff.next(), cancel).await
+        sleep_unless_cancelled(self.backoff.next(), cancel).await
     }
 
     /// Keep retrying the pending symbols until one gets its answer; `false`
@@ -519,21 +537,22 @@ fn planned_lifetime(longest: Duration) -> Duration {
 /// Keep one reader connected: admit each attempt through the shared gate,
 /// run the connection as its own task, and finish that task before starting
 /// the next. Returns only when cancelled.
+#[allow(clippy::too_many_arguments)]
 async fn supervise_reader<F, Fut>(
-    index: usize,
+    endpoint: String,
     connect: F,
     gate: Arc<Gate>,
     retry: RetryPolicy,
     longest_lifetime: Duration,
+    log_interval: Duration,
     metrics: Arc<FeedMetrics>,
     cancel: CancellationToken,
 ) where
     F: Fn(Duration) -> Fut,
     Fut: Future<Output = Exit> + Send + 'static,
 {
-    let reader = READER_NAMES[index];
     let mut backoff = Backoff::new(retry);
-    let mut log = LogLimiter::default();
+    let mut log = LogLimiter::new(log_interval);
     loop {
         if !gate.acquire_attempt(&cancel, &metrics).await {
             return;
@@ -544,13 +563,13 @@ async fn supervise_reader<F, Fut>(
         let reason = match connection.await {
             Ok(Exit::Cancelled) => return,
             Ok(Exit::Renewal) => {
-                tracing::info!(reader, "renewing Binance connection");
+                tracing::info!(%endpoint, "renewing Binance connection");
                 backoff.reset();
                 continue;
             }
             Ok(Exit::ServerShutdown) => {
                 metrics.server_shutdowns.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(reader, "Binance announced a shutdown; reconnecting");
+                tracing::info!(%endpoint, "Binance announced a shutdown; reconnecting");
                 backoff.reset();
                 continue;
             }
@@ -560,7 +579,7 @@ async fn supervise_reader<F, Fut>(
                 gate.cool_down(wait);
                 if let Some(suppressed) = log.allow() {
                     tracing::warn!(
-                        reader,
+                        %endpoint,
                         ?wait,
                         suppressed,
                         "Binance handshake rate limited; cooling down"
@@ -583,7 +602,7 @@ async fn supervise_reader<F, Fut>(
                     .or_else(|| payload.downcast_ref::<&str>().copied())
                     .unwrap_or("non-string panic payload");
                 tracing::error!(
-                    reader,
+                    %endpoint,
                     panic = message,
                     "Binance reader task panicked; restarting it"
                 );
@@ -594,9 +613,9 @@ async fn supervise_reader<F, Fut>(
         };
         let delay = backoff.next();
         if let Some(suppressed) = log.allow() {
-            tracing::warn!(reader, %reason, ?delay, suppressed, "Binance reader disconnected; reconnecting");
+            tracing::warn!(%endpoint, %reason, ?delay, suppressed, "Binance reader disconnected; reconnecting");
         }
-        if !Gate::sleep(delay, &cancel).await {
+        if !sleep_unless_cancelled(delay, &cancel).await {
             return;
         }
     }
@@ -720,6 +739,7 @@ pub(super) async fn run_feed(
             for (index, latest) in senders.into_iter().enumerate() {
                 let context = Arc::new(ReaderContext {
                     index,
+                    endpoint: config.stream_endpoints[index].clone(),
                     url: stream_url(&config.stream_endpoints[index], &markets),
                     markets: markets.clone(),
                     limits: config.limits,
@@ -727,17 +747,21 @@ pub(super) async fn run_feed(
                     connect_timeout: config.connect_timeout,
                     idle_timeout: config.idle_timeout,
                     data_idle_timeout: config.data_idle_timeout,
-                    stable_after: STABLE_CONNECTION,
+                    stable_after: config.stable_connection,
+                    log_interval: config.log_interval,
                     latest,
                     metrics: metrics.clone(),
                     cancel: generation.clone(),
                 });
+                let endpoint = config.stream_endpoints[index].clone();
+                let task = format!("Binance reader for {endpoint}");
                 let supervisor = supervise_reader(
-                    index,
+                    endpoint,
                     move |lifetime| run_connection(context.clone(), lifetime),
                     gate.clone(),
                     config.retry,
                     config.connection_lifetime,
+                    config.log_interval,
                     metrics.clone(),
                     generation.clone(),
                 );
@@ -747,7 +771,7 @@ pub(super) async fn run_feed(
                         Ok(())
                     })
                     .id();
-                names.insert(id, READER_TASKS[index]);
+                names.insert(id, task);
             }
             let receivers: [watch::Receiver<ReaderLatest>; READERS] = receivers
                 .try_into()
@@ -759,7 +783,7 @@ pub(super) async fn run_feed(
                 metrics.clone(),
                 generation.clone(),
             );
-            names.insert(tasks.spawn(publisher).id(), "price publisher");
+            names.insert(tasks.spawn(publisher).id(), "price publisher".to_string());
         }
 
         let outcome = tokio::select! {
@@ -774,7 +798,10 @@ pub(super) async fn run_feed(
         };
         generation.cancel();
         let drain = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, drain).await.is_err() {
+        if tokio::time::timeout(config.shutdown_timeout, drain)
+            .await
+            .is_err()
+        {
             tracing::warn!("price feed tasks did not stop in time; aborting them");
             tasks.abort_all();
         }
@@ -789,8 +816,11 @@ pub(super) async fn run_feed(
     }
 }
 
-fn task_name(names: &HashMap<tokio::task::Id, &'static str>, id: &tokio::task::Id) -> &'static str {
-    names.get(id).copied().unwrap_or("price feed task")
+fn task_name(names: &HashMap<tokio::task::Id, String>, id: &tokio::task::Id) -> String {
+    names
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| "price feed task".to_string())
 }
 
 /// Start the feed on its own OS thread. Markets are confirmed in the
@@ -804,6 +834,7 @@ pub(crate) fn spawn_price_feed_thread(
     metrics: Arc<FeedMetrics>,
     cancel: CancellationToken,
 ) -> anyhow::Result<thread::JoinHandle<()>> {
+    let shutdown_timeout = config.shutdown_timeout;
     thread::Builder::new()
         .name("price-feed".into())
         .spawn(move || {
@@ -824,7 +855,7 @@ pub(crate) fn spawn_price_feed_thread(
                 tracing::error!(%error, "price feed failed; stopping the solver");
             }
             // Bounded even if a DNS lookup is stuck on a blocking thread.
-            runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+            runtime.shutdown_timeout(shutdown_timeout);
         })
         .context("spawn price-feed thread")
 }

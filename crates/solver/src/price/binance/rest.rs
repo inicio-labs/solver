@@ -17,7 +17,7 @@ use super::market::{AssetCode, Listing, Symbol};
 pub(super) const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Binance bans last up to three days; a longer `Retry-After` is a server
 /// bug, not an instruction to wait a century.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+pub(super) const MAX_RETRY_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// Binance's error code for a symbol it does not list.
 const BAD_SYMBOL: i64 = -1121;
 /// Bound on server strings copied into errors and logs.

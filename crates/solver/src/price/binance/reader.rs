@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::Connector;
 use tokio_util::sync::CancellationToken;
 
-use super::feed::{FeedMetrics, LogLimiter, READER_NAMES};
+use super::feed::{FeedMetrics, LogLimiter};
 use super::market::Markets;
 use super::rest::{is_rate_limited, retry_after};
 use super::snapshot::Observation;
@@ -32,7 +32,10 @@ pub(super) const MAX_FRAME_BYTES: usize = 64 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct ReaderContext {
+    /// Position in the feed's per-reader metrics.
     pub(super) index: usize,
+    /// The configured stream endpoint; logs name the reader by it.
+    pub(super) endpoint: String,
     /// Full combined-stream URL.
     pub(super) url: String,
     pub(super) markets: Arc<Markets>,
@@ -47,6 +50,8 @@ pub(super) struct ReaderContext {
     /// A connection that delivered a valid quote and lasted this long counts
     /// as stable; see [`Exit::Failed`].
     pub(super) stable_after: Duration,
+    /// Repeated warnings are logged at most once per this interval.
+    pub(super) log_interval: Duration,
     pub(super) latest: watch::Sender<ReaderLatest>,
     pub(super) metrics: Arc<FeedMetrics>,
     pub(super) cancel: CancellationToken,
@@ -118,7 +123,7 @@ impl Drop for Connected<'_> {
 
 /// Run one connection until cancellation, failure, or `lifetime` elapses.
 pub(super) async fn run_connection(context: Arc<ReaderContext>, lifetime: Duration) -> Exit {
-    let reader = READER_NAMES[context.index];
+    let endpoint = context.endpoint.as_str();
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME_BYTES))
         .max_frame_size(Some(MAX_FRAME_BYTES));
@@ -143,8 +148,8 @@ pub(super) async fn run_connection(context: Arc<ReaderContext>, lifetime: Durati
     let mut last_frame = opened;
     let mut last_quote = opened;
     let mut delivered = false;
-    let mut rejections = LogLimiter::default();
-    let mut discards = LogLimiter::default();
+    let mut rejections = LogLimiter::new(context.log_interval);
+    let mut discards = LogLimiter::new(context.log_interval);
     let renewal = tokio::time::sleep(lifetime);
     tokio::pin!(renewal);
     let exit = loop {
@@ -186,7 +191,7 @@ pub(super) async fn run_connection(context: Arc<ReaderContext>, lifetime: Durati
                                 if let Some(suppressed) = rejections.allow() {
                                     let symbol = &context.markets.symbols()[observation.symbol];
                                     tracing::warn!(
-                                        reader,
+                                        endpoint,
                                         %symbol,
                                         update_id = observation.update_id,
                                         reason = %rejection,
@@ -205,7 +210,7 @@ pub(super) async fn run_connection(context: Arc<ReaderContext>, lifetime: Durati
                         metrics.discarded_frames[context.index].fetch_add(1, Ordering::Relaxed);
                         if let Some(suppressed) = discards.allow() {
                             tracing::warn!(
-                                reader,
+                                endpoint,
                                 reason = %discard,
                                 suppressed,
                                 "Binance frame discarded"

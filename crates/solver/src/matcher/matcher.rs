@@ -6,7 +6,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::clearing_book::{ClearingBook, ClearingBootstrap};
+use super::clearing_book::ClearingBook;
 use super::error::MatcherError;
 use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::matching::types::SwapBookSnapshot;
@@ -32,11 +32,13 @@ pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
-/// visits every configured pair and clears those with a confirmed Binance
-/// market and a fresh price; the others pause alone and are counted. RFQ
-/// selection uses fixed note limits and needs no price.
+/// visits every clearing pair (all confirmed at startup) and clears those with
+/// a fresh price; the others pause alone and are counted. RFQ selection uses
+/// fixed note limits and needs no price.
 pub struct ClearingRuntime {
-    pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
+    /// The active orders, sent once after ingestion reconciles persisted notes
+    /// against the chain.
+    pub bootstrap: oneshot::Receiver<Vec<BookOrder>>,
     pub prices: watch::Receiver<Arc<PriceSnapshot>>,
     pub config: ClearingConfig,
     pub routing: Option<crate::router::Routing>,
@@ -71,7 +73,7 @@ pub(super) async fn run_worker(
     runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
     let mut book = ClearingBook::default();
-    for order in &bootstrap.orders {
+    for order in &bootstrap {
         book.insert_or_skip(order);
     }
     let mut interval = tokio::time::interval(match_interval);
@@ -142,9 +144,8 @@ pub(super) fn internal_clear(
         group_ends: Vec::new(),
     };
     let mut included_pairs = 0usize;
-    // Each configured pair is one unordered market (checked when the plan was
-    // built), so no order can be selected twice in a tick. Unconfirmed pairs
-    // are visited too, so their skips are counted as `no_market`.
+    // Each clearing pair is one unordered market (checked when the plan was
+    // built), so no order can be selected twice in a tick.
     for (base, quote) in prices.markets().clearing_pairs() {
         let price = match prices.pair_price(base, quote, now) {
             Ok(price) => price,
@@ -473,9 +474,7 @@ mod tests {
                     snapshot_tx,
                     worker_runtime,
                 ));
-                assert!(bootstrap_tx
-                    .send(ClearingBootstrap { orders: persisted })
-                    .is_ok());
+                assert!(bootstrap_tx.send(persisted).is_ok());
                 snapshot_rx.changed().await.unwrap();
                 assert_eq!(snapshot_rx.borrow().len(), 4);
 

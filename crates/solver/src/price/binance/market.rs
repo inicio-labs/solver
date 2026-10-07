@@ -268,6 +268,11 @@ impl MarketPlan {
         (*asset != self.valuation_quote).then(|| Symbol::of_assets(asset, &self.valuation_quote))
     }
 
+    /// Every token with a Binance asset code.
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = TokenId> + '_ {
+        self.assets.keys().copied()
+    }
+
     /// Every symbol to confirm through `exchangeInfo`, once each.
     pub(crate) fn symbols(&self) -> BTreeSet<Symbol> {
         let clearing = self.clearing.iter().map(|market| market.symbol.clone());
@@ -326,7 +331,6 @@ impl MarketPlan {
                 .ok_or(IssueKind::NoDecimals { token })
         };
         for market in &self.clearing {
-            markets.configured.push((market.base, market.quote));
             // `new` guarantees both assets are mapped.
             let (base, quote) = (&self.assets[&market.base], &self.assets[&market.quote]);
             let use_ = || MarketUse::Clearing(market.name.clone());
@@ -482,10 +486,6 @@ pub(crate) struct Markets {
     index: HashMap<Symbol, usize>,
     /// Confirmed clearing pairs and their source symbol.
     pairs: BTreeMap<(TokenId, TokenId), PairSource>,
-    /// Every configured clearing pair, confirmed or not, in configuration
-    /// order: the matcher visits them all, so an unconfirmed pair is counted
-    /// as skipped rather than forgotten.
-    configured: Vec<(TokenId, TokenId)>,
     valuation: HashMap<TokenId, Valuation>,
 }
 
@@ -516,10 +516,9 @@ impl Markets {
         self.index.get(name).copied()
     }
 
-    /// Every configured clearing pair as `(base, quote)`, confirmed or not,
-    /// in configuration order. [`Self::pair`] is `None` for an unconfirmed one.
+    /// Every confirmed clearing pair as `(base, quote)`, in a stable order.
     pub(crate) fn clearing_pairs(&self) -> impl Iterator<Item = (TokenId, TokenId)> + '_ {
-        self.configured.iter().copied()
+        self.pairs.keys().copied()
     }
 
     pub(crate) fn pair(&self, base: TokenId, quote: TokenId) -> Option<PairSource> {

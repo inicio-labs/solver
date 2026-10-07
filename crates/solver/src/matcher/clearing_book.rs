@@ -9,11 +9,6 @@ use crate::clearing::{
 use crate::matching::types::{BestLevel, SwapBookSnapshot};
 use crate::types::{BookOrder, BookUpdate, TokenId};
 
-/// Sent once, after ingestion reconciles persisted notes against the chain.
-pub struct ClearingBootstrap {
-    pub orders: Vec<BookOrder>,
-}
-
 /// Live ingestion and startup hydration reject zero amounts before admission.
 /// Parse once here and maintain the exact price/FIFO index incrementally.
 /// Both directions use requested/offered: lower is always better.
@@ -417,11 +412,7 @@ mod tests {
         let order = fixture(false, 10, 18, 1, &mut rng);
         let (routing, mut route_rx) = routing_fixture(&order);
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
-        assert!(bootstrap_tx
-            .send(ClearingBootstrap {
-                orders: vec![order.clone()],
-            })
-            .is_ok());
+        assert!(bootstrap_tx.send(vec![order.clone()]).is_ok());
         // No price snapshot: direct clearing cannot match, but RFQ still can.
         let (_, prices) = watch::channel(Arc::new(crate::price::PriceSnapshot::default()));
         let runtime = ClearingRuntime {
@@ -474,9 +465,7 @@ mod tests {
         let (routing, mut route_rx) = routing_fixture(&seller);
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
         assert!(bootstrap_tx
-            .send(ClearingBootstrap {
-                orders: vec![seller.clone(), buyer.clone()],
-            })
+            .send(vec![seller.clone(), buyer.clone()])
             .is_ok());
         let (_, prices_rx) = watch::channel(Arc::new(crate::price::PriceSnapshot::for_tests(
             &[(pair.0, pair.1, "2", std::time::Instant::now())],
@@ -691,9 +680,7 @@ mod tests {
     #[tokio::test]
     async fn clearer_propagates_closed_update_channel() {
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
-        assert!(bootstrap_tx
-            .send(ClearingBootstrap { orders: Vec::new() })
-            .is_ok());
+        assert!(bootstrap_tx.send(Vec::new()).is_ok());
         let (_price_tx, prices) = watch::channel(Arc::new(crate::price::PriceSnapshot::default()));
         let runtime = ClearingRuntime {
             bootstrap,
@@ -805,11 +792,7 @@ mod tests {
         book_tx.send(buyer.clone().into()).await.unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(exec_rx.try_recv().is_err());
-        assert!(bootstrap_tx
-            .send(ClearingBootstrap {
-                orders: vec![seller.clone()],
-            })
-            .is_ok());
+        assert!(bootstrap_tx.send(vec![seller.clone()]).is_ok());
         let first = tokio::time::timeout(Duration::from_secs(1), exec_rx.recv())
             .await
             .unwrap()

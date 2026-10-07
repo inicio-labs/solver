@@ -222,14 +222,14 @@ pub async fn start(
 
     // 3. Binance markets from config: faucet asset codes, approved clearing
     //    symbols, wallet valuation. `SolverConfig::load` already validated the
-    //    mapping; the feed checks the markets against `exchangeInfo` once
-    //    running.
+    //    mapping; the feed checks every market against `exchangeInfo` once,
+    //    and startup waits for that check (step 13).
     let market_plan = config
         .market_plan()
         .context("invalid Binance market configuration")?;
 
-    // 4. Configured tokens to register. Pairs whose Binance market is
-    //    confirmed clear internally; the matcher reads them from the snapshot.
+    // 4. Configured tokens to register. A pair with an approved Binance symbol
+    //    clears internally; the matcher reads its price from the snapshot.
     let initial_tokens: Vec<TokenId> = config
         .faucet_pairs()
         .context("invalid pair faucet ids")?
@@ -256,7 +256,7 @@ pub async fn start(
     let last_sync_handle = obs_state.last_sync_handle();
 
     // 7. Build the PipelineConfig.
-    let binance_tokens = config.binance_tokens().context("invalid pair faucet ids")?;
+    let binance_tokens = market_plan.tokens().collect();
     let pipeline_config = PipelineConfig::new(
         &config.engine,
         db_pool.clone(),
@@ -370,12 +370,11 @@ pub async fn start(
     };
 
     // 12a. PRICE-FEED THREAD: Binance readers and publisher on their own
-    //      runtime. Every pair stays paused until markets are confirmed and
-    //      fresh quotes arrive. The thread cancels `cancel` when it ends, so a
-    //      feed failure stops the solver. Pair prices are in base units, so
-    //      the plan takes the tokens' on-chain decimals, which ingest startup
-    //      has just recorded; a pair whose token has none is reported and
-    //      stays paused until a restart.
+    //      runtime. A pair stays paused until fresh quotes arrive. The thread
+    //      cancels `cancel` when it ends, so a feed failure stops the solver.
+    //      Pair prices are in base units, so the plan takes the tokens'
+    //      on-chain decimals, which ingest startup has just recorded; a
+    //      clearing token without them fails the market check.
     let decimals = match db_pool.read(db::postgres_db::load_token_decimals_tx).await {
         Ok(decimals) => decimals,
         Err(error) => {
@@ -384,7 +383,7 @@ pub async fn start(
         }
     };
     let spawned = spawn_price_feed_thread(
-        config.binance.feed_config(),
+        config.binance.clone(),
         market_plan.with_decimals(decimals),
         channels.prices_tx,
         feed_metrics,

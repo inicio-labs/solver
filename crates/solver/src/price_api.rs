@@ -35,10 +35,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::config::PricePrecision;
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::db::{self, DbPool};
 use crate::matching::types::SwapBookSnapshot;
+use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{eval_can_fill, eval_off_market, SettlementStats};
 

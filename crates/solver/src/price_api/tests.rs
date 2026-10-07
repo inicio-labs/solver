@@ -13,10 +13,10 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
-use crate::config::PricePrecision;
 use crate::db;
 use crate::db::postgres_test::TestDb;
 use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
+use crate::price::PricePrecision;
 use crate::price::PriceSnapshot;
 use crate::swap_eta::SettlementStats;
 

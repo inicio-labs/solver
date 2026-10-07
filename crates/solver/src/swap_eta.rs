@@ -14,8 +14,8 @@ use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
 
 use crate::clearing::BatchPrice;
-use crate::config::PricePrecision;
 use crate::matching::types::BestLevel;
+use crate::price::PricePrecision;
 use crate::types::{TokenId, UnixSecs};
 
 /// Retention window for settlement samples (24h).

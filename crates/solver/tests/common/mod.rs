@@ -363,10 +363,10 @@ impl BinanceStub {
         solver::config::BinanceConfig {
             stream_endpoints: [self.mock.ws_url(), self.mock.ws_url()],
             rest_endpoint: self.mock.rest_url(),
-            quote_ttl_ms: 30_000,
+            quote_ttl: std::time::Duration::from_secs(30),
             max_spread_bps: 100,
-            retry_min_ms: 50,
-            retry_max_ms: 500,
+            retry_min: std::time::Duration::from_millis(50),
+            retry_max: std::time::Duration::from_millis(500),
             ..Default::default()
         }
     }

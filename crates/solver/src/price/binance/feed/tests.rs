@@ -38,33 +38,25 @@ fn fast() -> Settings {
     }
 }
 
-fn config_for(stream: &str, rest: &str) -> FeedConfig {
-    FeedConfig {
+fn config_for(stream: &str, rest: &str) -> BinanceConfig {
+    BinanceConfig {
         stream_endpoints: [stream.to_string(), stream.to_string()],
         rest_endpoint: rest.to_string(),
-        limits: QuoteLimits {
-            max_spread_bps: 100,
-            min_notional: None,
-        },
         quote_ttl: TTL,
+        max_spread_bps: 100,
         connect_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(2),
         idle_timeout: Duration::from_secs(2),
-        data_idle_timeout: Duration::from_secs(60),
         connection_lifetime: Duration::from_secs(3600),
-        retry: RetryPolicy {
-            min_delay: Duration::from_millis(20),
-            max_delay: Duration::from_millis(200),
-        },
+        retry_min: Duration::from_millis(20),
+        retry_max: Duration::from_millis(200),
         max_connection_attempts: 1_000,
         validation_timeout: Duration::from_secs(30),
-        stable_connection: Duration::from_secs(60),
-        shutdown_timeout: Duration::from_secs(5),
-        log_interval: Duration::from_secs(10),
+        ..BinanceConfig::default()
     }
 }
 
-fn config(mock: &MockBinance) -> FeedConfig {
+fn config(mock: &MockBinance) -> BinanceConfig {
     config_for(&mock.ws_url(), &mock.rest_url())
 }
 
@@ -77,11 +69,11 @@ struct Running {
 }
 
 impl Running {
-    fn start(config: FeedConfig) -> Self {
+    fn start(config: BinanceConfig) -> Self {
         Self::start_with_plan(config, eth_usdt_plan())
     }
 
-    fn start_with_plan(config: FeedConfig, plan: MarketPlan) -> Self {
+    fn start_with_plan(config: BinanceConfig, plan: MarketPlan) -> Self {
         let (output, snapshots) = watch::channel(Arc::new(PriceSnapshot::default()));
         let metrics = Arc::new(FeedMetrics::default());
         let cancel = CancellationToken::new();
@@ -201,7 +193,6 @@ async fn publishes_validated_quotes_from_both_readers() {
                 .all(|frames| frames.load(Ordering::Relaxed) > 0)
     })
     .await;
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 2);
     // A quote change reaches the snapshot exactly.
     mock.set_quote("ETHUSDT", "3000", "3000.02");
     feed.until(|snapshot| eth_usdt(snapshot) == Ok(price("3000.01")))
@@ -286,8 +277,6 @@ async fn a_spot_restricted_symbol_fails_startup_and_a_halted_one_is_subscribed()
     let mut feed = Running::start(config(&mock));
     let snapshot = feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
     assert_eq!(btc_value(&snapshot), Err(PriceUnavailable::NoQuote));
-    assert_eq!(feed.counter(|m| &m.halted_markets), 1);
-    assert_eq!(feed.counter(|m| &m.markets_confirmed), 2);
     mock.set_status("BTCUSDT", "TRADING");
     feed.until(|snapshot| btc_value(snapshot) == Ok(price("86369.995")))
         .await;
@@ -309,8 +298,7 @@ async fn lookups_retry_transient_failures_and_honour_retry_after() {
     let mut feed = Running::start(config(&mock));
     // While the lookups are held back, nothing has been published: every
     // pair is paused on the empty default snapshot.
-    let metrics = feed.metrics.clone();
-    eventually(|| metrics.lookup_failures.load(Ordering::Relaxed) == 2).await;
+    eventually(|| mock.rest_failures_left() == 0).await;
     assert!(!feed.snapshots.has_changed().unwrap());
     assert_eq!(eth_usdt(&feed.latest()), Err(PriceUnavailable::NoMarket));
     feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
@@ -318,7 +306,6 @@ async fn lookups_retry_transient_failures_and_honour_retry_after() {
         started.elapsed() >= Duration::from_secs(1),
         "Retry-After ignored"
     );
-    assert_eq!(feed.counter(|m| &m.lookup_failures), 2);
     feed.stop().await;
 }
 
@@ -475,7 +462,7 @@ async fn a_thin_book_is_invalid_under_a_minimum_notional() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
     let mut config = config(&mock);
     // The mock displays 1.0 on each side: 2718 USDT of ETH, 86370 of BTC.
-    config.limits.min_notional = Some(price("5000"));
+    config.min_notional = Some("5000".into());
     let mut feed = Running::start(config);
     let snapshot = feed
         .until(|snapshot| {
@@ -591,10 +578,8 @@ async fn a_pinging_but_quoteless_connection_is_replaced() {
 async fn a_server_shutdown_reconnects_without_backoff() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
     let mut config = config(&mock);
-    config.retry = RetryPolicy {
-        min_delay: Duration::from_secs(5),
-        max_delay: Duration::from_secs(5),
-    };
+    config.retry_min = Duration::from_secs(5);
+    config.retry_max = Duration::from_secs(5);
     let mut feed = Running::start(config);
     feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
     eventually(|| mock.open_connections() == 2).await;
@@ -687,10 +672,8 @@ async fn planned_renewals_replace_connections_without_a_gap() {
     let mock = MockBinance::start(markets(), fast()).await.unwrap();
     let mut config = config(&mock);
     config.connection_lifetime = Duration::from_millis(400);
-    config.retry = RetryPolicy {
-        min_delay: Duration::from_secs(5),
-        max_delay: Duration::from_secs(5),
-    };
+    config.retry_min = Duration::from_secs(5);
+    config.retry_max = Duration::from_secs(5);
     let mut feed = Running::start(config);
     feed.until(|snapshot| eth_usdt(snapshot).is_ok()).await;
     let started = Instant::now();
@@ -774,15 +757,12 @@ async fn cancellation_interrupts_a_retry_wait() {
         retry_after_secs: None,
     });
     let mut config = config(&mock);
-    config.retry = RetryPolicy {
-        min_delay: Duration::from_secs(60),
-        max_delay: Duration::from_secs(60),
-    };
+    config.retry_min = Duration::from_secs(60);
+    config.retry_max = Duration::from_secs(60);
     // Long enough that the feed waits out the retry instead of failing.
     config.validation_timeout = Duration::from_secs(600);
     let feed = Running::start(config);
-    let metrics = feed.metrics.clone();
-    eventually(|| metrics.lookup_failures.load(Ordering::Relaxed) == 1).await;
+    eventually(|| mock.rest_failures_left() == 0).await;
     let stopping = Instant::now();
     feed.stop().await;
     assert!(stopping.elapsed() < Duration::from_secs(1));
@@ -798,8 +778,7 @@ async fn an_absurd_retry_after_does_not_stop_the_feed() {
         retry_after_secs: Some(u64::MAX),
     });
     let feed = Running::start(config(&mock));
-    let metrics = feed.metrics.clone();
-    eventually(|| metrics.lookup_failures.load(Ordering::Relaxed) == 1).await;
+    eventually(|| mock.rest_failures_left() == 0).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!feed.task.is_finished(), "the feed ended on the header");
     feed.stop().await;
@@ -1184,7 +1163,7 @@ async fn live_binance_endpoints_publish_exact_prices() {
         "https://data-api.binance.vision",
     );
     config.stream_endpoints[1] = "wss://stream.binance.com:443".to_string();
-    config.limits.max_spread_bps = 50;
+    config.max_spread_bps = 50;
     config.connect_timeout = Duration::from_secs(10);
     config.request_timeout = Duration::from_secs(10);
     config.idle_timeout = Duration::from_secs(60);

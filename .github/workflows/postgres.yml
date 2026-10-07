@@ -45,7 +45,7 @@ jobs:
             crates/solver/src/executor/executor.rs crates/solver/src/ingest/ingest.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
             crates/solver/src/obs.rs crates/solver/src/clearing/{math,types}.rs \
-            crates/solver/src/price/mod.rs crates/solver/src/price/binance/*.rs \
+            crates/solver/src/price/{mod,precision}.rs crates/solver/src/price/binance/*.rs \
             crates/solver/src/price/binance/feed/tests.rs crates/mock-binance/src/*.rs \
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs \
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \

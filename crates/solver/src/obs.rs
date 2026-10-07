@@ -217,8 +217,6 @@ mod tests {
         feed.connected[1].store(true, Ordering::Relaxed);
         feed.connections[1].store(3, Ordering::Relaxed);
         feed.frames[0].store(7, Ordering::Relaxed);
-        feed.halted_markets.store(2, Ordering::Relaxed);
-        feed.markets_confirmed.store(1, Ordering::Relaxed);
         feed.conflicting_updates.store(4, Ordering::Relaxed);
         feed.last_publish_delay_us.store(1_500, Ordering::Relaxed);
         let received = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
@@ -237,8 +235,6 @@ mod tests {
             "solver_price_feed_connections_total{reader=\"1\",endpoint=\"wss://a.test\"} 3"
                 .to_string(),
             "solver_price_feed_frames_total{reader=\"0\",endpoint=\"wss://a.test\"} 7".to_string(),
-            "solver_price_feed_markets{state=\"halted\"} 2".to_string(),
-            "solver_price_feed_markets{state=\"confirmed\"} 1".to_string(),
             "solver_price_feed_conflicting_updates_total 4".to_string(),
             "solver_price_feed_publish_delay_seconds 0.0015".to_string(),
             format!("solver_price_quote_valid{{symbol=\"{symbol}\"}} 1"),

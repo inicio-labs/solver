@@ -1164,6 +1164,26 @@ async fn live_binance_endpoints_publish_exact_prices() {
     );
     config.stream_endpoints[1] = "wss://stream.binance.com:443".to_string();
     config.max_spread_bps = 50;
+    check_live_endpoints(config).await;
+}
+
+/// The same check against Binance's public Spot Testnet, the devnet price
+/// source: `cargo test -p solver --lib live_binance_spot_testnet -- --ignored
+/// --nocapture`. Its markets are quieter, so quotes live longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs network access to Binance"]
+async fn live_binance_spot_testnet_publishes_exact_prices() {
+    let mut config = config_for(
+        "wss://stream.testnet.binance.vision",
+        "https://testnet.binance.vision",
+    );
+    config.quote_ttl = Duration::from_secs(30);
+    check_live_endpoints(config).await;
+}
+
+/// Both readers connect, ETHUSDT and BTCUSDT get prices, and no frame or
+/// quote is refused.
+async fn check_live_endpoints(mut config: BinanceConfig) {
     config.connect_timeout = Duration::from_secs(10);
     config.request_timeout = Duration::from_secs(10);
     config.idle_timeout = Duration::from_secs(60);

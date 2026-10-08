@@ -245,8 +245,22 @@ Binance's `serverShutdown` event, which precedes a disconnect, reconnects at
 once; a connection that keeps answering pings but delivers no quote is replaced
 after `data_idle_timeout_ms`.
 
-**Devnet / local.** Faucet tokens have no Binance market of their own, so run
-the bundled mock (`crates/mock-binance`) and point both endpoints at it:
+**Devnet / local.** Faucet tokens have no Binance market of their own: map
+them to real assets and price them on Binance's public **Spot Testnet**. It
+has the same API and real symbols, needs no API key, and there is nothing to
+run locally:
+
+```toml
+[binance]
+stream_endpoints = ["wss://stream.testnet.binance.vision", "wss://stream.testnet.binance.vision"]
+rest_endpoint = "https://testnet.binance.vision"
+quote_ttl_ms = 30000   # testnet markets update only when their book changes
+max_spread_bps = 100
+```
+`e2e provision` writes this section. Its prices are not yours to set, its
+markets are quieter than Binance's (keep the TTL long), and it is reset from
+time to time. For fixed prices, failure drills or offline work, run the bundled
+mock (`crates/mock-binance`) and point both endpoints at it:
 
 ```bash
 cargo run -p mock-binance --release -- \
@@ -262,7 +276,7 @@ rest_endpoint = "http://127.0.0.1:8089"
 quote_ttl_ms = 30000
 max_spread_bps = 100
 ```
-`e2e provision` writes this section; **don't point a mainnet solver at a mock.**
+**Don't point a mainnet solver at the testnet or a mock.**
 
 ### Environment variables
 | Var | Description |

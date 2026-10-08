@@ -114,13 +114,16 @@ clearing_fee_ppm = 0
 admin_port = 3001
 obs_port = 9090
 
-# Devnet test tokens have no Binance market of their own, so point the feed at
-# the local mock, e.g. in another terminal:
+# Devnet test tokens have no Binance market of their own: they are priced as
+# {asset_b} and {asset_a} on Binance's public Spot Testnet (no API key, nothing
+# to run locally). Testnet markets update only when their book changes, hence
+# the long quote TTL. For fixed 1:1 prices offline instead, run
 #   cargo run -p mock-binance -- --market {binance_symbol}={asset_b}/{asset_a}:1/1
-# (`e2e run` starts its own mock and overrides these endpoints.)
+# and use ws://127.0.0.1:8089 and http://127.0.0.1:8089 below
+# (`e2e run --mock-prices` starts its own mock and overrides these endpoints).
 [binance]
-stream_endpoints = ["ws://127.0.0.1:8089", "ws://127.0.0.1:8089"]
-rest_endpoint = "http://127.0.0.1:8089"
+stream_endpoints = ["wss://stream.testnet.binance.vision", "wss://stream.testnet.binance.vision"]
+rest_endpoint = "https://testnet.binance.vision"
 quote_ttl_ms = 30000
 max_spread_bps = 100
 "#,
@@ -150,4 +153,47 @@ max_spread_bps = 100
 pub fn ensure_dir() -> Result<()> {
     std::fs::create_dir_all(E2E_DIR).with_context(|| format!("create {E2E_DIR}/"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated config loads as `run` and `solver-bin` load it, and
+    /// prices the pair on the Spot Testnet.
+    #[test]
+    fn generated_solver_config_is_valid() {
+        let token = |faucet_id: &str, symbol: &str, binance_asset: &str| TokenInfo {
+            faucet_id: faucet_id.to_string(),
+            symbol: symbol.to_string(),
+            decimals: 8,
+            binance_asset: binance_asset.to_string(),
+        };
+        let art = Artifacts {
+            rpc_endpoint: "https://rpc.devnet.miden.io".to_string(),
+            solver_account_id: "0x9f0c6ec13c4ed2b1076a2990a9fc29".to_string(),
+            token_a: token("0x9f0c6ec13c4ed2b1076a2990a9fc29", "MTA", "USDT"),
+            token_b: token("0x3ae73d7f166f723132e3acbba75e75", "MTB", "USDC"),
+            binance_symbol: "USDCUSDT".to_string(),
+            solver_keystore_path: solver_keystore(),
+            solver_executor_store_path: solver_executor_store(),
+            solver_ingest_store_path: solver_ingest_store(),
+            operator_store_path: operator_store(),
+            operator_keystore_path: operator_keystore(),
+        };
+        let path = std::env::temp_dir().join(format!("e2e-solver-{}.toml", std::process::id()));
+        let path = path.to_str().unwrap();
+        art.write_solver_config(path).unwrap();
+        let config = solver::config::SolverConfig::load(path);
+        std::fs::remove_file(path).unwrap();
+        let config = config.unwrap();
+        assert_eq!(
+            config.binance.rest_endpoint,
+            "https://testnet.binance.vision"
+        );
+        assert_eq!(
+            config.pairs[0].binance_symbol.as_ref().unwrap().to_string(),
+            "USDCUSDT"
+        );
+    }
 }

@@ -1,7 +1,8 @@
-//! `e2e run` — boot the real solver pipeline in-process against devnet with a
-//! deterministic price from an in-process mock Binance, let it ingest + match +
-//! settle the PSWAPs created by `load`, then report the solver's balance delta
-//! (the spread it captured = proof of settlement).
+//! `e2e run` — boot the real solver pipeline in-process against devnet, priced
+//! by Binance's Spot Testnet (or, with `--mock-prices`, a fixed price from an
+//! in-process mock Binance), let it ingest + match + settle the PSWAPs created
+//! by `load`, then report the solver's balance delta (the spread it captured =
+//! proof of settlement).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,9 +24,10 @@ use crate::accounts;
 use crate::artifacts::{self, Artifacts};
 use crate::devnet::{self, DEVNET_RPC};
 
-/// Fixed mid price of the pair's Binance market: both test tokens are worth the
-/// same, which keeps the crossing condition simple: each opposing order offers
-/// more than the other requests, so there is positive surplus for the solver.
+/// Fixed mid price of the pair's mock Binance market: both test tokens are
+/// worth the same, which keeps the crossing condition simple: each opposing
+/// order offers more than the other requests, so there is positive surplus for
+/// the solver.
 const MID_PRICE: &str = "1";
 
 /// e2e [`solver::ClientFactory`] — same shape as the production `ProdClientFactory`,
@@ -63,7 +65,7 @@ impl solver::ClientFactory for E2eFactory {
     }
 }
 
-pub async fn run(secs: u64) -> Result<()> {
+pub async fn run(secs: u64, mock_prices: bool) -> Result<()> {
     let art = Artifacts::load(&artifacts::artifacts_path())?;
     let mut config = SolverConfig::load(&artifacts::solver_config_path())
         .context("load generated solver config")?;
@@ -77,20 +79,31 @@ pub async fn run(secs: u64) -> Result<()> {
     // Pre-run balances (best-effort).
     let (pre_a, pre_b) = read_solver_balances(&art, solver_id, token_a, token_b).await;
 
-    // Deterministic prices: an in-process mock Binance quoting the pair's
-    // market, with the generated config's endpoints pointed at it.
-    let market = Market::new(
-        &art.binance_symbol,
-        &art.token_b.binance_asset,
-        &art.token_a.binance_asset,
-        MID_PRICE,
-        MID_PRICE,
-    );
-    let binance = MockBinance::start(vec![market], Default::default())
-        .await
-        .context("start mock Binance")?;
-    config.binance.stream_endpoints = [binance.ws_url(), binance.ws_url()];
-    config.binance.rest_endpoint = binance.rest_url();
+    // Prices come from the generated config's endpoints (the Spot Testnet),
+    // or, with `--mock-prices`, from an in-process mock Binance quoting the
+    // pair's market at a fixed price. The mock lives until the run ends.
+    let _mock = if mock_prices {
+        let market = Market::new(
+            &art.binance_symbol,
+            &art.token_b.binance_asset,
+            &art.token_a.binance_asset,
+            MID_PRICE,
+            MID_PRICE,
+        );
+        let binance = MockBinance::start(vec![market], Default::default())
+            .await
+            .context("start mock Binance")?;
+        config.binance.stream_endpoints = [binance.ws_url(), binance.ws_url()];
+        config.binance.rest_endpoint = binance.rest_url();
+        Some(binance)
+    } else {
+        None
+    };
+    let prices = if mock_prices {
+        "fixed mock prices"
+    } else {
+        "Binance Spot Testnet prices"
+    };
 
     let factory: Arc<dyn solver::ClientFactory> = Arc::new(E2eFactory {
         ingest_store: art.solver_ingest_store_path.clone(),
@@ -113,7 +126,7 @@ pub async fn run(secs: u64) -> Result<()> {
         c_to.cancel();
     });
 
-    tracing::info!(%solver_id, secs, "starting solver in-process against devnet (fixed prices)…");
+    tracing::info!(%solver_id, secs, prices, "starting solver in-process against devnet…");
     let result = solver::start(factory, solver_id, config, cancel).await;
 
     // Post-run balances → delta = spread captured = settlement proof.

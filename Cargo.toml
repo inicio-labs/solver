@@ -44,3 +44,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 [dev-dependencies]
 consume-script = { path = "crates/consume-script" }
 miden-testing.workspace = true
+
+# The integration tests prove real Miden transactions. With an unoptimised
+# prover they take well over an hour on CI. Optimise dependencies only: our own
+# crates still compile fast and debug normally.
+[profile.dev.package."*"]
+opt-level = 3

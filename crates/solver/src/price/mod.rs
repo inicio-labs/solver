@@ -3,6 +3,8 @@
 //! in sibling files; this file only wires the submodules and re-exports their
 //! public surface so callers keep using `crate::price::{...}`.
 
+pub(crate) mod binance;
+
 mod token_map;
 pub use token_map::{read_token_map, write_token_map, SharedTokenMap};
 

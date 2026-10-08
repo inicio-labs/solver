@@ -1,5 +1,6 @@
 use miden_protocol::asset::AssetAmount;
 use ruint::aliases::U256;
+use rust_decimal::Decimal;
 
 use super::config::PPM_DENOMINATOR;
 use super::types::{BatchPrice, ClearingError, ReferencePrice};
@@ -98,25 +99,40 @@ impl ReferencePrice {
 
     /// Parse a provider's decimal string exactly, e.g. Binance's
     /// `"123.45000000"`. Exponents, signs, and zero are rejected.
+    ///
+    /// A decimal with `places` digits after the point is an integer over
+    /// `10^places`: `"123.45"` is `12345 / 100`. So the fraction is
+    /// `(whole_part × 10^places + fractional_part) / 10^places`, built from
+    /// two integers and never rounded; [`Self::new`] then reduces it
+    /// (`12345 / 100` becomes `2469 / 20`).
     pub fn from_decimal(raw: &str) -> Result<Self, ClearingError> {
-        let (whole, fraction) = match raw.split_once('.') {
+        let (whole_text, fraction_text) = match raw.split_once('.') {
             Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
             Some(_) => return Err(ClearingError::InvalidOraclePrice),
             None => (raw, ""),
         };
-        if whole.is_empty()
-            || !whole.bytes().all(|character| character.is_ascii_digit())
-            || !fraction.bytes().all(|character| character.is_ascii_digit())
-        {
+        let all_digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+        if whole_text.is_empty() || !all_digits(whole_text) || !all_digits(fraction_text) {
             return Err(ClearingError::InvalidOraclePrice);
         }
-        let decimals =
-            u8::try_from(fraction.len()).map_err(|_| ClearingError::InvalidOraclePrice)?;
-        let denominator = power_of_ten(decimals).map_err(|_| ClearingError::InvalidOraclePrice)?;
-        let digits = [whole, fraction].concat();
-        let numerator =
-            U256::from_str_radix(&digits, 10).map_err(|_| ClearingError::InvalidOraclePrice)?;
-        Self::new(numerator, denominator)
+        fn invalid<E>(_: E) -> ClearingError {
+            ClearingError::InvalidOraclePrice
+        }
+        // An empty fractional part ("123") is zero; otherwise base 10.
+        let integer_of = |text: &str| {
+            if text.is_empty() {
+                Ok(U256::ZERO)
+            } else {
+                U256::from_str_radix(text, 10).map_err(invalid)
+            }
+        };
+        let places = u8::try_from(fraction_text.len()).map_err(invalid)?;
+        let scale = power_of_ten(places).map_err(invalid)?;
+        let numerator = checked_mul(integer_of(whole_text)?, scale)
+            .map_err(invalid)?
+            .checked_add(integer_of(fraction_text)?)
+            .ok_or(ClearingError::InvalidOraclePrice)?;
+        Self::new(numerator, scale)
     }
 
     /// Parse a JSON number without a floating-point round trip. Providers may
@@ -184,6 +200,32 @@ impl BatchPrice {
         Self::new(quote_units, base_units)
     }
 
+    /// `price` whole quote tokens per whole base token, in base units:
+    /// `price × 10^quote_decimals` quote units per `10^base_decimals` base
+    /// units. A `Decimal` is `mantissa / 10^scale`, so both sides are whole
+    /// numbers and nothing is rounded.
+    pub fn from_whole_price(
+        price: Decimal,
+        base_decimals: u8,
+        quote_decimals: u8,
+    ) -> Result<Self, ClearingError> {
+        let mantissa = u128::try_from(price.mantissa()).map_err(|_| ClearingError::InvalidPrice)?;
+        let scale = u8::try_from(price.scale()).map_err(|_| ClearingError::InvalidPrice)?;
+        Self::new(
+            checked_mul(U256::from(mantissa), power_of_ten(quote_decimals)?)?,
+            checked_mul(power_of_ten(scale)?, power_of_ten(base_decimals)?)?,
+        )
+    }
+
+    /// The same price seen from the other token: base and quote swap.
+    #[must_use]
+    pub fn inverse(self) -> Self {
+        Self {
+            quote_units: self.base_units,
+            base_units: self.quote_units,
+        }
+    }
+
     pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
         mul_div_floor(base, self.quote_units, self.base_units)
     }
@@ -207,8 +249,31 @@ mod tests {
         let price = ReferencePrice::from_decimal("0.00012500").unwrap();
         assert_eq!(price.numerator, U256::ONE);
         assert_eq!(price.denominator, U256::from(8_000u64));
-        for invalid in ["0", "-1", "1e4", "1.", ".1", "1.2.3"] {
-            assert!(ReferencePrice::from_decimal(invalid).is_err(), "{invalid}");
+        assert_eq!(
+            ReferencePrice::from_decimal("00.10").unwrap(),
+            decimal("0.1")
+        );
+        let too_many_places = format!("1.{}", "0".repeat(78));
+        for invalid in [
+            "0",
+            "0.0",
+            "-1",
+            "+1",
+            "",
+            " 1",
+            "1 ",
+            "1e4",
+            "1.",
+            ".1",
+            "1.2.3",
+            "１",
+            "0x10",
+            too_many_places.as_str(),
+        ] {
+            assert!(
+                ReferencePrice::from_decimal(invalid).is_err(),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -225,6 +290,73 @@ mod tests {
                 ReferencePrice::from_json_number(invalid).is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    fn decimal(raw: &str) -> ReferencePrice {
+        ReferencePrice::from_decimal(raw).unwrap()
+    }
+
+    fn dec(raw: &str) -> Decimal {
+        Decimal::from_str_exact(raw).unwrap()
+    }
+
+    #[test]
+    fn whole_price_converts_with_unequal_decimals() {
+        // 1 whole base token (18 decimals) = 2718.655 quote tokens (6 decimals):
+        // 2_718_655 / 10^15, reduced by their common factor 5.
+        let price = BatchPrice::from_whole_price(dec("2718.655"), 18, 6).unwrap();
+        assert_eq!(price.quote_units, U256::from(543_731u64));
+        assert_eq!(price.base_units, U256::from(200_000_000_000_000u64));
+        // Trailing zeros change nothing.
+        assert_eq!(
+            BatchPrice::from_whole_price(dec("2718.65500000"), 18, 6).unwrap(),
+            price
+        );
+        // Seen from the other token, the two numbers swap.
+        let inverse = price.inverse();
+        assert_eq!(inverse.quote_units, price.base_units);
+        assert_eq!(inverse.base_units, price.quote_units);
+    }
+
+    #[test]
+    fn whole_price_rejects_zero_negative_and_overflow() {
+        assert!(BatchPrice::from_whole_price(Decimal::ZERO, 6, 6).is_err());
+        assert!(BatchPrice::from_whole_price(dec("-1"), 6, 6).is_err());
+        assert!(matches!(
+            BatchPrice::from_whole_price(Decimal::MAX, 0, 78),
+            Err(ClearingError::ArithmeticOverflow)
+        ));
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A positive decimal with up to eight fractional digits, as Binance sends.
+        fn price() -> impl Strategy<Value = Decimal> {
+            (1i64..1_000_000_000_000_000, 0u32..=8)
+                .prop_map(|(units, places)| Decimal::new(units, places))
+        }
+
+        proptest! {
+            /// The base-unit price is the whole-token price scaled by the
+            /// decimals, in lowest terms.
+            #[test]
+            fn whole_price_conversion_preserves_the_ratio(
+                price in price(),
+                base_decimals in 0u8..=18,
+                quote_decimals in 0u8..=18,
+            ) {
+                let batch = BatchPrice::from_whole_price(price, base_decimals, quote_decimals).unwrap();
+                let ten = |power: u32| U256::from(10u8).pow(U256::from(power));
+                let mantissa = U256::from(u128::try_from(price.mantissa()).unwrap());
+                prop_assert_eq!(
+                    batch.quote_units * ten(price.scale()) * ten(base_decimals.into()),
+                    batch.base_units * mantissa * ten(quote_decimals.into())
+                );
+                prop_assert_eq!(batch.quote_units.gcd(batch.base_units), U256::ONE);
+            }
         }
     }
 }

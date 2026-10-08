@@ -56,8 +56,10 @@ jobs:
         run: cargo clippy -p solver -p solver-bin --locked
       - name: Pure solver tests
         run: cargo test -p solver --locked
+      # The live Binance test is skipped: Binance's main endpoints refuse
+      # some regions, including US runners. Run it by hand (see the test).
       - name: PostgreSQL library tests
-        run: cargo test -p solver --lib --locked -- --ignored --test-threads=2
+        run: cargo test -p solver --lib --locked -- --ignored --skip live_binance --test-threads=2
       - name: PostgreSQL startup and recovery integration
         run: |
           cargo test -p solver --test integration_startup_failure --locked -- --ignored

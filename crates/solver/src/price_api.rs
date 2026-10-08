@@ -348,10 +348,9 @@ struct SwapEtaResponse {
     /// The fill price less the buffer, and the requested amount at it.
     suggested_price: Option<String>,
     suggested_requested_amount: Option<String>,
-    /// Whether the solver could settle on its last tick.
+    /// Whether the solver is settling: `false` before its executor starts and
+    /// while it is in verification mode (no fee headroom, node or database down).
     accepting_orders: bool,
-    /// Unix secs of the book the quote used; `null` before the first tick.
-    as_of: Option<u64>,
     /// `fill_status == full` at the market price (kept for older wallets).
     can_fill: bool,
     /// `price_band == off_market` (kept for older wallets).
@@ -441,7 +440,7 @@ async fn get_swap_eta(
     let market = prices.market_price(a, b, now).ok();
     let (quoted, offered, requested, unpriced) = match prices.order_price(a, b, now) {
         Ok((side, price)) => {
-            let levels = |pair| book.levels.get(&pair).map_or(&[][..], Vec::as_slice);
+            let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
             let quoted = quote(side, price, terms, order, levels((a, b)), levels((b, a)))
                 .map_err(|error| ApiError::BadAmount(error.to_string()))?;
             (Some((side, quoted)), quoted.offered, quoted.requested, None)
@@ -469,7 +468,10 @@ async fn get_swap_eta(
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
     let now_unix = now_secs().max(0) as u64;
-    let median24h_seconds = state.stats_rx.borrow().median_secs((a, b), now_unix);
+    let (median24h_seconds, settling) = {
+        let stats = state.stats_rx.borrow();
+        (stats.median_secs((a, b), now_unix), stats.settling)
+    };
 
     let body = Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
@@ -490,13 +492,12 @@ async fn get_swap_eta(
             .and_then(|fill| suggested_price(fill, terms.buffer_bps))
             .map(price),
         suggested_requested_amount: amount(quote.map(|q| q.suggested_requested)),
-        accepting_orders: book.accepting_orders,
-        as_of: (book.as_of > 0).then_some(book.as_of),
+        accepting_orders: settling,
         can_fill: band == Some(PriceBand::AtMarket) && status == FillStatus::Full,
         off_market: band.map(|band| band == PriceBand::OffMarket),
         estimated_seconds: (band == Some(PriceBand::AtMarket)
             && status != FillStatus::None
-            && book.accepting_orders)
+            && settling)
             .then_some(state.swap_eta_secs),
         median24h_seconds,
     });

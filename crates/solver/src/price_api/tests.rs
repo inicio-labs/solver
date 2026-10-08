@@ -167,8 +167,7 @@ async fn swap_server(
     swap_server_at(true, registered, market, book, stats).await
 }
 
-/// A book with one level on directed pair `(offered, requested)`, from a
-/// solver that is settling.
+/// A book with one level on directed pair `(offered, requested)`.
 fn book(
     offered_tok: AccountId,
     requested_tok: AccountId,
@@ -180,11 +179,14 @@ fn book(
         rate: RateKey::new(requested, offered),
         volume,
     };
-    SwapBookSnapshot {
-        levels: [((offered_tok, requested_tok), vec![level])].into(),
-        accepting_orders: true,
-        as_of: now() as u64,
-    }
+    [((offered_tok, requested_tok), vec![level])].into()
+}
+
+/// Stats from an executor that is taking batches.
+fn settling() -> SettlementStats {
+    let mut stats = SettlementStats::new();
+    stats.settling = true;
+    stats
 }
 
 /// Buyers of A paying 2.14 B per A, eligible at the market of 2 B per A.
@@ -509,13 +511,7 @@ fn a_for_b(rest: &str) -> String {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_quotes_a_full_fill_at_market() {
-    let h = swap_server(
-        &registered(),
-        Some("2"),
-        buyers(3_000_000),
-        SettlementStats::new(),
-    )
-    .await;
+    let h = swap_server(&registered(), Some("2"), buyers(3_000_000), settling()).await;
     let v = swap_get(
         &h,
         &a_for_b("offered_amount=1000000&requested_amount=1990000"),
@@ -534,7 +530,6 @@ async fn swap_eta_quotes_a_full_fill_at_market() {
     assert_eq!(v["suggestedPrice"], "1.994004");
     assert_eq!(v["suggestedRequestedAmount"], "1994004");
     assert_eq!(v["acceptingOrders"], true);
-    assert!(v["asOf"].as_u64().unwrap() > 0);
     assert_eq!(v["canFill"], true);
     assert_eq!(v["offMarket"], false);
     assert_eq!(v["estimatedSeconds"], 14);
@@ -544,13 +539,7 @@ async fn swap_eta_quotes_a_full_fill_at_market() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
-    let h = swap_server(
-        &registered(),
-        Some("2"),
-        buyers(1_000_000),
-        SettlementStats::new(),
-    )
-    .await;
+    let h = swap_server(&registered(), Some("2"), buyers(1_000_000), settling()).await;
     let v = swap_get(
         &h,
         &a_for_b("offered_amount=1000000&requested_amount=1990000"),
@@ -573,9 +562,9 @@ async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
-    let mut paused = buyers(3_000_000);
-    paused.accepting_orders = false;
-    let h = swap_server(&registered(), Some("2"), paused, SettlementStats::new()).await;
+    // The executor has not started, or is in verification mode.
+    let paused = SettlementStats::new();
+    let h = swap_server(&registered(), Some("2"), buyers(3_000_000), paused).await;
     let v = swap_get(
         &h,
         &a_for_b("offered_amount=1000000&requested_amount=1990000"),

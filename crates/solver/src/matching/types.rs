@@ -207,15 +207,6 @@ pub struct BookLevel {
     pub volume: Amount,
 }
 
-/// The live book as the price API sees it, published by the matcher each
-/// tick for the swap quotes (see [`crate::swap_eta`]).
-#[derive(Clone, Debug, Default)]
-pub struct SwapBookSnapshot {
-    /// Per directed `(offered, requested)` pair, every level, best first.
-    pub levels: std::collections::HashMap<(TokenId, TokenId), Vec<BookLevel>>,
-    /// Whether the executor could take a batch on this tick. `false` while it
-    /// is busy or in verification mode, and before the first tick.
-    pub accepting_orders: bool,
-    /// Unix seconds of the tick.
-    pub as_of: crate::types::UnixSecs,
-}
+/// The live book as the price API sees it: per directed `(offered, requested)`
+/// pair, every level, best first (see [`crate::swap_eta::DepthBook`]).
+pub type SwapBookSnapshot = std::collections::HashMap<(TokenId, TokenId), Vec<BookLevel>>;

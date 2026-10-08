@@ -4,7 +4,8 @@
 //!  * [`SettlementStats`] — an **in-memory, ephemeral** rolling window of recent
 //!    settlement durations per directed pair (no DB storage). The executor owns
 //!    one, records into it on each successful settlement, and publishes it over a
-//!    `watch` channel; the price-API thread reads it to compute a 24h median.
+//!    `watch` channel; the price-API thread reads it to compute a 24h median,
+//!    and whether settlements run right now (`settling`).
 //!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
 //!    built from the [`DepthChange`]s the matcher sends as orders enter and
 //!    leave its book, so no depth work runs on the matcher.
@@ -48,6 +49,9 @@ struct Sample {
 #[derive(Clone, Debug, Default)]
 pub struct SettlementStats {
     by_pair: HashMap<(TokenId, TokenId), VecDeque<Sample>>,
+    /// Whether the executor takes batches: `false` before it starts and while
+    /// it is in verification mode (no fee headroom, node or database down).
+    pub settling: bool,
 }
 
 impl SettlementStats {
@@ -119,11 +123,6 @@ pub enum DepthChange {
         rate: RateKey,
         volume: Amount,
     },
-    /// The matcher finished a tick.
-    Tick {
-        accepting_orders: bool,
-        at: UnixSecs,
-    },
 }
 
 /// The matcher's resting levels, rebuilt from its [`DepthChange`]s on the
@@ -131,8 +130,6 @@ pub enum DepthChange {
 #[derive(Debug, Default)]
 pub struct DepthBook {
     levels: HashMap<(TokenId, TokenId), BTreeMap<RateKey, u128>>,
-    accepting_orders: bool,
-    as_of: UnixSecs,
 }
 
 impl DepthBook {
@@ -160,19 +157,11 @@ impl DepthBook {
                     self.levels.remove(&pair);
                 }
             }
-            DepthChange::Tick {
-                accepting_orders,
-                at,
-            } => {
-                self.accepting_orders = accepting_orders;
-                self.as_of = at;
-            }
         }
     }
 
     pub fn snapshot(&self) -> SwapBookSnapshot {
-        let levels = self
-            .levels
+        self.levels
             .iter()
             .map(|(&pair, levels)| {
                 let levels = levels
@@ -184,26 +173,17 @@ impl DepthBook {
                     .collect();
                 (pair, levels)
             })
-            .collect();
-        SwapBookSnapshot {
-            levels,
-            accepting_orders: self.accepting_orders,
-            as_of: self.as_of,
-        }
+            .collect()
     }
 
-    /// Apply `changes` up to and including the matcher's next tick.
+    /// Apply every change already queued.
     #[cfg(test)]
-    pub(crate) async fn follow_tick(
+    pub(crate) fn drain(
         &mut self,
         changes: &mut tokio::sync::mpsc::UnboundedReceiver<DepthChange>,
     ) {
-        loop {
-            let change = changes.recv().await.expect("the matcher is running");
+        while let Ok(change) = changes.try_recv() {
             self.apply(change);
-            if matches!(change, DepthChange::Tick { .. }) {
-                return;
-            }
         }
     }
 }
@@ -575,27 +555,20 @@ mod tests {
         depth.apply(added(4, 2, 100)); // 2 B per A
         depth.apply(added(2, 1, 50)); // the same rate
         depth.apply(added(1, 1, 7)); // better
-        depth.apply(DepthChange::Tick {
-            accepting_orders: true,
-            at: 9,
-        });
-        let book = depth.snapshot();
-        let levels: Vec<_> = book.levels[&pair]
+        let levels: Vec<_> = depth.snapshot()[&pair]
             .iter()
             .map(|level| (level.rate.requested, level.rate.offered, level.volume))
             .collect();
         assert_eq!(levels, [(1, 1, 7), (4, 2, 150)]);
-        assert!(book.accepting_orders);
-        assert_eq!(book.as_of, 9);
 
         depth.apply(removed(4, 2, 100));
-        assert_eq!(depth.snapshot().levels[&pair][1].volume, 50);
+        assert_eq!(depth.snapshot()[&pair][1].volume, 50);
         depth.apply(removed(2, 1, 50));
         depth.apply(removed(1, 1, 7));
-        assert!(depth.snapshot().levels.is_empty());
+        assert!(depth.snapshot().is_empty());
         // A change for a level the mirror never saw changes nothing.
         depth.apply(removed(3, 1, 5));
-        assert!(depth.snapshot().levels.is_empty());
+        assert!(depth.snapshot().is_empty());
     }
 
     // ── quote ─────────────────────────────────────────────────────────────

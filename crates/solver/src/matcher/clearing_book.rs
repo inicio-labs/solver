@@ -9,7 +9,7 @@ use crate::clearing::{
 };
 use crate::maker::{CutoffScope, MakerId, MakerUpdate};
 use crate::swap_eta::DepthChange;
-use crate::types::{now_unix, BookOrder, BookUpdate, TokenId};
+use crate::types::{BookOrder, BookUpdate, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
@@ -43,15 +43,6 @@ impl ClearingBook {
         if let Some(depth) = &self.depth {
             let _ = depth.send(change);
         }
-    }
-
-    /// Tell the depth mirror a tick finished, and whether the executor took
-    /// batches on it.
-    pub(super) fn end_tick(&self, accepting_orders: bool) {
-        self.send_depth(DepthChange::Tick {
-            accepting_orders,
-            at: now_unix(),
-        });
     }
 
     /// Expiry gates new selection only. Already selected proofs/settlements
@@ -482,7 +473,7 @@ mod tests {
             flat.sort_by_key(|(pair, rate, _)| (pair.0.to_hex(), *rate));
             flat
         };
-        assert_eq!(flat(depth.snapshot().levels), flat(book.levels()));
+        assert_eq!(flat(depth.snapshot()), flat(book.levels()));
     }
 
     #[test]
@@ -499,7 +490,7 @@ mod tests {
             book.insert(order).unwrap();
         }
         assert_mirrors(&book, &mut depth, &mut changes);
-        assert_eq!(depth.snapshot().levels.len(), 2);
+        assert_eq!(depth.snapshot().len(), 2);
 
         book.deactivate(first.id());
         assert_mirrors(&book, &mut depth, &mut changes);
@@ -515,7 +506,7 @@ mod tests {
             book.remove(order.id());
         }
         assert_mirrors(&book, &mut depth, &mut changes);
-        assert!(depth.snapshot().levels.is_empty());
+        assert!(depth.snapshot().is_empty());
     }
 
     #[test]
@@ -711,19 +702,18 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        depth.follow_tick(&mut depth_rx).await;
+        // Time is paused and the matcher ticks on whole seconds: half a
+        // second in, the tick at 0 s has finished.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        depth.drain(&mut depth_rx);
         assert!(
             exec_rx.try_recv().is_err(),
             "the cancelled quote never reached clearing"
         );
-        assert_eq!(
-            depth.snapshot().levels.len(),
-            1,
-            "only the buyer's side is left"
-        );
+        assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
-        tokio::time::advance(Duration::from_secs(1)).await;
-        depth.follow_tick(&mut depth_rx).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        depth.drain(&mut depth_rx);
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();
@@ -806,7 +796,10 @@ mod tests {
         ));
         // The first tick cannot clear, so it must not bypass internal
         // matching by routing an order to an external DEX either.
-        depth.follow_tick(&mut depth_rx).await;
+        // Time is paused and the matcher ticks on whole seconds: half a
+        // second in, the tick at 0 s has finished.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        depth.drain(&mut depth_rx);
         assert!(route_rx.try_recv().is_err());
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
@@ -867,10 +860,16 @@ mod tests {
             cancel.clone(),
         ));
 
-        depth.follow_tick(&mut depth_rx).await;
+        // Time is paused and the matcher ticks on whole seconds: half a
+
+        // second in, the tick at 0 s has finished.
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        depth.drain(&mut depth_rx);
         assert!(route_rx.try_recv().is_err());
         assert_eq!(
-            depth.snapshot().levels.len(),
+            depth.snapshot().len(),
             2,
             "orders stay live on a skipped tick"
         );
@@ -1310,19 +1309,18 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        depth.follow_tick(&mut depth_rx).await;
+        // Time is paused and the matcher ticks on whole seconds: half a
+        // second in, the tick at 0 s has finished.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        depth.drain(&mut depth_rx);
         assert!(
             exec_rx.try_recv().is_err(),
             "the expired quote never reached clearing"
         );
-        assert_eq!(
-            depth.snapshot().levels.len(),
-            1,
-            "only the buyer's side is left"
-        );
+        assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
-        tokio::time::advance(Duration::from_secs(1)).await;
-        depth.follow_tick(&mut depth_rx).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        depth.drain(&mut depth_rx);
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();

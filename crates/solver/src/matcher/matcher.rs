@@ -107,15 +107,12 @@ pub(super) async fn run_worker(
                 // executor queue is full (busy, or verifying it can settle),
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
-                let accepting_orders = executor_accepting(&exec_tx)?;
-                if accepting_orders {
+                if executor_accepting(&exec_tx)? {
                     internal_clear(&mut book, &runtime, &exec_tx)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
                 }
-                // The price API mirrors the book's depth from its changes.
-                book.end_tick(accepting_orders);
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -502,8 +499,11 @@ mod tests {
                         cutoffs: Vec::new(),
                     })
                     .is_ok());
-                depth.follow_tick(&mut depth_rx).await;
-                assert_eq!(depth.snapshot().levels.len(), 4);
+                // Time is paused and the matcher ticks on whole seconds: half a
+                // second in, the tick at 0 s has finished.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                depth.drain(&mut depth_rx);
+                assert_eq!(depth.snapshot().len(), 4);
 
                 book_tx
                     .send(BookUpdate {
@@ -514,13 +514,14 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
-                tokio::time::advance(Duration::from_secs(1)).await;
-                depth.follow_tick(&mut depth_rx).await;
-                assert_eq!(depth.snapshot().levels.len(), 3);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                depth.drain(&mut depth_rx);
+                assert_eq!(depth.snapshot().len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
-                tokio::time::advance(Duration::from_secs(1)).await;
-                depth.follow_tick(&mut depth_rx).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                depth.drain(&mut depth_rx);
                 assert_eq!(exec_rx.try_recv().unwrap().filled_notes.len(), 2);
                 worker.abort();
                 assert!(worker.await.unwrap_err().is_cancelled());

@@ -107,7 +107,7 @@ book.
   "feePpm": 1000, "feeAmount": "2500000",
   "marketPrice": "2500", "fillPrice": "2497.5",
   "suggestedPrice": "2492.505", "suggestedRequestedAmount": "2492505000",
-  "acceptingOrders": true, "asOf": 1791470000,
+  "acceptingOrders": true,
   "canFill": true, "offMarket": false,
   "estimatedSeconds": 14, "median24hSeconds": 11
 }
@@ -128,8 +128,7 @@ whole offered token. Optional fields are `null`, never omitted.
 | `marketPrice` | the Binance mid |
 | `fillPrice` | the mid after the fee: the best price that fills now |
 | `suggestedPrice`, `suggestedRequestedAmount` | the fill price less `swap_suggest_buffer_bps` (default 0.2%), and the amount to request at it, so the order still fills after a small move. Use it as is; do not apply slippage on top |
-| `acceptingOrders` | `false` while the solver cannot settle (busy or recovering): orders wait |
-| `asOf` | unix secs of the book the quote used |
+| `acceptingOrders` | `false` while the solver cannot settle (it is recovering from missing fee funds, or the node or database being down): orders wait |
 | `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
 | `canFill`, `offMarket` | kept for older wallets: `at_market` and `full`; `priceBand == off_market` |

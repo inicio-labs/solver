@@ -361,8 +361,9 @@ bound to `127.0.0.1` by default (`price_query_bind`).
 ```bash
 GET /v1/price/{faucet_id}?precision=&allow_stale=
 GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, … }
-GET /v1/pair-price?offered_faucet=&requested_faucet=
-GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
+GET /v2/pair-price?offered_faucet=&requested_faucet=
+GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
+GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=   # frozen
 ```
 ```jsonc
 // GET /v1/price/0x8fe0…?precision=4
@@ -382,16 +383,18 @@ GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amo
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   **once, when a token is registered** (config tokens at boot, admin-added tokens
   via the subscribe relay), then cached — never re-polled.
-- `/v1/pair-price` gives a pair's clearing price (mid and mid after the fee)
-  to build an ask from; `/v1/swap-eta` judges that exact order the way the
+- `/v2/pair-price` gives a pair's clearing price (mid and mid after the fee)
+  to build an ask from; `/v2/swap-eta` judges that exact order the way the
   matcher would clear it now: price band (`at_market` / `tolerated` /
   `off_market`), fill status (`full` / `partial` / `none` with a reason),
   fillable and available amounts, under the same TTL and fee as the matcher
   (see `docs/price-api.md`).
+- `/v1/swap-eta` is the original check (top of book, raw mid), frozen for
+  wallets built against it.
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).
-- Versioned under `/v1` so a future model lands as `/v2` without breaking clients.
+- Versioned: the swap model lives under `/v2`; `/v1` keeps answering as it always has, so existing clients do not break.
 - See the `[engine]` price-query knobs in `solver.toml.example`.
 
 ---

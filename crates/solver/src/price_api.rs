@@ -1,7 +1,8 @@
 //! Public, read-only **price-query HTTP API** for swap UIs: a token's price by
 //! faucet id (`/v1/price`, `/v1/prices`), a pair's clearing price to build an
-//! ask from (`/v1/pair-price`), and what the matcher would do with an order the
-//! wallet is about to sign (`/v1/swap-eta`, see [`crate::swap_eta`]).
+//! ask from (`/v2/pair-price`), and what the matcher would do with an order the
+//! wallet is about to sign (`/v2/swap-eta`, see [`crate::swap_eta`]).
+//! `/v1/swap-eta` keeps its original answers for wallets built against it.
 //!
 //! ISOLATION (P0): this is a public, unauthenticated surface, so it runs on its
 //! OWN OS thread + multi-thread runtime. It never touches the `!Send` miden
@@ -44,8 +45,8 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    fill_price, quote, DepthBook, DepthChange, FillStatus, NoFillReason, PriceBand, QuoteOrder,
-    QuoteTerms, SettlementStats,
+    eval_can_fill, eval_off_market, fill_price, quote, DepthBook, DepthChange, FillStatus,
+    NoFillReason, PriceBand, QuoteOrder, QuoteTerms, SettlementStats,
 };
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -70,7 +71,8 @@ pub struct PriceApiConfig {
     /// Estimated block time (ms) — a term of the ETA.
     pub swap_block_ms: u64,
     /// How far (bps) the price may still have to move an order's way for
-    /// `/v1/swap-eta` to call it `tolerated` rather than `off_market`.
+    /// `/v2/swap-eta` to call it `tolerated` rather than `off_market` (and
+    /// `/v1/swap-eta`'s slack before `offMarket` against the raw mid).
     pub swap_offmarket_tol_bps: u64,
     /// The matcher's clearing fee, so quotes apply the same rule.
     pub clearing_fee_ppm: u32,
@@ -348,7 +350,7 @@ struct PairPriceResponse {
     as_of: i64,
 }
 
-/// Response for `GET /v1/swap-eta`: what the matcher would do with the order
+/// Response for `GET /v2/swap-eta`: what the matcher would do with the order
 /// now (see [`crate::swap_eta::quote`]), plus time estimates. Amounts are base
 /// units, prices whole requested tokens per whole offered token. Optional
 /// fields serialise as `null` (stable shape for the wallet), never omitted.
@@ -380,16 +382,11 @@ struct SwapEtaResponse {
     /// The Binance mid.
     market_price: Option<String>,
     /// The best price an ask can name and still fill now, as on
-    /// `/v1/pair-price`.
+    /// `/v2/pair-price`.
     fill_price: Option<String>,
     /// Whether the solver is settling: `false` before its executor starts and
     /// while it is in verification mode (no fee headroom, node or database down).
     accepting_orders: bool,
-    /// Fills fully now: at the market price, and the solver is settling
-    /// (kept for older wallets).
-    can_fill: bool,
-    /// `price_band == off_market` (kept for older wallets).
-    off_market: Option<bool>,
     /// Next-batch ETA (secs) for an order the book fills at the market price
     /// while the solver is settling; otherwise `null`.
     estimated_seconds: Option<u64>,
@@ -561,18 +558,104 @@ async fn get_swap_eta(
         market_price: market.map(price),
         fill_price: fill.map(price),
         accepting_orders: settling,
-        can_fill: fills_now && status == FillStatus::Full,
-        off_market: band.map(|band| band == PriceBand::OffMarket),
         estimated_seconds: (fills_now && status != FillStatus::None).then_some(state.swap_eta_secs),
         median24h_seconds,
     });
-    // Don't let the router-level `max-age` layer cache this: the quote comes
-    // from independently-updated snapshots, so a shared max-age would serve a
-    // stale fill. `no-store` wins because the layer is `if_not_present`.
-    Ok((
+    Ok(no_store(body))
+}
+
+/// Don't let the router-level `max-age` layer cache a swap answer: it comes
+/// from independently-updated snapshots, so a shared max-age would serve a
+/// stale fill. `no-store` wins because the layer is `if_not_present`.
+fn no_store(body: impl IntoResponse) -> impl IntoResponse {
+    (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         body,
-    ))
+    )
+}
+
+// ── v1 swap-eta (frozen) ─────────────────────────────────────────────────────
+
+/// Response for `GET /v1/swap-eta`, frozen for wallets built against it (new
+/// wallets use `/v2/swap-eta`). Two independent liquidity signals — the live
+/// book (`can_fill` + `estimated_seconds`) and the Binance midpoint
+/// (`off_market` + `market_price`) — plus the historical in-memory median. All
+/// optional fields serialise as `null` (stable shape for the wallet), never
+/// omitted.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapEtaV1Response {
+    offered_faucet: String,
+    requested_faucet: String,
+    offered_amount: String,
+    requested_amount: String,
+    /// Book: crosses the best opposite-pair rate AND that level has the depth.
+    can_fill: bool,
+    /// Market: order priced worse than the Binance mid (why it won't fill).
+    /// `null` if the pair has no fresh market price.
+    off_market: Option<bool>,
+    /// Next-batch ETA (secs); `null` when `can_fill` is false.
+    estimated_seconds: Option<u64>,
+    /// Binance mid in whole requested tokens per whole offered token, at the
+    /// clearing freshness rule; `null` if unpriced.
+    market_price: Option<String>,
+    /// In-memory rolling per-pair median settlement secs; `null` when no samples.
+    median24h_seconds: Option<u64>,
+}
+
+/// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=`
+///
+/// Given a prospective order (offer A / request B, raw base-unit amounts), report
+/// whether it can fill in the next batch against the top of the live book, the
+/// market price verdict, and the in-memory 24h median settlement time for the
+/// pair.
+async fn get_swap_eta_v1(
+    State(state): State<PriceApiState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (a, b) = pair_ids(&q)?;
+    let offered_amount = required_amount(&q, "offered_amount")?;
+    let requested_amount = required_amount(&q, "requested_amount")?;
+    let (d_a, d_b) = registered_decimals(&state, a, b).await?;
+
+    // Book check — the incoming order (offer A, request B) crosses against the
+    // top of the OPPOSITE pair (offer B, request A).
+    let best = state
+        .book_rx
+        .borrow()
+        .get(&(b, a))
+        .and_then(|levels| levels.first().copied());
+    let can_fill = eval_can_fill(offered_amount, requested_amount, best);
+    let estimated_seconds = can_fill.then_some(state.swap_eta_secs);
+
+    // Market check (advisory; independent of the book): the clearing pair's
+    // Binance mid under the same freshness rule the matcher uses.
+    let snapshot = state.prices.borrow().clone();
+    let market = snapshot.market_price(a, b, Instant::now()).ok();
+    let (off_market, market_price) = eval_off_market(
+        offered_amount,
+        d_a,
+        requested_amount,
+        d_b,
+        market,
+        state.quote_terms.tolerance_bps,
+    );
+
+    // Median — same direction (A → B) the note settles as; purely in-memory.
+    let now = now_secs().max(0) as u64;
+    let median24h_seconds = state.stats_rx.borrow().median_secs((a, b), now);
+
+    Ok(no_store(Json(SwapEtaV1Response {
+        offered_faucet: a.to_hex(),
+        requested_faucet: b.to_hex(),
+        offered_amount: offered_amount.to_string(),
+        requested_amount: requested_amount.to_string(),
+        can_fill,
+        off_market,
+        estimated_seconds,
+        market_price,
+        median24h_seconds,
+    })))
 }
 
 /// How often the depth mirror republishes the book for the quote handlers.
@@ -621,6 +704,10 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     let v1 = Router::new()
         .route("/price/{faucet_id}", get(get_price))
         .route("/prices", get(get_prices))
+        // Frozen for wallets built against it; new wallets use /v2.
+        .route("/swap-eta", get(get_swap_eta_v1))
+        .with_state(state.clone());
+    let v2 = Router::new()
         .route("/pair-price", get(get_pair_price))
         .route("/swap-eta", get(get_swap_eta))
         .with_state(state);
@@ -634,6 +721,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
 
     Router::new()
         .nest("/v1", v1)
+        .nest("/v2", v2)
         // Outer protections (applied to all routes):
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,

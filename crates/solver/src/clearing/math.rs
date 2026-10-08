@@ -123,6 +123,21 @@ impl BatchPrice {
         }
     }
 
+    /// Whether `requested` quote units are worth more than `offered` base
+    /// units at this price, by more than `tolerance_bps`:
+    /// `requested > offered × price × (1 + tolerance_bps / 10_000)`, exactly.
+    pub(crate) fn exceeds(
+        self,
+        offered: u64,
+        requested: u64,
+        tolerance_bps: u64,
+    ) -> Result<bool, ClearingError> {
+        let requested = checked_mul(checked_mul(requested, self.base_units)?, 10_000u32)?;
+        let tolerance = U256::from(10_000u64) + U256::from(tolerance_bps);
+        let offered = checked_mul(checked_mul(offered, self.quote_units)?, tolerance)?;
+        Ok(requested > offered)
+    }
+
     pub(crate) fn quote_for_base_floor(self, base: U256) -> Result<U256, ClearingError> {
         mul_div_floor(base, self.quote_units, self.base_units)
     }

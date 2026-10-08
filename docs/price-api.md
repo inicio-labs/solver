@@ -4,9 +4,11 @@ Read-only HTTP API for swap UIs:
 
 - `/v1/price`, `/v1/prices`: a token's **price in USDT** (the exact Binance
   Spot midpoint of its `<ASSET>USDT` market) plus its **on-chain decimals**.
-- `/v1/pair-price`: a pair's clearing price, to build an order's ask from.
-- `/v1/swap-eta`: whether the order a wallet is about to sign fills now,
+- `/v2/pair-price`: a pair's clearing price, to build an order's ask from.
+- `/v2/swap-eta`: whether the order a wallet is about to sign fills now,
   partly, or not, and why.
+- `/v1/swap-eta`: the original swap check, frozen for wallets built against
+  it. New integrations use `/v2`.
 
 Field names are snake_case on `/v1/price(s)` and camelCase on the swap
 endpoints.
@@ -87,13 +89,13 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 
 ### Swapping: three steps for the wallet
 
-1. **Price.** `GET /v1/pair-price` gives the pair's `fillPrice`: the Binance
+1. **Price.** `GET /v2/pair-price` gives the pair's `fillPrice`: the Binance
    mid less the clearing fee, the best price an ask can name and still fill
    right now (rounded down, so an ask built from it never overshoots).
 2. **Ask.** The wallet builds the order with the user's slippage (BigInt or a
    decimal library, never floats):
    `requested_amount = floor(offered_amount × fillPrice × (1 − slippage) × 10^requestedDecimals / 10^offeredDecimals)`
-3. **Verdict.** `GET /v1/swap-eta` with both amounts says whether that exact
+3. **Verdict.** `GET /v2/swap-eta` with both amounts says whether that exact
    order fills now, partly, or not, and why. If it is off market, go back to
    step 1 for a fresh price.
 
@@ -118,7 +120,7 @@ Ask before the user signs. Once the order is in the book, asking again counts
 it as volume ahead of itself; an order-status endpoint for the "not filling
 soon, cancel?" prompt is planned.
 
-### `GET /v1/pair-price` — the price to build an ask from
+### `GET /v2/pair-price` — the price to build an ask from
 
 | Param | Meaning |
 |---|---|
@@ -147,7 +149,7 @@ It follows the solver's own freshness rule: `503` `no_market` when the pair
 has no clearing market, `503` `no_price` when its quote is missing, invalid
 or stale. `404` unknown faucet, `400` bad or equal faucet ids.
 
-### `GET /v1/swap-eta` — will this order fill?
+### `GET /v2/swap-eta` — will this order fill?
 
 What the solver would do **now** with the order the wallet is about to
 sign: where its price sits, how much of it the live book fills, and how long
@@ -175,7 +177,6 @@ the live book.
   "feePpm": 1000, "feeAmount": "2500000",
   "marketPrice": "2500", "fillPrice": "2497.5",
   "acceptingOrders": true,
-  "canFill": true, "offMarket": false,
   "estimatedSeconds": 14, "median24hSeconds": 11
 }
 ```
@@ -193,11 +194,10 @@ whole offered token. Optional fields are `null`, never omitted.
 | `availableOfferedAmount` | how much of the offered token the book takes now at this order's price, not capped by the order's size: "max you can swap now". `null` off market or without a price |
 | `expectedRequestedAmount` | what a **full** fill pays at today's price: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
 | `feePpm`, `feeAmount` | the clearing fee, and what it takes from a full fill at today's price (requested token). The fee only comes out of the surplus over the ask, so it is smaller, down to `0`, for an order that is not at market |
-| `marketPrice`, `fillPrice` | as in `/v1/pair-price`, for showing "the market is now X" |
+| `marketPrice`, `fillPrice` | as in `/v2/pair-price`, for showing "the market is now X" |
 | `acceptingOrders` | `false` while the solver cannot settle (it is recovering from missing fee funds, or the node or database being down): orders wait |
 | `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
-| `canFill`, `offMarket` | kept for older wallets: `at_market`, `full` and `acceptingOrders`; `priceBand == off_market` |
 
 Suggested wallet copy:
 
@@ -206,7 +206,7 @@ Suggested wallet copy:
 | `at_market` + `full` | no warning |
 | `at_market` + `partial` | "Only `fillableOfferedAmount` can fill now; the rest waits" |
 | `tolerated` | "May take longer: fills when the price moves slightly" |
-| `none` + `price` | "The price moved." Get a fresh `/v1/pair-price` and rebuild the ask |
+| `none` + `price` | "The price moved." Get a fresh `/v2/pair-price` and rebuild the ask |
 | `none` + `liquidity` | "Not enough orders at the current price right now" |
 | `none` + `no_market` | "This pair isn't traded" |
 | `none` + `no_price` | "Prices are unavailable right now; try again shortly" |
@@ -223,12 +223,24 @@ are equal), `bad_amount` (missing, zero or non-numeric amount, or amounts too
 large to price); `404` `unknown_faucet`. Without a price the answer is still
 `200`, with `reason` `no_market` or `no_price`.
 
-**Older wallets.** The response keeps every field older wallets read. Two
-meanings are stricter now: `canFill` is true only when the order fills fully
-at today's price while the solver is settling, and `offMarket` is measured
-from the mid less the fee. A wallet that asks exactly the mid, or the mid less
-a slippage smaller than the fee, now gets `tolerated` with `canFill: false`:
-such an order would not clear until the price moves.
+### `GET /v1/swap-eta` — the original check (frozen)
+
+Kept unchanged for wallets built against it; new integrations use
+`/v2/pair-price` and `/v2/swap-eta`. Same parameters (both amounts
+required); it answers:
+
+| Field | Meaning |
+|---|---|
+| `offeredFaucet`, `requestedFaucet`, `offeredAmount`, `requestedAmount` | the order, as asked |
+| `canFill` | the order's rate crosses the **best** opposite level's own rate, and that level holds at least `requestedAmount` |
+| `offMarket` | the order asks more than its offer is worth at the Binance mid by more than `swap_offmarket_tolerance_bps`; `null` without a fresh price |
+| `estimatedSeconds` | next-batch ETA when `canFill`; otherwise `null` |
+| `marketPrice` | the Binance mid; `null` without a fresh price |
+| `median24hSeconds` | the pair's median settlement time over the last 24 h |
+
+It looks at the top of the book only and ignores the clearing fee, so it can
+differ from what the solver does; `/v2/swap-eta` follows the solver's own
+rule.
 
 ### Status codes
 
@@ -292,7 +304,7 @@ const usdt = quoteValue(ibtc, 250000000); // 2.5 IBTC -> 25
 
 ## Notes
 
-- **Read-only, public, cached** (`Cache-Control: max-age=1`; `/v1/swap-eta` is `no-store`). Concurrency-limited; excess → `503`.
+- **Read-only, public, cached** (`Cache-Control: max-age=1`; both `swap-eta` versions are `no-store`). Concurrency-limited; excess → `503`.
 - `price` is per **whole token** (not per base unit) — combine with `decimals` as shown.
 - Prices come from Binance Spot `bookTicker` midpoints. On devnet the faucet tokens are priced by a mock Binance server, so the values in the table above are fixed test prices.
 - Endpoint accepts the **hex** faucet id today. (Bech32 `mdev…` acceptance can be added on request.)

@@ -1,5 +1,6 @@
-//! Swap pricing and quotes for the public `/v1/pair-price` and `/v1/swap-eta`
-//! endpoints. All pure/self-contained and unit-tested here:
+//! Swap pricing and quotes for the public `/v2/pair-price` and `/v2/swap-eta`
+//! endpoints, and the frozen `/v1/swap-eta` checks. All pure/self-contained
+//! and unit-tested here:
 //!  * [`SettlementStats`] — an **in-memory, ephemeral** rolling window of recent
 //!    settlement durations per directed pair (no DB storage). The executor owns
 //!    one, records into it on each successful settlement, and publishes it over a
@@ -25,6 +26,7 @@ use crate::clearing::{
     OrderSide, PPM_DENOMINATOR,
 };
 use crate::matching::types::{Amount, BookLevel, RateKey, SwapBookSnapshot};
+use crate::price::PricePrecision;
 use crate::types::{TokenId, UnixSecs};
 
 /// Retention window for settlement samples (24h).
@@ -459,6 +461,56 @@ fn to_u64(value: U256) -> Result<u64, ClearingError> {
     u64::try_from(value).map_err(|_| ClearingError::ArithmeticOverflow)
 }
 
+// ── v1 (frozen) ──────────────────────────────────────────────────────────────
+// `/v1/swap-eta` keeps its original answers for wallets built against it;
+// new wallets use `/v2` and [`quote`].
+
+/// Can an order offering `offered_a` of token A and requesting `requested_b` of
+/// token B fill against `best` — the top level of the **opposite** pair (B→A)?
+///
+/// Crossing is strict (`>`), mirroring
+/// [`crate::matching::types::Order::is_profitable_with`]; additionally the top
+/// level must hold enough volume (`best.volume >= requested_b`).
+pub(crate) fn eval_can_fill(offered_a: u64, requested_b: u64, best: Option<BookLevel>) -> bool {
+    let Some(best) = best else {
+        return false;
+    };
+    // Cross iff  offered_a * best.offered  >  requested_b * best.requested.
+    let cross = (offered_a as u128) * (best.rate.offered as u128)
+        > (requested_b as u128) * (best.rate.requested as u128);
+    cross && best.volume >= requested_b
+}
+
+/// Is the order priced worse than the market (off-market)?
+///
+/// `market` is the pair's Binance midpoint in whole B per whole A. Returns
+/// `(off_market, market_price)`. `off_market = Some(true)` when the order asks
+/// for more B than its A is worth at `market`, by more than `tol_bps`.
+/// `off_market` is `None` without a market price or either token's decimals;
+/// `market_price` (B per A, exact up to 18 decimal places, like the price
+/// API's `full` precision) is present whenever `market` is.
+pub(crate) fn eval_off_market(
+    offered_a: u64,
+    d_a: Option<u8>,
+    requested_b: u64,
+    d_b: Option<u8>,
+    market: Option<Decimal>,
+    tol_bps: u64,
+) -> (Option<bool>, Option<String>) {
+    let Some(market) = market else {
+        return (None, None);
+    };
+    let market_price = Some(PricePrecision::Full.format(market));
+    let (Some(d_a), Some(d_b)) = (d_a, d_b) else {
+        return (None, market_price);
+    };
+    // On overflow → unknown (conservative).
+    let off = BatchPrice::from_whole_price(market, d_a, d_b)
+        .and_then(|price| price.exceeds(offered_a, requested_b, tol_bps))
+        .ok();
+    (off, market_price)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,5 +824,93 @@ mod tests {
         assert_eq!(fill, Decimal::new(24975, 1));
         let fill = fill_price(OrderSide::BuyBase, Decimal::TWO, 1_000).unwrap();
         assert_eq!(fill.to_string(), "1.998001998001998001");
+    }
+
+    // ── v1: eval_can_fill ─────────────────────────────────────────────────────
+    #[test]
+    fn can_fill_crosses_with_enough_volume() {
+        // user offers 100 A, wants 200 B; opposite best offers 300 B for 100 A.
+        // cross: 100*300 > 200*100 → 30000 > 20000 ✓. volume 300 >= 200 ✓.
+        assert!(eval_can_fill(100, 200, Some(level(100, 300, 300))));
+    }
+
+    #[test]
+    fn can_fill_crosses_but_thin_volume() {
+        // Same rate cross, but only 50 B available < 200 requested → not fillable.
+        assert!(!eval_can_fill(100, 200, Some(level(100, 300, 50))));
+    }
+
+    #[test]
+    fn can_fill_no_cross() {
+        // Opposite best gives only 1.5 B per A (offers 150 B for 100 A); user wants
+        // 2 B per A → 100*150 > 200*100? 15000 > 20000? no → doesn't cross.
+        assert!(!eval_can_fill(100, 200, Some(level(100, 150, 1000))));
+    }
+
+    #[test]
+    fn can_fill_no_book_entry() {
+        assert!(!eval_can_fill(100, 200, None));
+    }
+
+    // ── eval_off_market (asymmetric decimals) ─────────────────────────────
+    // 1 A (8 decimals) = 2 B (6 decimals) at the market midpoint.
+    fn market_two() -> Option<Decimal> {
+        Some(Decimal::TWO)
+    }
+
+    #[test]
+    fn off_market_fair_note_is_false() {
+        // offer 1 A (1e8), request 2 B (2e6): exactly the market.
+        let (off, mkt) =
+            eval_off_market(100_000_000, Some(8), 2_000_000, Some(6), market_two(), 50);
+        assert_eq!(off, Some(false));
+        assert_eq!(mkt.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn off_market_greedy_note_is_true() {
+        // offer 1 A, request 4 B → asks twice the market → off-market.
+        let (off, mkt) =
+            eval_off_market(100_000_000, Some(8), 4_000_000, Some(6), market_two(), 50);
+        assert_eq!(off, Some(true));
+        assert_eq!(mkt.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn off_market_tolerance_is_exact() {
+        // 2.01 B for 1 A is exactly 50 bps above the market: still within.
+        let (off, _) = eval_off_market(100_000_000, Some(8), 2_010_000, Some(6), market_two(), 50);
+        assert_eq!(off, Some(false));
+        let (off, _) = eval_off_market(100_000_000, Some(8), 2_010_001, Some(6), market_two(), 50);
+        assert_eq!(off, Some(true));
+    }
+
+    #[test]
+    fn off_market_generous_note_is_false() {
+        // offer 1 A, request 1 B → gives more than it asks.
+        let (off, _) = eval_off_market(100_000_000, Some(8), 1_000_000, Some(6), market_two(), 50);
+        assert_eq!(off, Some(false));
+    }
+
+    #[test]
+    fn off_market_unpriced_is_none() {
+        let (off, mkt) = eval_off_market(1, Some(8), 1, Some(6), None, 50);
+        assert_eq!(off, None);
+        assert_eq!(mkt, None);
+    }
+
+    #[test]
+    fn off_market_missing_decimals_keeps_market_price() {
+        // Market known, decimals unknown → flag unknown but market price present.
+        let (off, mkt) = eval_off_market(1, None, 1, Some(6), market_two(), 50);
+        assert_eq!(off, None);
+        assert_eq!(mkt.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn market_price_is_rounded_to_eighteen_places() {
+        let third = Some(Decimal::ONE / Decimal::from(3));
+        let (_, mkt) = eval_off_market(1, Some(0), 1, Some(0), third, 0);
+        assert_eq!(mkt.as_deref(), Some("0.333333333333333333"));
     }
 }

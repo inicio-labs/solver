@@ -217,7 +217,7 @@ pub struct EngineConfig {
     #[serde(default = "default_price_precision")]
     pub price_precision: String,
 
-    // ── Swap time-estimation API (`/v1/swap-eta`) ─────────────────────────────
+    // ── Swap quote API (`/v2/swap-eta`, and the frozen `/v1/swap-eta`) ────────
     /// Estimated proof-generation time (ms) for a settlement tx — a term of the
     /// next-batch ETA. Calibrate to the deployment's prover. Default 2000.
     #[serde(default = "default_swap_proving_estimate_ms")]
@@ -226,7 +226,8 @@ pub struct EngineConfig {
     #[serde(default = "default_swap_block_time_ms")]
     pub swap_block_time_ms: u64,
     /// How far (bps) the price may still have to move an order's way for
-    /// `/v1/swap-eta` to call it `tolerated`; further is `off_market`.
+    /// `/v2/swap-eta` to call it `tolerated`; further is `off_market`. Also
+    /// `/v1/swap-eta`'s slack before `offMarket` against the raw mid.
     /// Default 50 (0.5%).
     #[serde(default = "default_swap_offmarket_tolerance_bps")]
     pub swap_offmarket_tolerance_bps: u64,

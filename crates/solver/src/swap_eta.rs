@@ -5,11 +5,14 @@
 //!    settlement durations per directed pair (no DB storage). The executor owns
 //!    one, records into it on each successful settlement, and publishes it over a
 //!    `watch` channel; the price-API thread reads it to compute a 24h median.
+//!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
+//!    built from the [`DepthChange`]s the matcher sends as orders enter and
+//!    leave its book, so no depth work runs on the matcher.
 //!  * [`quote`] — what the matcher would do with a prospective order now: where
 //!    its price sits against the clearing price, how much of it the live book
 //!    can fill, and the price we suggest instead.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{btree_map, BTreeMap, HashMap, VecDeque};
 
 use ruint::aliases::U256;
 use rust_decimal::Decimal;
@@ -19,7 +22,7 @@ use crate::clearing::{
     checked_mul, eligible_units, mul_div_ceil, mul_div_floor, ppm_floor, BatchPrice, ClearingError,
     OrderSide, PPM_DENOMINATOR,
 };
-use crate::matching::types::{BookLevel, RateKey};
+use crate::matching::types::{Amount, BookLevel, RateKey, SwapBookSnapshot};
 use crate::types::{TokenId, UnixSecs};
 
 /// Retention window for settlement samples (24h).
@@ -99,6 +102,110 @@ pub fn median_of(v: &mut [u64]) -> Option<u64> {
         // u128 to avoid overflow on the sum of two large durations.
         ((v[n / 2 - 1] as u128 + v[n / 2] as u128) / 2) as u64
     })
+}
+
+/// One change to the matcher's active book, sent as it happens.
+#[derive(Clone, Copy, Debug)]
+pub enum DepthChange {
+    /// An order entered the active book of directed `pair` at `rate`.
+    Added {
+        pair: (TokenId, TokenId),
+        rate: RateKey,
+        volume: Amount,
+    },
+    /// An order left it.
+    Removed {
+        pair: (TokenId, TokenId),
+        rate: RateKey,
+        volume: Amount,
+    },
+    /// The matcher finished a tick.
+    Tick {
+        accepting_orders: bool,
+        at: UnixSecs,
+    },
+}
+
+/// The matcher's resting levels, rebuilt from its [`DepthChange`]s on the
+/// price API's thread.
+#[derive(Debug, Default)]
+pub struct DepthBook {
+    levels: HashMap<(TokenId, TokenId), BTreeMap<RateKey, u128>>,
+    accepting_orders: bool,
+    as_of: UnixSecs,
+}
+
+impl DepthBook {
+    pub fn apply(&mut self, change: DepthChange) {
+        match change {
+            DepthChange::Added { pair, rate, volume } => {
+                *self
+                    .levels
+                    .entry(pair)
+                    .or_default()
+                    .entry(rate)
+                    .or_default() += u128::from(volume);
+            }
+            DepthChange::Removed { pair, rate, volume } => {
+                let Some(levels) = self.levels.get_mut(&pair) else {
+                    return;
+                };
+                if let btree_map::Entry::Occupied(mut level) = levels.entry(rate) {
+                    *level.get_mut() = level.get().saturating_sub(u128::from(volume));
+                    if *level.get() == 0 {
+                        level.remove();
+                    }
+                }
+                if levels.is_empty() {
+                    self.levels.remove(&pair);
+                }
+            }
+            DepthChange::Tick {
+                accepting_orders,
+                at,
+            } => {
+                self.accepting_orders = accepting_orders;
+                self.as_of = at;
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> SwapBookSnapshot {
+        let levels = self
+            .levels
+            .iter()
+            .map(|(&pair, levels)| {
+                let levels = levels
+                    .iter()
+                    .map(|(&rate, &volume)| BookLevel {
+                        rate,
+                        volume: Amount::try_from(volume).unwrap_or(Amount::MAX),
+                    })
+                    .collect();
+                (pair, levels)
+            })
+            .collect();
+        SwapBookSnapshot {
+            levels,
+            accepting_orders: self.accepting_orders,
+            as_of: self.as_of,
+        }
+    }
+
+    /// Apply `changes` up to and including the matcher's next tick.
+    #[cfg(test)]
+    pub(crate) async fn follow_tick(
+        &mut self,
+        changes: &mut tokio::sync::mpsc::UnboundedReceiver<DepthChange>,
+    ) {
+        loop {
+            let change = changes.recv().await.expect("the matcher is running");
+            self.apply(change);
+            if matches!(change, DepthChange::Tick { .. }) {
+                return;
+            }
+        }
+    }
 }
 
 /// Basis points in one.
@@ -448,6 +555,47 @@ mod tests {
         let now = 100 + WINDOW_SECS + 10;
         s.record(pair, now, 50); // fresh — this record() call prunes the old one
         assert_eq!(s.median_secs(pair, now), Some(50));
+    }
+
+    // ── DepthBook ─────────────────────────────────────────────────────────
+    #[test]
+    fn depth_book_merges_equal_rates_and_drops_empty_levels() {
+        let pair = (tok_a(), tok_b());
+        let added = |requested, offered, volume| DepthChange::Added {
+            pair,
+            rate: RateKey::new(requested, offered),
+            volume,
+        };
+        let removed = |requested, offered, volume| DepthChange::Removed {
+            pair,
+            rate: RateKey::new(requested, offered),
+            volume,
+        };
+        let mut depth = DepthBook::default();
+        depth.apply(added(4, 2, 100)); // 2 B per A
+        depth.apply(added(2, 1, 50)); // the same rate
+        depth.apply(added(1, 1, 7)); // better
+        depth.apply(DepthChange::Tick {
+            accepting_orders: true,
+            at: 9,
+        });
+        let book = depth.snapshot();
+        let levels: Vec<_> = book.levels[&pair]
+            .iter()
+            .map(|level| (level.rate.requested, level.rate.offered, level.volume))
+            .collect();
+        assert_eq!(levels, [(1, 1, 7), (4, 2, 150)]);
+        assert!(book.accepting_orders);
+        assert_eq!(book.as_of, 9);
+
+        depth.apply(removed(4, 2, 100));
+        assert_eq!(depth.snapshot().levels[&pair][1].volume, 50);
+        depth.apply(removed(2, 1, 50));
+        depth.apply(removed(1, 1, 7));
+        assert!(depth.snapshot().levels.is_empty());
+        // A change for a level the mirror never saw changes nothing.
+        depth.apply(removed(3, 1, 5));
+        assert!(depth.snapshot().levels.is_empty());
     }
 
     // ── quote ─────────────────────────────────────────────────────────────

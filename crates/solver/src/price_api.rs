@@ -29,7 +29,7 @@ use miden_protocol::account::AccountId;
 use miden_protocol::crypto::utils::Serializable;
 use serde::Serialize;
 use serde_json::json;
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -41,8 +41,8 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    fill_price, quote, suggested_price, FillStatus, NoFillReason, PriceBand, QuoteOrder,
-    QuoteTerms, SettlementStats,
+    fill_price, quote, suggested_price, DepthBook, DepthChange, FillStatus, NoFillReason,
+    PriceBand, QuoteOrder, QuoteTerms, SettlementStats,
 };
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -84,7 +84,7 @@ pub struct PriceApiState {
     default_precision: PricePrecision,
     max_batch: usize,
     // ── swap-eta ──
-    /// The matcher's resting levels, published each tick (read lock-free).
+    /// The matcher's resting levels, from [`mirror_depth`] (read lock-free).
     swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
     /// In-memory settlement-time window from the executor.
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
@@ -509,6 +509,27 @@ async fn get_swap_eta(
     ))
 }
 
+/// How often the depth mirror republishes the book for the quote handlers.
+const DEPTH_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Mirror the matcher's book depth from its changes and publish it for the
+/// quote handlers, at most every [`DEPTH_PUBLISH_INTERVAL`]. Runs on this
+/// thread: the matcher only sends the changes its index already made.
+async fn mirror_depth(
+    mut changes: mpsc::UnboundedReceiver<DepthChange>,
+    book_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+) {
+    let mut depth = DepthBook::default();
+    while let Some(change) = changes.recv().await {
+        depth.apply(change);
+        while let Ok(change) = changes.try_recv() {
+            depth.apply(change);
+        }
+        book_tx.send_replace(Arc::new(depth.snapshot()));
+        tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
+    }
+}
+
 /// Concurrency limiter: acquire a permit per request, shed with `503` if none.
 async fn concurrency_guard(
     State(sem): State<Arc<Semaphore>>,
@@ -570,7 +591,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
 pub fn spawn_price_api_thread(
     cfg: PriceApiConfig,
     prices: watch::Receiver<Arc<PriceSnapshot>>,
-    swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    depth_rx: mpsc::UnboundedReceiver<DepthChange>,
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pool: DbPool,
     cancel: CancellationToken,
@@ -590,6 +611,8 @@ pub fn spawn_price_api_thread(
                 }
             };
             rt.block_on(async move {
+                let (book_tx, swap_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+                tokio::spawn(mirror_depth(depth_rx, book_tx));
                 let default_precision =
                     PricePrecision::parse(&cfg.precision).unwrap_or(PricePrecision::Full);
                 let swap_eta_secs = (cfg.swap_sync_ms

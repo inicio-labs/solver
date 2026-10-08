@@ -8,8 +8,8 @@ use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
 use crate::maker::{CutoffScope, MakerId, MakerUpdate};
-use crate::matching::types::BookLevel;
-use crate::types::{BookOrder, BookUpdate, TokenId};
+use crate::swap_eta::DepthChange;
+use crate::types::{now_unix, BookOrder, BookUpdate, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
@@ -26,9 +26,34 @@ pub(crate) struct ClearingBook {
     orders: HashMap<NoteId, Order>,
     pairs: HashMap<(TokenId, TokenId), BTreeMap<OrderKey, NoteId>>,
     makers: MakerIndex,
+    /// Where index changes go for the price API's depth mirror. Sending never
+    /// blocks; a closed receiver is ignored.
+    depth: Option<mpsc::UnboundedSender<DepthChange>>,
 }
 
 impl ClearingBook {
+    pub(super) fn with_depth(depth: mpsc::UnboundedSender<DepthChange>) -> Self {
+        Self {
+            depth: Some(depth),
+            ..Self::default()
+        }
+    }
+
+    fn send_depth(&self, change: DepthChange) {
+        if let Some(depth) = &self.depth {
+            let _ = depth.send(change);
+        }
+    }
+
+    /// Tell the depth mirror a tick finished, and whether the executor took
+    /// batches on it.
+    pub(super) fn end_tick(&self, accepting_orders: bool) {
+        self.send_depth(DepthChange::Tick {
+            accepting_orders,
+            at: now_unix(),
+        });
+    }
+
     /// Expiry gates new selection only. Already selected proofs/settlements
     /// continue, and give-backs/remainders are checked again on their next tick.
     pub(super) fn remove_expired(&mut self, now_ms: u64, buffer_ms: u64) {
@@ -88,15 +113,30 @@ impl ClearingBook {
         }
     }
 
-    fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
+    fn remove_from_index(
+        &mut self,
+        pair: (TokenId, TokenId),
+        key: OrderKey,
+        id: NoteId,
+        volume: u64,
+    ) {
+        let mut removed = false;
         if let Some(index) = self.pairs.get_mut(&pair) {
             // A remainder can inherit this exact key. A stale parent event
             // must never remove the child's entry.
             if let btree_map::Entry::Occupied(entry) = index.entry(key) {
                 if *entry.get() == id {
                     entry.remove();
+                    removed = true;
                 }
             }
+        }
+        if removed {
+            self.send_depth(DepthChange::Removed {
+                pair,
+                rate: key.rate,
+                volume,
+            });
         }
     }
 
@@ -107,15 +147,21 @@ impl ClearingBook {
     }
 
     fn add_to_index(&mut self, id: NoteId) -> Result<(), ClearingError> {
-        let (pair, key) = self
+        let order = self
             .orders
             .get(&id)
-            .ok_or(ClearingError::InternalInvariant("missing order to index"))?
-            .index_key();
+            .ok_or(ClearingError::InternalInvariant("missing order to index"))?;
+        let (pair, key) = order.index_key();
+        let volume = order.offered_asset().amount().as_u64();
         let index = self.pairs.entry(pair).or_default();
         match index.entry(key) {
             btree_map::Entry::Vacant(entry) => {
                 entry.insert(id);
+                self.send_depth(DepthChange::Added {
+                    pair,
+                    rate: key.rate,
+                    volume,
+                });
             }
             btree_map::Entry::Occupied(entry) => {
                 if *entry.get() != id {
@@ -133,10 +179,11 @@ impl ClearingBook {
     pub fn deactivate(&mut self, id: NoteId) {
         if let Some(order) = self.orders.get_mut(&id) {
             let (pair, key) = order.index_key();
+            let volume = order.offered_asset().amount().as_u64();
             // The order record remains for recovery, but the active index must
             // no longer expose it to matching or RFQ.
             order.deactivate();
-            self.remove_from_index(pair, key, id);
+            self.remove_from_index(pair, key, id, volume);
         }
     }
 
@@ -222,7 +269,8 @@ impl ClearingBook {
         self.makers.forget(id);
         if let Some(order) = self.orders.remove(&id) {
             let (pair, key) = order.index_key();
-            self.remove_from_index(pair, key, id);
+            let volume = order.offered_asset().amount().as_u64();
+            self.remove_from_index(pair, key, id, volume);
         }
     }
 
@@ -277,9 +325,14 @@ impl ClearingBook {
         Ok(PairBatch::new(price, sell_orders, buy_orders))
     }
 
-    /// Every non-empty directed pair's levels, best first: the depth the
-    /// price API quotes swaps against.
-    pub(super) fn levels(&self) -> HashMap<(TokenId, TokenId), Vec<BookLevel>> {
+    /// Every non-empty directed pair's levels, best first, read straight from
+    /// the index: the reference the depth mirror must match.
+    #[cfg(test)]
+    pub(super) fn levels(
+        &self,
+    ) -> HashMap<(TokenId, TokenId), Vec<crate::matching::types::BookLevel>> {
+        use crate::matching::types::BookLevel;
+
         self.pairs
             .iter()
             .filter(|(_, index)| !index.is_empty())
@@ -312,7 +365,7 @@ mod tests {
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
     use crate::matcher::MatcherError;
-    use crate::matching::types::SwapBookSnapshot;
+    use crate::swap_eta::DepthBook;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -406,6 +459,63 @@ mod tests {
             crate::router::Routing::new(quotes_rx, route_tx, 10),
             route_rx,
         )
+    }
+
+    /// Drain `changes` into `depth`, then compare it with the index itself.
+    fn assert_mirrors(
+        book: &ClearingBook,
+        depth: &mut DepthBook,
+        changes: &mut mpsc::UnboundedReceiver<DepthChange>,
+    ) {
+        while let Ok(change) = changes.try_recv() {
+            depth.apply(change);
+        }
+        let flat = |levels: HashMap<(TokenId, TokenId), Vec<crate::matching::types::BookLevel>>| {
+            let mut flat: Vec<_> = levels
+                .into_iter()
+                .flat_map(|(pair, levels)| {
+                    levels
+                        .into_iter()
+                        .map(move |level| (pair, level.rate, level.volume))
+                })
+                .collect();
+            flat.sort_by_key(|(pair, rate, _)| (pair.0.to_hex(), *rate));
+            flat
+        };
+        assert_eq!(flat(depth.snapshot().levels), flat(book.levels()));
+    }
+
+    #[test]
+    fn depth_mirror_matches_the_index_through_every_change() {
+        let mut rng = RandomCoin::new(Word::default());
+        let (depth_tx, mut changes) = mpsc::unbounded_channel();
+        let mut book = ClearingBook::with_depth(depth_tx);
+        let mut depth = DepthBook::default();
+        let first = fixture(false, 10, 18, 1, &mut rng);
+        let same_rate = fixture(false, 20, 36, 2, &mut rng);
+        let worse = fixture(false, 5, 11, 3, &mut rng);
+        let buyer = fixture(true, 30, 10, 4, &mut rng);
+        for order in [&first, &same_rate, &worse, &buyer] {
+            book.insert(order).unwrap();
+        }
+        assert_mirrors(&book, &mut depth, &mut changes);
+        assert_eq!(depth.snapshot().levels.len(), 2);
+
+        book.deactivate(first.id());
+        assert_mirrors(&book, &mut depth, &mut changes);
+        book.reactivate(first.id()).unwrap();
+        // Indexing an already indexed order changes nothing.
+        book.insert(&worse).unwrap();
+        assert_mirrors(&book, &mut depth, &mut changes);
+        book.remove(same_rate.id());
+        book.remove(same_rate.id());
+        book.deactivate(same_rate.id());
+        assert_mirrors(&book, &mut depth, &mut changes);
+        for order in [&first, &worse, &buyer] {
+            book.remove(order.id());
+        }
+        assert_mirrors(&book, &mut depth, &mut changes);
+        assert!(depth.snapshot().levels.is_empty());
     }
 
     #[test]
@@ -590,29 +700,30 @@ mod tests {
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
+        let mut depth = DepthBook::default();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
             exec_tx,
             Duration::from_secs(1),
-            snapshot_tx,
+            depth_tx,
             runtime,
             cancel.clone(),
         ));
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(
             exec_rx.try_recv().is_err(),
             "the cancelled quote never reached clearing"
         );
         assert_eq!(
-            snapshot_rx.borrow().levels.len(),
+            depth.snapshot().levels.len(),
             1,
             "only the buyer's side is left"
         );
         // The ordered book stream remains open for subsequent updates.
         tokio::time::advance(Duration::from_secs(1)).await;
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();
@@ -682,19 +793,20 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
+        let mut depth = DepthBook::default();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
             exec_tx,
             Duration::from_secs(1),
-            snapshot_tx,
+            depth_tx,
             runtime,
             cancel.clone(),
         ));
         // The first tick cannot clear, so it must not bypass internal
         // matching by routing an order to an external DEX either.
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(route_rx.try_recv().is_err());
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
@@ -743,21 +855,22 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
+        let mut depth = DepthBook::default();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
             exec_tx,
             Duration::from_secs(1),
-            snapshot_tx,
+            depth_tx,
             runtime,
             cancel.clone(),
         ));
 
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(route_rx.try_recv().is_err());
         assert_eq!(
-            snapshot_rx.borrow().levels.len(),
+            depth.snapshot().levels.len(),
             2,
             "orders stay live on a skipped tick"
         );
@@ -801,16 +914,10 @@ mod tests {
             };
             let (_book_tx, book_rx) = mpsc::channel(1);
             let (exec_tx, _exec_rx) = mpsc::channel(1);
-            let (snapshot_tx, _) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+            let (depth_tx, _) = mpsc::unbounded_channel();
             let result = tokio::time::timeout(
                 Duration::from_secs(1),
-                run_worker(
-                    book_rx,
-                    exec_tx,
-                    Duration::from_secs(1),
-                    snapshot_tx,
-                    runtime,
-                ),
+                run_worker(book_rx, exec_tx, Duration::from_secs(1), depth_tx, runtime),
             )
             .await
             .expect("an invalid config must fail before waiting for bootstrap");
@@ -956,16 +1063,10 @@ mod tests {
         let (book_tx, book_rx) = mpsc::channel(1);
         drop(book_tx);
         let (exec_tx, _exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
-        let error = run_worker(
-            book_rx,
-            exec_tx,
-            Duration::from_secs(1),
-            snapshot_tx,
-            runtime,
-        )
-        .await
-        .unwrap_err();
+        let (depth_tx, _depth_rx) = mpsc::unbounded_channel();
+        let error = run_worker(book_rx, exec_tx, Duration::from_secs(1), depth_tx, runtime)
+            .await
+            .unwrap_err();
         assert!(matches!(error, MatcherError::IngestStopped), "{error:?}");
     }
 
@@ -1003,16 +1104,10 @@ mod tests {
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, _exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, _depth_rx) = mpsc::unbounded_channel();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            run_worker(
-                book_rx,
-                exec_tx,
-                Duration::from_secs(1),
-                snapshot_tx,
-                runtime,
-            ),
+            run_worker(book_rx, exec_tx, Duration::from_secs(1), depth_tx, runtime),
         )
         .await
         .expect("invalid config must not wait for bootstrap");
@@ -1046,13 +1141,13 @@ mod tests {
         let (book_tx, book_rx) = mpsc::channel(4);
         let (exec_tx, mut exec_rx) = mpsc::channel(4);
         let queued_batches = exec_tx.clone();
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, _depth_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
             exec_tx,
             Duration::from_millis(10),
-            snapshot_tx,
+            depth_tx,
             runtime,
             cancel.clone(),
         ));
@@ -1204,29 +1299,30 @@ mod tests {
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+        let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
+        let mut depth = DepthBook::default();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
             exec_tx,
             Duration::from_secs(1),
-            snapshot_tx,
+            depth_tx,
             runtime,
             cancel.clone(),
         ));
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(
             exec_rx.try_recv().is_err(),
             "the expired quote never reached clearing"
         );
         assert_eq!(
-            snapshot_rx.borrow().levels.len(),
+            depth.snapshot().levels.len(),
             1,
             "only the buyer's side is left"
         );
         // The ordered book stream remains open for subsequent updates.
         tokio::time::advance(Duration::from_secs(1)).await;
-        snapshot_rx.changed().await.unwrap();
+        depth.follow_tick(&mut depth_rx).await;
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();

@@ -142,29 +142,16 @@ impl Order {
     ) -> Result<Option<MatchOrder<'_>>, ClearingError> {
         let offered = self.offered_asset();
         let requested = self.requested_asset();
-        let (comparison_units, payment_units) = match side {
-            OrderSide::SellBase => (
-                checked_mul(price.quote_units, offered.amount().as_u64())?,
-                checked_mul(price.base_units, requested.amount().as_u64())?,
-            ),
-            OrderSide::BuyBase => (
-                checked_mul(price.base_units, offered.amount().as_u64())?,
-                checked_mul(price.quote_units, requested.amount().as_u64())?,
-            ),
-        };
-        let eligible = match side {
-            OrderSide::SellBase => {
-                checked_mul(payment_units, PPM_DENOMINATOR)?
-                    <= checked_mul(comparison_units, PPM_DENOMINATOR - fee_ppm)?
-            }
-            OrderSide::BuyBase => {
-                checked_mul(comparison_units, PPM_DENOMINATOR)?
-                    >= checked_mul(payment_units, PPM_DENOMINATOR + fee_ppm)?
-            }
-        };
-        if !eligible {
+        let Some((comparison_units, payment_units)) = eligible_units(
+            side,
+            price,
+            fee_ppm,
+            offered.amount().as_u64(),
+            requested.amount().as_u64(),
+        )?
+        else {
             return Ok(None);
-        }
+        };
 
         let fill_scale = FillScale::new(comparison_units, payment_units);
         let minimum_payment = self.pswap.storage().min_fill_step().min(requested.amount());
@@ -195,6 +182,49 @@ impl Order {
 pub(crate) enum OrderSide {
     SellBase,
     BuyBase,
+}
+
+impl OrderSide {
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            OrderSide::SellBase => OrderSide::BuyBase,
+            OrderSide::BuyBase => OrderSide::SellBase,
+        }
+    }
+}
+
+/// The `(comparison, payment)` units of an order offering `offered` for
+/// `requested` on `side`, when it is eligible to clear at `price` after the
+/// `fee_ppm` edge; `None` when it is not. The live book and the price API's
+/// swap quotes share this one rule.
+pub(crate) fn eligible_units(
+    side: OrderSide,
+    price: BatchPrice,
+    fee_ppm: u32,
+    offered: u64,
+    requested: u64,
+) -> Result<Option<(U256, U256)>, ClearingError> {
+    let (comparison_units, payment_units) = match side {
+        OrderSide::SellBase => (
+            checked_mul(price.quote_units, offered)?,
+            checked_mul(price.base_units, requested)?,
+        ),
+        OrderSide::BuyBase => (
+            checked_mul(price.base_units, offered)?,
+            checked_mul(price.quote_units, requested)?,
+        ),
+    };
+    let eligible = match side {
+        OrderSide::SellBase => {
+            checked_mul(payment_units, PPM_DENOMINATOR)?
+                <= checked_mul(comparison_units, PPM_DENOMINATOR - fee_ppm)?
+        }
+        OrderSide::BuyBase => {
+            checked_mul(comparison_units, PPM_DENOMINATOR)?
+                >= checked_mul(payment_units, PPM_DENOMINATOR + fee_ppm)?
+        }
+    };
+    Ok(eligible.then_some((comparison_units, payment_units)))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

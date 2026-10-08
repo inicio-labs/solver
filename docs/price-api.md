@@ -78,6 +78,80 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 }
 ```
 
+### `GET /v1/swap-eta` — swap quote
+
+What the solver would do **now** with an order the wallet is about to sign:
+where its price sits, how much of it the live book fills, the price we
+suggest, and how long it takes. The solver fills every order at the Binance
+mid less the clearing fee; this endpoint applies that same rule to the live
+book.
+
+| Param | Required | Meaning |
+|---|---|---|
+| `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
+| `offered_amount` | one of the two | base units the order offers |
+| `requested_amount` | one of the two | base units the order requests. Leave one amount out and the solver fills it in at the suggested price ("sell 1 ETH" → how much USDT to ask) |
+| `min_fill_step` | no | the note's smallest partial fill; a smaller partial answer becomes `none` |
+
+**200 response** — selling 1 ETH (18 decimals) for USDT (6 decimals), mid 2500, fee 0.1%, `requested_amount` left out:
+
+```json
+{
+  "offeredFaucet": "0x…", "requestedFaucet": "0x…",
+  "offeredAmount": "1000000000000000000", "requestedAmount": "2492505000",
+  "priceBand": "at_market",
+  "fillStatus": "full",
+  "reason": null,
+  "fillableOfferedAmount": "1000000000000000000", "fillableRequestedAmount": "2492505000",
+  "expectedRequestedAmount": "2497500000",
+  "feePpm": 1000, "feeAmount": "2500000",
+  "marketPrice": "2500", "fillPrice": "2497.5",
+  "suggestedPrice": "2492.505", "suggestedRequestedAmount": "2492505000",
+  "acceptingOrders": true, "asOf": 1791470000,
+  "canFill": true, "offMarket": false,
+  "estimatedSeconds": 14, "median24hSeconds": 11
+}
+```
+
+Amounts are **base units** (strings); prices are whole requested tokens per
+whole offered token. Optional fields are `null`, never omitted.
+
+| Field | Meaning |
+|---|---|
+| `offeredAmount`, `requestedAmount` | the order, with a left-out amount filled in |
+| `priceBand` | `at_market`: fills at today's price · `tolerated`: fills once the price moves at most `swap_offmarket_tolerance_bps` (default 0.5%) the order's way · `off_market`: further than that · `null`: no fresh price |
+| `fillStatus` | `full`, `partial` or `none` |
+| `reason` | only for `none`: `price` (off market), `liquidity` (priced fine, nothing left in the book for it), `no_market` (the pair has no clearing market), `no_price` (no fresh price right now) |
+| `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order the book fills now; a partial fill pays the order's own ratio |
+| `expectedRequestedAmount` | what a **full** fill pays now: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
+| `feePpm`, `feeAmount` | the clearing fee, and its amount on a full fill now (requested token) |
+| `marketPrice` | the Binance mid |
+| `fillPrice` | the mid after the fee: the best price that fills now |
+| `suggestedPrice`, `suggestedRequestedAmount` | the fill price less `swap_suggest_buffer_bps` (default 0.2%), and the amount to request at it, so the order still fills after a small move. Use it as is; do not apply slippage on top |
+| `acceptingOrders` | `false` while the solver cannot settle (busy or recovering): orders wait |
+| `asOf` | unix secs of the book the quote used |
+| `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
+| `median24hSeconds` | the pair's median settlement time over the last 24 h |
+| `canFill`, `offMarket` | kept for older wallets: `at_market` and `full`; `priceBand == off_market` |
+
+Suggested wallet copy:
+
+| Answer | Show |
+|---|---|
+| `at_market` + `full` | no warning |
+| `at_market` + `partial` | "Only `fillableOfferedAmount` can fill now; the rest waits" |
+| `tolerated` | "May take longer: fills when the price moves slightly" |
+| `none` + `price` | "Price too far from market. Use `suggestedPrice`?" |
+| `none` + `liquidity` | "Not enough liquidity right now" |
+| `acceptingOrders: false` | "Settlement delayed" |
+
+The quote is advisory: nothing is reserved, so two wallets can be told
+`full` for the same liquidity. It counts the solver's own book only, not
+external liquidity routing, and ignores the per-side order cap of one batch.
+Errors: `400` bad or missing amounts, or an amount too small to price;
+`404` unknown faucet; `503` `no_market` / `no_price` when an amount is left
+out and there is no price to fill it in.
+
 ### Status codes
 
 | Code | When |

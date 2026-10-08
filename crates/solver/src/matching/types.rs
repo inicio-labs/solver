@@ -199,16 +199,23 @@ pub struct SettlementBatch {
     pub remaining_orders: u64,
 }
 
-/// Top-of-book for one directed pair: the best (lowest) resting `rate` and the
-/// summed `offered_remaining()` (`volume`) of the active orders at that rate —
-/// i.e. how much of the OFFERED token is available to fill an incoming crossing
-/// order. Consumed by the swap-eta API (see [`crate::swap_eta`]).
+/// One price level of a directed pair: the summed offered `volume` of the
+/// active orders resting at exactly `rate`.
 #[derive(Clone, Copy, Debug)]
-pub struct BestLevel {
+pub struct BookLevel {
     pub rate: RateKey,
     pub volume: Amount,
 }
 
-/// Per directed `(offered, requested)` pair → its best resting level. Published
-/// by the matcher each tick (top-of-book only, so it stays tiny).
-pub type SwapBookSnapshot = std::collections::HashMap<(TokenId, TokenId), BestLevel>;
+/// The live book as the price API sees it, published by the matcher each
+/// tick for the swap quotes (see [`crate::swap_eta`]).
+#[derive(Clone, Debug, Default)]
+pub struct SwapBookSnapshot {
+    /// Per directed `(offered, requested)` pair, every level, best first.
+    pub levels: std::collections::HashMap<(TokenId, TokenId), Vec<BookLevel>>,
+    /// Whether the executor could take a batch on this tick. `false` while it
+    /// is busy or in verification mode, and before the first tick.
+    pub accepting_orders: bool,
+    /// Unix seconds of the tick.
+    pub as_of: crate::types::UnixSecs,
+}

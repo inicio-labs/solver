@@ -87,6 +87,11 @@ admin_port = 3001
 # price_query_timeout_ms = 3000
 # price_precision = "full"           # decimals of the PRICE number: "full" or 0..=18
 #                                    # (per-request override: ?precision=). NOT the token's decimals.
+# GET /v1/swap-eta quotes a prospective order against the live book at the
+# clearing price (docs/price-api.md).
+# swap_offmarket_tolerance_bps = 50  # how far the price may still have to move an
+#                                    # order's way: "tolerated", beyond is "off_market"
+# swap_suggest_buffer_bps = 20       # the suggested price sits this far below the fill price
 
 # External RFQ routing hands unmatched whole notes to allow-listed DEXes.
 # Set SOLVER_ROUTER_TOKENS to comma-separated bearer tokens when enabling it.

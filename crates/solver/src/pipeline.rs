@@ -198,7 +198,7 @@ pub fn create_channels() -> PipelineChannels {
     // each is the sole, lock-free writer of its own stream. Both read by the
     // swap-eta handler in price_api.rs.
     let (swap_snapshot_tx, swap_snapshot_rx) =
-        watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
+        watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::default()));
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(EXEC_CHANNEL_BUF);

@@ -50,6 +50,8 @@ pub(crate) enum ConfigError {
     TooManyConnectionAttempts { value: usize, limit: usize },
     #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
     InvalidClearingFee { fee: u32, maximum: u32 },
+    #[error("engine.swap_suggest_buffer_bps must be below 10000, got {0}")]
+    InvalidSuggestBuffer(u64),
     #[error("engine.{0} must be at least 1")]
     ZeroMakerIntakeLimit(&'static str),
     #[error("pair {pair}: invalid {side}_faucet_id: {reason}")]
@@ -225,10 +227,15 @@ pub struct EngineConfig {
     /// Estimated chain block time (ms) — a term of the next-batch ETA. Default 6000.
     #[serde(default = "default_swap_block_time_ms")]
     pub swap_block_time_ms: u64,
-    /// Slack (bps) before an order is flagged `offMarket` vs the Binance mid.
+    /// How far (bps) the price may still have to move an order's way for
+    /// `/v1/swap-eta` to call it `tolerated`; further is `off_market`.
     /// Default 50 (0.5%).
     #[serde(default = "default_swap_offmarket_tolerance_bps")]
     pub swap_offmarket_tolerance_bps: u64,
+    /// How far (bps) below the fill price `/v1/swap-eta` suggests a price, so
+    /// the order still clears after a small move. Below 10000. Default 20 (0.2%).
+    #[serde(default = "default_swap_suggest_buffer_bps")]
+    pub swap_suggest_buffer_bps: u64,
     // ── External liquidity routing (RFQ websocket to other DEXes) ─────────────
     /// Enable the external-liquidity router (websocket RFQ server + matcher
     /// external pass). Default `false` (opt-in). Allow-list tokens are sourced
@@ -337,6 +344,9 @@ fn default_swap_block_time_ms() -> u64 {
 }
 fn default_swap_offmarket_tolerance_bps() -> u64 {
     50
+}
+fn default_swap_suggest_buffer_bps() -> u64 {
+    20
 }
 fn default_router_bind() -> String {
     "127.0.0.1".to_string()
@@ -475,6 +485,11 @@ impl SolverConfig {
                 fee: self.engine.clearing_fee_ppm,
                 maximum: crate::clearing::PPM_DENOMINATOR,
             });
+        }
+        if self.engine.swap_suggest_buffer_bps >= 10_000 {
+            return Err(ConfigError::InvalidSuggestBuffer(
+                self.engine.swap_suggest_buffer_bps,
+            ));
         }
         for (name, value) in [
             (

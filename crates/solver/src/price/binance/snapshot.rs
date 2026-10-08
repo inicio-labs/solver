@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 
 use super::market::{Markets, Orientation, Symbol, Valuation};
 use super::ticker::QuoteRejection;
-use crate::clearing::BatchPrice;
+use crate::clearing::{BatchPrice, OrderSide};
 use crate::types::TokenId;
 
 /// One reader's parsed `bookTicker` update for a subscribed symbol.
@@ -223,6 +223,28 @@ impl PriceSnapshot {
         }
         pair.in_base_units(latest.mid)
             .ok_or(PriceUnavailable::Invalid)
+    }
+
+    /// The side an order offering `offered` for `requested` takes in its
+    /// clearing pair, and that pair's [`Self::pair_price`]: exactly what the
+    /// matcher would clear it at now.
+    pub(crate) fn order_price(
+        &self,
+        offered: TokenId,
+        requested: TokenId,
+        now: Instant,
+    ) -> Result<(OrderSide, BatchPrice), PriceUnavailable> {
+        if self.markets.pair(offered, requested).is_some() {
+            Ok((
+                OrderSide::SellBase,
+                self.pair_price(offered, requested, now)?,
+            ))
+        } else {
+            Ok((
+                OrderSide::BuyBase,
+                self.pair_price(requested, offered, now)?,
+            ))
+        }
     }
 
     /// Whole `requested` tokens per whole `offered` token, for a clearing pair

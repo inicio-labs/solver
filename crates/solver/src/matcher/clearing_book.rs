@@ -8,7 +8,7 @@ use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
 use crate::maker::{CutoffScope, MakerId, MakerUpdate};
-use crate::matching::types::{BestLevel, SwapBookSnapshot};
+use crate::matching::types::BookLevel;
 use crate::types::{BookOrder, BookUpdate, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
@@ -277,19 +277,30 @@ impl ClearingBook {
         Ok(PairBatch::new(price, sell_orders, buy_orders))
     }
 
-    pub(super) fn best_levels_snapshot(&self) -> SwapBookSnapshot {
+    /// Every non-empty directed pair's levels, best first: the depth the
+    /// price API quotes swaps against.
+    pub(super) fn levels(&self) -> HashMap<(TokenId, TokenId), Vec<BookLevel>> {
         self.pairs
             .iter()
-            .filter_map(|(&pair, index)| {
-                let rate = index.first_key_value()?.0.rate;
-                let volume = index
-                    .iter()
-                    .take_while(|(key, _)| key.rate == rate)
-                    .filter_map(|(_, id)| self.orders.get(id))
-                    .fold(0u64, |sum, order| {
-                        sum.saturating_add(order.offered_asset().amount().as_u64())
-                    });
-                Some((pair, BestLevel { rate, volume }))
+            .filter(|(_, index)| !index.is_empty())
+            .map(|(&pair, index)| {
+                let mut levels: Vec<BookLevel> = Vec::new();
+                for (key, id) in index {
+                    let Some(order) = self.orders.get(id) else {
+                        continue;
+                    };
+                    let volume = order.offered_asset().amount().as_u64();
+                    match levels.last_mut() {
+                        Some(level) if level.rate == key.rate => {
+                            level.volume = level.volume.saturating_add(volume);
+                        }
+                        _ => levels.push(BookLevel {
+                            rate: key.rate,
+                            volume,
+                        }),
+                    }
+                }
+                (pair, levels)
             })
             .collect()
     }
@@ -301,6 +312,7 @@ mod tests {
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
     use crate::matcher::MatcherError;
+    use crate::matching::types::SwapBookSnapshot;
     use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -410,14 +422,14 @@ mod tests {
         assert_eq!(handover.items[0].note_id, order.id());
         assert_eq!(handover.items[0].fill, 18);
         assert_eq!(handover.items[0].note_bytes, order.note.to_bytes());
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
         routing.dispatch(&mut book, 101).unwrap();
         assert!(
             route_rx.try_recv().is_err(),
             "RFQ must not dispatch a reserved note twice"
         );
         routing.release_expired(&mut book, 109).unwrap();
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
         routing.release_expired(&mut book, 110).unwrap();
         assert_eq!(admit(&book, false, 100)[0].order().priority_sequence(), 1);
         assert_eq!(book.orders[&order.id()].note().id(), order.id());
@@ -442,7 +454,7 @@ mod tests {
         book.remove(order.id());
         routing.release_expired(&mut book, 111).unwrap();
         assert!(book.orders.is_empty());
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
     }
 
     fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
@@ -515,7 +527,7 @@ mod tests {
             "metadata must not release an in-flight order"
         );
         assert!(!stored.can_route_to_rfq());
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
     }
 
     #[test]
@@ -578,7 +590,7 @@ mod tests {
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -594,7 +606,7 @@ mod tests {
             "the cancelled quote never reached clearing"
         );
         assert_eq!(
-            snapshot_rx.borrow().len(),
+            snapshot_rx.borrow().levels.len(),
             1,
             "only the buyer's side is left"
         );
@@ -670,7 +682,7 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -731,7 +743,7 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -745,7 +757,7 @@ mod tests {
         snapshot_rx.changed().await.unwrap();
         assert!(route_rx.try_recv().is_err());
         assert_eq!(
-            snapshot_rx.borrow().len(),
+            snapshot_rx.borrow().levels.len(),
             2,
             "orders stay live on a skipped tick"
         );
@@ -789,7 +801,7 @@ mod tests {
             };
             let (_book_tx, book_rx) = mpsc::channel(1);
             let (exec_tx, _exec_rx) = mpsc::channel(1);
-            let (snapshot_tx, _) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+            let (snapshot_tx, _) = watch::channel(Arc::new(SwapBookSnapshot::default()));
             let result = tokio::time::timeout(
                 Duration::from_secs(1),
                 run_worker(
@@ -944,7 +956,7 @@ mod tests {
         let (book_tx, book_rx) = mpsc::channel(1);
         drop(book_tx);
         let (exec_tx, _exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let error = run_worker(
             book_rx,
             exec_tx,
@@ -963,13 +975,13 @@ mod tests {
         let order = fixture(false, 10, 18, 1, &mut rng);
         let mut book = ClearingBook::default();
         book.insert(&order).unwrap();
-        assert_eq!(book.best_levels_snapshot().len(), 1);
+        assert_eq!(book.levels().len(), 1);
         book.remove(order.id());
         book.remove(order.id());
         assert!(book.orders.is_empty());
         let pair = Order::from_book_order(&order).unwrap().index_key().0;
         assert!(book.pairs[&pair].is_empty());
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
         book.insert(&order).unwrap();
         assert_eq!(book.pairs.len(), 1);
         assert_eq!(admit(&book, false, 100)[0].order().id(), order.id());
@@ -991,7 +1003,7 @@ mod tests {
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, _exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             run_worker(
@@ -1034,7 +1046,7 @@ mod tests {
         let (book_tx, book_rx) = mpsc::channel(4);
         let (exec_tx, mut exec_rx) = mpsc::channel(4);
         let queued_batches = exec_tx.clone();
-        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, _snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -1162,7 +1174,7 @@ mod tests {
             !book.orders.contains_key(&quote.id()),
             "expired giveback cannot be selected again"
         );
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
     }
     #[tokio::test(start_paused = true)]
     async fn an_expired_maker_order_is_not_selected_after_hydration() {
@@ -1192,7 +1204,7 @@ mod tests {
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_matcher(
             book_rx,
@@ -1208,7 +1220,7 @@ mod tests {
             "the expired quote never reached clearing"
         );
         assert_eq!(
-            snapshot_rx.borrow().len(),
+            snapshot_rx.borrow().levels.len(),
             1,
             "only the buyer's side is left"
         );

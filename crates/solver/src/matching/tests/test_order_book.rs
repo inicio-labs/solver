@@ -150,18 +150,6 @@ fn best_level_skips_inactive_front() {
 }
 
 #[test]
-fn snapshot_best_levels_covers_each_directed_pair() {
-    let mut book = OrderBook::new(make_feed());
-    let mut gen = NoteIdGen::new();
-    book.add_user_order(gen.next(), usdc(), eth(), 2000, 1);
-    book.add_user_order(gen.next(), eth(), usdc(), 1, 1800);
-    let snap = book.snapshot_best_levels();
-    assert_eq!(snap.len(), 2);
-    assert!(snap.contains_key(&(usdc(), eth())));
-    assert!(snap.contains_key(&(eth(), usdc())));
-}
-
-#[test]
 fn cleanup_removes_inactive() {
     let feed = make_feed();
     let mut book = OrderBook::new(feed);

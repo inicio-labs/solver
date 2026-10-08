@@ -326,18 +326,6 @@ impl<F: PriceFeed> OrderBook<F> {
         None
     }
 
-    /// Snapshot the top-of-book of every directed pair — for the swap-eta API.
-    /// O(active orders); called once per matcher tick.
-    pub fn snapshot_best_levels(&self) -> SwapBookSnapshot {
-        let mut map = SwapBookSnapshot::with_capacity(self.pair_index.len());
-        for &pair in self.pair_index.keys() {
-            if let Some((rate, volume)) = self.best_level(pair.0, pair.1) {
-                map.insert(pair, BestLevel { rate, volume });
-            }
-        }
-        map
-    }
-
     /// Tokens that have orders offering `offered` (outgoing neighbors).
     pub fn neighbors(&self, offered: TokenId) -> Vec<TokenId> {
         self.user_adjacency

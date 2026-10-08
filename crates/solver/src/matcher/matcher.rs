@@ -107,14 +107,19 @@ pub(super) async fn run_worker(
                 // executor queue is full (busy, or verifying it can settle),
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
-                if executor_accepting(&exec_tx)? {
+                let accepting_orders = executor_accepting(&exec_tx)?;
+                if accepting_orders {
                     internal_clear(&mut book, &runtime, &exec_tx)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
                 }
-                // Latest order-book levels for the price API's swap-ETA estimates.
-                snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
+                // What is left resting, for the price API's swap quotes.
+                snapshot_tx.send_replace(Arc::new(SwapBookSnapshot {
+                    levels: book.levels(),
+                    accepting_orders,
+                    as_of: now_unix(),
+                }));
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -390,7 +395,7 @@ mod tests {
             Err(MatcherError::ExecutorStopped)
         ));
         assert_eq!(
-            book.best_levels_snapshot().len(),
+            book.levels().len(),
             4,
             "a stopped executor must leave orders live"
         );
@@ -402,7 +407,7 @@ mod tests {
             .unwrap();
         assert!(!executor_accepting(&exec_tx).unwrap());
         assert_eq!(
-            book.best_levels_snapshot().len(),
+            book.levels().len(),
             4,
             "a full executor queue must leave orders active for a later tick"
         );
@@ -411,7 +416,7 @@ mod tests {
         let stale_skips = PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed);
         clear(&mut book, &exec_tx);
         assert!(exec_rx.try_recv().is_err(), "a stale price must not clear");
-        assert_eq!(book.best_levels_snapshot().len(), 4);
+        assert_eq!(book.levels().len(), 4);
         assert!(
             PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed)
                 >= stale_skips + 2
@@ -422,7 +427,7 @@ mod tests {
         clear(&mut book, &exec_tx);
         let miden = exec_rx.try_recv().unwrap();
         assert_eq!(miden.group_ends, vec![2]);
-        assert_eq!(book.best_levels_snapshot().len(), 2);
+        assert_eq!(book.levels().len(), 2);
         prices_tx.send_replace(prices(Instant::now(), Instant::now()));
         clear(&mut book, &exec_tx);
         let eth = exec_rx.try_recv().unwrap();
@@ -441,7 +446,7 @@ mod tests {
                 .unwrap();
             assert!(Arc::ptr_eq(&filled.note, &source.note));
         }
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
         clear(&mut book, &exec_tx);
         assert!(
             exec_rx.try_recv().is_err(),
@@ -474,7 +479,7 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
         let worker_runtime = ClearingRuntime {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
@@ -500,7 +505,7 @@ mod tests {
                     })
                     .is_ok());
                 snapshot_rx.changed().await.unwrap();
-                assert_eq!(snapshot_rx.borrow().len(), 4);
+                assert_eq!(snapshot_rx.borrow().levels.len(), 4);
 
                 book_tx
                     .send(BookUpdate {
@@ -513,7 +518,7 @@ mod tests {
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
                 tokio::time::advance(Duration::from_secs(1)).await;
                 snapshot_rx.changed().await.unwrap();
-                assert_eq!(snapshot_rx.borrow().len(), 3);
+                assert_eq!(snapshot_rx.borrow().levels.len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
                 tokio::time::advance(Duration::from_secs(1)).await;

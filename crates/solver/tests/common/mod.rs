@@ -393,6 +393,7 @@ pub fn engine_config() -> solver::config::EngineConfig {
         swap_proving_estimate_ms: 2000,
         swap_block_time_ms: 6000,
         swap_offmarket_tolerance_bps: 50,
+        swap_suggest_buffer_bps: 20,
         router_enabled: false,
         router_bind: "127.0.0.1".to_string(),
         router_port: 0,

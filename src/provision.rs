@@ -17,6 +17,8 @@ use miden_client::account::{AccountBuilder, AccountBuilderSchemaCommitmentExt, A
 use miden_client::auth::AuthSchemeId;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::note::Note;
+use miden_client::block::BlockNumber;
+use miden_client::rpc::{Endpoint, EndpointError, GrpcClient, NodeRpcClient, RegisterAccountError};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::AccountId;
@@ -85,6 +87,56 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
 /// Consume every note waiting for the solver account (the first such transaction
 /// also deploys it), then wait until the fee-asset balance shows up. The running
 /// solver does this by itself; this is for claiming without starting it.
+/// Register an account with the network so the sequencer funds it with the native fee asset.
+///
+/// A node binds an invitation code to a new account with `RegisterAccount`; when its sequencer
+/// funds registrations, a new registration also sends the account a public note of the fee
+/// asset, which the solver then claims like any incoming funds. The public testnet doesn't
+/// enforce an allowlist, so any code works, including an empty one. Registering again never
+/// funds twice. Ported from inicio-faucet `register_for_funding`.
+///
+/// This calls the RPC directly: `Client::register_account` returns `AccountAlreadyAllowed`
+/// without sending anything when the node already admits the account, which is always the case
+/// on a network without allowlist enforcement, so it would never trigger the funding.
+pub async fn register_account(config: &SolverConfig, account: Option<&str>) -> Result<()> {
+    let hex = account.unwrap_or(&config.solver.account_id);
+    let account_id = AccountId::from_hex(hex).with_context(|| format!("invalid account id {hex:?}"))?;
+
+    let factory = ProdClientFactory::from_config(config);
+    let mut client = factory.build_executor().await?;
+    client.sync_state().await.context("sync with the node")?;
+    // The node checks the request against the network's genesis, as it does for submissions.
+    let (genesis, _) = client
+        .get_block_header_by_num(BlockNumber::GENESIS)
+        .await
+        .context("read the genesis header")?
+        .ok_or_else(|| anyhow!("genesis header not in the store"))?;
+
+    let endpoint = Endpoint::try_from(config.rpc.endpoint.as_str())
+        .map_err(|e| anyhow!("invalid rpc endpoint: {e}"))?;
+    let node = GrpcClient::new(&endpoint, config.rpc.timeout_ms);
+    node.set_genesis_commitment(genesis.commitment())
+        .await
+        .context("set the genesis commitment")?;
+
+    match node.register_account("", account_id).await {
+        Ok(()) => println!(
+            "registered {} with the network; if it funds registrations, a fee-asset note is on its way",
+            account_id.to_hex()
+        ),
+        Err(e)
+            if matches!(
+                e.endpoint_error(),
+                Some(EndpointError::RegisterAccount(RegisterAccountError::AlreadyRegistered))
+            ) =>
+        {
+            println!("{} is already registered (registration funds an account only once)", account_id.to_hex())
+        }
+        Err(e) => bail!("register {}: {e}", account_id.to_hex()),
+    }
+    Ok(())
+}
+
 pub async fn fund_account(config: &SolverConfig) -> Result<()> {
     let solver_id = AccountId::from_hex(&config.solver.account_id)
         .with_context(|| format!("invalid solver account_id {:?}", config.solver.account_id))?;

@@ -74,6 +74,16 @@ fn cli() -> clap::Command {
                 .about("Consume the notes sent to the solver account, which deploys and funds it"),
         )
         .subcommand(
+            clap::Command::new("register-account")
+                .about("Register an account with the network so it funds it with the fee asset")
+                .arg(
+                    clap::Arg::new("account")
+                        .long("account")
+                        .value_name("HEX")
+                        .help("Account to register instead of [solver] account_id"),
+                ),
+        )
+        .subcommand(
             clap::Command::new("migrate-db")
                 .about("Apply PostgreSQL schema migrations using SOLVER_MIGRATION_DATABASE_URL"),
         )
@@ -99,6 +109,13 @@ async fn run(matches: clap::ArgMatches) -> Result<()> {
     match matches.subcommand_name() {
         Some("provision-account") => return provision::provision_account(&config).await,
         Some("fund-account") => return provision::fund_account(&config).await,
+        Some("register-account") => {
+            let account = matches
+                .subcommand_matches("register-account")
+                .and_then(|m| m.get_one::<String>("account"))
+                .map(String::as_str);
+            return provision::register_account(&config, account).await;
+        }
         _ => {}
     }
     let solver_id = AccountId::from_hex(&config.solver.account_id)

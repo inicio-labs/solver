@@ -65,14 +65,17 @@ pub async fn create_pswap(
     requested: FungibleAsset,
     payback: NoteType,
 ) -> Result<()> {
+    // Build against a fresh reference block: a fee-paying transaction's expiration is capped
+    // relative to it, so a stale view makes the node reject the order as expired.
+    client.sync_state().await.map_err(|e| anyhow!("sync_state: {e}"))?;
     let data = PswapTransactionData::new(account, offered, requested);
     let request = TransactionRequestBuilder::new()
         .build_pswap_create(&data, NoteType::Public, payback, None, client.rng())
-        .map_err(|e| anyhow!("build pswap-create: {e}"))?;
+        .map_err(|e| anyhow!(e).context("build pswap-create"))?;
     client
         .submit_new_transaction(account, request)
         .await
-        .map_err(|e| anyhow!("submit pswap-create: {e}"))?;
+        .map_err(|e| anyhow!(e).context("submit pswap-create"))?;
     Ok(())
 }
 

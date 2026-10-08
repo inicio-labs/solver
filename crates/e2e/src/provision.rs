@@ -87,7 +87,8 @@ pub async fn run() -> Result<()> {
         .await
         .unwrap_or(0);
 
-    // 7. Persist artifacts + solver config.
+    // 7. Persist artifacts + solver config. The pair is priced by USDCUSDT on
+    //    Binance's Spot Testnet: about 1, so `load`'s orders cross.
     let art = Artifacts {
         rpc_endpoint: devnet::DEVNET_RPC.to_string(),
         solver_account_id: solver_id.to_hex(),
@@ -101,9 +102,9 @@ pub async fn run() -> Result<()> {
             faucet_id: faucet_b.to_hex(),
             symbol: "MTB".to_string(),
             decimals: DECIMALS,
-            binance_asset: "ETH".to_string(),
+            binance_asset: "USDC".to_string(),
         },
-        binance_symbol: "ETHUSDT".to_string(),
+        binance_symbol: "USDCUSDT".to_string(),
         solver_keystore_path: artifacts::solver_keystore(),
         solver_executor_store_path: artifacts::solver_executor_store(),
         solver_ingest_store_path: artifacts::solver_ingest_store(),

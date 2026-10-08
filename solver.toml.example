@@ -100,9 +100,12 @@ admin_port = 3001
 
 # ── Binance Spot public market data (the only price source) ─────────────────
 # Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.
-# No API key. For devnet/local, run `cargo run -p mock-binance -- --market
-# ETHUSDT=ETH/USDT:2718.65/2718.66` and point the stream and REST endpoints at
-# it. A misspelled key in this section is an error, not a silent default.
+# No API key. For devnet/local, use Binance's public Spot Testnet (stream
+# endpoints wss://stream.testnet.binance.vision, REST endpoint
+# https://testnet.binance.vision, quote_ttl_ms = 30000: its markets are quiet),
+# or for fixed prices run `cargo run -p mock-binance -- --market
+# ETHUSDT=ETH/USDT:2718.65/2718.66` and point both endpoints at it. A
+# misspelled key in this section is an error, not a silent default.
 [binance]
 # A quote is usable while younger than this, measured from local receipt, for
 # clearing, swap guidance and wallet prices alike. Required: choose it per

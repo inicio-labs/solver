@@ -27,8 +27,9 @@ cargo run -p e2e --release -- provision
 #     MTB->MTA) that the solver can match.
 cargo run -p e2e --release -- load --rounds 1
 
-# 3. Run the solver in-process against devnet (deterministic fixed prices from
-#    an in-process mock Binance). First provision a fresh PostgreSQL application
+# 3. Run the solver in-process against devnet, priced by Binance's public Spot
+#    Testnet (add --mock-prices for a fixed 1:1 price from an in-process mock
+#    Binance, e.g. offline). First provision a fresh PostgreSQL application
 #    schema; use distinct migration, writer, and reader roles in deployment.
 export SOLVER_MIGRATION_DATABASE_URL='postgresql://migration-role@host/database'
 cargo run -p solver-bin --release -- migrate-db
@@ -64,11 +65,14 @@ cargo run -p e2e --release -- fund --amount 50000000
 * **The matcher pairs two opposing user orders** (it is not a single-order
   inventory filler), so `load` always creates A→B and B→A pairs. Each offers
   more than the counterparty requests, leaving a spread the solver captures.
-* **Fixed prices in `run`.** `run` starts an in-process `mock-binance` quoting
-  the pair's market (`ETHUSDT`, MTB as ETH and MTA as USDT) at a mid of 1 and
-  points the generated config's `[binance]` endpoints at it, so matching is
-  deterministic and exercises the real price feed. To run the real `solver-bin`
-  with the generated `solver.devnet.toml`, start `cargo run -p mock-binance --
-  --market ETHUSDT=ETH/USDT:1/1` first (it listens on `127.0.0.1:8089`).
+* **Spot Testnet prices.** The generated `solver.devnet.toml` prices the pair
+  on Binance's public Spot Testnet (`testnet.binance.vision`: no API key,
+  nothing to run locally) as `USDCUSDT`, MTB as USDC and MTA as USDT. Its mid
+  is about 1, so `load`'s orders cross; the real `solver-bin` runs with the
+  generated config as it is. `run --mock-prices` instead starts an in-process
+  `mock-binance` at a fixed mid of 1 and points the endpoints at it: matching
+  is deterministic and works offline. Artifacts provisioned before this change
+  name `ETHUSDT` (about 2,500, so the orders never cross): provision again, or
+  use `--mock-prices`.
 * The solver buffer (provisioned inventory) lets the executor bridge fills
   during settlement.

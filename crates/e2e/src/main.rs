@@ -64,6 +64,10 @@ enum Command {
         /// How long to run before shutting down (seconds).
         #[arg(long, default_value_t = 240)]
         secs: u64,
+        /// Price the pair at a fixed 1:1 from an in-process mock Binance
+        /// instead of the Spot Testnet endpoints in the generated config.
+        #[arg(long)]
+        mock_prices: bool,
     },
 }
 
@@ -88,7 +92,7 @@ fn main() -> Result<()> {
             Command::Fund { amount } => ops::fund(amount).await,
             Command::Mint { to, token, amount } => ops::mint(&to, &token, amount).await,
             Command::Load { rounds } => ops::load(rounds).await,
-            Command::Run { secs } => run::run(secs).await,
+            Command::Run { secs, mock_prices } => run::run(secs, mock_prices).await,
         }
     })
 }

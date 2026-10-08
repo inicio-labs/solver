@@ -380,10 +380,12 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   **once, when a token is registered** (config tokens at boot, admin-added tokens
   via the subscribe relay), then cached — never re-polled.
-- `/v1/swap-eta` quotes a prospective order the way the matcher would clear
-  it now: price band (`at_market` / `tolerated` / `off_market`), fill status
-  (`full` / `partial` / `none` with a reason), fillable amounts, and a suggested
-  price, under the same TTL and fee as the matcher (see `docs/price-api.md`).
+- `/v1/pair-price` gives a pair's clearing price (mid and mid after the fee)
+  to build an ask from; `/v1/swap-eta` judges that exact order the way the
+  matcher would clear it now: price band (`at_market` / `tolerated` /
+  `off_market`), fill status (`full` / `partial` / `none` with a reason),
+  fillable and available amounts, under the same TTL and fee as the matcher
+  (see `docs/price-api.md`).
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).

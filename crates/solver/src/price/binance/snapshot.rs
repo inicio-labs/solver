@@ -257,6 +257,17 @@ impl PriceSnapshot {
         requested: TokenId,
         now: Instant,
     ) -> Result<Decimal, PriceUnavailable> {
+        self.market_quote(offered, requested, now)
+            .map(|(price, _)| price)
+    }
+
+    /// [`Self::market_price`] with the time the solver received its quote.
+    pub(crate) fn market_quote(
+        &self,
+        offered: TokenId,
+        requested: TokenId,
+        now: Instant,
+    ) -> Result<(Decimal, Instant), PriceUnavailable> {
         let (pair, flipped) = match self.markets.pair(offered, requested) {
             Some(pair) => (pair, false),
             None => (
@@ -271,13 +282,14 @@ impl PriceSnapshot {
             return Err(PriceUnavailable::Stale);
         }
         // The midpoint prices Binance's base asset; is that `offered`?
-        if (pair.orientation == Orientation::Direct) != flipped {
-            Ok(latest.mid)
+        let price = if (pair.orientation == Orientation::Direct) != flipped {
+            latest.mid
         } else {
             Decimal::ONE
                 .checked_div(latest.mid)
-                .ok_or(PriceUnavailable::Invalid)
-        }
+                .ok_or(PriceUnavailable::Invalid)?
+        };
+        Ok((price, latest.received_at))
     }
 
     /// One whole `token` in the valuation quote asset, under the same TTL as

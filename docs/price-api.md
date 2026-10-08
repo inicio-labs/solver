@@ -78,35 +78,77 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 }
 ```
 
-### `GET /v1/swap-eta` — swap quote
+### Swapping: three steps for the wallet
 
-What the solver would do **now** with an order the wallet is about to sign:
-where its price sits, how much of it the live book fills, the price we
-suggest, and how long it takes. The solver fills every order at the Binance
-mid less the clearing fee; this endpoint applies that same rule to the live
-book.
+1. **Price.** `GET /v1/pair-price` gives the pair's `fillPrice`: the Binance
+   mid less the clearing fee, the best price that fills right now.
+2. **Ask.** The wallet builds the order with the user's slippage (BigInt or a
+   decimal library, never floats):
+   `requested_amount = floor(offered_amount × fillPrice × (1 − slippage) × 10^requestedDecimals / 10^offeredDecimals)`
+3. **Verdict.** `GET /v1/swap-eta` with both amounts says whether that exact
+   order fills now, partly, or not, and why. If it is off market, go back to
+   step 1 for a fresh price.
 
-| Param | Required | Meaning |
-|---|---|---|
-| `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
-| `offered_amount` | one of the two | base units the order offers |
-| `requested_amount` | one of the two | base units the order requests. Leave one amount out and the solver fills it in at the suggested price ("sell 1 ETH" → how much USDT to ask) |
-| `min_fill_step` | no | the note's smallest partial fill; a smaller partial answer becomes `none` |
+Slippage here protects the user against the mid moving before the next
+batch. It does not buy more liquidity: the solver fills every order at the
+mid less the fee, never at a resting order's own price.
 
-**200 response** — selling 1 ETH (18 decimals) for USDT (6 decimals), mid 2500, fee 0.1%, `requested_amount` left out:
+### `GET /v1/pair-price` — the price to build an ask from
+
+| Param | Meaning |
+|---|---|
+| `offered_faucet`, `requested_faucet` | hex faucet ids; the order offers the first and requests the second |
+
+**200 response** — selling ETH (18 decimals) for USDT (6 decimals), mid 2500, fee 0.1%:
 
 ```json
 {
   "offeredFaucet": "0x…", "requestedFaucet": "0x…",
-  "offeredAmount": "1000000000000000000", "requestedAmount": "2492505000",
+  "marketPrice": "2500", "fillPrice": "2497.5", "feePpm": 1000,
+  "offeredDecimals": 18, "requestedDecimals": 6,
+  "asOf": 1791470000
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `marketPrice` | the Binance mid of the pair's clearing market, in whole requested tokens per whole offered token |
+| `fillPrice` | the mid after the clearing fee, as this side pays it: the best ask that fills now |
+| `feePpm` | the clearing fee |
+| `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals, to turn prices into base units; `null` until fetched |
+| `asOf` | unix seconds the solver received this quote |
+
+It follows the solver's own freshness rule: `503` `no_market` when the pair
+has no clearing market, `503` `no_price` when its quote is missing, invalid
+or stale. `404` unknown faucet, `400` bad or equal faucet ids.
+
+### `GET /v1/swap-eta` — will this order fill?
+
+What the solver would do **now** with the order the wallet is about to
+sign: where its price sits, how much of it the live book fills, and how long
+it takes. It applies the solver's own rule (fill at the mid less the fee) to
+the live book.
+
+| Param | Required | Meaning |
+|---|---|---|
+| `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
+| `offered_amount`, `requested_amount` | yes | the order, in base units |
+| `min_fill_step` | no | the note's smallest partial fill. A wallet that does not allow partial fills sends the requested amount; a smaller partial answer becomes `none` |
+
+**200 response** — selling 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with 3.2 ETH of buyers in the book:
+
+```json
+{
+  "offeredFaucet": "0x…", "requestedFaucet": "0x…",
+  "offeredAmount": "1000000000000000000", "requestedAmount": "2485012500",
   "priceBand": "at_market",
   "fillStatus": "full",
   "reason": null,
-  "fillableOfferedAmount": "1000000000000000000", "fillableRequestedAmount": "2492505000",
+  "fillableOfferedAmount": "1000000000000000000", "fillableRequestedAmount": "2485012500",
+  "availableOfferedAmount": "3200000000000000000",
   "expectedRequestedAmount": "2497500000",
   "feePpm": 1000, "feeAmount": "2500000",
   "marketPrice": "2500", "fillPrice": "2497.5",
-  "suggestedPrice": "2492.505", "suggestedRequestedAmount": "2492505000",
   "acceptingOrders": true,
   "canFill": true, "offMarket": false,
   "estimatedSeconds": 14, "median24hSeconds": 11
@@ -118,16 +160,15 @@ whole offered token. Optional fields are `null`, never omitted.
 
 | Field | Meaning |
 |---|---|
-| `offeredAmount`, `requestedAmount` | the order, with a left-out amount filled in |
+| `offeredAmount`, `requestedAmount` | the order, as asked |
 | `priceBand` | `at_market`: fills at today's price · `tolerated`: fills once the price moves at most `swap_offmarket_tolerance_bps` (default 0.5%) the order's way · `off_market`: further than that · `null`: no fresh price |
 | `fillStatus` | `full`, `partial` or `none` |
 | `reason` | only for `none`: `price` (off market), `liquidity` (priced fine, nothing left in the book for it), `no_market` (the pair has no clearing market), `no_price` (no fresh price right now) |
 | `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order the book fills now; a partial fill pays the order's own ratio |
+| `availableOfferedAmount` | how much of the offered token the book takes now at this order's price, not capped by the order's size: "max you can swap now". `null` off market or without a price |
 | `expectedRequestedAmount` | what a **full** fill pays now: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
 | `feePpm`, `feeAmount` | the clearing fee, and its amount on a full fill now (requested token) |
-| `marketPrice` | the Binance mid |
-| `fillPrice` | the mid after the fee: the best price that fills now |
-| `suggestedPrice`, `suggestedRequestedAmount` | the fill price less `swap_suggest_buffer_bps` (default 0.2%), and the amount to request at it, so the order still fills after a small move. Use it as is; do not apply slippage on top |
+| `marketPrice`, `fillPrice` | as in `/v1/pair-price`, for showing "the market is now X" |
 | `acceptingOrders` | `false` while the solver cannot settle (it is recovering from missing fee funds, or the node or database being down): orders wait |
 | `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
@@ -140,16 +181,16 @@ Suggested wallet copy:
 | `at_market` + `full` | no warning |
 | `at_market` + `partial` | "Only `fillableOfferedAmount` can fill now; the rest waits" |
 | `tolerated` | "May take longer: fills when the price moves slightly" |
-| `none` + `price` | "Price too far from market. Use `suggestedPrice`?" |
-| `none` + `liquidity` | "Not enough liquidity right now" |
+| `none` + `price` | "The price moved." Get a fresh `/v1/pair-price` and rebuild the ask |
+| `none` + `liquidity` | "Not enough orders at the current price right now" |
 | `acceptingOrders: false` | "Settlement delayed" |
 
-The quote is advisory: nothing is reserved, so two wallets can be told
+The verdict is advisory: nothing is reserved, so two wallets can be told
 `full` for the same liquidity. It counts the solver's own book only, not
 external liquidity routing, and ignores the per-side order cap of one batch.
-Errors: `400` bad or missing amounts, or an amount too small to price;
-`404` unknown faucet; `503` `no_market` / `no_price` when an amount is left
-out and there is no price to fill it in.
+Errors: `400` bad or missing amounts or faucet ids, `404` unknown faucet.
+Without a price the answer is still `200`, with `reason` `no_market` or
+`no_price`.
 
 ### Status codes
 

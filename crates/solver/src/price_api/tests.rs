@@ -63,7 +63,6 @@ fn cfg() -> PriceApiConfig {
         swap_proving_ms: 2000,
         swap_block_ms: 6000,
         swap_offmarket_tol_bps: 50,
-        swap_suggest_buffer_bps: 20,
         clearing_fee_ppm: 1_000,
     }
 }
@@ -106,7 +105,6 @@ async fn serve(
         quote_terms: QuoteTerms {
             fee_ppm: 1_000,
             tolerance_bps: 50,
-            buffer_bps: 20,
         },
     };
     Harness {
@@ -527,8 +525,8 @@ async fn swap_eta_quotes_a_full_fill_at_market() {
     assert_eq!(v["feeAmount"], "2000");
     assert_eq!(v["marketPrice"], "2");
     assert_eq!(v["fillPrice"], "1.998");
-    assert_eq!(v["suggestedPrice"], "1.994004");
-    assert_eq!(v["suggestedRequestedAmount"], "1994004");
+    // The book takes 3_000_000 B: 1_500_000 A, more than this order.
+    assert_eq!(v["availableOfferedAmount"], "1500000");
     assert_eq!(v["acceptingOrders"], true);
     assert_eq!(v["canFill"], true);
     assert_eq!(v["offMarket"], false);
@@ -548,6 +546,7 @@ async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
     assert_eq!(v["fillStatus"], "partial");
     assert_eq!(v["fillableOfferedAmount"], "500000");
     assert_eq!(v["fillableRequestedAmount"], "995000");
+    assert_eq!(v["availableOfferedAmount"], "500000");
     assert_eq!(v["canFill"], false);
     assert_eq!(v["estimatedSeconds"], 14);
     let v = swap_get(
@@ -605,25 +604,8 @@ async fn swap_eta_tolerates_a_small_gap_and_flags_a_large_one() {
     assert_eq!(v["reason"], "price");
     assert_eq!(v["offMarket"], true);
     assert_eq!(v["fillableOfferedAmount"], "0");
-    assert_eq!(v["suggestedRequestedAmount"], "1994004");
+    assert!(v["availableOfferedAmount"].is_null());
     assert_eq!(v["median24hSeconds"], 20); // median of 10, 20, 30
-}
-
-#[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_fills_in_a_missing_amount() {
-    let h = swap_server(
-        &registered(),
-        Some("2"),
-        buyers(3_000_000),
-        SettlementStats::new(),
-    )
-    .await;
-    let v = swap_get(&h, &a_for_b("offered_amount=1000000")).await;
-    assert_eq!(v["requestedAmount"], "1994004");
-    assert_eq!(v["fillStatus"], "full");
-    let v = swap_get(&h, &a_for_b("requested_amount=1994004")).await;
-    assert_eq!(v["offeredAmount"], "1000000");
 }
 
 #[tokio::test]
@@ -647,16 +629,7 @@ async fn swap_eta_without_a_price_fills_nothing() {
     assert_eq!(v["reason"], "no_market");
     assert!(v["offMarket"].is_null());
     assert!(v["marketPrice"].is_null());
-    assert!(v["suggestedPrice"].is_null());
-    let r = h
-        .server
-        .get(&format!(
-            "/v1/swap-eta?{}",
-            a_for_b("offered_amount=1000000")
-        ))
-        .await;
-    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(r.json::<Value>()["error"], "no_market");
+    assert!(v["availableOfferedAmount"].is_null());
 
     // A market whose quote is at least the TTL old fails closed.
     let h = swap_server_at(
@@ -675,12 +648,6 @@ async fn swap_eta_without_a_price_fills_nothing() {
     assert_eq!(v["reason"], "no_price");
     assert!(v["offMarket"].is_null());
     assert!(v["marketPrice"].is_null());
-    let r = h
-        .server
-        .get(&format!("/v1/swap-eta?{}", a_for_b("requested_amount=1")))
-        .await;
-    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(r.json::<Value>()["error"], "no_price");
 }
 
 #[tokio::test]
@@ -742,29 +709,23 @@ async fn swap_eta_bad_input() {
         SettlementStats::new(),
     )
     .await;
-    // zero amount, zero min fill step, or no amount → 400
-    assert_eq!(
-        swap_status(&h, &a_for_b("offered_amount=0&requested_amount=200")).await,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        swap_status(&h, &a_for_b("offered_amount=100&min_fill_step=0")).await,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        swap_status(&h, &a_for_b("min_fill_step=5")).await,
-        StatusCode::BAD_REQUEST
-    );
-    // too small to price → 400
-    let dust = format!(
-        "offered_faucet={}&requested_faucet={}&offered_amount=1",
-        faucet_b().to_hex(),
-        faucet_a().to_hex()
-    );
-    assert_eq!(swap_status(&h, &dust).await, StatusCode::BAD_REQUEST);
+    // a zero or missing amount, or a zero min fill step → 400
+    for query in [
+        "offered_amount=0&requested_amount=200",
+        "offered_amount=100&requested_amount=200&min_fill_step=0",
+        "offered_amount=100",
+        "requested_amount=200",
+        "min_fill_step=5",
+    ] {
+        assert_eq!(
+            swap_status(&h, &a_for_b(query)).await,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
     // same faucet → 400
     let same = format!(
-        "offered_faucet={0}&requested_faucet={0}&offered_amount=1",
+        "offered_faucet={0}&requested_faucet={0}&offered_amount=1&requested_amount=1",
         faucet_a().to_hex()
     );
     assert_eq!(swap_status(&h, &same).await, StatusCode::BAD_REQUEST);
@@ -773,11 +734,91 @@ async fn swap_eta_bad_input() {
     assert_eq!(swap_status(&h, bad).await, StatusCode::BAD_REQUEST);
     // unknown (well-formed) faucet → 404
     let unknown = format!(
-        "offered_faucet={}&requested_faucet={}&offered_amount=100",
+        "offered_faucet={}&requested_faucet={}&offered_amount=100&requested_amount=200",
         faucet_unregistered().to_hex(),
         faucet_b().to_hex()
     );
     assert_eq!(swap_status(&h, &unknown).await, StatusCode::NOT_FOUND);
+}
+
+// ── pair-price ────────────────────────────────────────────────────────────
+
+/// `/v1/pair-price` for an order offering `offered` for `requested`.
+fn pair_url(offered: AccountId, requested: AccountId) -> String {
+    format!(
+        "/v1/pair-price?offered_faucet={}&requested_faucet={}",
+        offered.to_hex(),
+        requested.to_hex()
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn pair_price_gives_each_side_its_fill_price() {
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    // Selling A: 2 B per A less the 0.1% fee.
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["marketPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+    assert_eq!(v["feePpm"], 1_000);
+    assert_eq!(v["offeredDecimals"], 8);
+    assert_eq!(v["requestedDecimals"], 8);
+    assert!((v["asOf"].as_i64().unwrap() - now()).abs() <= 5, "{v}");
+    // Buying A with B: 0.5 A per B divided by 1.001.
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["marketPrice"], "0.5");
+    assert!(
+        v["fillPrice"].as_str().unwrap().starts_with("0.4995004995"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn pair_price_fails_closed_without_a_fresh_price() {
+    async fn error(h: &Harness, url: String) -> (StatusCode, Value) {
+        let r = h.server.get(&url).await;
+        (r.status_code(), r.json::<Value>()["error"].clone())
+    }
+    let h = swap_server(
+        &registered(),
+        None,
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_b())).await,
+        (StatusCode::SERVICE_UNAVAILABLE, Value::from("no_market"))
+    );
+    assert_eq!(
+        error(&h, pair_url(faucet_unregistered(), faucet_b()))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_a())).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let h = swap_server_at(
+        false,
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_b())).await,
+        (StatusCode::SERVICE_UNAVAILABLE, Value::from("no_price"))
+    );
 }
 
 fn faucet_unregistered() -> AccountId {

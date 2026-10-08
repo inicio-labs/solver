@@ -436,7 +436,6 @@ pub async fn start(
         swap_proving_ms: config.engine.swap_proving_estimate_ms,
         swap_block_ms: config.engine.swap_block_time_ms,
         swap_offmarket_tol_bps: config.engine.swap_offmarket_tolerance_bps,
-        swap_suggest_buffer_bps: config.engine.swap_suggest_buffer_bps,
         clearing_fee_ppm: config.engine.clearing_fee_ppm,
     };
     let spawned = crate::price_api::spawn_price_api_thread(

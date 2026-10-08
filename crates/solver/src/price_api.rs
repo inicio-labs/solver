@@ -41,8 +41,8 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    fill_price, quote, suggested_price, DepthBook, DepthChange, FillStatus, NoFillReason,
-    PriceBand, QuoteOrder, QuoteTerms, SettlementStats,
+    fill_price, quote, DepthBook, DepthChange, FillStatus, NoFillReason, PriceBand, QuoteOrder,
+    QuoteTerms, SettlementStats,
 };
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -69,8 +69,6 @@ pub struct PriceApiConfig {
     /// How far (bps) the price may still have to move an order's way for
     /// `/v1/swap-eta` to call it `tolerated` rather than `off_market`.
     pub swap_offmarket_tol_bps: u64,
-    /// How far (bps) below the fill price `/v1/swap-eta` suggests a price.
-    pub swap_suggest_buffer_bps: u64,
     /// The matcher's clearing fee, so quotes apply the same rule.
     pub clearing_fee_ppm: u32,
 }
@@ -315,6 +313,27 @@ async fn get_prices(
 
 // ── swap-eta ─────────────────────────────────────────────────────────────────
 
+/// Response for `GET /v1/pair-price`: the price a wallet builds its ask from.
+/// Prices are whole requested tokens per whole offered token.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairPriceResponse {
+    offered_faucet: String,
+    requested_faucet: String,
+    /// The Binance mid of the pair's clearing market.
+    market_price: String,
+    /// The mid after the clearing fee, as this side pays it: the best ask
+    /// that fills now.
+    fill_price: String,
+    fee_ppm: u32,
+    /// On-chain decimals, to turn whole-token prices into base units; `null`
+    /// until ingest has fetched them.
+    offered_decimals: Option<u8>,
+    requested_decimals: Option<u8>,
+    /// Unix secs the solver received this quote.
+    as_of: i64,
+}
+
 /// Response for `GET /v1/swap-eta`: what the matcher would do with the order
 /// now (see [`crate::swap_eta::quote`]), plus time estimates. Amounts are base
 /// units, prices whole requested tokens per whole offered token. Optional
@@ -324,7 +343,7 @@ async fn get_prices(
 struct SwapEtaResponse {
     offered_faucet: String,
     requested_faucet: String,
-    /// The order; a missing amount is filled in at the suggested price.
+    /// The order, as asked.
     offered_amount: String,
     requested_amount: String,
     /// `at_market`, `tolerated` or `off_market`; `null` without a fresh price.
@@ -336,6 +355,9 @@ struct SwapEtaResponse {
     /// How much of the order the book fills now.
     fillable_offered_amount: String,
     fillable_requested_amount: String,
+    /// How much of the offered token the book takes at this order's price,
+    /// not capped by its size; `null` off market or without a price.
+    available_offered_amount: Option<String>,
     /// What a full fill pays now: market value minus the fee, at least the ask.
     expected_requested_amount: Option<String>,
     fee_ppm: u32,
@@ -345,9 +367,6 @@ struct SwapEtaResponse {
     market_price: Option<String>,
     /// The mid after the fee: what a full fill pays.
     fill_price: Option<String>,
-    /// The fill price less the buffer, and the requested amount at it.
-    suggested_price: Option<String>,
-    suggested_requested_amount: Option<String>,
     /// Whether the solver is settling: `false` before its executor starts and
     /// while it is in verification mode (no fee headroom, node or database down).
     accepting_orders: bool,
@@ -380,6 +399,11 @@ async fn token_rows(
         .collect())
 }
 
+/// A required positive base-unit amount.
+fn required_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
+    parse_amount(q, key)?.ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))
+}
+
 /// An optional positive base-unit amount.
 fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<Option<u64>, ApiError> {
     let Some(raw) = q.get(key) else {
@@ -401,36 +425,77 @@ fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, Api
     AccountId::from_hex(raw).map_err(|e| ApiError::BadFaucetId(format!("`{key}`: {e}")))
 }
 
-/// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=`
-///
-/// Quote a prospective order (offer A / request B, base units): where its
-/// price sits, how much of it the live book fills, the price we suggest, and
-/// the time estimates. One of the two amounts may be left out.
-async fn get_swap_eta(
-    State(state): State<PriceApiState>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, ApiError> {
-    let a = parse_faucet(&q, "offered_faucet")?;
-    let b = parse_faucet(&q, "requested_faucet")?;
+/// The two faucets of a pair request, distinct and both registered.
+async fn pair_rows(
+    state: &PriceApiState,
+    q: &HashMap<String, String>,
+) -> Result<(AccountId, AccountId, HashMap<AccountId, RegisteredTokenRow>), ApiError> {
+    let a = parse_faucet(q, "offered_faucet")?;
+    let b = parse_faucet(q, "requested_faucet")?;
     if a == b {
         return Err(ApiError::BadRequest(
             "offered_faucet and requested_faucet must differ".into(),
         ));
     }
-    let order = QuoteOrder {
-        offered: parse_amount(&q, "offered_amount")?,
-        requested: parse_amount(&q, "requested_amount")?,
-        min_fill_step: parse_amount(&q, "min_fill_step")?,
-    };
-    if order.offered.is_none() && order.requested.is_none() {
-        return Err(ApiError::BadAmount(
-            "give `offered_amount`, `requested_amount` or both".into(),
-        ));
-    }
-    let rows = token_rows(&state, vec![a, b]).await?;
+    let rows = token_rows(state, vec![a, b]).await?;
     if !rows.contains_key(&a) || !rows.contains_key(&b) {
         return Err(ApiError::UnknownFaucet);
     }
+    Ok((a, b, rows))
+}
+
+/// `GET /v1/pair-price?offered_faucet=&requested_faucet=`
+///
+/// The pair's clearing price, under the same freshness rule and fee as the
+/// matcher. The wallet builds its ask from `fill_price` and the user's
+/// slippage, then asks `/v1/swap-eta` about that exact order.
+async fn get_pair_price(
+    State(state): State<PriceApiState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<PairPriceResponse>, ApiError> {
+    let (a, b, rows) = pair_rows(&state, &q).await?;
+    let prices = state.prices.borrow().clone();
+    let now = Instant::now();
+    let unavailable = |reason| match reason {
+        PriceUnavailable::NoMarket => ApiError::NoMarket,
+        _ => ApiError::NoPrice,
+    };
+    let (side, _) = prices.order_price(a, b, now).map_err(unavailable)?;
+    let (market, received_at) = prices.market_quote(a, b, now).map_err(unavailable)?;
+    let fee_ppm = state.quote_terms.fee_ppm;
+    let fill = fill_price(side, market, fee_ppm).ok_or(ApiError::NoPrice)?;
+    let age = now.saturating_duration_since(received_at);
+    let decimals = |token| {
+        rows.get(&token)
+            .and_then(RegisteredTokenRow::token_decimals)
+    };
+    Ok(Json(PairPriceResponse {
+        offered_faucet: a.to_hex(),
+        requested_faucet: b.to_hex(),
+        market_price: PricePrecision::Full.format(market),
+        fill_price: PricePrecision::Full.format(fill),
+        fee_ppm,
+        offered_decimals: decimals(a),
+        requested_decimals: decimals(b),
+        as_of: now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX)),
+    }))
+}
+
+/// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=`
+///
+/// Judge the order a wallet is about to sign (offer A / request B, base
+/// units): where its price sits, how much of it the live book fills, and the
+/// time estimates.
+async fn get_swap_eta(
+    State(state): State<PriceApiState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let order = QuoteOrder {
+        offered: required_amount(&q, "offered_amount")?,
+        requested: required_amount(&q, "requested_amount")?,
+        min_fill_step: parse_amount(&q, "min_fill_step")?,
+    };
+    let (a, b, _) = pair_rows(&state, &q).await?;
 
     // One price snapshot, one book snapshot, one clock reading.
     let prices = state.prices.borrow().clone();
@@ -438,24 +503,16 @@ async fn get_swap_eta(
     let now = Instant::now();
     let terms = state.quote_terms;
     let market = prices.market_price(a, b, now).ok();
-    let (quoted, offered, requested, unpriced) = match prices.order_price(a, b, now) {
+    let (quoted, unpriced) = match prices.order_price(a, b, now) {
         Ok((side, price)) => {
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
             let quoted = quote(side, price, terms, order, levels((a, b)), levels((b, a)))
-                .map_err(|error| ApiError::BadAmount(error.to_string()))?;
-            (Some((side, quoted)), quoted.offered, quoted.requested, None)
+                .map_err(|error| ApiError::BadAmount(format!("cannot price: {error}")))?;
+            (Some((side, quoted)), None)
         }
-        // Without a price nothing fills, and a missing amount cannot be priced.
-        Err(reason) => {
-            let (no_fill, error) = match reason {
-                PriceUnavailable::NoMarket => (NoFillReason::NoMarket, ApiError::NoMarket),
-                _ => (NoFillReason::NoPrice, ApiError::NoPrice),
-            };
-            let (Some(offered), Some(requested)) = (order.offered, order.requested) else {
-                return Err(error);
-            };
-            (None, offered, requested, Some(no_fill))
-        }
+        // Without a price nothing fills.
+        Err(PriceUnavailable::NoMarket) => (None, Some(NoFillReason::NoMarket)),
+        Err(_) => (None, Some(NoFillReason::NoPrice)),
     };
     let quote = quoted.map(|(_, quote)| quote);
     let band = quote.map(|quote| quote.band);
@@ -476,22 +533,19 @@ async fn get_swap_eta(
     let body = Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
-        offered_amount: offered.to_string(),
-        requested_amount: requested.to_string(),
+        offered_amount: order.offered.to_string(),
+        requested_amount: order.requested.to_string(),
         price_band: band,
         fill_status: status,
         reason: quote.map_or(unpriced, |quote| quote.reason),
         fillable_offered_amount: quote.map_or(0, |q| q.fillable_offered).to_string(),
         fillable_requested_amount: quote.map_or(0, |q| q.fillable_requested).to_string(),
+        available_offered_amount: amount(quote.and_then(|q| q.available_offered)),
         expected_requested_amount: amount(quote.map(|q| q.expected_requested)),
         fee_ppm: terms.fee_ppm,
         fee_amount: amount(quote.map(|q| q.fee)),
         market_price: market.map(price),
         fill_price: fill.map(price),
-        suggested_price: fill
-            .and_then(|fill| suggested_price(fill, terms.buffer_bps))
-            .map(price),
-        suggested_requested_amount: amount(quote.map(|q| q.suggested_requested)),
         accepting_orders: settling,
         can_fill: band == Some(PriceBand::AtMarket) && status == FillStatus::Full,
         off_market: band.map(|band| band == PriceBand::OffMarket),
@@ -558,6 +612,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     let v1 = Router::new()
         .route("/price/{faucet_id}", get(get_price))
         .route("/prices", get(get_prices))
+        .route("/pair-price", get(get_pair_price))
         .route("/swap-eta", get(get_swap_eta))
         .with_state(state);
 
@@ -633,7 +688,6 @@ pub fn spawn_price_api_thread(
                     quote_terms: QuoteTerms {
                         fee_ppm: cfg.clearing_fee_ppm,
                         tolerance_bps: cfg.swap_offmarket_tol_bps,
-                        buffer_bps: cfg.swap_suggest_buffer_bps,
                     },
                 };
                 let app = build_app(state, &cfg);

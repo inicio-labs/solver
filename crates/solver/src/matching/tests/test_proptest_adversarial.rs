@@ -15,7 +15,7 @@ use crate::matching::direct_matching::run_direct_matching;
 use crate::matching::order_book::OrderBook;
 use crate::matching::three_edge_cycle::run_three_edge_cycle;
 use crate::matching::types::Order;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 
 fn order(seed: u64, off_tok: crate::types::TokenId, req_tok: crate::types::TokenId, offered: u64, requested: u64) -> Order {
     Order {
@@ -85,7 +85,7 @@ proptest! {
         req_bc in 1u64..=100_000_000_000_000,
         req_ca in 1u64..=100_000_000_000_000,
     ) {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(eth(), 100);
         feed.set_price_cents(usdc(), 100);
         feed.set_price_cents(sol(), 100);
@@ -116,7 +116,7 @@ proptest! {
         p0 in 1u64..=10_000_000, p1 in 1u64..=10_000_000, p2 in 1u64..=10_000_000,
     ) {
         let toks = [eth(), usdc(), sol()];
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(toks[0], p0);
         feed.set_price_cents(toks[1], p1);
         feed.set_price_cents(toks[2], p2);

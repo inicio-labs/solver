@@ -29,7 +29,7 @@ use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder}
 use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
-use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
+use solver::config::{RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
 use common::{
@@ -297,6 +297,16 @@ async fn three_user_direct_matching() -> Result<()> {
             });
 
             // 6. SolverConfig; the application database is the isolated PostgreSQL schema.
+            // Binance lists ETHUSDC (ETH base) at 100; the configured USDC/ETH pair
+            // has USDC as base, so it clears at the reciprocal, 100 USDC/ETH:
+            // Alice and Bob execute, leaving 20 USDC. Both faucets have the
+            // same decimals.
+            // ETHUSDT and USDCUSDT value the two tokens; startup checks them too.
+            let binance = common::BinanceStub::start(&[
+                ("ETHUSDC", "ETH", "USDC", "100"),
+                ("ETHUSDT", "ETH", "USDT", "100"),
+                ("USDCUSDT", "USDC", "USDT", "1"),
+            ]);
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
@@ -310,55 +320,16 @@ async fn three_user_direct_matching() -> Result<()> {
                     ingest_store_path,
                     read_pool_size: 2,
                 },
-                pairs: vec![AssetPairConfig {
-                    name: "USDC-ETH".into(),
-                    asset_x_faucet_id: usdc.id().to_hex(),
-                    asset_x_external_symbol: None,
-                    asset_y_faucet_id: eth.id().to_hex(),
-                    asset_y_external_symbol: None,
-                }],
-                engine: EngineConfig {
-                    pulse_interval_ms: 200,
-                    fetch_interval_ms: 100,
-                    price_interval_ms: 60_000,
-                    clearing_fee_ppm: 0,
-                    clearing_max_source_age_secs: 60,
-                    clearing_max_source_skew_secs: 30,
-                    admin_port: 0,
-                    debug_mode: false,
-                    obs_port: 0,
-                    readiness_freshness_secs: 60,
-                    verify_interval_ms: 5_000,
-                    price_api_base_url: None,
-                    price_query_port: 8080,
-                    price_query_bind: "127.0.0.1".to_string(),
-                    price_query_max_inflight: 128,
-                    price_query_max_batch: 50,
-                    price_query_timeout_ms: 3000,
-                    price_precision: "full".to_string(),
-                    price_vs_currency: "usd".to_string(),
-                    price_staleness_secs: 30,
-                    swap_proving_estimate_ms: 2000,
-                    swap_block_time_ms: 6000,
-                    swap_offmarket_tolerance_bps: 50,
-                    router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
-                    maker_gateway_enabled: false,
-                    maker_gateway_bind: "127.0.0.1".into(),
-                    maker_gateway_port: 0,
-                    maker_intake_round_submits: 500,
-                    maker_intake_submit_queue: 4096,
-                    maker_intake_cancel_queue: 1024,
-                    maker_stream_buffer: 256,
-                    maker_stream_heartbeat_ms: 10_000,
-                    maker_watch_interval_ms: 1_000,
-                    maker_settlement_buffer_ms: 30_000,
-                },
+                pairs: vec![common::pair_config(
+                    "USDC-ETH",
+                    usdc.id(),
+                    "USDC",
+                    eth.id(),
+                    "ETH",
+                    "ETHUSDC",
+                )],
+                engine: common::engine_config(),
+                binance: binance.config(),
             };
 
             // 7. Spawn solver::start with the L2 factory. start() spawns the
@@ -366,25 +337,10 @@ async fn three_user_direct_matching() -> Result<()> {
             //    on their own OS threads.
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            // Clear at 100 USDC/ETH: Alice and Bob execute, leaving 20 USDC.
-            // Both faucets have the same decimals, so the reference ratio is 100.
-            let price_map: std::collections::HashMap<_, u64> =
-                [(usdc.id(), 100), (eth.id(), 10_000)].into_iter().collect();
             let restart_factory = factory.clone();
             let restart_config = config.clone();
-            let restart_price_map = price_map.clone();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(
-                    factory,
-                    move |_sm, _key| {
-                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
-                            as Box<dyn solver::price::PriceClient + Send + Sync>)
-                    },
-                    solver_id,
-                    config,
-                    solver_cancel,
-                )
-                .await
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
             // 8. Wait for the alice↔bob fill to land. We can't observe paybacks
@@ -420,12 +376,6 @@ async fn three_user_direct_matching() -> Result<()> {
                 let mut restarted = tokio::task::spawn_local(async move {
                     solver::start(
                         restart_factory,
-                        move |_sm, _key| {
-                            Ok(
-                                Box::new(solver::price::MockPriceClient::new(restart_price_map))
-                                    as Box<dyn solver::price::PriceClient + Send + Sync>,
-                            )
-                        },
                         solver_id,
                         restart_config,
                         restart_task_cancel,

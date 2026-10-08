@@ -1,15 +1,11 @@
-//! Regression-lock for audit finding **C2**: direct (pairwise) matching must
-//! refuse to settle a trade involving a token with **no USD price**.
+//! Regression-lock for audit finding **C2**: the solver must refuse to settle
+//! a trade on a pair with **no usable price**.
 //!
-//! Scenario: alice⇄bob form a raw-balanced reciprocal pair, but the offered
-//! token `FOO` has no injected price. Correct behaviour (after the C2 fix —
-//! call `feed.is_order_profitable(...)` on the direct path): the solver must
-//! NOT settle it (an unpriced token is not matchable).
-//!
-//! `#[ignore]` ON PURPOSE: on current code the direct path never consults the
-//! price feed (that is exactly bug C2), so today this trade *does* settle and
-//! the assertion below fails. Un-ignore this test as the regression-lock the
-//! moment the C2 fix lands.
+//! Scenario: alice⇄bob form a raw-balanced reciprocal FOO/ETH pair. FOO has
+//! no Binance market (the mock Binance knows only `ETHUSDT`):
+//! - configured with the unlisted symbol `FOOETH`, startup fails and names it;
+//! - configured without a Binance market, the solver runs, but the pair has no
+//!   price and the solver must NOT settle it.
 
 mod common;
 
@@ -24,10 +20,12 @@ use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder}
 use miden_protocol::account::AccountType;
 use miden_protocol::asset::FungibleAsset;
 use miden_testing::MockChain;
-use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
+use solver::config::{RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
-use common::{build_test_client, temp_paths, vault_balance, MockClientFactory, PgSchema};
+use common::{
+    build_test_client, count_orders, temp_paths, vault_balance, MockClientFactory, PgSchema,
+};
 
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
@@ -35,7 +33,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            let _pg = PgSchema::new().await?;
+            let pg = PgSchema::new().await?;
             let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
 
             let (user_temp, user_keystore_path, user_store_path) = temp_paths()?;
@@ -49,7 +47,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
             let scheme = AuthSchemeId::Falcon512Poseidon2;
             let mode = AccountType::Public;
 
-            // `foo` is the UNPRICED token; `eth` is priced.
+            // FOO/ETH has no listed Binance market; ETH alone is priced.
             let (foo, _) = user_client
                 .insert_account(AccountSetup::faucet(mode).auth_scheme(scheme))
                 .await?;
@@ -137,7 +135,8 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 executor_store: solver_store_path,
                 keystore: solver_keystore_path.clone(),
             });
-            let config = SolverConfig {
+            let binance = common::BinanceStub::start(&[("ETHUSDT", "ETH", "USDT", "1")]);
+            let config_with = |pairs: Vec<solver::config::AssetPairConfig>| SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
                     timeout_ms: 1_000,
@@ -146,88 +145,60 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),
-                    executor_store_path,
-                    ingest_store_path,
+                    executor_store_path: executor_store_path.clone(),
+                    ingest_store_path: ingest_store_path.clone(),
                     read_pool_size: 2,
                 },
-                pairs: vec![AssetPairConfig {
-                    name: "FOO-ETH".into(),
-                    asset_x_faucet_id: foo_id.to_hex(),
-                    asset_x_external_symbol: None,
-                    asset_y_faucet_id: eth_id.to_hex(),
-                    asset_y_external_symbol: None,
-                }],
-                engine: EngineConfig {
-                    pulse_interval_ms: 200,
-                    fetch_interval_ms: 100,
-                    price_interval_ms: 60_000,
-                    clearing_fee_ppm: 0,
-                    clearing_max_source_age_secs: 60,
-                    clearing_max_source_skew_secs: 30,
-                    admin_port: 0,
-                    debug_mode: false,
-                    obs_port: 0,
-                    readiness_freshness_secs: 60,
-                    verify_interval_ms: 5_000,
-                    price_api_base_url: None,
-                    price_query_port: 8080,
-                    price_query_bind: "127.0.0.1".to_string(),
-                    price_query_max_inflight: 128,
-                    price_query_max_batch: 50,
-                    price_query_timeout_ms: 3000,
-                    price_precision: "full".to_string(),
-                    price_vs_currency: "usd".to_string(),
-                    price_staleness_secs: 30,
-                    swap_proving_estimate_ms: 2000,
-                    swap_block_time_ms: 6000,
-                    swap_offmarket_tolerance_bps: 50,
-                    router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
-                    maker_gateway_enabled: false,
-                    maker_gateway_bind: "127.0.0.1".into(),
-                    maker_gateway_port: 0,
-                    maker_intake_round_submits: 500,
-                    maker_intake_submit_queue: 4096,
-                    maker_intake_cancel_queue: 1024,
-                    maker_stream_buffer: 256,
-                    maker_stream_heartbeat_ms: 10_000,
-                    maker_watch_interval_ms: 1_000,
-                    maker_settlement_buffer_ms: 30_000,
-                },
+                pairs,
+                engine: common::engine_config(),
+                binance: binance.config(),
             };
+
+            // FOOETH is not listed: startup fails and names the market.
+            let listed_nowhere = config_with(vec![common::pair_config(
+                "FOO-ETH", foo_id, "FOO", eth_id, "ETH", "FOOETH",
+            )]);
+            let started = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                solver::start(
+                    factory.clone(),
+                    solver_id,
+                    listed_nowhere,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("startup must fail promptly");
+            match started {
+                Err(error) if format!("{error:#}").contains("FOOETH") => {}
+                other => panic!("startup must fail on the unlisted FOOETH: {other:?}"),
+            }
+
+            // Without a Binance market for FOO the solver runs, unpriced.
+            let config = config_with(vec![common::unpriced_pair_config(
+                "FOO-ETH", foo_id, eth_id, "ETH",
+            )]);
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            // Only ETH is priced; FOO is deliberately absent → unpriced.
-            let price_map: std::collections::HashMap<_, u64> =
-                [(eth_id, 100)].into_iter().collect();
             let initial_committed = rpc.mock_chain.read().committed_notes().len();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(
-                    factory,
-                    move |_sm, _key| {
-                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
-                            as Box<dyn solver::price::PriceClient + Send + Sync>)
-                    },
-                    solver_id,
-                    config,
-                    solver_cancel,
-                )
-                .await
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
-            // Drive generously; with the C2 fix an unpriced token is never
-            // matchable, so NOTHING should settle.
+            // Drive generously; a pair without a usable price never clears,
+            // so NOTHING should settle.
             for _ in 0..120 {
                 rpc.prove_block();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
+            // The solver ran the whole time and knew both orders: nothing
+            // settled because the pair had no price, not because it stopped.
+            if solver_handle.is_finished() {
+                panic!("solver stopped early: {:?}", (&mut solver_handle).await);
+            }
+            assert_eq!(count_orders(&pg.url, "active").await, 2);
             let verdict: Result<()> = {
                 let chain = rpc.mock_chain.read();
                 let solver_foo = vault_balance(&chain, solver_id, foo_id);
@@ -236,12 +207,12 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                 if solver_foo != 0 {
                     Err(anyhow::anyhow!(
                         "solver settled an UNPRICED-token trade (FOO surplus = {solver_foo}); \
-                         direct path must reject unpriced tokens (audit C2)"
+                         a pair without a usable price must not clear (audit C2)"
                     ))
                 } else if grown != 0 {
                     Err(anyhow::anyhow!(
                         "settlement paybacks appeared ({grown}) for an unpriced-token trade; \
-                         direct path must reject unpriced tokens (audit C2)"
+                         a pair without a usable price must not clear (audit C2)"
                     ))
                 } else {
                     Ok(())

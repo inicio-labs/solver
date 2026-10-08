@@ -11,7 +11,7 @@
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::matching::price_feed::PriceFeed;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use crate::matching::types::*;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen, make_note_id};
 
@@ -30,10 +30,10 @@ fn prices_5() -> [u64; 5] {
     [200_000, 100, 15_000, 6_000_000, 5_000] // ETH, USDC, SOL, BTC, MATIC in cents
 }
 
-fn make_5token_feed() -> WatchPriceFeed {
+fn make_5token_feed() -> FixedPriceFeed {
     let tokens = tokens_5();
     let prices = prices_5();
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     for i in 0..5 {
         feed.set_price_cents(tokens[i], prices[i]);
     }
@@ -43,7 +43,7 @@ fn make_5token_feed() -> WatchPriceFeed {
 // -- Invariant Checkers --
 
 /// Check all invariants that must hold after any engine run.
-fn check_invariants(engine: &MatchingEngine<WatchPriceFeed>, batch: &SettlementBatch, label: &str) {
+fn check_invariants(engine: &MatchingEngine<FixedPriceFeed>, batch: &SettlementBatch, label: &str) {
     let book = &engine.book;
 
     // 1. No overfill: every order's requested_filled <= requested
@@ -148,7 +148,7 @@ fn fuzz_lopsided_prices() {
     let prices: [u64; 5] = [200_000, 100, 15_000, 6_000_000, 50];
 
     for trial in 0..100 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed);
@@ -210,7 +210,7 @@ fn fuzz_unit_amounts() {
 /// Orders with identical offered and requested (rate=1).
 #[test]
 fn fuzz_rate_one() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     let tokens = tokens_5();
     // All same price -> rate 1 orders are oracle-profitable
     for &t in &tokens { feed.set_price_cents(t, 100); }
@@ -245,7 +245,7 @@ fn fuzz_rate_one() {
 /// Should match perfectly with zero surplus.
 #[test]
 fn exact_cancel_zero_surplus() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -268,7 +268,7 @@ fn exact_cancel_zero_surplus() {
 /// Tests that the engine correctly matches many-to-one.
 #[test]
 fn many_small_vs_one_large() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -309,7 +309,7 @@ fn all_same_direction() {
 /// Orders that are just barely profitable (offered product exceeds requested product by 1).
 #[test]
 fn barely_profitable_direct() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -330,7 +330,7 @@ fn barely_profitable_direct() {
 /// Orders that are exactly at oracle rate (not profitable: offered == requested in USD).
 #[test]
 fn exactly_at_oracle_no_match() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -354,7 +354,7 @@ fn exactly_at_oracle_no_match() {
 /// Symmetric cycle: every leg offers X, requests X.
 #[test]
 fn symmetric_triangle() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -377,7 +377,7 @@ fn symmetric_triangle() {
 /// The tiny leg is the bottleneck.
 #[test]
 fn triangle_one_unit_bottleneck() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -508,7 +508,7 @@ fn fuzz_2token_no_triangles() {
     let mut seed: u64 = 55555;
 
     for trial in 0..50 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(eth(), 200_000);
         feed.set_price_cents(usdc(), 100);
 
@@ -540,7 +540,7 @@ fn fuzz_2token_no_triangles() {
 /// For each filled order: offered_released should not exceed original offered.
 #[test]
 fn conservation_detailed_direct_match() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -573,7 +573,7 @@ fn conservation_detailed_direct_match() {
 /// Same but for triangular matching.
 #[test]
 fn conservation_detailed_triangle() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -659,7 +659,7 @@ fn order_book_consistency_after_run() {
 /// 50 orders per direction on a single pair. Tests order promotion heavily.
 #[test]
 fn stress_50_orders_per_direction() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -893,7 +893,7 @@ fn deterministic_output() {
 /// No value should be created from nothing.
 #[test]
 fn surplus_usd_conservation_direct() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -1124,7 +1124,7 @@ fn order_filled_by_both_phases() {
 /// Verifies LIFO/FIFO behavior is consistent.
 #[test]
 fn identical_orders_fair_matching() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -1163,7 +1163,7 @@ fn identical_orders_fair_matching() {
 /// The engine should not mark such orders as "filled" if nothing was released.
 #[test]
 fn no_phantom_fills() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -1378,7 +1378,7 @@ fn fuzz_per_token_flow_conservation() {
 /// If two such orders are counterparts, offered_for may round to 0.
 #[test]
 fn tiny_offered_huge_requested() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -1398,7 +1398,7 @@ fn tiny_offered_huge_requested() {
 /// Both sides offer exactly 1 unit.
 #[test]
 fn both_sides_one_unit() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -1419,7 +1419,7 @@ fn both_sides_one_unit() {
 /// correct ordering (best rate matched first).
 #[test]
 fn deep_order_book_100_levels() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 

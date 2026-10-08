@@ -1,6 +1,6 @@
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen};
 
 fn pseudo_rand(seed: &mut u64) -> u64 {
@@ -18,7 +18,7 @@ fn fuzz_random_orders() {
 
     let mut cases = 0u64;
     for &(pa, pb) in &prices {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(token_a, pa);
         feed.set_price_cents(token_b, pb);
 
@@ -60,7 +60,7 @@ fn fuzz_multi_token() {
     let mut seed: u64 = 12345;
 
     for trial in 0..50 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());
@@ -100,7 +100,7 @@ fn fuzz_no_panic() {
     let mut seed: u64 = 99999;
 
     for _ in 0..50 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(token_a, 2000);
         feed.set_price_cents(token_b, 1);
 
@@ -137,7 +137,7 @@ fn fuzz_realistic() {
     let mut seed: u64 = 20260327;
 
     for trial in 0..100 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed.clone());

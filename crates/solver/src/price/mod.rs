@@ -1,15 +1,15 @@
-//! Price module. The oracle-agnostic token map ([`token_map`]), the
-//! `coingecko` adapter, and the core price-feed implementation ([`price`]) live
-//! in sibling files; this file only wires the submodules and re-exports their
-//! public surface so callers keep using `crate::price::{...}`.
+//! Prices. Binance Spot `bookTicker` midpoints are the only source, for
+//! internal clearing, swap guidance and wallet valuation alike (ADR 0004).
+//! This is the one path to the price types: `crate::price::{..}`.
 
-mod token_map;
-pub use token_map::{read_token_map, write_token_map, SharedTokenMap};
+mod binance;
+mod precision;
 
-pub mod coingecko;
-pub use coingecko::{
-    build_http_price_client, build_http_price_client_with_base, HttpPriceClient, COINGECKO_BASE,
+#[cfg(test)]
+pub(crate) use binance::test_support;
+pub(crate) use binance::{
+    parse_positive_decimal, spawn_price_feed_thread, ClearingMarket, MarketPlan, PriceUnavailable,
+    Valued,
 };
-
-mod price;
-pub use price::*;
+pub use binance::{AssetCode, BinanceConfig, FeedMetrics, MarketError, PriceSnapshot, Symbol};
+pub use precision::PricePrecision;

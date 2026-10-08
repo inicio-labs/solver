@@ -1,10 +1,10 @@
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use super::{eth, usdc, sol, NoteIdGen};
 
-fn make_feed() -> WatchPriceFeed {
-    let mut feed = WatchPriceFeed::new();
+fn make_feed() -> FixedPriceFeed {
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed
@@ -39,12 +39,12 @@ fn triangular_disabled_skips_3cycle_phase() {
     // Build a book where the ONLY possible match is a triangular cycle
     // (no direct counter-orders exist for any pair). With triangular enabled
     // the cycle should execute; with it disabled, nothing matches.
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
 
-    fn build_triangle_book(feed: WatchPriceFeed) -> OrderBook<WatchPriceFeed> {
+    fn build_triangle_book(feed: FixedPriceFeed) -> OrderBook<FixedPriceFeed> {
         let mut book = OrderBook::new(feed);
         let mut gen = NoteIdGen::new();
         // Profitable triangle: offered_product (10*10*11) > requested_product (10*10*10).
@@ -79,8 +79,8 @@ fn triangular_disabled_skips_3cycle_phase() {
     );
 }
 
-fn make_feed_3() -> WatchPriceFeed {
-    let mut feed = WatchPriceFeed::new();
+fn make_feed_3() -> FixedPriceFeed {
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -89,7 +89,7 @@ fn make_feed_3() -> WatchPriceFeed {
 
 #[test]
 fn engine_multi_pair() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 2000);
     feed.set_price_cents(usdc(), 1);
     feed.set_price_cents(sol(), 150);

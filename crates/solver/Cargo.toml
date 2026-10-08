@@ -36,12 +36,20 @@ hex = "0.4"
 subtle = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing = "0.1"
 ruint = "1.18"
 range-set-blaze = "0.7"
 thiserror = "2"
 strum = { version = "0.28", features = ["derive"] }
+# Exact decimal arithmetic for Binance prices (ADR 0004).
+rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
+# Binance price feed (ADR 0004): WebSocket readers over an explicitly
+# configured Rustls client (ring provider, webpki roots; the feed passes its
+# own ClientConfig).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 # Maker gateway gRPC (ADR 0003): the versions miden-client already brings in.
 tonic = { version = "0.14", default-features = false, features = ["server", "router", "codegen"] }
 tonic-prost = "0.14"
@@ -66,8 +74,8 @@ miden-protocol = { workspace = true, features = ["testing"] }
 miden-testing.workspace = true
 consume-script = { path = "../consume-script" }
 tempfile = "3"
-# WS client for the router end-to-end test (matches the version axum 0.8 pulls).
-tokio-tungstenite = "0.29"
+# Local Binance stand-in for the price feed tests.
+mock-binance = { path = "../mock-binance", default-features = false }
 # Surfaces the solver's tracing logs in integration tests (e.g. the executor's
 # exact failure assertion) under `--nocapture`.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

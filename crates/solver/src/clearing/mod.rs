@@ -14,5 +14,5 @@ pub use order::Order;
 pub(crate) use order::{MatchOrder, OrderKey, OrderSide};
 pub use types::{
     BatchPrice, CandidatePlan, ClearingError, ClearingOutcome, InvalidOrderReason, OrderExecution,
-    PairAmounts, ReferencePrice, SettlementPlan, SkipReason, SolverAccruals,
+    PairAmounts, SettlementPlan, SkipReason, SolverAccruals,
 };

@@ -1,12 +1,12 @@
 use crate::matching::engine::MatchingEngine;
 use crate::matching::three_edge_cycle::run_three_edge_cycle;
 use crate::matching::order_book::OrderBook;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use std::collections::HashSet;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen};
 
-fn make_3token_feed() -> WatchPriceFeed {
-    let mut feed = WatchPriceFeed::new();
+fn make_3token_feed() -> FixedPriceFeed {
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);   // $2000
     feed.set_price_cents(usdc(), 100);      // $1
     feed.set_price_cents(sol(), 15_000);    // $150
@@ -235,7 +235,7 @@ fn surplus_to_protocol_balance() {
 /// protocol balance should be zero or minimal.
 #[test]
 fn minimal_surplus_tight_rates() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     // Set prices so orders are barely profitable
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
@@ -259,7 +259,7 @@ fn minimal_surplus_tight_rates() {
 /// Multiple triangles: highest surplus executed first.
 #[test]
 fn multiple_triangles_highest_surplus_first() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -331,7 +331,7 @@ fn stale_order_promotes_next_best() {
 /// Very small amounts: 1-unit orders. Verify no panic and correct behavior.
 #[test]
 fn tiny_amounts_no_panic() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -350,7 +350,7 @@ fn tiny_amounts_no_panic() {
 /// Large amounts near u64 limits. Verify no overflow.
 #[test]
 fn large_amounts_no_overflow() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -372,7 +372,7 @@ fn large_amounts_no_overflow() {
 /// finds cycles in the remainder.
 #[test]
 fn phase1_then_phase2() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -401,7 +401,7 @@ fn phase1_then_phase2() {
 /// phase 2 should still find and execute the triangle with remaining amounts.
 #[test]
 fn phase1_partial_then_phase2_triangle() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -450,7 +450,7 @@ fn unprofitable_leg_no_cycle() {
 /// Four tokens, two independent triangles (no shared edges).
 #[test]
 fn four_tokens_two_triangles() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -477,7 +477,7 @@ fn four_tokens_two_triangles() {
 /// Five tokens with overlapping edges. Verify no double-counting or panic.
 #[test]
 fn five_tokens_stress() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);

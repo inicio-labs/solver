@@ -18,7 +18,7 @@ use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::testing::mock::MockRpcApi;
 use miden_protocol::account::AccountType;
 use miden_testing::MockChain;
-use solver::config::{EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
+use solver::config::{RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
 use common::{build_test_client, temp_paths, FailingExecutorFactory, PgSchema};
@@ -61,6 +61,8 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                 ingest_store: solver_temp.path().join("ingest_store.sqlite3"),
             });
 
+            // No markets: the feed starts with nothing to price.
+            let binance = common::BinanceStub::start(&[]);
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
@@ -83,66 +85,14 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     read_pool_size: 2,
                 },
                 pairs: vec![], // no pairs needed; executor build fails first
-                engine: EngineConfig {
-                    pulse_interval_ms: 200,
-                    fetch_interval_ms: 100,
-                    price_interval_ms: 60_000,
-                    clearing_fee_ppm: 0,
-                    clearing_max_source_age_secs: 60,
-                    clearing_max_source_skew_secs: 30,
-                    admin_port: 0,
-                    debug_mode: false,
-                    obs_port: 0,
-                    readiness_freshness_secs: 60,
-                    verify_interval_ms: 5_000,
-                    price_api_base_url: None,
-                    price_query_port: 8080,
-                    price_query_bind: "127.0.0.1".to_string(),
-                    price_query_max_inflight: 128,
-                    price_query_max_batch: 50,
-                    price_query_timeout_ms: 3000,
-                    price_precision: "full".to_string(),
-                    price_vs_currency: "usd".to_string(),
-                    price_staleness_secs: 30,
-                    swap_proving_estimate_ms: 2000,
-                    swap_block_time_ms: 6000,
-                    swap_offmarket_tolerance_bps: 50,
-                    router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
-                    maker_gateway_enabled: false,
-                    maker_gateway_bind: "127.0.0.1".into(),
-                    maker_gateway_port: 0,
-                    maker_intake_round_submits: 500,
-                    maker_intake_submit_queue: 4096,
-                    maker_intake_cancel_queue: 1024,
-                    maker_stream_buffer: 256,
-                    maker_stream_heartbeat_ms: 10_000,
-                    maker_watch_interval_ms: 1_000,
-                    maker_settlement_buffer_ms: 30_000,
-                },
+                engine: common::engine_config(),
+                binance: binance.config(),
             };
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
             let mut handle = tokio::task::spawn_local(async move {
-                solver::start(
-                    factory,
-                    move |_sm, _key| {
-                        Ok(Box::new(solver::price::MockPriceClient::new(
-                            std::collections::HashMap::new(),
-                        ))
-                            as Box<dyn solver::price::PriceClient + Send + Sync>)
-                    },
-                    solver_id,
-                    config,
-                    solver_cancel,
-                )
-                .await
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
             // start() must return (Err) within the bound. A timeout here means
@@ -160,7 +110,15 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
                     Ok(Ok(())) => Err(anyhow::anyhow!(
                         "start() returned Ok despite executor-build failure (should be Err)"
                     )),
-                    Ok(Err(_start_err)) => Ok(()), // clean error, bounded time
+                    // A clean error in bounded time, for the injected failure.
+                    Ok(Err(error))
+                        if format!("{error:#}").contains("injected executor build failure") =>
+                    {
+                        Ok(())
+                    }
+                    Ok(Err(error)) => Err(anyhow::anyhow!(
+                        "start() failed for another reason: {error:#}"
+                    )),
                 },
             };
 

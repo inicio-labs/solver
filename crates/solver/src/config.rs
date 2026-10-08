@@ -3,20 +3,79 @@
 //! Living in the library so both `solver::start` and `main.rs` can read the
 //! same struct without a reverse dependency from library → binary.
 
+use std::net::IpAddr;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use miden_protocol::account::AccountId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::price::BinanceConfig;
+use crate::price::{
+    parse_positive_decimal, AssetCode, ClearingMarket, MarketError, MarketPlan, PricePrecision,
+    Symbol,
+};
+use crate::types::TokenId;
+
+/// Binance's limit on stream connection attempts per 5 minutes per client IP;
+/// exceeding it gets the IP rate limited, then banned.
+const BINANCE_CONNECTION_ATTEMPT_LIMIT: usize = 300;
+/// The TTL is what pauses clearing when both readers stall; a typo that makes
+/// it minutes long would clear at a frozen price.
+const MAX_QUOTE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Error)]
-enum ConfigError {
+pub(crate) enum ConfigError {
     #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
     InvalidPricePrecision(String),
-    #[error("engine.price_vs_currency must be non-empty")]
-    EmptyPriceCurrency,
+    #[error("binance.{0} must be set to a positive value")]
+    ZeroBinanceSetting(&'static str),
+    #[error("binance.{name} {url:?} must be a {}:// or {}:// URL with a host and no path or query", .schemes[0], .schemes[1])]
+    InvalidEndpoint {
+        name: &'static str,
+        url: String,
+        schemes: [&'static str; 2],
+    },
+    #[error(
+        "binance.{name} {url:?} is plaintext; only loopback hosts may use it, since the listing \
+         decides each pair's orientation and the stream its price"
+    )]
+    PlaintextEndpoint { name: &'static str, url: String },
+    #[error("binance.quote_ttl_ms must be at most {maximum}, got {value}")]
+    TtlTooLong { value: u128, maximum: u128 },
+    #[error("binance.min_notional {0:?} must be a positive decimal amount of the quote asset")]
+    InvalidMinNotional(String),
+    #[error("binance.max_connection_attempts must be between 1 and Binance's per-IP limit of {limit} (exclusive), got {value}")]
+    TooManyConnectionAttempts { value: usize, limit: usize },
     #[error("engine.clearing_fee_ppm must be below {maximum}, got {fee}")]
     InvalidClearingFee { fee: u32, maximum: u32 },
     #[error("engine.{0} must be at least 1")]
     ZeroMakerIntakeLimit(&'static str),
+    #[error("pair {pair}: invalid {side}_faucet_id: {reason}")]
+    InvalidFaucet {
+        pair: String,
+        side: &'static str,
+        reason: String,
+    },
+    #[error(
+        "pair {pair}: binance_symbol {symbol} is neither {forward} nor {reverse}, the two asset \
+         codes joined in either order"
+    )]
+    SymbolMismatch {
+        pair: String,
+        symbol: Symbol,
+        forward: Symbol,
+        reverse: Symbol,
+    },
+    #[error(transparent)]
+    Market(MarketError),
+}
+
+impl From<MarketError> for ConfigError {
+    fn from(error: MarketError) -> Self {
+        Self::Market(error)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,6 +84,7 @@ pub struct SolverConfig {
     pub solver: SolverAccountConfig,
     pub pairs: Vec<AssetPairConfig>,
     pub engine: EngineConfig,
+    pub binance: BinanceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,40 +121,53 @@ fn default_read_pool_size() -> u32 {
     4
 }
 
+/// A misspelled key here is an error, not a silently ignored one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetPairConfig {
     pub name: String,
     pub asset_x_faucet_id: String,
-    /// Optional CoinGecko-style ID (e.g. `"tether"`, `"ethereum"`) for the
-    /// `asset_x` faucet's underlying token. Used by the production price
-    /// client to look up USD prices. Tokens without a mapping fall back to
-    /// the 1-cent default in matching.
+    /// Binance asset code of the `asset_x` token (e.g. `"ETH"`). The price API
+    /// values the token by the `<ASSET><binance.valuation_quote_asset>` market;
+    /// without a code the token has no price.
     #[serde(default)]
-    pub asset_x_external_symbol: Option<String>,
+    pub asset_x_binance_asset: Option<AssetCode>,
     pub asset_y_faucet_id: String,
-    /// See `asset_x_external_symbol`.
+    /// See `asset_x_binance_asset`.
     #[serde(default)]
-    pub asset_y_external_symbol: Option<String>,
+    pub asset_y_binance_asset: Option<AssetCode>,
+    /// Approved Binance Spot symbol of the direct market between the two
+    /// assets (e.g. `"ETHUSDT"`); both asset codes are then required. Without
+    /// it the pair does not clear internally. Which asset is Binance's base
+    /// comes from `exchangeInfo`, so either pair orientation works.
+    #[serde(default)]
+    pub binance_symbol: Option<Symbol>,
+}
+
+impl AssetPairConfig {
+    /// The pair's faucets, `(asset_x, asset_y)`.
+    fn faucets(&self) -> std::result::Result<(TokenId, TokenId), ConfigError> {
+        let parse = |hex: &str, side: &'static str| {
+            AccountId::from_hex(hex).map_err(|error| ConfigError::InvalidFaucet {
+                pair: self.name.clone(),
+                side,
+                reason: error.to_string(),
+            })
+        };
+        Ok((
+            parse(&self.asset_x_faucet_id, "asset_x")?,
+            parse(&self.asset_y_faucet_id, "asset_y")?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EngineConfig {
     pub pulse_interval_ms: u64,
     pub fetch_interval_ms: u64,
-    /// How often the price feed task polls upstream (CoinGecko) for new
-    /// prices. Matcher reads from a watch channel on every pulse regardless,
-    /// so this only affects how stale the prices can get, not the matcher's
-    /// tick rate.
-    pub price_interval_ms: u64,
     /// Protocol fee and minimum eligibility edge in ppm. Zero disables fees.
     #[serde(default)]
     pub clearing_fee_ppm: u32,
-    /// Maximum age of each provider's own price timestamp when clearing.
-    #[serde(default = "default_clearing_source_age_secs")]
-    pub clearing_max_source_age_secs: u64,
-    /// Maximum difference between the two provider price timestamps.
-    #[serde(default = "default_clearing_source_skew_secs")]
-    pub clearing_max_source_skew_secs: u64,
     /// TCP port the admin HTTP server binds on `127.0.0.1`. Defaults to 3001.
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
@@ -118,18 +191,10 @@ pub struct EngineConfig {
     /// keeps orders live meanwhile. Defaults to 5000.
     #[serde(default = "default_verify_interval_ms")]
     pub verify_interval_ms: u64,
-    /// Override the price-API base URL. Defaults to the public CoinGecko
-    /// endpoint. Point this at a self-hosted or **mock** CoinGecko-compatible
-    /// service (e.g. `http://127.0.0.1:8089/api/v3/simple/price`) for devnet /
-    /// local runs where the faucet tokens aren't listed and no key is available.
-    /// The solver uses its normal `HttpPriceClient` either way — only the URL
-    /// changes. Pairs still map tokens → ids via `asset_*_external_symbol`.
-    #[serde(default)]
-    pub price_api_base_url: Option<String>,
 
     // ── Public price-query HTTP API (wallets fetch token prices) ──────────────
-    // Distinct from `price_api_base_url` above, which is the UPSTREAM source we
-    // call; these configure the endpoint we SERVE. It runs on its own OS thread.
+    // The endpoint we SERVE, from the Binance snapshot. It runs on its own OS
+    // thread.
     /// Port the price-query API binds. Default 8080.
     #[serde(default = "default_price_query_port")]
     pub price_query_port: u16,
@@ -146,20 +211,11 @@ pub struct EngineConfig {
     /// Per-request timeout in ms. Default 3000.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
-    /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`
-    /// (mirrors CoinGecko's `precision`). One value applied to the price; distinct
-    /// from a token's on-chain decimals. Default `"full"`. Overridable per request.
+    /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`.
+    /// One value applied to the price; distinct from a token's on-chain
+    /// decimals. Default `"full"` (exact, up to 18 places). Overridable per request.
     #[serde(default = "default_price_precision")]
     pub price_precision: String,
-    /// Quote currency (CoinGecko `vs_currencies`). Default `"usd"`. Must be a
-    /// CoinGecko-supported vs_currency (usd/eur/btc/…), NOT a coin like `"usdt"`.
-    #[serde(default = "default_price_vs_currency")]
-    pub price_vs_currency: String,
-    /// Max age (secs) of the last SUCCESSFUL price refresh before the price-query
-    /// API treats prices as stale (→ `503` unless `?allow_stale=true`). Default 30.
-    /// Set ≥ 2 × (price_interval_ms / 1000).
-    #[serde(default = "default_price_staleness_secs")]
-    pub price_staleness_secs: u64,
 
     // ── Swap time-estimation API (`/v1/swap-eta`) ─────────────────────────────
     /// Estimated proof-generation time (ms) for a settlement tx — a term of the
@@ -169,7 +225,7 @@ pub struct EngineConfig {
     /// Estimated chain block time (ms) — a term of the next-batch ETA. Default 6000.
     #[serde(default = "default_swap_block_time_ms")]
     pub swap_block_time_ms: u64,
-    /// Slack (bps) before an order is flagged `offMarket` vs the oracle mid.
+    /// Slack (bps) before an order is flagged `offMarket` vs the Binance mid.
     /// Default 50 (0.5%).
     #[serde(default = "default_swap_offmarket_tolerance_bps")]
     pub swap_offmarket_tolerance_bps: u64,
@@ -239,32 +295,6 @@ pub struct EngineConfig {
     pub maker_settlement_buffer_ms: u64,
 }
 
-/// Resolved price precision (decimal places of the price NUMBER): `Full` or a
-/// fixed `0..=18`. Mirrors CoinGecko's `precision`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PricePrecision {
-    Full,
-    Fixed(u8),
-}
-
-impl PricePrecision {
-    /// Parse `"full"` (case-insensitive) or an integer `0..=18`.
-    pub fn parse(s: &str) -> Option<Self> {
-        if s.eq_ignore_ascii_case("full") {
-            return Some(Self::Full);
-        }
-        s.parse::<u8>().ok().filter(|n| *n <= 18).map(Self::Fixed)
-    }
-}
-
-fn default_clearing_source_age_secs() -> u64 {
-    60
-}
-
-fn default_clearing_source_skew_secs() -> u64 {
-    30
-}
-
 fn default_admin_port() -> u16 {
     3001
 }
@@ -298,12 +328,6 @@ fn default_price_query_timeout_ms() -> u64 {
 }
 fn default_price_precision() -> String {
     "full".to_string()
-}
-fn default_price_vs_currency() -> String {
-    "usd".to_string()
-}
-fn default_price_staleness_secs() -> u64 {
-    30
 }
 fn default_swap_proving_estimate_ms() -> u64 {
     2000
@@ -360,6 +384,73 @@ fn default_maker_watch_interval_ms() -> u64 {
     1_000
 }
 
+/// `url` parses, uses one of `schemes` (plaintext first, TLS second), names a
+/// host and nothing more, and is plaintext only for a loopback host.
+fn check_endpoint(
+    name: &'static str,
+    url: &str,
+    schemes: [&'static str; 2],
+) -> std::result::Result<(), ConfigError> {
+    let invalid = || ConfigError::InvalidEndpoint {
+        name,
+        url: url.to_string(),
+        schemes,
+    };
+    let parsed = reqwest::Url::parse(url).map_err(|_| invalid())?;
+    let bare = matches!(parsed.path(), "" | "/")
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    let Some(host) = parsed
+        .host_str()
+        .filter(|_| bare && schemes.contains(&parsed.scheme()))
+    else {
+        return Err(invalid());
+    };
+    let loopback = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if parsed.scheme() == schemes[0] && !loopback {
+        return Err(ConfigError::PlaintextEndpoint {
+            name,
+            url: url.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The `[binance]` checks that matter at load: the two required settings,
+/// the TTL cap, the per-IP attempt budget, `min_notional`, and the endpoints.
+fn check_binance(binance: &BinanceConfig) -> std::result::Result<(), ConfigError> {
+    if binance.quote_ttl.is_zero() {
+        return Err(ConfigError::ZeroBinanceSetting("quote_ttl_ms"));
+    }
+    if binance.max_spread_bps == 0 {
+        return Err(ConfigError::ZeroBinanceSetting("max_spread_bps"));
+    }
+    if binance.quote_ttl > MAX_QUOTE_TTL {
+        return Err(ConfigError::TtlTooLong {
+            value: binance.quote_ttl.as_millis(),
+            maximum: MAX_QUOTE_TTL.as_millis(),
+        });
+    }
+    if !(1..BINANCE_CONNECTION_ATTEMPT_LIMIT).contains(&binance.max_connection_attempts) {
+        return Err(ConfigError::TooManyConnectionAttempts {
+            value: binance.max_connection_attempts,
+            limit: BINANCE_CONNECTION_ATTEMPT_LIMIT,
+        });
+    }
+    if let Some(raw) = &binance.min_notional {
+        parse_positive_decimal(raw).ok_or_else(|| ConfigError::InvalidMinNotional(raw.clone()))?;
+    }
+    for endpoint in &binance.stream_endpoints {
+        check_endpoint("stream_endpoints", endpoint, ["ws", "wss"])?;
+    }
+    check_endpoint("rest_endpoint", &binance.rest_endpoint, ["http", "https"])
+}
+
 impl SolverConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -371,15 +462,13 @@ impl SolverConfig {
         Ok(config)
     }
 
-    /// Validate fields that have constrained domains (fail fast at boot).
+    /// Validate fields that have constrained domains (fail fast at boot),
+    /// including the Binance market mapping of the pairs.
     fn validate(&self) -> std::result::Result<(), ConfigError> {
         if PricePrecision::parse(&self.engine.price_precision).is_none() {
             return Err(ConfigError::InvalidPricePrecision(
                 self.engine.price_precision.clone(),
             ));
-        }
-        if self.engine.price_vs_currency.trim().is_empty() {
-            return Err(ConfigError::EmptyPriceCurrency);
         }
         if self.engine.clearing_fee_ppm >= crate::clearing::PPM_DENOMINATOR {
             return Err(ConfigError::InvalidClearingFee {
@@ -414,10 +503,66 @@ impl SolverConfig {
                 return Err(ConfigError::ZeroMakerIntakeLimit(name));
             }
         }
+        check_binance(&self.binance)?;
+        self.market_plan()?;
         Ok(())
     }
 
-    /// The Miden client no longer exposes debug mode.
+    /// Every pair's faucets, `(asset_x, asset_y)`, in configuration order.
+    pub(crate) fn faucet_pairs(&self) -> std::result::Result<Vec<(TokenId, TokenId)>, ConfigError> {
+        self.pairs.iter().map(AssetPairConfig::faucets).collect()
+    }
+
+    /// The Binance markets the configuration asks for: each faucet's asset
+    /// code, each pair with an approved symbol, and the valuation quote. A
+    /// clearing symbol must be the pair's two asset codes joined, in either
+    /// order; which order Binance uses comes from `exchangeInfo` at runtime.
+    pub(crate) fn market_plan(&self) -> std::result::Result<MarketPlan, ConfigError> {
+        let mut assets = Vec::new();
+        let mut clearing = Vec::new();
+        for (pair, (x, y)) in self.pairs.iter().zip(self.faucet_pairs()?) {
+            let codes = [
+                (x, &pair.asset_x_binance_asset),
+                (y, &pair.asset_y_binance_asset),
+            ];
+            assets.extend(
+                codes
+                    .into_iter()
+                    .filter_map(|(token, code)| Some((token, code.clone()?))),
+            );
+            let Some(symbol) = &pair.binance_symbol else {
+                tracing::warn!(
+                    pair = %pair.name,
+                    "pair has no binance_symbol; it will not clear internally"
+                );
+                continue;
+            };
+            if let (Some(code_x), Some(code_y)) =
+                (&pair.asset_x_binance_asset, &pair.asset_y_binance_asset)
+            {
+                let forward = Symbol::of_assets(code_x, code_y);
+                let reverse = Symbol::of_assets(code_y, code_x);
+                if *symbol != forward && *symbol != reverse {
+                    return Err(ConfigError::SymbolMismatch {
+                        pair: pair.name.clone(),
+                        symbol: symbol.clone(),
+                        forward,
+                        reverse,
+                    });
+                }
+            }
+            clearing.push(ClearingMarket {
+                name: pair.name.clone(),
+                base: x,
+                quote: y,
+                symbol: symbol.clone(),
+            });
+        }
+        let quote = self.binance.valuation_quote_asset.clone();
+        Ok(MarketPlan::new(assets, clearing, quote)?)
+    }
+
+    /// Settings this binary accepts but does not use.
     fn warn_ignored_settings(&self) {
         if self.engine.debug_mode {
             tracing::warn!("engine.debug_mode is ignored: miden-client 0.16 removed debug mode");
@@ -432,20 +577,211 @@ impl SolverConfig {
 }
 
 #[cfg(test)]
-mod maker_expiry_tests {
+mod tests {
     use super::*;
 
+    const EXAMPLE: &str = include_str!("../../../solver.toml.example");
+
+    /// `text` parsed, with the example's faucet placeholders replaced by
+    /// valid ids.
+    fn parsed(text: &str) -> SolverConfig {
+        let mut config: SolverConfig = toml::from_str(text).expect("config parses");
+        config.pairs[0].asset_x_faucet_id = "0x9f0c6ec13c4ed2b1076a2990a9fc29".into();
+        config.pairs[0].asset_y_faucet_id = "0x3ae73d7f166f723132e3acbba75e75".into();
+        config
+    }
+
+    fn example() -> SolverConfig {
+        parsed(EXAMPLE)
+    }
+
+    /// The validation error of `example()` after `change`.
+    fn check(change: impl FnOnce(&mut SolverConfig)) -> String {
+        let mut config = example();
+        change(&mut config);
+        config.validate().unwrap_err().to_string()
+    }
+
+    fn accepted(change: impl FnOnce(&mut SolverConfig)) {
+        let mut config = example();
+        change(&mut config);
+        config.validate().unwrap();
+    }
+
     #[test]
-    fn settlement_buffer_defaults_and_can_be_disabled() {
-        let example = include_str!("../../../solver.toml.example");
-        let config: SolverConfig = toml::from_str(example).unwrap();
-        assert_eq!(config.engine.maker_settlement_buffer_ms, 30_000);
-        let explicit = example.replace(
+    fn example_config_is_valid() {
+        let config = example();
+        config.validate().unwrap();
+        let binance = &config.binance;
+        assert_eq!(binance.quote_ttl, Duration::from_secs(2));
+        assert_eq!(binance.max_spread_bps, 50);
+        assert_eq!(binance.min_notional, None);
+        assert_eq!(binance.validation_timeout, Duration::from_secs(60));
+        let defaults = BinanceConfig::default();
+        assert_eq!(binance.stream_endpoints, defaults.stream_endpoints);
+        assert_ne!(
+            defaults.stream_endpoints[0], defaults.stream_endpoints[1],
+            "the readers default to different endpoints"
+        );
+        assert_eq!(binance.connection_lifetime, defaults.connection_lifetime);
+    }
+
+    /// Durations are read in the unit their key names, and survive a save.
+    #[test]
+    fn binance_durations_use_their_key_units() {
+        let text = EXAMPLE.replace(
+            "max_spread_bps = 50",
+            "max_spread_bps = 50\nretry_min_ms = 250\nconnection_lifetime_secs = 7200",
+        );
+        let config = parsed(&text);
+        assert_eq!(config.binance.retry_min, Duration::from_millis(250));
+        assert_eq!(
+            config.binance.connection_lifetime,
+            Duration::from_secs(7200)
+        );
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("retry_min_ms = 250"), "{saved}");
+        assert!(saved.contains("connection_lifetime_secs = 7200"), "{saved}");
+    }
+
+    #[test]
+    fn example_pair_maps_to_its_binance_market() {
+        let plan = example().market_plan().unwrap();
+        let symbols: Vec<_> = plan.symbols().into_iter().map(|s| s.to_string()).collect();
+        // The clearing market also values ETH; USDT is the valuation quote.
+        assert_eq!(symbols, ["ETHUSDT"]);
+    }
+
+    #[test]
+    fn binance_codes_are_checked_at_load() {
+        let lowercase = EXAMPLE.replace(
+            r#"binance_symbol = "ETHUSDT""#,
+            r#"binance_symbol = "ethusdt""#,
+        );
+        let config: SolverConfig = toml::from_str(&lowercase).unwrap();
+        assert_eq!(
+            config.pairs[0].binance_symbol,
+            Some(Symbol::parse("ETHUSDT").unwrap())
+        );
+        let invalid = EXAMPLE.replace(
+            r#"asset_y_binance_asset = "ETH""#,
+            r#"asset_y_binance_asset = "E-TH""#,
+        );
+        let error = toml::from_str::<SolverConfig>(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("asset_y_binance_asset"), "{error}");
+    }
+
+    /// A misspelled key must not load as if the setting had been applied.
+    #[test]
+    fn misspelled_keys_are_rejected() {
+        let pair_key = EXAMPLE.replace(
+            r#"binance_symbol = "ETHUSDT""#,
+            r#"binance_symbl = "ETHUSDT""#,
+        );
+        let error = toml::from_str::<SolverConfig>(&pair_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("binance_symbl"), "{error}");
+        let binance_key = EXAMPLE.replace(
+            "max_spread_bps = 50",
+            "max_spread_bps = 50\nstream_endpoint = \"wss://x\"",
+        );
+        let error = toml::from_str::<SolverConfig>(&binance_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stream_endpoint"), "{error}");
+    }
+
+    #[test]
+    fn pair_mappings_are_checked_at_load() {
+        let error = check(|config| config.pairs[0].asset_x_binance_asset = None);
+        assert!(error.contains("has no Binance asset code"), "{error}");
+        let error = check(|config| config.pairs[0].asset_x_faucet_id = "0xnot-hex".into());
+        assert!(error.contains("asset_x_faucet_id"), "{error}");
+        let error = check(|config| {
+            config.pairs[0].binance_symbol = Some(Symbol::parse("ETHUSTD").unwrap())
+        });
+        assert!(
+            error.contains("ETHUSTD") && error.contains("USDTETH"),
+            "{error}"
+        );
+        // Either order of the two codes is a valid symbol.
+        accepted(|config| config.pairs[0].binance_symbol = Some(Symbol::parse("USDTETH").unwrap()));
+    }
+
+    /// Only the checks that matter: the two required settings, the TTL cap,
+    /// the per-IP attempt budget, `min_notional`, and the endpoints.
+    #[test]
+    fn binance_settings_are_checked() {
+        type Change = fn(&mut BinanceConfig);
+        let check = |change: Change| check(|config| change(&mut config.binance));
+        assert!(check(|b| b.quote_ttl = Duration::ZERO).contains("quote_ttl_ms"));
+        assert!(check(|b| b.max_spread_bps = 0).contains("max_spread_bps"));
+        assert!(
+            check(|b| b.quote_ttl = MAX_QUOTE_TTL + Duration::from_millis(1))
+                .contains("quote_ttl_ms")
+        );
+        accepted(|c| c.binance.quote_ttl = MAX_QUOTE_TTL);
+        assert!(check(|b| b.max_connection_attempts = 0).contains("max_connection_attempts"));
+        assert!(check(|b| b.max_connection_attempts = 300).contains("per-IP limit of 300"));
+        accepted(|c| c.binance.max_connection_attempts = 299);
+        assert!(check(|b| b.min_notional = Some("0".into())).contains("min_notional"));
+        assert!(check(|b| b.min_notional = Some("5e3".into())).contains("min_notional"));
+        accepted(|c| c.binance.min_notional = Some("0.5".into()));
+        assert!(
+            check(|b| b.stream_endpoints[1] = "https://example.com".into())
+                .contains("stream_endpoints")
+        );
+        assert!(check(|b| b.rest_endpoint = "wss://example.com".into()).contains("rest_endpoint"));
+        assert!(check(|b| b.rest_endpoint = String::new()).contains("rest_endpoint"));
+        // A path or query would be mangled when the feed appends its own.
+        assert!(
+            check(|b| b.stream_endpoints[0] = "wss://stream.binance.com:9443/ws".into())
+                .contains("no path or query")
+        );
+        assert!(
+            check(|b| b.rest_endpoint = "https://api.binance.com/?x=1".into())
+                .contains("no path or query")
+        );
+        // Plaintext only on loopback: a listing over HTTP could invert a pair.
+        assert!(
+            check(|b| b.rest_endpoint = "http://data-api.binance.vision".into())
+                .contains("plaintext")
+        );
+        for endpoint in [
+            "ws://127.0.0.1:8089",
+            "ws://localhost:8089",
+            "ws://[::1]:8089",
+        ] {
+            let mut config = example();
+            config.binance.stream_endpoints = [endpoint.into(), endpoint.into()];
+            config.validate().unwrap();
+        }
+        // The timing settings are not bounded: any value loads.
+        accepted(|c| c.binance.retry_min = Duration::from_millis(1));
+        accepted(|c| c.binance.connection_lifetime = Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_binance_section_is_required() {
+        let mut table: toml::Table = toml::from_str(EXAMPLE).unwrap();
+        table.remove("binance");
+        let error = toml::from_str::<SolverConfig>(&table.to_string()).unwrap_err();
+        assert!(error.to_string().contains("binance"), "{error}");
+    }
+
+    #[test]
+    fn maker_settlement_buffer_defaults_and_can_be_disabled() {
+        assert_eq!(example().engine.maker_settlement_buffer_ms, 30_000);
+        let explicit = EXAMPLE.replace(
             "# maker_settlement_buffer_ms = 30000",
             "maker_settlement_buffer_ms = 0",
         );
-        let config: SolverConfig = toml::from_str(&explicit).unwrap();
+        let config = parsed(&explicit);
         assert_eq!(config.engine.maker_settlement_buffer_ms, 0);
         config.validate().unwrap();
+        assert!(check(|c| c.engine.maker_stream_buffer = 0).contains("maker_stream_buffer"));
     }
 }

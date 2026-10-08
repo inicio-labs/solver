@@ -2569,14 +2569,15 @@ mod tests {
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
         run(conn, alpha, "s1", 1, submit(&note(1)))?;
-        // Expiry and the later columns go first; the maker tables refuse.
-        postgres_migrations::revert_last(conn)?;
-        postgres_migrations::revert_last(conn)?;
-        postgres_migrations::revert_last(conn)?;
+        // The token column (ADR 0004), expiry and the later columns go first;
+        // the maker tables refuse.
+        for _ in 0..4 {
+            postgres_migrations::revert_last(conn)?;
+        }
         assert!(postgres_migrations::revert_last(conn).is_err());
 
         let mut empty = TestSchema::migrated()?;
-        for _ in 0..4 {
+        for _ in 0..5 {
             postgres_migrations::revert_last(&mut empty.conn)?;
         }
         postgres_migrations::migrate(&mut empty.conn)?;
@@ -2599,8 +2600,9 @@ mod tests {
             let conn = &mut fixture.conn;
             let alpha = maker(conn, "alpha")?;
             run(conn, alpha, "c1", 1, cancel)?;
-            // Expiry and the later columns go first; the maker tables refuse.
-            for _ in 0..3 {
+            // The token column (ADR 0004), expiry and the later columns go
+            // first; the maker tables refuse.
+            for _ in 0..4 {
                 postgres_migrations::revert_last(conn)?;
             }
             assert!(postgres_migrations::revert_last(conn).is_err());
@@ -2662,6 +2664,8 @@ mod tests {
         })?;
         assert_eq!(update.active[0].id(), child.unwrap().id());
         assert_eq!(update.active[0].maker.unwrap().expires_at_unix_ms, Some(1));
+        // The token column (ADR 0004) goes first; the expiry refuses.
+        postgres_migrations::revert_last(conn)?;
         assert!(
             postgres_migrations::revert_last(conn).is_err(),
             "rollback cannot discard a recorded expiry"

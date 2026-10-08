@@ -1,8 +1,15 @@
 # Miden Price API — dApp Integration
 
-Read-only HTTP API. Given a token's **faucet id**, returns its **price in USDT**
-(the exact Binance Spot midpoint of its `<ASSET>USDT` market) plus the token's
-**on-chain decimals** — enough to render a swap quote unambiguously.
+Read-only HTTP API for swap UIs:
+
+- `/v1/price`, `/v1/prices`: a token's **price in USDT** (the exact Binance
+  Spot midpoint of its `<ASSET>USDT` market) plus its **on-chain decimals**.
+- `/v1/pair-price`: a pair's clearing price, to build an order's ask from.
+- `/v1/swap-eta`: whether the order a wallet is about to sign fills now,
+  partly, or not, and why.
+
+Field names are snake_case on `/v1/price(s)` and camelCase on the swap
+endpoints.
 
 ## Base URL
 
@@ -81,7 +88,8 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 ### Swapping: three steps for the wallet
 
 1. **Price.** `GET /v1/pair-price` gives the pair's `fillPrice`: the Binance
-   mid less the clearing fee, the best price that fills right now.
+   mid less the clearing fee, the best price an ask can name and still fill
+   right now (rounded down, so an ask built from it never overshoots).
 2. **Ask.** The wallet builds the order with the user's slippage (BigInt or a
    decimal library, never floats):
    `requested_amount = floor(offered_amount × fillPrice × (1 − slippage) × 10^requestedDecimals / 10^offeredDecimals)`
@@ -92,6 +100,23 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 Slippage here protects the user against the mid moving before the next
 batch. It does not buy more liquidity: the solver fills every order at the
 mid less the fee, never at a resting order's own price.
+
+**Reading the verdict.** Check `acceptingOrders` first, then `priceBand`, then
+`fillStatus`:
+
+| Outcome | Answer |
+|---|---|
+| Solver paused: orders wait | `acceptingOrders: false` (whatever the rest says) |
+| Can be filled | `at_market` + `full` |
+| Can be filled partially | `at_market` + `partial` |
+| Can't be filled due to price | `off_market` (`none`, reason `price`) |
+| Close: fills after a small price move | `tolerated`, with `fillStatus` judged at the price where the order starts to fill |
+| Not enough orders at today's price | `at_market` or `tolerated` + `none`, reason `liquidity` |
+| No price for the pair | `none`, reason `no_market` or `no_price` |
+
+Ask before the user signs. Once the order is in the book, asking again counts
+it as volume ahead of itself; an order-status endpoint for the "not filling
+soon, cancel?" prompt is planned.
 
 ### `GET /v1/pair-price` — the price to build an ask from
 
@@ -113,9 +138,9 @@ mid less the fee, never at a resting order's own price.
 | Field | Meaning |
 |---|---|
 | `marketPrice` | the Binance mid of the pair's clearing market, in whole requested tokens per whole offered token |
-| `fillPrice` | the mid after the clearing fee, as this side pays it: the best ask that fills now |
+| `fillPrice` | the best price an ask can name and still fill now: the mid after the clearing fee as this side is charged it, rounded toward zero |
 | `feePpm` | the clearing fee |
-| `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals, to turn prices into base units; `null` until fetched |
+| `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals, to turn prices into base units (a pair is only priced once both are known) |
 | `asOf` | unix seconds the solver received this quote |
 
 It follows the solver's own freshness rule: `503` `no_market` when the pair
@@ -133,7 +158,7 @@ the live book.
 |---|---|---|
 | `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
 | `offered_amount`, `requested_amount` | yes | the order, in base units |
-| `min_fill_step` | no | the note's smallest partial fill. A wallet that does not allow partial fills sends the requested amount; a smaller partial answer becomes `none` |
+| `min_fill_step` | no | the note's smallest partial fill, in requested-token base units. A wallet that does not allow partial fills sends the requested amount; a smaller partial answer becomes `none` |
 
 **200 response** — selling 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with 3.2 ETH of buyers in the book:
 
@@ -161,18 +186,18 @@ whole offered token. Optional fields are `null`, never omitted.
 | Field | Meaning |
 |---|---|
 | `offeredAmount`, `requestedAmount` | the order, as asked |
-| `priceBand` | `at_market`: fills at today's price · `tolerated`: fills once the price moves at most `swap_offmarket_tolerance_bps` (default 0.5%) the order's way · `off_market`: further than that · `null`: no fresh price |
+| `priceBand` | `at_market`: fills at today's price · `tolerated`: fills once the price moves at most `swap_offmarket_tolerance_bps` (default 0.5%) the order's way; its fill fields are judged at the price where it starts to fill · `off_market`: further than that · `null`: no fresh price |
 | `fillStatus` | `full`, `partial` or `none` |
 | `reason` | only for `none`: `price` (off market), `liquidity` (priced fine, nothing left in the book for it), `no_market` (the pair has no clearing market), `no_price` (no fresh price right now) |
 | `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order the book fills now; a partial fill pays the order's own ratio |
 | `availableOfferedAmount` | how much of the offered token the book takes now at this order's price, not capped by the order's size: "max you can swap now". `null` off market or without a price |
-| `expectedRequestedAmount` | what a **full** fill pays now: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
-| `feePpm`, `feeAmount` | the clearing fee, and its amount on a full fill now (requested token) |
+| `expectedRequestedAmount` | what a **full** fill pays at today's price: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
+| `feePpm`, `feeAmount` | the clearing fee, and what it takes from a full fill at today's price (requested token). The fee only comes out of the surplus over the ask, so it is smaller, down to `0`, for an order that is not at market |
 | `marketPrice`, `fillPrice` | as in `/v1/pair-price`, for showing "the market is now X" |
 | `acceptingOrders` | `false` while the solver cannot settle (it is recovering from missing fee funds, or the node or database being down): orders wait |
 | `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
-| `canFill`, `offMarket` | kept for older wallets: `at_market` and `full`; `priceBand == off_market` |
+| `canFill`, `offMarket` | kept for older wallets: `at_market`, `full` and `acceptingOrders`; `priceBand == off_market` |
 
 Suggested wallet copy:
 
@@ -183,21 +208,34 @@ Suggested wallet copy:
 | `tolerated` | "May take longer: fills when the price moves slightly" |
 | `none` + `price` | "The price moved." Get a fresh `/v1/pair-price` and rebuild the ask |
 | `none` + `liquidity` | "Not enough orders at the current price right now" |
-| `acceptingOrders: false` | "Settlement delayed" |
+| `none` + `no_market` | "This pair isn't traded" |
+| `none` + `no_price` | "Prices are unavailable right now; try again shortly" |
+| `acceptingOrders: false` | "Settlement delayed" (shown first) |
 
 The verdict is advisory: nothing is reserved, so two wallets can be told
-`full` for the same liquidity. It counts the solver's own book only, not
-external liquidity routing, and ignores the per-side order cap of one batch.
-Errors: `400` bad or missing amounts or faucet ids, `404` unknown faucet.
-Without a price the answer is still `200`, with `reason` `no_market` or
-`no_price`.
+`full` for the same liquidity. It counts the solver's own book only. Not
+modelled: external liquidity routing, the per-side order cap of one batch,
+and other orders' own minimum fills (an all-or-nothing order counts in full
+even when it could not fill against this one).
+
+Errors: `400` `bad_faucet_id` (malformed id), `bad_request` (the two faucets
+are equal), `bad_amount` (missing, zero or non-numeric amount, or amounts too
+large to price); `404` `unknown_faucet`. Without a price the answer is still
+`200`, with `reason` `no_market` or `no_price`.
+
+**Older wallets.** The response keeps every field older wallets read. Two
+meanings are stricter now: `canFill` is true only when the order fills fully
+at today's price while the solver is settling, and `offMarket` is measured
+from the mid less the fee. A wallet that asks exactly the mid, or the mid less
+a slippage smaller than the fee, now gets `tolerated` with `canFill: false`:
+such an order would not clear until the price moves.
 
 ### Status codes
 
 | Code | When |
 |---|---|
 | `200` | OK |
-| `400` | malformed faucet id, bad `precision`, or too many ids |
+| `400` | `bad_faucet_id`: malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (equal faucets) and `bad_amount` |
 | `404` | faucet not registered with the solver |
 | `503` | `no_market`: registered but no Binance market is configured for the token — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, or the newest was crossed, too wide or too thin); `stale`: the quote is at least the quote TTL old (use `?allow_stale=true` to override) |
 
@@ -254,7 +292,7 @@ const usdt = quoteValue(ibtc, 250000000); // 2.5 IBTC -> 25
 
 ## Notes
 
-- **Read-only, public, cached** (`Cache-Control: max-age=1`). Concurrency-limited; excess → `503`.
+- **Read-only, public, cached** (`Cache-Control: max-age=1`; `/v1/swap-eta` is `no-store`). Concurrency-limited; excess → `503`.
 - `price` is per **whole token** (not per base unit) — combine with `decimals` as shown.
 - Prices come from Binance Spot `bookTicker` midpoints. On devnet the faucet tokens are priced by a mock Binance server, so the values in the table above are fixed test prices.
 - Endpoint accepts the **hex** faucet id today. (Bech32 `mdev…` acceptance can be added on request.)

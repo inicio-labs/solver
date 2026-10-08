@@ -261,6 +261,16 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::swap_eta::DepthBook;
+
+    /// With time paused the matcher ticks at 0 s, 1 s, 2 s and so on: these
+    /// return half a second after the first tick, or one tick later.
+    async fn after_first_tick() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    async fn after_next_tick() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -499,9 +509,7 @@ mod tests {
                         cutoffs: Vec::new(),
                     })
                     .is_ok());
-                // Time is paused and the matcher ticks on whole seconds: half a
-                // second in, the tick at 0 s has finished.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                after_first_tick().await;
                 depth.drain(&mut depth_rx);
                 assert_eq!(depth.snapshot().len(), 4);
 
@@ -514,14 +522,12 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                after_next_tick().await;
                 depth.drain(&mut depth_rx);
                 assert_eq!(depth.snapshot().len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
-
-                depth.drain(&mut depth_rx);
+                after_next_tick().await;
                 assert_eq!(exec_rx.try_recv().unwrap().filled_notes.len(), 2);
                 worker.abort();
                 assert!(worker.await.unwrap_err().is_cancelled());

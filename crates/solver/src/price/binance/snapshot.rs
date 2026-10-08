@@ -590,6 +590,25 @@ mod tests {
             snapshot.market_price(eth(), btc(), now),
             Err(PriceUnavailable::NoMarket)
         );
+        // A quote finds the order's side of the configured pair, at the
+        // matcher's own price, and when that quote arrived.
+        let clearing = snapshot.pair_price(usdt(), eth(), now).unwrap();
+        assert_eq!(
+            snapshot.order_price(usdt(), eth(), now),
+            Ok((OrderSide::SellBase, clearing))
+        );
+        assert_eq!(
+            snapshot.order_price(eth(), usdt(), now),
+            Ok((OrderSide::BuyBase, clearing))
+        );
+        assert_eq!(
+            snapshot.order_price(eth(), btc(), now),
+            Err(PriceUnavailable::NoMarket)
+        );
+        assert_eq!(
+            snapshot.market_quote(eth(), usdt(), now),
+            Ok((price("2000"), now))
+        );
         assert_eq!(
             snapshot.valuation(usdt(), now),
             Ok(Valued {

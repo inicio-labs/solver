@@ -193,7 +193,7 @@ pub fn create_channels() -> PipelineChannels {
     // after each settlement (the 24h median). Both are read on the price API's
     // thread. The depth feed is unbounded so the matcher never waits on or
     // drops a change: it only sends what its index already did, and the price
-    // API's mirror drains it continuously (see `price_api::mirror_depth`).
+    // API's mirror drains it every 250 ms (see `price_api::mirror_depth`).
     let (depth_tx, depth_rx) = mpsc::unbounded_channel::<DepthChange>();
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));

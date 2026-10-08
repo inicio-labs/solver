@@ -361,6 +361,8 @@ bound to `127.0.0.1` by default (`price_query_bind`).
 ```bash
 GET /v1/price/{faucet_id}?precision=&allow_stale=
 GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, … }
+GET /v1/pair-price?offered_faucet=&requested_faucet=
+GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
 ```
 ```jsonc
 // GET /v1/price/0x8fe0…?precision=4

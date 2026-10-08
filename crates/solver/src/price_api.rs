@@ -1,5 +1,7 @@
-//! Public, read-only **price-query HTTP API** — wallets fetch a token's current
-//! price by faucet id (for swap UIs).
+//! Public, read-only **price-query HTTP API** for swap UIs: a token's price by
+//! faucet id (`/v1/price`, `/v1/prices`), a pair's clearing price to build an
+//! ask from (`/v1/pair-price`), and what the matcher would do with an order the
+//! wallet is about to sign (`/v1/swap-eta`, see [`crate::swap_eta`]).
 //!
 //! ISOLATION (P0): this is a public, unauthenticated surface, so it runs on its
 //! OWN OS thread + multi-thread runtime. It never touches the `!Send` miden
@@ -10,7 +12,8 @@
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
 //! while younger than the quote TTL. Decimals + ticker come from the DB
-//! (fetched on-chain by ingest).
+//! (fetched on-chain by ingest). The book depth for swap quotes comes from
+//! [`mirror_depth`], which this thread runs: the matcher only sends changes.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -83,7 +86,7 @@ pub struct PriceApiState {
     max_batch: usize,
     // ── swap-eta ──
     /// The matcher's resting levels, from [`mirror_depth`] (read lock-free).
-    swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
     /// In-memory settlement-time window from the executor.
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     /// Next-batch ETA (secs) = ceil((sync + trigger + proving + block)/1000).
@@ -140,14 +143,14 @@ impl IntoResponse for ApiError {
             ApiError::NoMarket => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_market",
-                "no Binance market is configured for this token; it has no price until the \
-                 solver's configuration changes"
+                "no Binance market is configured for this token or pair; it has no price \
+                 until the solver's configuration changes"
                     .into(),
             ),
             ApiError::NoPrice => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_price",
-                "no valid price for this token right now".into(),
+                "no valid price for this token or pair right now".into(),
             ),
             ApiError::Stale(as_of) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -170,6 +173,15 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl From<PriceUnavailable> for ApiError {
+    fn from(reason: PriceUnavailable) -> Self {
+        match reason {
+            PriceUnavailable::NoMarket => ApiError::NoMarket,
+            _ => ApiError::NoPrice,
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn now_secs() -> i64 {
@@ -177,6 +189,11 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Unix secs of a quote received `age` ago.
+fn received_secs(age: Duration) -> i64 {
+    now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn precision_label(p: PricePrecision) -> String {
@@ -223,13 +240,10 @@ fn quote_from_row(
         fresh,
     } = snapshot.valuation(account_id, now).map_err(|reason| {
         tracing::debug!(faucet = %account_id, %reason, "no price for token");
-        match reason {
-            PriceUnavailable::NoMarket => ApiError::NoMarket,
-            _ => ApiError::NoPrice,
-        }
+        ApiError::from(reason)
     })?;
     let age = received_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-    let as_of = now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
+    let as_of = received_secs(age);
     if !fresh && !allow_stale {
         return Err(ApiError::Stale(as_of));
     }
@@ -322,12 +336,12 @@ struct PairPriceResponse {
     requested_faucet: String,
     /// The Binance mid of the pair's clearing market.
     market_price: String,
-    /// The mid after the clearing fee, as this side pays it: the best ask
-    /// that fills now.
+    /// The best price an ask can name and still fill now: the mid after the
+    /// clearing fee as this side is charged it, rounded toward zero.
     fill_price: String,
     fee_ppm: u32,
-    /// On-chain decimals, to turn whole-token prices into base units; `null`
-    /// until ingest has fetched them.
+    /// On-chain decimals, to turn whole-token prices into base units. A pair
+    /// is only priced once both are known.
     offered_decimals: Option<u8>,
     requested_decimals: Option<u8>,
     /// Unix secs the solver received this quote.
@@ -365,12 +379,14 @@ struct SwapEtaResponse {
     fee_amount: Option<String>,
     /// The Binance mid.
     market_price: Option<String>,
-    /// The mid after the fee: what a full fill pays.
+    /// The best price an ask can name and still fill now, as on
+    /// `/v1/pair-price`.
     fill_price: Option<String>,
     /// Whether the solver is settling: `false` before its executor starts and
     /// while it is in verification mode (no fee headroom, node or database down).
     accepting_orders: bool,
-    /// `fill_status == full` at the market price (kept for older wallets).
+    /// Fills fully now: at the market price, and the solver is settling
+    /// (kept for older wallets).
     can_fill: bool,
     /// `price_band == off_market` (kept for older wallets).
     off_market: Option<bool>,
@@ -425,11 +441,8 @@ fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, Api
     AccountId::from_hex(raw).map_err(|e| ApiError::BadFaucetId(format!("`{key}`: {e}")))
 }
 
-/// The two faucets of a pair request, distinct and both registered.
-async fn pair_rows(
-    state: &PriceApiState,
-    q: &HashMap<String, String>,
-) -> Result<(AccountId, AccountId, HashMap<AccountId, RegisteredTokenRow>), ApiError> {
+/// The two faucets of a pair request: valid, distinct hex ids.
+fn pair_ids(q: &HashMap<String, String>) -> Result<(AccountId, AccountId), ApiError> {
     let a = parse_faucet(q, "offered_faucet")?;
     let b = parse_faucet(q, "requested_faucet")?;
     if a == b {
@@ -437,11 +450,20 @@ async fn pair_rows(
             "offered_faucet and requested_faucet must differ".into(),
         ));
     }
+    Ok((a, b))
+}
+
+/// Both tokens' on-chain decimals; `404` unless both are registered.
+async fn registered_decimals(
+    state: &PriceApiState,
+    a: AccountId,
+    b: AccountId,
+) -> Result<(Option<u8>, Option<u8>), ApiError> {
     let rows = token_rows(state, vec![a, b]).await?;
-    if !rows.contains_key(&a) || !rows.contains_key(&b) {
-        return Err(ApiError::UnknownFaucet);
+    match (rows.get(&a), rows.get(&b)) {
+        (Some(row_a), Some(row_b)) => Ok((row_a.token_decimals(), row_b.token_decimals())),
+        _ => Err(ApiError::UnknownFaucet),
     }
-    Ok((a, b, rows))
 }
 
 /// `GET /v1/pair-price?offered_faucet=&requested_faucet=`
@@ -453,31 +475,23 @@ async fn get_pair_price(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<PairPriceResponse>, ApiError> {
-    let (a, b, rows) = pair_rows(&state, &q).await?;
+    let (a, b) = pair_ids(&q)?;
+    let (offered_decimals, requested_decimals) = registered_decimals(&state, a, b).await?;
     let prices = state.prices.borrow().clone();
     let now = Instant::now();
-    let unavailable = |reason| match reason {
-        PriceUnavailable::NoMarket => ApiError::NoMarket,
-        _ => ApiError::NoPrice,
-    };
-    let (side, _) = prices.order_price(a, b, now).map_err(unavailable)?;
-    let (market, received_at) = prices.market_quote(a, b, now).map_err(unavailable)?;
+    let (side, _) = prices.order_price(a, b, now)?;
+    let (market, received_at) = prices.market_quote(a, b, now)?;
     let fee_ppm = state.quote_terms.fee_ppm;
     let fill = fill_price(side, market, fee_ppm).ok_or(ApiError::NoPrice)?;
-    let age = now.saturating_duration_since(received_at);
-    let decimals = |token| {
-        rows.get(&token)
-            .and_then(RegisteredTokenRow::token_decimals)
-    };
     Ok(Json(PairPriceResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         market_price: PricePrecision::Full.format(market),
         fill_price: PricePrecision::Full.format(fill),
         fee_ppm,
-        offered_decimals: decimals(a),
-        requested_decimals: decimals(b),
-        as_of: now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX)),
+        offered_decimals,
+        requested_decimals,
+        as_of: received_secs(now.saturating_duration_since(received_at)),
     }))
 }
 
@@ -490,45 +504,45 @@ async fn get_swap_eta(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let (a, b) = pair_ids(&q)?;
     let order = QuoteOrder {
         offered: required_amount(&q, "offered_amount")?,
         requested: required_amount(&q, "requested_amount")?,
         min_fill_step: parse_amount(&q, "min_fill_step")?,
     };
-    let (a, b, _) = pair_rows(&state, &q).await?;
+    registered_decimals(&state, a, b).await?;
 
     // One price snapshot, one book snapshot, one clock reading.
     let prices = state.prices.borrow().clone();
-    let book = state.swap_rx.borrow().clone();
+    let book = state.book_rx.borrow().clone();
     let now = Instant::now();
     let terms = state.quote_terms;
     let market = prices.market_price(a, b, now).ok();
-    let (quoted, unpriced) = match prices.order_price(a, b, now) {
+    let (quoted, fill, unpriced) = match prices.order_price(a, b, now) {
         Ok((side, price)) => {
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
             let quoted = quote(side, price, terms, order, levels((a, b)), levels((b, a)))
                 .map_err(|error| ApiError::BadAmount(format!("cannot price: {error}")))?;
-            (Some((side, quoted)), None)
+            let fill = market.and_then(|market| fill_price(side, market, terms.fee_ppm));
+            (Some(quoted), fill, None)
         }
         // Without a price nothing fills.
-        Err(PriceUnavailable::NoMarket) => (None, Some(NoFillReason::NoMarket)),
-        Err(_) => (None, Some(NoFillReason::NoPrice)),
+        Err(PriceUnavailable::NoMarket) => (None, None, Some(NoFillReason::NoMarket)),
+        Err(_) => (None, None, Some(NoFillReason::NoPrice)),
     };
-    let quote = quoted.map(|(_, quote)| quote);
-    let band = quote.map(|quote| quote.band);
-    let status = quote.map_or(FillStatus::None, |quote| quote.status);
-    let fill = quoted
-        .zip(market)
-        .and_then(|((side, _), market)| fill_price(side, market, terms.fee_ppm));
+    let band = quoted.map(|q| q.band);
+    let status = quoted.map_or(FillStatus::None, |q| q.status);
     let price = |value| PricePrecision::Full.format(value);
     let amount = |value: Option<u64>| value.map(|value| value.to_string());
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
+    // `settling` is the executor's own word on whether it takes batches.
     let now_unix = now_secs().max(0) as u64;
     let (median24h_seconds, settling) = {
         let stats = state.stats_rx.borrow();
         (stats.median_secs((a, b), now_unix), stats.settling)
     };
+    let fills_now = band == Some(PriceBand::AtMarket) && settling;
 
     let body = Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
@@ -537,22 +551,19 @@ async fn get_swap_eta(
         requested_amount: order.requested.to_string(),
         price_band: band,
         fill_status: status,
-        reason: quote.map_or(unpriced, |quote| quote.reason),
-        fillable_offered_amount: quote.map_or(0, |q| q.fillable_offered).to_string(),
-        fillable_requested_amount: quote.map_or(0, |q| q.fillable_requested).to_string(),
-        available_offered_amount: amount(quote.and_then(|q| q.available_offered)),
-        expected_requested_amount: amount(quote.map(|q| q.expected_requested)),
+        reason: quoted.map_or(unpriced, |q| q.reason()),
+        fillable_offered_amount: quoted.map_or(0, |q| q.fillable_offered).to_string(),
+        fillable_requested_amount: quoted.map_or(0, |q| q.fillable_requested).to_string(),
+        available_offered_amount: amount(quoted.and_then(|q| q.available_offered)),
+        expected_requested_amount: amount(quoted.map(|q| q.expected_requested)),
         fee_ppm: terms.fee_ppm,
-        fee_amount: amount(quote.map(|q| q.fee)),
+        fee_amount: amount(quoted.map(|q| q.fee)),
         market_price: market.map(price),
         fill_price: fill.map(price),
         accepting_orders: settling,
-        can_fill: band == Some(PriceBand::AtMarket) && status == FillStatus::Full,
+        can_fill: fills_now && status == FillStatus::Full,
         off_market: band.map(|band| band == PriceBand::OffMarket),
-        estimated_seconds: (band == Some(PriceBand::AtMarket)
-            && status != FillStatus::None
-            && settling)
-            .then_some(state.swap_eta_secs),
+        estimated_seconds: (fills_now && status != FillStatus::None).then_some(state.swap_eta_secs),
         median24h_seconds,
     });
     // Don't let the router-level `max-age` layer cache this: the quote comes
@@ -577,9 +588,7 @@ async fn mirror_depth(
     let mut depth = DepthBook::default();
     while let Some(change) = changes.recv().await {
         depth.apply(change);
-        while let Ok(change) = changes.try_recv() {
-            depth.apply(change);
-        }
+        depth.drain(&mut changes);
         book_tx.send_replace(Arc::new(depth.snapshot()));
         tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
     }
@@ -667,7 +676,7 @@ pub fn spawn_price_api_thread(
                 }
             };
             rt.block_on(async move {
-                let (book_tx, swap_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+                let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
                 tokio::spawn(mirror_depth(depth_rx, book_tx));
                 let default_precision =
                     PricePrecision::parse(&cfg.precision).unwrap_or(PricePrecision::Full);
@@ -682,7 +691,7 @@ pub fn spawn_price_api_thread(
                     vs_currency: cfg.vs_currency.clone(),
                     default_precision,
                     max_batch: cfg.max_batch,
-                    swap_rx,
+                    book_rx,
                     stats_rx,
                     swap_eta_secs,
                     quote_terms: QuoteTerms {

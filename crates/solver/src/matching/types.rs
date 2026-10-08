@@ -201,7 +201,7 @@ pub struct SettlementBatch {
 
 /// One price level of a directed pair: the summed offered `volume` of the
 /// active orders resting at exactly `rate`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookLevel {
     pub rate: RateKey,
     pub volume: Amount,

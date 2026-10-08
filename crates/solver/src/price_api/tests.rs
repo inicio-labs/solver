@@ -91,7 +91,7 @@ async fn serve(
     .unwrap();
     // The receivers keep the values after their senders drop.
     let (_tx, prices) = watch::channel(Arc::new(snapshot));
-    let (_stx, swap_rx) = watch::channel(Arc::new(book));
+    let (_book_tx, book_rx) = watch::channel(Arc::new(book));
     let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
     let state = PriceApiState {
         prices,
@@ -99,7 +99,7 @@ async fn serve(
         vs_currency: "usdt".into(),
         default_precision: PricePrecision::Full,
         max_batch: 3,
-        swap_rx,
+        book_rx,
         stats_rx,
         swap_eta_secs: 14, // 5000+1000+2000+6000 ms → 14s (matches cfg())
         quote_terms: QuoteTerms {
@@ -478,7 +478,7 @@ async fn cors_header_present_for_browser_clients() {
 
 // ── swap-eta ──────────────────────────────────────────────────────────────
 // The A/B market is 2 B per A (both tokens 0 decimals in the market plan);
-// fee 0.1%, tolerance 0.5%, buffer 0.2% (see `serve`).
+// fee 0.1%, tolerance 0.5% (see `serve`).
 
 fn registered() -> [(AccountId, Option<u8>); 2] {
     [(faucet_a(), Some(8)), (faucet_b(), Some(8))]
@@ -561,7 +561,8 @@ async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
-    // The executor has not started, or is in verification mode.
+    // The executor has not started, or is in verification mode: the book
+    // still fills the order, but not now.
     let paused = SettlementStats::new();
     let h = swap_server(&registered(), Some("2"), buyers(3_000_000), paused).await;
     let v = swap_get(
@@ -571,13 +572,14 @@ async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
     .await;
     assert_eq!(v["fillStatus"], "full");
     assert_eq!(v["acceptingOrders"], false);
+    assert_eq!(v["canFill"], false);
     assert!(v["estimatedSeconds"].is_null());
 }
 
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_tolerates_a_small_gap_and_flags_a_large_one() {
-    let mut stats = SettlementStats::new();
+    let mut stats = settling();
     for d in [10u64, 30, 20] {
         stats.record((faucet_a(), faucet_b()), now() as u64, d);
     }
@@ -739,6 +741,32 @@ async fn swap_eta_bad_input() {
         faucet_b().to_hex()
     );
     assert_eq!(swap_status(&h, &unknown).await, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn a_reversed_binance_listing_prices_and_quotes_the_same() {
+    // Binance lists the pair the other way round (its base is B): the
+    // stream carries 0.5, and both endpoints still see 2 B per A.
+    let pairs = [(faucet_a(), faucet_b(), "2", received(true))];
+    let decimals = [(faucet_a(), 0), (faucet_b(), 0)];
+    let snapshot = PriceSnapshot::for_tests_reversed(&pairs, &decimals, TTL);
+    let registered: Vec<_> = registered()
+        .iter()
+        .map(|(id, dec)| (*id, *dec, None))
+        .collect();
+    let h = serve(&registered, snapshot, buyers(3_000_000), settling()).await;
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["marketPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(v["availableOfferedAmount"], "1500000");
 }
 
 // ── pair-price ────────────────────────────────────────────────────────────

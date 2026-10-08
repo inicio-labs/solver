@@ -111,23 +111,19 @@ impl ClearingBook {
         id: NoteId,
         volume: u64,
     ) {
-        let mut removed = false;
         if let Some(index) = self.pairs.get_mut(&pair) {
             // A remainder can inherit this exact key. A stale parent event
             // must never remove the child's entry.
             if let btree_map::Entry::Occupied(entry) = index.entry(key) {
                 if *entry.get() == id {
                     entry.remove();
-                    removed = true;
+                    self.send_depth(DepthChange::Removed {
+                        pair,
+                        rate: key.rate,
+                        volume,
+                    });
                 }
             }
-        }
-        if removed {
-            self.send_depth(DepthChange::Removed {
-                pair,
-                rate: key.rate,
-                volume,
-            });
         }
     }
 
@@ -319,9 +315,7 @@ impl ClearingBook {
     /// Every non-empty directed pair's levels, best first, read straight from
     /// the index: the reference the depth mirror must match.
     #[cfg(test)]
-    pub(super) fn levels(
-        &self,
-    ) -> HashMap<(TokenId, TokenId), Vec<crate::matching::types::BookLevel>> {
+    pub(super) fn levels(&self) -> crate::matching::types::SwapBookSnapshot {
         use crate::matching::types::BookLevel;
 
         self.pairs
@@ -371,6 +365,16 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
+
+    /// With time paused the matcher ticks at 0 s, 1 s, 2 s and so on: these
+    /// return half a second after the first tick, or one tick later.
+    async fn after_first_tick() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    async fn after_next_tick() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     fn fixture(
         buy: bool,
@@ -458,22 +462,8 @@ mod tests {
         depth: &mut DepthBook,
         changes: &mut mpsc::UnboundedReceiver<DepthChange>,
     ) {
-        while let Ok(change) = changes.try_recv() {
-            depth.apply(change);
-        }
-        let flat = |levels: HashMap<(TokenId, TokenId), Vec<crate::matching::types::BookLevel>>| {
-            let mut flat: Vec<_> = levels
-                .into_iter()
-                .flat_map(|(pair, levels)| {
-                    levels
-                        .into_iter()
-                        .map(move |level| (pair, level.rate, level.volume))
-                })
-                .collect();
-            flat.sort_by_key(|(pair, rate, _)| (pair.0.to_hex(), *rate));
-            flat
-        };
-        assert_eq!(flat(depth.snapshot()), flat(book.levels()));
+        depth.drain(changes);
+        assert_eq!(depth.snapshot(), book.levels());
     }
 
     #[test]
@@ -702,9 +692,7 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        // Time is paused and the matcher ticks on whole seconds: half a
-        // second in, the tick at 0 s has finished.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        after_first_tick().await;
         depth.drain(&mut depth_rx);
         assert!(
             exec_rx.try_recv().is_err(),
@@ -712,8 +700,9 @@ mod tests {
         );
         assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        after_next_tick().await;
         depth.drain(&mut depth_rx);
+        assert_eq!(depth.snapshot().len(), 1);
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();
@@ -796,10 +785,9 @@ mod tests {
         ));
         // The first tick cannot clear, so it must not bypass internal
         // matching by routing an order to an external DEX either.
-        // Time is paused and the matcher ticks on whole seconds: half a
-        // second in, the tick at 0 s has finished.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        after_first_tick().await;
         depth.drain(&mut depth_rx);
+        assert_eq!(depth.snapshot().len(), 1);
         assert!(route_rx.try_recv().is_err());
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
@@ -860,12 +848,7 @@ mod tests {
             cancel.clone(),
         ));
 
-        // Time is paused and the matcher ticks on whole seconds: half a
-
-        // second in, the tick at 0 s has finished.
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
+        after_first_tick().await;
         depth.drain(&mut depth_rx);
         assert!(route_rx.try_recv().is_err());
         assert_eq!(
@@ -1234,7 +1217,9 @@ mod tests {
         let other = fixture(true, 22, 10, 6, &mut rng);
         assert_ne!(holder.id(), stale.id());
 
-        let mut book = ClearingBook::default();
+        let (depth_tx, mut changes) = mpsc::unbounded_channel();
+        let mut book = ClearingBook::with_depth(depth_tx);
+        let mut depth = DepthBook::default();
         book.apply(BookUpdate {
             removed: Vec::new(),
             active: vec![holder.clone(), stale.clone(), other.clone()],
@@ -1246,13 +1231,22 @@ mod tests {
         assert!(!book.orders.contains_key(&stale.id()));
         let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
         assert_eq!(indexed, 2, "the slot still belongs to the holder");
+        // The skipped order never reached the depth mirror, so dropping it
+        // must not remove the holder's volume there either.
+        assert_mirrors(&book, &mut depth, &mut changes);
+        book.remove(stale.id());
+        assert_mirrors(&book, &mut depth, &mut changes);
+        book.remove(holder.id());
+        assert_mirrors(&book, &mut depth, &mut changes);
     }
     #[test]
     fn expiry_removes_active_orders_but_preserves_selected_work_and_checks_givebacks() {
         let mut rng = RandomCoin::new(Word::default());
         let mut quote = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
         quote.maker.as_mut().unwrap().expires_at_unix_ms = Some(1000);
-        let mut book = ClearingBook::default();
+        let (depth_tx, mut changes) = mpsc::unbounded_channel();
+        let mut book = ClearingBook::with_depth(depth_tx);
+        let mut depth = DepthBook::default();
         book.insert_or_skip(&quote);
         book.remove_expired(899, 100);
         assert!(book.orders.contains_key(&quote.id()));
@@ -1269,6 +1263,7 @@ mod tests {
             "expired giveback cannot be selected again"
         );
         assert!(book.levels().is_empty());
+        assert_mirrors(&book, &mut depth, &mut changes);
     }
     #[tokio::test(start_paused = true)]
     async fn an_expired_maker_order_is_not_selected_after_hydration() {
@@ -1309,9 +1304,7 @@ mod tests {
             runtime,
             cancel.clone(),
         ));
-        // Time is paused and the matcher ticks on whole seconds: half a
-        // second in, the tick at 0 s has finished.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        after_first_tick().await;
         depth.drain(&mut depth_rx);
         assert!(
             exec_rx.try_recv().is_err(),
@@ -1319,8 +1312,9 @@ mod tests {
         );
         assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        after_next_tick().await;
         depth.drain(&mut depth_rx);
+        assert_eq!(depth.snapshot().len(), 1);
         assert!(!task.is_finished());
         cancel.cancel();
         task.await.unwrap().unwrap();

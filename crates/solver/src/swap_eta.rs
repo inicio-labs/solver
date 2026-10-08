@@ -1,6 +1,5 @@
-//! Swap quotes and time estimates for the public `/v1/swap-eta` endpoint.
-//!
-//! Three pieces, all pure/self-contained and unit-tested here:
+//! Swap pricing and quotes for the public `/v1/pair-price` and `/v1/swap-eta`
+//! endpoints. All pure/self-contained and unit-tested here:
 //!  * [`SettlementStats`] — an **in-memory, ephemeral** rolling window of recent
 //!    settlement durations per directed pair (no DB storage). The executor owns
 //!    one, records into it on each successful settlement, and publishes it over a
@@ -9,6 +8,7 @@
 //!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
 //!    built from the [`DepthChange`]s the matcher sends as orders enter and
 //!    leave its book, so no depth work runs on the matcher.
+//!  * [`fill_price`] — the best price an ask can name and still fill now.
 //!  * [`quote`] — what the matcher would do now with the order a wallet is
 //!    about to sign: where its price sits against the clearing price, and how
 //!    much of it the live book can fill.
@@ -16,12 +16,13 @@
 use std::collections::{btree_map, BTreeMap, HashMap, VecDeque};
 
 use ruint::aliases::U256;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use crate::clearing::{
-    checked_mul, eligible_units, mul_div_floor, ppm_floor, BatchPrice, ClearingError, OrderSide,
-    PPM_DENOMINATOR,
+    checked_mul, eligible_units, mul_div_ceil, mul_div_floor, ppm_floor, BatchPrice, ClearingError,
+    OrderSide, PPM_DENOMINATOR,
 };
 use crate::matching::types::{Amount, BookLevel, RateKey, SwapBookSnapshot};
 use crate::types::{TokenId, UnixSecs};
@@ -128,12 +129,12 @@ pub enum DepthChange {
 /// The matcher's resting levels, rebuilt from its [`DepthChange`]s on the
 /// price API's thread.
 #[derive(Debug, Default)]
-pub struct DepthBook {
+pub(crate) struct DepthBook {
     levels: HashMap<(TokenId, TokenId), BTreeMap<RateKey, u128>>,
 }
 
 impl DepthBook {
-    pub fn apply(&mut self, change: DepthChange) {
+    pub(crate) fn apply(&mut self, change: DepthChange) {
         match change {
             DepthChange::Added { pair, rate, volume } => {
                 *self
@@ -144,23 +145,42 @@ impl DepthBook {
                     .or_default() += u128::from(volume);
             }
             DepthChange::Removed { pair, rate, volume } => {
-                let Some(levels) = self.levels.get_mut(&pair) else {
+                // The mirror sees every change from the matcher's first one,
+                // so removing more than it holds means the two have drifted.
+                let level =
+                    self.levels
+                        .get_mut(&pair)
+                        .and_then(|levels| match levels.entry(rate) {
+                            btree_map::Entry::Occupied(level) => Some(level),
+                            btree_map::Entry::Vacant(_) => None,
+                        });
+                let Some(mut level) = level else {
+                    tracing::warn!(?pair, "depth mirror: removal for an unknown level");
                     return;
                 };
-                if let btree_map::Entry::Occupied(mut level) = levels.entry(rate) {
-                    *level.get_mut() = level.get().saturating_sub(u128::from(volume));
-                    if *level.get() == 0 {
-                        level.remove();
-                    }
+                let held = *level.get();
+                if held < u128::from(volume) {
+                    tracing::warn!(?pair, held, volume, "depth mirror: level underflow");
                 }
-                if levels.is_empty() {
+                *level.get_mut() = held.saturating_sub(u128::from(volume));
+                if *level.get() == 0 {
+                    level.remove();
+                }
+                if self.levels.get(&pair).is_some_and(BTreeMap::is_empty) {
                     self.levels.remove(&pair);
                 }
             }
         }
     }
 
-    pub fn snapshot(&self) -> SwapBookSnapshot {
+    /// Apply every change already queued.
+    pub(crate) fn drain(&mut self, changes: &mut mpsc::UnboundedReceiver<DepthChange>) {
+        while let Ok(change) = changes.try_recv() {
+            self.apply(change);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> SwapBookSnapshot {
         self.levels
             .iter()
             .map(|(&pair, levels)| {
@@ -175,26 +195,12 @@ impl DepthBook {
             })
             .collect()
     }
-
-    /// Apply every change already queued.
-    #[cfg(test)]
-    pub(crate) fn drain(
-        &mut self,
-        changes: &mut tokio::sync::mpsc::UnboundedReceiver<DepthChange>,
-    ) {
-        while let Ok(change) = changes.try_recv() {
-            self.apply(change);
-        }
-    }
 }
-
-/// Basis points in one.
-const BPS: u64 = 10_000;
 
 /// Where an order's price sits against the price the matcher clears at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PriceBand {
+pub(crate) enum PriceBand {
     /// Clears at the current price.
     AtMarket,
     /// Clears once the price moves at most the tolerance the order's way.
@@ -205,7 +211,7 @@ pub enum PriceBand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FillStatus {
+pub(crate) enum FillStatus {
     Full,
     Partial,
     None,
@@ -214,7 +220,7 @@ pub enum FillStatus {
 /// Why a quote says [`FillStatus::None`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NoFillReason {
+pub(crate) enum NoFillReason {
     /// The order is [`PriceBand::OffMarket`].
     Price,
     /// Priced well enough, but the book holds nothing for it.
@@ -227,7 +233,7 @@ pub enum NoFillReason {
 
 /// The settings every quote is evaluated with.
 #[derive(Clone, Copy, Debug)]
-pub struct QuoteTerms {
+pub(crate) struct QuoteTerms {
     /// The clearing fee, exactly as the matcher charges it.
     pub fee_ppm: u32,
     /// How far (bps) the price may still have to move the order's way.
@@ -236,30 +242,38 @@ pub struct QuoteTerms {
 
 /// The order the wallet is about to sign.
 #[derive(Clone, Copy, Debug)]
-pub struct QuoteOrder {
+pub(crate) struct QuoteOrder {
     pub offered: u64,
     pub requested: u64,
-    /// The note's smallest partial fill, if the wallet sets one.
+    /// The note's smallest partial fill, in requested units, if it has one.
     pub min_fill_step: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quote {
+pub(crate) struct Quote {
     pub band: PriceBand,
     pub status: FillStatus,
-    /// Set only when `status` is [`FillStatus::None`].
-    pub reason: Option<NoFillReason>,
     /// How much of the order the book fills: all of it, part of it, or zero.
     pub fillable_offered: u64,
     pub fillable_requested: u64,
     /// How much of the offered token the book takes at this order's price,
     /// not capped by the order's size. `None` off market.
     pub available_offered: Option<u64>,
-    /// What a full fill pays at the current price: the order's market value
-    /// minus the fee, never less than `requested`.
+    /// What a full fill pays at today's price, as the matcher settles it.
     pub expected_requested: u64,
-    /// The fee on a full fill at the current price.
+    /// The fee on that full fill.
     pub fee: u64,
+}
+
+impl Quote {
+    /// Why nothing fills, when nothing does.
+    pub(crate) fn reason(&self) -> Option<NoFillReason> {
+        match (self.status, self.band) {
+            (FillStatus::None, PriceBand::OffMarket) => Some(NoFillReason::Price),
+            (FillStatus::None, _) => Some(NoFillReason::Liquidity),
+            _ => None,
+        }
+    }
 }
 
 /// What the matcher would do now with `order` on `side` of its clearing
@@ -269,9 +283,10 @@ pub struct Quote {
 /// Mirrors one clearing tick: the order is eligible after the fee
 /// ([`eligible_units`]); opposite levels eligible at the same price supply it;
 /// same-side levels at a better or equal rate are served first (the new order
-/// joins its rate last). An order outside the price but within the tolerance
-/// is evaluated at the tolerance edge, the worst price it would clear at.
-/// Ignored: external liquidity routing and the per-side order cap.
+/// joins its rate last). A tolerated order is judged at its break-even price,
+/// the first price it would clear at. Not modelled: external liquidity
+/// routing, the per-side order cap, and the opposite orders' own minimum
+/// fills (an all-or-nothing order counts in full).
 pub(crate) fn quote(
     side: OrderSide,
     price: BatchPrice,
@@ -287,25 +302,25 @@ pub(crate) fn quote(
     } = order;
     let fee_ppm = terms.fee_ppm;
 
-    // A full fill pays the market value minus the fee, at least the ask.
-    let worth = value(side, price, offered)?;
-    let fee = ppm_floor(worth, fee_ppm)?;
-    let expected_requested = to_u64((worth - fee).max(U256::from(requested)))?;
+    // A full fill today, as `MatchOrder::execution` settles it: the market
+    // value less the fee, and the fee never exceeds the surplus over the ask.
+    let market_worth = value(side, price, offered)?;
+    let fee =
+        ppm_floor(market_worth, fee_ppm)?.min(market_worth.saturating_sub(U256::from(requested)));
+    let expected_requested = to_u64((market_worth - fee).max(U256::from(requested)))?;
     let fee = to_u64(fee)?;
 
     let eligible_at = |at| eligible_units(side, at, fee_ppm, offered, requested);
-    let tolerance_edge = shifted(side, price, BPS + terms.tolerance_bps, BPS)?;
-    let (band, clear_at) = if eligible_at(price)?.is_some() {
-        (PriceBand::AtMarket, price)
-    } else if eligible_at(tolerance_edge)?.is_some() {
-        (PriceBand::Tolerated, tolerance_edge)
+    let band = if eligible_at(price)?.is_some() {
+        PriceBand::AtMarket
+    } else if eligible_at(tolerance_edge(side, price, terms.tolerance_bps)?)?.is_some() {
+        PriceBand::Tolerated
     } else {
-        (PriceBand::OffMarket, price)
+        PriceBand::OffMarket
     };
-    let quote = Quote {
+    let unfilled = Quote {
         band,
         status: FillStatus::None,
-        reason: Some(NoFillReason::Price),
         fillable_offered: 0,
         fillable_requested: 0,
         available_offered: None,
@@ -313,14 +328,30 @@ pub(crate) fn quote(
         fee,
     };
     if band == PriceBand::OffMarket {
-        return Ok(quote);
+        return Ok(unfilled);
     }
+    let clear_at = match band {
+        PriceBand::AtMarket => price,
+        _ => break_even(side, fee_ppm, offered, requested)?,
+    };
+    let (comparison_units, payment_units) = eligible_at(clear_at)?.ok_or(
+        ClearingError::InternalInvariant("quoted order not eligible at its clearing price"),
+    )?;
 
     // Both sides in requested units at `clear_at`.
     let mut supply = U256::ZERO;
     for level in opposite {
-        let (offered, requested) = (level.rate.offered, level.rate.requested);
-        if eligible_units(side.opposite(), clear_at, fee_ppm, offered, requested)?.is_none() {
+        let opposite_side = side.opposite();
+        let (level_offered, level_requested) = (level.rate.offered, level.rate.requested);
+        if eligible_units(
+            opposite_side,
+            clear_at,
+            fee_ppm,
+            level_offered,
+            level_requested,
+        )?
+        .is_none()
+        {
             // Eligibility is monotone in the book's rate order.
             break;
         }
@@ -333,68 +364,87 @@ pub(crate) fn quote(
     }
     let worth = value(side, clear_at, offered)?;
     let available = supply.saturating_sub(ahead);
-    // The same amount in the offered token, at this order's own worth.
-    let available_offered = u64::try_from(mul_div_floor(offered, available, worth)?).ok();
-    let quote = Quote {
-        available_offered: Some(available_offered.unwrap_or(u64::MAX)),
-        ..quote
+    let available_offered =
+        u64::try_from(mul_div_floor(offered, available, worth)?).unwrap_or(u64::MAX);
+
+    let (status, fillable_offered, fillable_requested) = if available >= worth {
+        (FillStatus::Full, offered, requested)
+    } else {
+        // A partial fill pays the note's own ratio, rounded up as the matcher
+        // does, and must reach the note's minimum.
+        let paid = to_u64(mul_div_ceil(available, payment_units, comparison_units)?)?;
+        let released = to_u64(mul_div_floor(offered, paid, requested)?)?;
+        let minimum = min_fill_step.unwrap_or(1).min(requested).max(1);
+        if paid < minimum || released == 0 {
+            (FillStatus::None, 0, 0)
+        } else {
+            (FillStatus::Partial, released, paid)
+        }
     };
-    let fill = available.min(worth);
-    if fill == worth {
-        return Ok(Quote {
-            status: FillStatus::Full,
-            reason: None,
-            fillable_offered: offered,
-            fillable_requested: requested,
-            ..quote
-        });
-    }
-    // A partial fill pays the note's own ratio, as PSWAP computes it.
-    let fillable_requested = to_u64(mul_div_floor(requested, fill, worth)?)?;
-    let fillable_offered = to_u64(mul_div_floor(offered, fillable_requested, requested)?)?;
-    let minimum = min_fill_step.unwrap_or(1).clamp(1, requested);
-    if fillable_requested < minimum || fillable_offered == 0 {
-        return Ok(Quote {
-            reason: Some(NoFillReason::Liquidity),
-            ..quote
-        });
-    }
     Ok(Quote {
-        status: FillStatus::Partial,
-        reason: None,
+        status,
         fillable_offered,
         fillable_requested,
-        ..quote
+        available_offered: Some(available_offered),
+        ..unfilled
     })
 }
 
-/// Whole requested tokens per whole offered token that a full fill pays at the
-/// `market` mid: the mid after the fee, as the order's side is charged it.
+/// The best price an ask can name and still fill now, in whole requested
+/// tokens per whole offered token: the `market` mid after the fee as the
+/// order's side is charged it, rounded toward zero at 18 places so an ask
+/// built from it never overshoots.
 pub(crate) fn fill_price(side: OrderSide, market: Decimal, fee_ppm: u32) -> Option<Decimal> {
     let ppm = Decimal::from(PPM_DENOMINATOR);
     let fee = Decimal::from(fee_ppm);
-    match side {
+    let fill = match side {
         OrderSide::SellBase => market.checked_mul((ppm - fee).checked_div(ppm)?),
         OrderSide::BuyBase => market.checked_mul(ppm.checked_div(ppm + fee)?),
-    }
+    }?;
+    Some(
+        fill.round_dp_with_strategy(18, RoundingStrategy::ToZero)
+            .normalize(),
+    )
 }
 
-/// `price` with the order's rate (requested per offered) scaled by `num / den`:
-/// above one moves it the order's way, below one against it.
-fn shifted(
+/// `price` moved `tolerance_bps` the order's way: the order's own rate
+/// (requested per offered) grows by that much.
+fn tolerance_edge(
     side: OrderSide,
     price: BatchPrice,
-    num: u64,
-    den: u64,
+    tolerance_bps: u64,
 ) -> Result<BatchPrice, ClearingError> {
+    const BPS: u64 = 10_000;
     let (quote_factor, base_factor) = match side {
-        OrderSide::SellBase => (num, den),
-        OrderSide::BuyBase => (den, num),
+        OrderSide::SellBase => (BPS + tolerance_bps, BPS),
+        OrderSide::BuyBase => (BPS, BPS + tolerance_bps),
     };
     BatchPrice::new(
         checked_mul(price.quote_units, quote_factor)?,
         checked_mul(price.base_units, base_factor)?,
     )
+}
+
+/// The price at which an order just becomes eligible after the fee:
+/// [`eligible_units`]'s boundary solved for the price.
+fn break_even(
+    side: OrderSide,
+    fee_ppm: u32,
+    offered: u64,
+    requested: u64,
+) -> Result<BatchPrice, ClearingError> {
+    match side {
+        // requested × 10^6 = offered × price × (10^6 − fee)
+        OrderSide::SellBase => BatchPrice::new(
+            checked_mul(requested, PPM_DENOMINATOR)?,
+            checked_mul(offered, PPM_DENOMINATOR - fee_ppm)?,
+        ),
+        // offered × 10^6 = requested × price × (10^6 + fee)
+        OrderSide::BuyBase => BatchPrice::new(
+            checked_mul(offered, PPM_DENOMINATOR)?,
+            checked_mul(requested, PPM_DENOMINATOR + fee_ppm)?,
+        ),
+    }
 }
 
 /// What `offered` is worth at `price`, in requested units, rounded down.
@@ -537,7 +587,7 @@ mod tests {
         let q = sell(1_990_000, &[], &deep_buyers(3_000_000));
         assert_eq!(q.band, PriceBand::AtMarket);
         assert_eq!(q.status, FillStatus::Full);
-        assert_eq!(q.reason, None);
+        assert_eq!(q.reason(), None);
         assert_eq!(
             (q.fillable_offered, q.fillable_requested),
             (1_000_000, 1_990_000)
@@ -577,51 +627,80 @@ mod tests {
     }
 
     #[test]
+    fn buyers_ahead_are_served_first_too() {
+        // Offer 2_000_000 B for 990_000 A (worth 1_000_000 A at 2 B per A).
+        // A buyer at a better rate takes 1_000_000 A of the 1_500_000 A sold.
+        let ahead = level(900_000, 2_000_000, 2_000_000);
+        let sellers = [level(1_900_000, 1_000_000, 1_500_000)];
+        let order = order(2_000_000, 990_000);
+        let q = quote(OrderSide::BuyBase, two(), TERMS, order, &[ahead], &sellers).unwrap();
+        assert_eq!(q.status, FillStatus::Partial);
+        assert_eq!(
+            (q.fillable_offered, q.fillable_requested),
+            (1_000_000, 495_000)
+        );
+        assert_eq!(q.available_offered, Some(1_000_000));
+    }
+
+    #[test]
     fn nothing_left_or_nothing_eligible_is_none_for_liquidity() {
         for opposite in [vec![], vec![level(1_000_000, 1_000_000, 50_000_000)]] {
             let q = sell(1_990_000, &[], &opposite);
             assert_eq!(q.band, PriceBand::AtMarket);
             assert_eq!(q.status, FillStatus::None);
-            assert_eq!(q.reason, Some(NoFillReason::Liquidity));
+            assert_eq!(q.reason(), Some(NoFillReason::Liquidity));
             assert_eq!((q.fillable_offered, q.fillable_requested), (0, 0));
             assert_eq!(q.available_offered, Some(0));
         }
     }
 
     #[test]
-    fn partial_below_the_min_fill_step_is_none() {
-        let order = QuoteOrder {
-            min_fill_step: Some(1_000_000),
-            ..order(1_000_000, 1_990_000)
+    fn a_partial_fill_must_reach_the_min_fill_step() {
+        let with_step = |min_fill_step, buyers| {
+            let order = QuoteOrder {
+                min_fill_step: Some(min_fill_step),
+                ..order(1_000_000, 1_990_000)
+            };
+            quote(
+                OrderSide::SellBase,
+                two(),
+                TERMS,
+                order,
+                &[],
+                &deep_buyers(buyers),
+            )
+            .unwrap()
         };
-        let q = quote(
-            OrderSide::SellBase,
-            two(),
-            TERMS,
-            order,
-            &[],
-            &deep_buyers(1_000_000),
-        )
-        .unwrap();
-        assert_eq!(q.status, FillStatus::None);
-        assert_eq!(q.reason, Some(NoFillReason::Liquidity));
+        let q = with_step(1_000_000, 1_000_000);
+        assert_eq!(q.reason(), Some(NoFillReason::Liquidity));
+        // A step above the whole order means all or nothing.
+        assert_eq!(with_step(5_000_000, 1_000_000).status, FillStatus::None);
+        assert_eq!(with_step(5_000_000, 3_000_000).status, FillStatus::Full);
     }
 
     #[test]
-    fn ask_within_the_tolerance_is_tolerated_and_judged_at_the_edge() {
+    fn a_tolerated_order_is_judged_at_its_break_even_price() {
         // 2.005 B per A: above the 1.998 fill price, below the 2.00799 edge.
+        // It starts to fill at 2.005 / 0.999 = 2.007007 B per A.
         let q = sell(2_005_000, &[], &deep_buyers(3_000_000));
         assert_eq!(q.band, PriceBand::Tolerated);
         assert_eq!(q.status, FillStatus::Full);
-        // Today it is worth less than it asks: a fill pays the ask.
+        // Today it is worth less than it asks: no surplus, so no fee, and a
+        // fill pays the ask.
         assert_eq!(q.expected_requested, 2_005_000);
-        // At the edge (2.01) a buyer must pay at least 2.01201 B per A.
-        let thin_buyer = level(1_000_000, 2_011_000, 50_000_000);
-        let q = sell(2_005_000, &[], &[thin_buyer]);
-        assert_eq!(q.reason, Some(NoFillReason::Liquidity));
-        // The same buyer fills an at-market order.
-        let q = sell(1_990_000, &[], &[thin_buyer]);
-        assert_eq!(q.status, FillStatus::Full);
+        assert_eq!(q.fee, 0);
+        // A buyer at 2.011 B per A still buys at 2.007007 (up to 2.008991)…
+        let buyer_at = |pays| level(1_000_000, pays, 1_000_000);
+        let q = sell(2_005_000, &[], &[buyer_at(2_011_000)]);
+        assert_eq!(q.status, FillStatus::Partial);
+        assert_eq!(
+            (q.fillable_offered, q.fillable_requested),
+            (498_254, 999_000)
+        );
+        assert_eq!(q.available_offered, Some(498_254));
+        // …one at 2.0075 (up to 2.005494) does not.
+        let q = sell(2_005_000, &[], &[buyer_at(2_007_500)]);
+        assert_eq!(q.reason(), Some(NoFillReason::Liquidity));
     }
 
     #[test]
@@ -630,7 +709,7 @@ mod tests {
         let q = sell(2_007_991, &[], &deep_buyers(3_000_000));
         assert_eq!(q.band, PriceBand::OffMarket);
         assert_eq!(q.status, FillStatus::None);
-        assert_eq!(q.reason, Some(NoFillReason::Price));
+        assert_eq!(q.reason(), Some(NoFillReason::Price));
         assert_eq!(q.available_offered, None);
     }
 
@@ -645,8 +724,14 @@ mod tests {
         let q = at(999_000);
         assert_eq!(q.band, PriceBand::AtMarket);
         assert_eq!(q.status, FillStatus::Full);
-        assert_eq!(q.expected_requested, 999_000);
+        // Worth 1_000_000 A; the fee is capped at the 1_000 A surplus.
+        assert_eq!((q.expected_requested, q.fee), (999_000, 1_000));
         assert_eq!(at(999_001).band, PriceBand::Tolerated);
+        // The buyer's rule is looser than 1 − fee: the fee stops at the surplus.
+        let order = order(4_000_000, 1_998_001);
+        let q = quote(OrderSide::BuyBase, two(), TERMS, order, &[], &sellers).unwrap();
+        assert_eq!(q.band, PriceBand::AtMarket);
+        assert_eq!((q.expected_requested, q.fee), (1_998_001, 1_999));
     }
 
     #[test]
@@ -655,18 +740,30 @@ mod tests {
         // wallet asks the fill price less 0.5% slippage: 2485.0125 USDT.
         let price = BatchPrice::from_whole_price(Decimal::from(2500), 18, 6).unwrap();
         let eth = 1_000_000_000_000_000_000;
-        let q = quote(
-            OrderSide::SellBase,
-            price,
-            TERMS,
-            order(eth, 2_485_012_500),
-            &[],
-            &[],
-        )
-        .unwrap();
+        let order = order(eth, 2_485_012_500);
+        let q = quote(OrderSide::SellBase, price, TERMS, order, &[], &[]).unwrap();
         assert_eq!(q.band, PriceBand::AtMarket);
         assert_eq!(q.expected_requested, 2_497_500_000);
         assert_eq!(q.fee, 2_500_000);
+    }
+
+    #[test]
+    fn an_ask_built_from_the_fill_price_is_at_market() {
+        // Buying ETH (18 decimals) with 10_000 USDT (6), mid 2500: the fill
+        // price 0.0003996003996003996… is cut, not rounded up, at 18 places.
+        let price = BatchPrice::from_whole_price(Decimal::from(2500), 18, 6).unwrap();
+        let fill = fill_price(
+            OrderSide::BuyBase,
+            Decimal::ONE / Decimal::from(2500),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(fill.to_string(), "0.000399600399600399");
+        let usdt = 10_000_000_000u64;
+        let eth = (Decimal::from(usdt) * fill * Decimal::from(10u64.pow(12))).floor();
+        let order = order(usdt, eth.try_into().unwrap());
+        let q = quote(OrderSide::BuyBase, price, TERMS, order, &[], &[]).unwrap();
+        assert_eq!(q.band, PriceBand::AtMarket);
     }
 
     #[test]
@@ -674,6 +771,6 @@ mod tests {
         let fill = fill_price(OrderSide::SellBase, Decimal::from(2500), 1_000).unwrap();
         assert_eq!(fill, Decimal::new(24975, 1));
         let fill = fill_price(OrderSide::BuyBase, Decimal::TWO, 1_000).unwrap();
-        assert_eq!(fill.round_dp(9), Decimal::new(1998001998, 9));
+        assert_eq!(fill.to_string(), "1.998001998001998001");
     }
 }

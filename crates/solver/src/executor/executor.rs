@@ -107,6 +107,8 @@ struct PreparedInput {
     args: NoteArgs,
     payback_id: NoteId,
     remainder: Option<Note>,
+    /// Requested-asset units filled: the payback amount.
+    fill_amount: u64,
 }
 
 /// Inputs pre-computed once for a batch. Retries reuse the *same proven
@@ -124,6 +126,7 @@ struct PendingSettlement {
     tx_id: TransactionId,
     attempt: SettlementAttemptRow,
     parent_notes: Vec<Note>,
+    fills: Arc<db::maker_db::SettlementFills>,
     /// Remainders this transaction creates when it commits.
     child_notes: Vec<Note>,
     retry_at: Option<tokio::time::Instant>,
@@ -136,6 +139,22 @@ impl PendingSettlement {
             tx_id,
             attempt,
             parent_notes: components.notes(),
+            fills: Arc::new(
+                components
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        Ok((
+                            input.note.id().to_bytes().to_vec(),
+                            db::maker_db::input_fill(
+                                &input.note,
+                                input.fill_amount,
+                                input.remainder.as_ref(),
+                            )?,
+                        ))
+                    })
+                    .collect::<db::DbResult<_>>()?,
+            ),
             child_notes: components
                 .inputs
                 .iter()
@@ -171,6 +190,7 @@ impl PendingSettlement {
                     tx_id,
                     attempt,
                     parent_notes,
+                    fills: Arc::new(recovered.fills),
                     child_notes,
                     retry_at: None,
                 },
@@ -251,6 +271,7 @@ impl BatchComponents {
                 args: note_args,
                 payback_id,
                 remainder,
+                fill_amount: filled.requested_filled,
             });
         }
 
@@ -334,6 +355,7 @@ impl BatchComponents {
                     parent_note_id: input.note.id().to_bytes().to_vec(),
                     child_note_id: remainder.map(|note| note.id().to_bytes().to_vec()),
                     child_note_data: remainder.map(Serializable::to_bytes),
+                    fill_amount: Some(i64::try_from(input.fill_amount).map_err(db::DbError::from)?),
                 })
             })
             .collect()
@@ -417,9 +439,12 @@ async fn release_held(
     pool.write_book(book_tx, move |conn| {
         let consumed_bytes: Vec<_> = consumed.iter().map(|id| id.to_bytes().to_vec()).collect();
         db::postgres_db::mark_orders_onchain_nullified_tx(conn, &consumed_bytes)?;
-        let mut update = db::postgres_db::active_book_update_tx(conn, orders)?;
-        update.removed.extend(consumed);
-        Ok(update)
+        // `write_book` keeps only the orders that are still live.
+        Ok(BookUpdate {
+            removed: consumed.into_iter().collect(),
+            active: orders,
+            maker_updates: Vec::new(),
+        })
     })
     .await?;
     tracing::info!(returned, dropped, "held orders returned to the matcher");
@@ -432,8 +457,8 @@ async fn release_held(
 /// another filler of the same parent and amount reproduces exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TxOutcome {
-    /// The node committed our transaction.
-    Committed,
+    /// The node committed our transaction in `block`.
+    Committed { block: BlockNumber },
     /// It can never commit: rejected by the node, or its whole validity
     /// window has passed without it appearing.
     NeverCommits,
@@ -447,13 +472,13 @@ enum TxOutcome {
 /// transaction is valid in its expiration block; once the chain is past it
 /// and the node never committed it, it never will.
 fn node_outcome(
-    committed: bool,
+    committed: Option<BlockNumber>,
     synced: BlockNumber,
     expiration: BlockNumber,
     resubmittable: bool,
 ) -> TxOutcome {
-    if committed {
-        TxOutcome::Committed
+    if let Some(block) = committed {
+        TxOutcome::Committed { block }
     } else if synced > expiration {
         TxOutcome::NeverCommits
     } else {
@@ -1136,10 +1161,16 @@ impl Executor {
             Err(error) => return Ok(build_failed(error)),
         };
         let durable_attempt = pending.attempt.clone();
+        let fills = pending.fills.clone();
         let persisted = self
             .pool
             .write(move |conn| {
-                db::postgres_db::prepare_settlement_tx(conn, &durable_attempt, &inputs)
+                db::postgres_db::prepare_settlement_tx(
+                    conn,
+                    &durable_attempt,
+                    &inputs,
+                    Some(&fills),
+                )
             })
             .await;
         match persisted {
@@ -1291,7 +1322,11 @@ impl Executor {
         };
         let resubmittable = record.is_none();
         match record.map(|record| record.status) {
-            Some(TransactionStatus::Committed { .. }) => return Ok(TxOutcome::Committed),
+            Some(TransactionStatus::Committed { block_number, .. }) => {
+                return Ok(TxOutcome::Committed {
+                    block: block_number,
+                })
+            }
             // A definite discard means the node never accepted this transaction.
             Some(TransactionStatus::Discarded(reason))
                 if !matches!(
@@ -1337,7 +1372,9 @@ impl Executor {
     /// Returns `true` only after a terminal database and matcher transition.
     async fn reconcile_settlement(&self, settlement: &mut PendingSettlement) -> ExecResult<bool> {
         match self.transaction_outcome(settlement).await? {
-            TxOutcome::Committed => self.activate_confirmed_settlement(settlement).await,
+            TxOutcome::Committed { block } => {
+                self.activate_confirmed_settlement(settlement, block).await
+            }
             // Inputs return by nullifier: a parent someone else consumed is
             // retired, every other parent goes back to the matcher.
             TxOutcome::NeverCommits => {
@@ -1373,6 +1410,7 @@ impl Executor {
     async fn activate_confirmed_settlement(
         &self,
         settlement: &PendingSettlement,
+        commit_block: BlockNumber,
     ) -> ExecResult<bool> {
         let consumed_children = if settlement.child_notes.is_empty() {
             HashSet::new()
@@ -1392,9 +1430,18 @@ impl Executor {
             }
         };
         let attempt_id = settlement.id_bytes().to_vec();
+        let consumer = self.solver_id;
+        let fills = settlement.fills.clone();
         self.pool
             .write_book(&self.book_tx, move |conn| {
-                db::postgres_db::confirm_settlement_tx(conn, &attempt_id, &consumed_children)
+                db::postgres_db::confirm_settlement_tx(
+                    conn,
+                    &attempt_id,
+                    &consumed_children,
+                    commit_block,
+                    consumer,
+                    Some(&fills),
+                )
             })
             .await?;
         Ok(true)
@@ -2012,10 +2059,11 @@ mod recovery_tests {
                 parent_note_id: parent_id.to_bytes().to_vec(),
                 child_note_id: None,
                 child_note_data: None,
+                fill_amount: None,
             };
             pool.write(move |conn| {
                 db::postgres_db::insert_orders_batch_tx(conn, &[order_row], 1)?;
-                db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input])?;
+                db::postgres_db::prepare_settlement_tx(conn, &attempt_for_write, &[input], None)?;
                 db::postgres_db::mark_settlement_rejected_tx(conn, &attempt_for_write.tx_id)
             })
             .await?;
@@ -2026,6 +2074,7 @@ mod recovery_tests {
                 tx_id,
                 attempt: rejected_attempt,
                 parent_notes: vec![parent],
+                fills: Arc::default(),
                 child_notes: Vec::new(),
                 retry_at: None,
             };
@@ -2101,18 +2150,25 @@ mod recovery_tests {
     fn node_outcome_waits_until_the_validity_window_has_passed() {
         let expiration = BlockNumber::from(100_u32);
         assert_eq!(
-            node_outcome(true, BlockNumber::from(50_u32), expiration, true),
-            TxOutcome::Committed
+            node_outcome(
+                Some(BlockNumber::from(40_u32)),
+                BlockNumber::from(50_u32),
+                expiration,
+                true
+            ),
+            TxOutcome::Committed {
+                block: BlockNumber::from(40_u32)
+            }
         );
         assert_eq!(
-            node_outcome(false, BlockNumber::from(100_u32), expiration, true),
+            node_outcome(None, BlockNumber::from(100_u32), expiration, true),
             TxOutcome::Unknown {
                 resubmittable: true
             },
             "still valid in its expiration block"
         );
         assert_eq!(
-            node_outcome(false, BlockNumber::from(101_u32), expiration, false),
+            node_outcome(None, BlockNumber::from(101_u32), expiration, false),
             TxOutcome::NeverCommits
         );
     }
@@ -2142,6 +2198,7 @@ mod recovery_tests {
                     priority_seq: 1,
                     arrival_unix: 1,
                     note: Arc::new(note.clone()),
+                    maker: None,
                 })
                 .collect();
             let adapter = chain(&notes, consumed, fail_lookup);

@@ -98,6 +98,19 @@ admin_port = 3001
 # router_quote_ttl_ms = 20000
 # router_inflight_ttl_ms = 30000 # must exceed expected external settlement latency
 
+# Market-maker gRPC gateway (ADR 0003). Plaintext HTTP/2: put a TLS-terminating
+# proxy in front of it. Onboard makers and issue API keys through the admin API.
+# maker_gateway_enabled = false
+# maker_gateway_bind = "127.0.0.1"
+# maker_gateway_port = 8095
+# maker_intake_round_submits = 500   # most submits per intake transaction
+# maker_intake_submit_queue = 4096   # full → UNAVAILABLE, never a hang
+# maker_intake_cancel_queue = 1024   # cancels queue separately
+# maker_stream_buffer = 256          # per-stream buffer; a stalled stream is dropped
+# maker_stream_heartbeat_ms = 10000  # also ends streams of a revoked key
+# maker_settlement_buffer_ms = 30000 # selection stops this long before MM expiry
+# maker_watch_interval_ms = 1000     # maker-note watcher: new blocks, spends
+
 # ── Binance Spot public market data (the only price source) ─────────────────
 # Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.
 # No API key. For devnet/local, run `cargo run -p mock-binance -- --market

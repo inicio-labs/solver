@@ -311,6 +311,7 @@ mod tests {
             priority_seq: 7,
             arrival_unix: 1,
             note: Arc::new(note),
+            maker: None,
         };
         assert_eq!(
             Order::from_book_order(&ingested)
@@ -741,6 +742,7 @@ mod tests {
                     priority_seq: order.priority_sequence(),
                     arrival_unix: 1,
                     note: Arc::new(note),
+                    maker: None,
                 }
             })
             .collect();

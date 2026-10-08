@@ -273,6 +273,13 @@ impl MarketPlan {
         self.assets.keys().copied()
     }
 
+    /// Every configured clearing pair as `(base, quote)`.
+    pub(crate) fn clearing_pairs(&self) -> impl Iterator<Item = (TokenId, TokenId)> + '_ {
+        self.clearing
+            .iter()
+            .map(|market| (market.base, market.quote))
+    }
+
     /// Every symbol to confirm through `exchangeInfo`, once each.
     pub(crate) fn symbols(&self) -> BTreeSet<Symbol> {
         let clearing = self.clearing.iter().map(|market| market.symbol.clone());

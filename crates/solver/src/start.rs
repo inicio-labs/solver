@@ -257,6 +257,12 @@ pub async fn start(
 
     // 7. Build the PipelineConfig.
     let binance_tokens = market_plan.tokens().collect();
+    // Makers quote only pairs that clear internally. Startup fails unless
+    // Binance confirms every one of them.
+    let maker_markets = market_plan
+        .clearing_pairs()
+        .map(|(x, y)| crate::maker::market_key(x, y))
+        .collect();
     let pipeline_config = PipelineConfig::new(
         &config.engine,
         db_pool.clone(),
@@ -287,6 +293,7 @@ pub async fn start(
             protocol_fee_ppm: config.engine.clearing_fee_ppm,
             ..crate::clearing::ClearingConfig::default()
         },
+        maker_settlement_buffer_ms: config.engine.maker_settlement_buffer_ms,
     };
 
     // 9. Spawn the `Send` services (matcher, admin) on THIS thread's
@@ -489,6 +496,55 @@ pub async fn start(
         None
     };
 
+    // 12d. MAKER GATEWAY THREAD (ADR 0003): gRPC maker commands and the maker
+    //      intake writer on their own OS thread, runtime and database session,
+    //      so maker traffic cannot slow ingest or settlement. Only spawned when
+    //      enabled; committed cancels reach the matcher in book update order.
+    let gateway_ready_rx = if config.engine.maker_gateway_enabled {
+        let gateway_cfg = crate::gateway::GatewayConfig {
+            bind: config.engine.maker_gateway_bind.clone(),
+            port: config.engine.maker_gateway_port,
+            watch_interval: Duration::from_millis(config.engine.maker_watch_interval_ms),
+            maker_store_path: std::path::PathBuf::from(format!(
+                "{}.maker.sqlite3",
+                config.solver.ingest_store_path
+            )),
+            markets: maker_markets,
+            round_submits: config.engine.maker_intake_round_submits,
+            submit_queue: config.engine.maker_intake_submit_queue,
+            cancel_queue: config.engine.maker_intake_cancel_queue,
+            stream: crate::gateway::StreamConfig {
+                buffer: config.engine.maker_stream_buffer,
+                heartbeat: Duration::from_millis(config.engine.maker_stream_heartbeat_ms),
+            },
+        };
+        // The core writer notifies it after every commit that appended maker
+        // events.
+        let maker_events = crate::gateway::EventWake::global().clone();
+        let spawned = factory.rpc().and_then(|rpc| {
+            crate::gateway::spawn_gateway_thread(
+                gateway_cfg,
+                db_pool.clone(),
+                maker_events,
+                rpc,
+                channels.book_tx.clone(),
+                cancel.clone(),
+            )
+        });
+        match spawned {
+            Ok((thread, ready_rx)) => {
+                threads.push(("maker-gateway", thread));
+                Some(ready_rx)
+            }
+            Err(error) => {
+                let error = error.context("maker gateway startup failed");
+                return Err(abort_startup(&cancel, threads, error).await);
+            }
+        }
+    } else {
+        None
+    };
+
     // 13. Startup gate: every worker must report ready (client built and
     //     tasks spawned, the Binance market check passed) before startup is
     //     considered successful. The first failure cancels everything, joins
@@ -503,6 +559,12 @@ pub async fn start(
             None => Ok(()),
         }
     };
+    let gateway_ready = async move {
+        match gateway_ready_rx {
+            Some(rx) => ready(rx, "maker-gateway").await,
+            None => Ok(()),
+        }
+    };
     let startup: Result<()> = tokio::select! {
       biased;
       result = async {
@@ -511,6 +573,7 @@ pub async fn start(
             feed_ready,
             ready(price_api_ready_rx, "price-api"),
             router_ready,
+            gateway_ready,
         )
         .map(|_| ())
       } => result,

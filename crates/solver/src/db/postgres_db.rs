@@ -12,16 +12,21 @@ use diesel::prelude::*;
 use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
+use super::maker_db::{self, SettlementPhase};
 use super::postgres_models::{
-    NewOrderRow, NewRemainderOrderRow, OrderRow, RegisteredTokenRow, SettlementAttemptRow,
-    SettlementInputRow, SettlementStatus,
+    maker_tag, LiveOrderRow, NewOrderRow, NewRemainderOrderRow, OrderKeyColumns, OrderRow,
+    RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
-    orders, registered_tokens, settlement_attempts, settlement_inputs, sync_state,
+    live_orders, maker_lineages, makers, orders, registered_tokens, settlement_attempts,
+    settlement_inputs, sync_state,
 };
+use crate::maker::MakerTag;
 use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
+use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
 
-/// Rows per multi-row INSERT. The widest row (a remainder order) binds four
+/// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
 const INSERT_CHUNK_ROWS: usize = 1_000;
 
@@ -88,11 +93,12 @@ pub fn existing_note_ids_tx(
         .collect())
 }
 
-pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
-    let rows: Vec<OrderRow> = orders::table
-        .filter(orders::status.eq(OrderStatus::Active.as_str()))
-        .order(orders::priority_seq.asc())
-        .select(OrderRow::as_select())
+/// Every order that can trade now, through the one liveness rule, with maker
+/// tags: startup hydration of the matcher.
+pub fn load_live_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>> {
+    let rows: Vec<LiveOrderRow> = live_orders::table
+        .order(live_orders::priority_seq.asc())
+        .select(LiveOrderRow::as_select())
         .load(conn)?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
@@ -106,31 +112,91 @@ pub fn load_active_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<BookOrder>
     Ok(result)
 }
 
-pub fn active_book_update_tx(
+/// Pass every order a book-changing transaction activates through the one
+/// liveness rule, inside that transaction (`PgPool::write_book` calls this
+/// for every update). Orders that are not live are dropped from the update:
+/// rows no longer Active, and maker orders below a cutoff or stopped, which
+/// are stored Stopped here since this write happens anyway. Live orders gain
+/// their maker tag.
+pub fn live_book_update_tx(
     conn: &mut PgConnection,
-    candidates: Vec<BookOrder>,
+    mut update: BookUpdate,
 ) -> DbResult<BookUpdate> {
-    let ids: Vec<_> = candidates
+    if update.active.is_empty() {
+        return Ok(update);
+    }
+    let ids: Vec<Vec<u8>> = update
+        .active
         .iter()
         .map(|order| order.id().to_bytes().to_vec())
         .collect();
-    if ids.is_empty() {
-        return Ok(BookUpdate::default());
-    }
-    let active: HashSet<Vec<u8>> = orders::table
-        .filter(orders::note_id.eq_any(ids))
-        .filter(orders::status.eq(OrderStatus::Active.as_str()))
-        .select(orders::note_id)
-        .load::<Vec<u8>>(conn)?
+    let live: HashMap<Vec<u8>, Option<MakerTag>> = live_orders::table
+        .filter(live_orders::note_id.eq_any(&ids))
+        .select((
+            live_orders::note_id,
+            live_orders::maker_id,
+            live_orders::root_seq,
+            live_orders::expires_at_unix_ms,
+        ))
+        .load::<(Vec<u8>, Option<i64>, Option<i64>, Option<i64>)>(conn)?
         .into_iter()
+        .map(|(id, maker_id, root_seq, expiry)| Ok((id, maker_tag(maker_id, root_seq, expiry)?)))
+        .collect::<DbResult<_>>()?;
+    let excluded: Vec<Vec<u8>> = ids
+        .into_iter()
+        .filter(|id| !live.contains_key(id))
         .collect();
-    Ok(BookUpdate {
-        removed: Vec::new(),
-        active: candidates
-            .into_iter()
-            .filter(|order| active.contains(order.id().to_bytes().as_slice()))
-            .collect(),
-    })
+    if !excluded.is_empty() {
+        // Only a maker order can be Active yet excluded by the rule.
+        diesel::update(
+            orders::table
+                .filter(orders::note_id.eq_any(&excluded))
+                .filter(orders::status.eq(OrderStatus::Active.as_str())),
+        )
+        .set(orders::status.eq(OrderStatus::Stopped.as_str()))
+        .execute(conn)?;
+    }
+    update
+        .active
+        .retain_mut(|order| match live.get(order.id().to_bytes().as_slice()) {
+            Some(tag) => {
+                order.maker = *tag;
+                true
+            }
+            None => false,
+        });
+    Ok(update)
+}
+
+/// Fill the order keys of unfinished rows stored before the maker migration,
+/// so a lineage a maker claims later applies to them too. Run at startup,
+/// before hydration; rows that cannot be parsed keep NULL and are never maker
+/// orders.
+pub fn backfill_order_keys_tx(conn: &mut PgConnection) -> DbResult<usize> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = orders::table
+        .filter(orders::lineage_id.is_null())
+        .filter(
+            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+        )
+        .select((orders::note_id, orders::raw_data))
+        .load(conn)?;
+    let mut filled = 0;
+    for (note_id, raw_data) in rows {
+        let keys = Note::read_from(&mut SliceReader::new(&raw_data))
+            .map_err(DbError::from)
+            .and_then(|note| OrderKeyColumns::of(&note));
+        match keys {
+            Ok(keys) => {
+                filled += diesel::update(orders::table.find(&note_id))
+                    .set(&keys)
+                    .execute(conn)?;
+            }
+            Err(error) => {
+                tracing::warn!(note_id = %hex::encode(&note_id), %error, "stored order has no order keys");
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// Retire orders whose notes are consumed on chain. A consumed note is spent
@@ -148,9 +214,14 @@ pub fn mark_orders_onchain_nullified_tx(
     let mut sorted = note_ids.to_vec();
     sorted.sort();
     sorted.dedup();
+    super::maker_db::report_spent_tx(conn, &sorted)?;
     Ok(
         diesel::update(orders::table.filter(orders::note_id.eq_any(sorted)).filter(
-            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
+            orders::status.eq_any([
+                OrderStatus::Active.as_str(),
+                OrderStatus::Settling.as_str(),
+                OrderStatus::Stopped.as_str(),
+            ]),
         ))
         .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
         .execute(conn)?,
@@ -163,6 +234,7 @@ pub fn prepare_settlement_tx(
     conn: &mut PgConnection,
     attempt: &SettlementAttemptRow,
     inputs: &[SettlementInputRow],
+    cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<()> {
     if inputs.is_empty() {
         return Err(SettlementError::NoInputs.into());
@@ -191,10 +263,32 @@ pub fn prepare_settlement_tx(
     if locked.len() != parent_ids.len() {
         return Err(SettlementError::MissingInputOrder.into());
     }
-    if locked
-        .iter()
-        .any(|parent| parent.status != OrderStatus::Active.as_str())
-    {
+    // Serialize with cancels: lock the control rows of the makers that own
+    // these inputs, found from the locked rows (an attribution can arrive
+    // after the matcher picked a candidate), in maker-ID order. A cancel
+    // raising a cutoff takes the same lock, so either it sees this
+    // reservation as exposure or this check sees its cutoff.
+    let owners: Vec<i64> = orders::table
+        .inner_join(
+            maker_lineages::table.on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+        )
+        .filter(orders::note_id.eq_any(&parent_ids))
+        .select(maker_lineages::maker_id)
+        .distinct()
+        .load(conn)?;
+    if !owners.is_empty() {
+        makers::table
+            .filter(makers::maker_id.eq_any(&owners))
+            .order(makers::maker_id.asc())
+            .for_no_key_update()
+            .select(makers::maker_id)
+            .load::<i64>(conn)?;
+    }
+    let live: i64 = live_orders::table
+        .filter(live_orders::note_id.eq_any(&parent_ids))
+        .count()
+        .get_result(conn)?;
+    if usize::try_from(live)? != parent_ids.len() {
         return Err(SettlementError::InputOrderNotActive.into());
     }
     let parents: HashMap<&[u8], &OrderRow> = locked
@@ -221,6 +315,22 @@ pub fn prepare_settlement_tx(
     diesel::insert_into(settlement_inputs::table)
         .values(inputs)
         .execute(conn)?;
+    let report_inputs = inputs
+        .iter()
+        .map(|input| {
+            let parent = parents
+                .get(input.parent_note_id.as_slice())
+                .ok_or(SettlementError::MissingInputOrder)?;
+            Ok((input, *parent))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+    maker_db::report_settlement_tx(
+        conn,
+        &attempt.tx_id,
+        &report_inputs,
+        SettlementPhase::Pending,
+        cached_fills,
+    )?;
     tracing::info!(
         tx_id = %hex::encode(&attempt.tx_id),
         parents = changed,
@@ -291,6 +401,7 @@ pub struct UnresolvedAttempt {
     pub parents: Vec<BookOrder>,
     /// Remainders the transaction creates when it commits.
     pub children: Vec<Note>,
+    pub fills: maker_db::SettlementFills,
 }
 
 type UnresolvedAttemptJoinRow = (
@@ -333,7 +444,14 @@ pub fn load_unresolved_attempts_tx(conn: &mut PgConnection) -> DbResult<Vec<Unre
                 attempt,
                 parents: Vec::new(),
                 children: Vec::new(),
+                fills: HashMap::new(),
             });
+        if let Some(amount) = input.fill_amount {
+            entry.fills.insert(
+                input.parent_note_id.clone(),
+                maker_db::input_fill(&parent.note, u64::try_from(amount)?, child.as_ref())?,
+            );
+        }
         entry.parents.push(parent);
         entry.children.extend(child);
     }
@@ -378,11 +496,13 @@ fn remainder_of(
         raw_data,
         arrival_unix: parent.arrival_unix,
         priority_seq: parent.priority_seq,
+        keys: OrderKeyColumns::of(&note)?,
     };
     let order = BookOrder {
         priority_seq: u64::try_from(parent.priority_seq)?,
         arrival_unix: u64::try_from(parent.arrival_unix)?,
         note: std::sync::Arc::new(note),
+        maker: None,
     };
     Ok((row, order))
 }
@@ -418,24 +538,24 @@ pub fn finish_discarded_settlement_tx(
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
     }
-    let rows: Vec<OrderRow> = settlement_inputs::table
+    let inputs: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
         .filter(settlement_inputs::tx_id.eq(tx_id))
         .order(settlement_inputs::parent_note_id.asc())
         .for_update()
-        .select(OrderRow::as_select())
+        .select((SettlementInputRow::as_select(), OrderRow::as_select()))
         .load(conn)?;
 
     let mut active_ids = Vec::new();
     let mut consumed_ids = Vec::new();
     let mut update = BookUpdate::default();
-    for row in rows {
+    for (_, row) in &inputs {
         // Only a reserved parent is ours to release.
         if row.status != OrderStatus::Settling.as_str() {
             tracing::warn!(note_id = %hex::encode(&row.note_id), status = %row.status, "discarded settlement parent is not settling; leaving it");
             continue;
         }
-        let parent = row.into_book_order()?;
+        let parent = row.clone().into_book_order()?;
         let id = parent.id();
         if consumed.contains(&id) {
             consumed_ids.push(id.to_bytes().to_vec());
@@ -455,6 +575,11 @@ pub fn finish_discarded_settlement_tx(
                 .execute(conn)?;
         }
     }
+    let report_inputs: Vec<_> = inputs
+        .iter()
+        .map(|(input, parent)| (input, parent))
+        .collect();
+    maker_db::report_settlement_tx(conn, tx_id, &report_inputs, SettlementPhase::Voided, None)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     tracing::info!(
         tx_id = %hex::encode(tx_id),
@@ -478,6 +603,9 @@ pub fn confirm_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
+    commit_block: BlockNumber,
+    consumer: AccountId,
+    cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<BookUpdate> {
     if !lock_attempt(conn, tx_id)? {
         return Ok(BookUpdate::default());
@@ -494,7 +622,7 @@ pub fn confirm_settlement_tx(
     let mut children = Vec::new();
     let mut child_rows = Vec::new();
     let mut parent_ids = Vec::with_capacity(rows.len());
-    for (input, parent) in rows {
+    for (input, parent) in &rows {
         // Our transaction consumed it, whatever the database last recorded.
         if parent.status != OrderStatus::Settling.as_str() {
             tracing::warn!(note_id = %hex::encode(&parent.note_id), status = %parent.status, "confirmed parent was not settling; retiring it");
@@ -502,11 +630,11 @@ pub fn confirm_settlement_tx(
         removed.push(OrderId::read_from(&mut SliceReader::new(
             &input.parent_note_id,
         ))?);
-        parent_ids.push(input.parent_note_id);
+        parent_ids.push(input.parent_note_id.clone());
         // Validated against this parent at prepare time.
-        if let Some(raw) = input.child_note_data {
-            let child_note = Note::read_from(&mut SliceReader::new(&raw))?;
-            let (row, child) = remainder_of(&parent, child_note, raw)?;
+        if let Some(raw) = &input.child_note_data {
+            let child_note = Note::read_from(&mut SliceReader::new(raw))?;
+            let (row, child) = remainder_of(parent, child_note, raw.clone())?;
             child_rows.push(row);
             children.push(child);
         }
@@ -541,6 +669,12 @@ pub fn confirm_settlement_tx(
     )
     .set(orders::status.eq(OrderStatus::Executed.as_str()))
     .execute(conn)?;
+    let committed = SettlementPhase::Committed {
+        block: commit_block,
+        consumer,
+    };
+    let report_inputs: Vec<_> = rows.iter().map(|(input, parent)| (input, parent)).collect();
+    maker_db::report_settlement_tx(conn, tx_id, &report_inputs, committed, cached_fills)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     let active: Vec<BookOrder> = children
         .into_iter()
@@ -556,7 +690,11 @@ pub fn confirm_settlement_tx(
         status = "confirmed",
         "persisted settlement confirmation"
     );
-    Ok(BookUpdate { removed, active })
+    Ok(BookUpdate {
+        removed,
+        active,
+        maker_updates: Vec::new(),
+    })
 }
 
 /// Ingest observed notes that our own settlements expect as remainders. Each
@@ -701,6 +839,14 @@ pub fn seed_tokens_from_config_tx(conn: &mut PgConnection, tokens: &[TokenId]) -
     Ok(())
 }
 
+/// The account a test settlement is consumed by.
+#[cfg(test)]
+pub(crate) fn test_consumer() -> AccountId {
+    miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+        .try_into()
+        .expect("valid test account ID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +905,7 @@ mod tests {
                 parent_note_id: id,
                 child_note_id: Some(child.id().to_bytes()),
                 child_note_data: Some(child.to_bytes()),
+                fill_amount: None,
             });
         }
         let inserted = conn
@@ -776,7 +923,9 @@ mod tests {
             tx_result: vec![9],
             status: "prepared".into(),
         };
-        conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, &inputs))?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            prepare_settlement_tx(conn, &attempt, &inputs, None)
+        })?;
         let settling: i64 = orders::table
             .filter(orders::status.eq(OrderStatus::Settling.as_str()))
             .count()
@@ -798,7 +947,7 @@ mod tests {
             .collect();
         assert!(conn
             .transaction::<_, DbError, _>(|conn| {
-                prepare_settlement_tx(conn, &competing, &competing_inputs)
+                prepare_settlement_tx(conn, &competing, &competing_inputs, None)
             })
             .is_err());
         let attempts: i64 = settlement_attempts::table.count().get_result(conn)?;
@@ -806,7 +955,14 @@ mod tests {
         assert_eq!((attempts, mappings), (1, 511));
 
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
+            confirm_settlement_tx(
+                conn,
+                &attempt.tx_id,
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                None,
+            )
         })?;
         assert_eq!(update.removed.len(), 511);
         assert_eq!(update.active.len(), 511);
@@ -823,7 +979,14 @@ mod tests {
             );
         }
         let duplicate = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(conn, &attempt.tx_id, &HashSet::new())
+            confirm_settlement_tx(
+                conn,
+                &attempt.tx_id,
+                &HashSet::new(),
+                BlockNumber::GENESIS,
+                test_consumer(),
+                None,
+            )
         })?;
         assert!(duplicate.is_empty());
         let executed: i64 = orders::table
@@ -855,7 +1018,9 @@ mod tests {
                     parent_note_id: id.clone(),
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 }],
+                None,
             )
         })?;
 
@@ -871,7 +1036,14 @@ mod tests {
                 conn.batch_execute(&format!("SET search_path TO {schema}"))?;
                 barrier.wait();
                 let update = conn.transaction::<_, DbError, _>(|conn| {
-                    confirm_settlement_tx(conn, &[7], &HashSet::new())
+                    confirm_settlement_tx(
+                        conn,
+                        &[7],
+                        &HashSet::new(),
+                        BlockNumber::GENESIS,
+                        test_consumer(),
+                        None,
+                    )
                 })?;
                 Ok(update.removed.len())
             }));
@@ -922,10 +1094,11 @@ mod tests {
                     parent_note_id: parent_id,
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 };
                 barrier.wait();
                 match conn.transaction::<_, DbError, _>(|conn| {
-                    prepare_settlement_tx(conn, &attempt, &[input])
+                    prepare_settlement_tx(conn, &attempt, &[input], None)
                 }) {
                     Ok(()) => Ok(true),
                     Err(DbError::Settlement(SettlementError::InputOrderNotActive)) => Ok(false),
@@ -969,7 +1142,9 @@ mod tests {
                     parent_note_id: note.id().to_bytes(),
                     child_note_id: None,
                     child_note_data: None,
+                    fill_amount: None,
                 }],
+                None,
             )
         })?;
         let url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
@@ -983,7 +1158,14 @@ mod tests {
             conn.batch_execute(&format!("SET search_path TO {confirm_schema}"))?;
             confirm_barrier.wait();
             conn.transaction::<_, DbError, _>(|conn| {
-                confirm_settlement_tx(conn, &[41], &HashSet::new())
+                confirm_settlement_tx(
+                    conn,
+                    &[41],
+                    &HashSet::new(),
+                    BlockNumber::GENESIS,
+                    test_consumer(),
+                    None,
+                )
             })
             .map_err(Into::into)
         });
@@ -1053,7 +1235,9 @@ mod tests {
                         parent_note_id: prepare_parent,
                         child_note_id: None,
                         child_note_data: None,
+                        fill_amount: None,
                     }],
+                    None,
                 )
             }) {
                 Ok(()) => Ok(true),
@@ -1143,10 +1327,11 @@ mod tests {
             parent_note_id: note.id().to_bytes(),
             child_note_id: Some(vec![10]),
             child_note_data: Some(vec![11]),
+            fill_amount: None,
         };
         assert!(conn
             .transaction::<_, DbError, _>(|conn| {
-                prepare_settlement_tx(conn, &attempt, &[input])
+                prepare_settlement_tx(conn, &attempt, &[input], None)
             })
             .is_err());
         assert_eq!(
@@ -1206,22 +1391,28 @@ mod tests {
     fn ingest_batch_beyond_the_bind_parameter_limit_is_chunked() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
-        // Three binds per row: 22,000 rows need 66,000 parameters, more than
+        // Seven binds per row: 10,000 rows need 70,000 parameters, more than
         // the 65,535 PostgreSQL accepts in one statement.
-        let rows: Vec<NewOrderRow> = (0..22_000_u32)
+        let rows: Vec<NewOrderRow> = (0..10_000_u32)
             .map(|index| NewOrderRow {
                 note_id: index.to_be_bytes().to_vec(),
                 raw_data: vec![1],
                 arrival_unix: 1,
+                keys: OrderKeyColumns {
+                    lineage_id: index.to_be_bytes().to_vec(),
+                    depth: 0,
+                    market: vec![1],
+                    direction: vec![1],
+                },
             })
             .collect();
         let inserted =
             conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &rows, 5))?;
-        assert_eq!(inserted.len(), 22_000);
+        assert_eq!(inserted.len(), 10_000);
         let priorities: HashSet<u64> = inserted.values().copied().collect();
         assert_eq!(
             priorities.len(),
-            22_000,
+            10_000,
             "every order gets its own FIFO slot"
         );
         assert_eq!(get_last_fetched_block_tx(conn)?, 5);

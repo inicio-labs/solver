@@ -1,5 +1,5 @@
-use axum::extract::{Request, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header::AUTHORIZATION, header::CACHE_CONTROL, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
 use crate::db::{self, DbPool, DbResult};
+use crate::maker::{api_key_hash, new_api_key, MakerId};
 use crate::types::TokenId;
 
 /// Command sent to the subscribe task: subscribe both directions of a pair
@@ -64,6 +65,9 @@ impl AdminState {
             .route("/admin/tokens", get(list_tokens))
             .route("/admin/tokens", post(add_token))
             .route("/admin/tokens", delete(remove_token))
+            .route("/admin/makers", post(create_maker))
+            .route("/admin/makers/{maker_id}/keys", post(issue_api_key))
+            .route("/admin/keys/{key_id}", delete(revoke_api_key))
             .layer(middleware::from_fn_with_state(token, require_bearer_token))
             .with_state(self)
     }
@@ -206,6 +210,88 @@ async fn remove_token(
     })
 }
 
+/// Longest maker name, in bytes.
+const MAX_MAKER_NAME_LEN: usize = 64;
+
+/// Onboard a market maker (ADR 0003). 409 when the name is taken.
+async fn create_maker(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<MakerRequest>,
+) -> Result<(StatusCode, Json<MakerResponse>), StatusCode> {
+    let name = req.name.trim().to_owned();
+    if name.is_empty() || name.len() > MAX_MAKER_NAME_LEN {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let created = state
+        .pool
+        .write(move |conn| db::maker_db::create_maker_tx(conn, &name))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let maker_id = created.ok_or(StatusCode::CONFLICT)?;
+    Ok((StatusCode::CREATED, Json(MakerResponse { maker_id })))
+}
+
+/// Issue a new API key. The key is in this response only; the database keeps
+/// its hash. A response lost after commit leaves an unusable key: revoke it.
+async fn issue_api_key(
+    State(state): State<Arc<AdminState>>,
+    Path(maker_id): Path<MakerId>,
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        Json<ApiKeyResponse>,
+    ),
+    StatusCode,
+> {
+    let api_key = new_api_key();
+    let key_hash = api_key_hash(&api_key);
+    let key_id = state
+        .pool
+        .write(move |conn| db::maker_db::issue_api_key_tx(conn, maker_id, &key_hash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, "no-store")],
+        Json(ApiKeyResponse { key_id, api_key }),
+    ))
+}
+
+/// Revoke an API key. Accepted orders stay; revoking is not cancelling.
+async fn revoke_api_key(
+    State(state): State<Arc<AdminState>>,
+    Path(key_id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    let revoked = state
+        .pool
+        .write(move |conn| db::maker_db::revoke_api_key_tx(conn, key_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(if revoked {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+#[derive(Deserialize)]
+pub struct MakerRequest {
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MakerResponse {
+    pub maker_id: MakerId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ApiKeyResponse {
+    pub key_id: i64,
+    pub api_key: String,
+}
+
 /// A field this API does not know is rejected rather than accepted and
 /// silently dropped.
 #[derive(Deserialize)]
@@ -271,6 +357,53 @@ mod tests {
         let mut bytes = Vec::new();
         token.write_into(&mut bytes);
         hex::encode(bytes)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn makers_are_onboarded_with_keys_that_can_be_revoked() {
+        let (server, db, _subscriptions) = test_server().await;
+        let created = server
+            .post("/admin/makers")
+            .json(&json!({"name": "alpha"}))
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let maker_id = created.json::<MakerResponse>().maker_id;
+        server
+            .post("/admin/makers")
+            .json(&json!({"name": " alpha "}))
+            .await
+            .assert_status(StatusCode::CONFLICT);
+        server
+            .post("/admin/makers")
+            .json(&json!({"name": "  "}))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        let issued = server.post(&format!("/admin/makers/{maker_id}/keys")).await;
+        issued.assert_status(StatusCode::CREATED);
+        assert_eq!(issued.header(CACHE_CONTROL), "no-store");
+        let ApiKeyResponse { key_id, api_key } = issued.json();
+        let hash = api_key_hash(&api_key);
+        let authenticate = |hash: Vec<u8>| {
+            db.pool
+                .read(move |conn| db::maker_db::authenticate_tx(conn, &hash))
+        };
+        assert_eq!(authenticate(hash.clone()).await.unwrap(), Some(maker_id));
+        server
+            .post(&format!("/admin/makers/{}/keys", maker_id + 1))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        server
+            .delete(&format!("/admin/keys/{key_id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .delete(&format!("/admin/keys/{key_id}"))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(authenticate(hash).await.unwrap(), None);
     }
 
     #[tokio::test]

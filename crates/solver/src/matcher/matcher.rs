@@ -6,7 +6,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::clearing_book::ClearingBook;
+use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
 use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::matching::types::SwapBookSnapshot;
@@ -14,11 +14,17 @@ use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
+}
+
+/// Backlog on the ordered book/maker update stream at the last tick.
+pub(crate) fn ordered_update_backlog() -> u64 {
+    ORDERED_UPDATE_BACKLOG.load(Ordering::Relaxed)
 }
 
 /// Pairs skipped for want of a usable price, per reason.
@@ -36,11 +42,13 @@ pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
 /// a fresh price; the others pause alone and are counted. RFQ selection uses
 /// fixed note limits and needs no price.
 pub struct ClearingRuntime {
-    /// The active orders, sent once after ingestion reconciles persisted notes
-    /// against the chain.
-    pub bootstrap: oneshot::Receiver<Vec<BookOrder>>,
+    /// The active orders and maker cutoffs, sent once after ingestion
+    /// reconciles persisted notes against the chain.
+    pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
     pub prices: watch::Receiver<Arc<PriceSnapshot>>,
     pub config: ClearingConfig,
+    /// Stop selecting MM orders this long before their expiry (wall clock).
+    pub maker_settlement_buffer_ms: u64,
     pub routing: Option<crate::router::Routing>,
 }
 
@@ -73,22 +81,28 @@ pub(super) async fn run_worker(
     runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
     let mut book = ClearingBook::default();
-    for order in &bootstrap {
+    for (maker_id, scope, cutoff) in &bootstrap.cutoffs {
+        book.raise_maker_cutoff(*maker_id, scope.clone(), *cutoff);
+    }
+    for order in &bootstrap.orders {
         book.insert_or_skip(order);
     }
     let mut interval = tokio::time::interval(match_interval);
     loop {
         // Update the book immediately; run matching only on the batch timer.
+        // The timer precedes new receives so a busy producer cannot postpone
+        // matching; it drains the already queued committed updates in order.
         tokio::select! {
-            update = book_rx.recv() => {
-                book.apply(update.ok_or(MatcherError::IngestStopped)?);
-            }
+            biased;
             _ = interval.tick() => {
-                book.apply_pending(&mut book_rx);
                 let now = now_millis();
+                ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
+                book.apply_pending(&mut book_rx);
                 if let Some(routing) = runtime.routing.as_mut() {
                     routing.release_expired(&mut book, now).map_err(MatcherError::Routing)?;
                 }
+                // After give-backs return, so an expired one is not selected.
+                book.remove_expired(now, runtime.maker_settlement_buffer_ms);
                 // Internal clearing has first claim on the book. While the
                 // executor queue is full (busy, or verifying it can settle),
                 // skip the whole tick: routing would otherwise send external
@@ -101,6 +115,9 @@ pub(super) async fn run_worker(
                 }
                 // Latest order-book levels for the price API's swap-ETA estimates.
                 snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
+            }
+            update = book_rx.recv() => {
+                book.apply(update.ok_or(MatcherError::IngestStopped)?);
             }
         }
     }
@@ -331,7 +348,7 @@ mod tests {
         .await
         .unwrap();
         let persisted = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         let mut book = ClearingBook::default();
@@ -357,6 +374,7 @@ mod tests {
             bootstrap: oneshot::channel().1,
             prices: prices_rx,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -461,6 +479,7 @@ mod tests {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
             config: runtime.config,
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let removed_id = persisted[0].id();
@@ -474,7 +493,12 @@ mod tests {
                     snapshot_tx,
                     worker_runtime,
                 ));
-                assert!(bootstrap_tx.send(persisted).is_ok());
+                assert!(bootstrap_tx
+                    .send(ClearingBootstrap {
+                        orders: persisted,
+                        cutoffs: Vec::new(),
+                    })
+                    .is_ok());
                 snapshot_rx.changed().await.unwrap();
                 assert_eq!(snapshot_rx.borrow().len(), 4);
 
@@ -482,6 +506,7 @@ mod tests {
                     .send(BookUpdate {
                         removed: vec![removed_id],
                         active: Vec::new(),
+                        maker_updates: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -582,7 +607,7 @@ mod tests {
         .await
         .unwrap();
         let persisted = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         let book = || {
@@ -602,6 +627,7 @@ mod tests {
             )))
             .1,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let (exec_tx, mut exec_rx) = mpsc::channel(1);

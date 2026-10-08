@@ -3,11 +3,20 @@ use std::collections::{btree_map, BTreeMap, HashMap};
 use miden_protocol::note::NoteId;
 use tokio::sync::mpsc;
 
+use super::maker_index::MakerIndex;
 use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, MatchOrder, Order, OrderKey, OrderSide, PairBatch,
 };
+use crate::maker::{CutoffScope, MakerId, MakerUpdate};
 use crate::matching::types::{BestLevel, SwapBookSnapshot};
 use crate::types::{BookOrder, BookUpdate, TokenId};
+
+/// Sent once, after ingestion reconciles persisted notes against the chain.
+pub struct ClearingBootstrap {
+    pub orders: Vec<BookOrder>,
+    /// Every maker cancel-all barrier, applied to later arrivals.
+    pub cutoffs: Vec<(MakerId, CutoffScope, u64)>,
+}
 
 /// Live ingestion and startup hydration reject zero amounts before admission.
 /// Parse once here and maintain the exact price/FIFO index incrementally.
@@ -16,12 +25,27 @@ use crate::types::{BookOrder, BookUpdate, TokenId};
 pub(crate) struct ClearingBook {
     orders: HashMap<NoteId, Order>,
     pairs: HashMap<(TokenId, TokenId), BTreeMap<OrderKey, NoteId>>,
+    makers: MakerIndex,
 }
 
 impl ClearingBook {
+    /// Expiry gates new selection only. Already selected proofs/settlements
+    /// continue, and give-backs/remainders are checked again on their next tick.
+    pub(super) fn remove_expired(&mut self, now_ms: u64, buffer_ms: u64) {
+        let expired = self.makers.expired(now_ms, buffer_ms);
+        for id in expired {
+            if self.orders.get(&id).is_some_and(|order| order.is_active()) {
+                self.remove(id);
+            }
+        }
+    }
+
     /// Synchronous handoff: no matching can run between parent removal and
     /// remainder activation. Input comes from committed, ordered DB updates.
     pub(super) fn apply(&mut self, update: BookUpdate) {
+        for maker_update in update.maker_updates {
+            self.apply_maker_update(maker_update);
+        }
         for id in update.removed {
             self.remove(id);
         }
@@ -46,9 +70,21 @@ impl ClearingBook {
     /// holds its FIFO slot. One bad order must not stop matching for every
     /// other one; it stays Active in the database and returns on next boot.
     pub(super) fn insert_or_skip(&mut self, order: &BookOrder) {
+        if !self.makers.admit(order) {
+            // A maker cancel bars it; the database stores it Stopped.
+            self.remove(order.id());
+            tracing::debug!(note_id = %order.id(), "cancelled maker order left out of the book");
+            return;
+        }
         if let Err(error) = self.insert(order) {
             self.remove(order.id());
             tracing::warn!(note_id = %order.id(), %error, "order left out of the live book");
+        }
+        if let (Some(tag), Some(stored)) = (
+            self.makers.tag(&order.id()),
+            self.orders.get_mut(&order.id()),
+        ) {
+            stored.set_maker(tag);
         }
     }
 
@@ -64,7 +100,7 @@ impl ClearingBook {
         }
     }
 
-    pub fn insert(&mut self, order: &BookOrder) -> Result<(), ClearingError> {
+    pub(super) fn insert(&mut self, order: &BookOrder) -> Result<(), ClearingError> {
         let id = order.id();
         self.orders.insert(id, Order::from_book_order(order)?);
         self.add_to_index(id)
@@ -125,9 +161,11 @@ impl ClearingBook {
             .keys()
             .filter_map(|pair| {
                 let index = self.pairs.get(pair)?;
+                // Maker orders are never routed (ADR 0003).
                 let orders = index
                     .values()
                     .filter_map(|id| self.orders.get(id))
+                    .filter(|order| order.can_route_to_rfq())
                     .map(|order| {
                         let offered = order.offered_asset();
                         let requested = order.requested_asset();
@@ -146,7 +184,42 @@ impl ClearingBook {
             .collect()
     }
 
+    /// Apply a committed maker update and remove any orders it cancels.
+    pub(super) fn apply_maker_update(&mut self, update: MakerUpdate) {
+        let attribution = match &update {
+            MakerUpdate::OrdersAttributed { order_ids, tag, .. } => Some((order_ids.clone(), *tag)),
+            _ => None,
+        };
+        let cancelled = self.makers.apply(update);
+        if let Some((order_ids, tag)) = attribution {
+            for id in order_ids {
+                if let Some(order) = self.orders.get_mut(&id) {
+                    order.set_maker(tag);
+                }
+            }
+        }
+        if !cancelled.is_empty() {
+            tracing::debug!(
+                cancelled = cancelled.len(),
+                "maker cancel dropped book entries"
+            );
+        }
+        for id in cancelled {
+            self.remove(id);
+        }
+    }
+
+    pub(super) fn raise_maker_cutoff(
+        &mut self,
+        maker_id: MakerId,
+        scope: CutoffScope,
+        cutoff: u64,
+    ) {
+        self.makers.raise_cutoff(maker_id, scope, cutoff);
+    }
+
     pub fn remove(&mut self, id: NoteId) {
+        self.makers.forget(id);
         if let Some(order) = self.orders.remove(&id) {
             let (pair, key) = order.index_key();
             self.remove_from_index(pair, key, id);
@@ -228,7 +301,7 @@ mod tests {
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
     use crate::matcher::MatcherError;
-    use crate::types::ExecutionBatch;
+    use crate::types::{now_millis, ExecutionBatch};
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
     use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
     use miden_protocol::note::{Note, NoteType};
@@ -275,6 +348,7 @@ mod tests {
             priority_seq: seq,
             arrival_unix: 1,
             note: Arc::new(note),
+            maker: None,
         }
     }
 
@@ -371,6 +445,167 @@ mod tests {
         assert!(book.best_levels_snapshot().is_empty());
     }
 
+    fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
+        order.maker = Some(crate::maker::MakerTag {
+            maker_id,
+            root_seq,
+            expires_at_unix_ms: None,
+        });
+        order
+    }
+
+    #[test]
+    fn rfq_never_routes_a_maker_order() {
+        let mut rng = RandomCoin::new(Word::default());
+        let quote = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        let public = fixture(false, 10, 18, 2, &mut rng);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&quote);
+        let (mut routing, mut route_rx) = routing_fixture(&quote);
+        routing.dispatch(&mut book, 100).unwrap();
+        assert!(
+            route_rx.try_recv().is_err(),
+            "a maker order is never routed"
+        );
+        assert_eq!(
+            admit(&book, false, 100).len(),
+            1,
+            "it still clears internally"
+        );
+
+        // A public order becomes a maker order when its maker's submit
+        // arrives after ingest: from then on it is not routed either.
+        book.insert_or_skip(&public);
+        book.apply_maker_update(MakerUpdate::OrdersAttributed {
+            order_ids: vec![public.id()],
+            tag: crate::maker::MakerTag {
+                maker_id: 7,
+                root_seq: 2,
+                expires_at_unix_ms: None,
+            },
+            cancelled: false,
+        });
+        routing.dispatch(&mut book, 101).unwrap();
+        assert!(route_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn late_attribution_preserves_an_inactive_orders_lifecycle() {
+        let mut rng = RandomCoin::new(Word::default());
+        let public = fixture(false, 10, 18, 1, &mut rng);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&public);
+        book.deactivate(public.id());
+        book.apply(BookUpdate {
+            removed: Vec::new(),
+            active: Vec::new(),
+            maker_updates: vec![MakerUpdate::OrdersAttributed {
+                order_ids: vec![public.id()],
+                tag: crate::maker::MakerTag {
+                    maker_id: 7,
+                    root_seq: 1,
+                    expires_at_unix_ms: None,
+                },
+                cancelled: false,
+            }],
+        });
+        let stored = &book.orders[&public.id()];
+        assert!(
+            !stored.is_active(),
+            "metadata must not release an in-flight order"
+        );
+        assert!(!stored.can_route_to_rfq());
+        assert!(book.best_levels_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_maker_cutoff_drops_entries_and_bars_later_updates() {
+        let mut rng = RandomCoin::new(Word::default());
+        let old = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        let new = tagged(fixture(false, 10, 18, 2, &mut rng), 7, 9);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&old);
+        book.insert_or_skip(&new);
+        book.apply_maker_update(MakerUpdate::CutoffRaised {
+            maker_id: 7,
+            scope: CutoffScope::all(),
+            cutoff: 5,
+        });
+        assert!(!book.orders.contains_key(&old.id()));
+        assert!(book.orders.contains_key(&new.id()));
+        // A stale activation is still refused by the cutoff.
+        book.apply(old.clone().into());
+        assert!(!book.orders.contains_key(&old.id()));
+        assert_eq!(admit(&book, false, 100).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_cancel_binds_the_next_tick() {
+        let mut rng = RandomCoin::new(Word::default());
+        let seller = tagged(fixture(false, 11, 18, 1, &mut rng), 7, 1);
+        let buyer = fixture(true, 22, 10, 2, &mut rng);
+        let pair = Order::from_book_order(&seller).unwrap().index_key().0;
+        let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
+        let (_, prices_rx) = watch::channel(Arc::new(crate::price::PriceSnapshot::for_tests(
+            &[(pair.0, pair.1, "2", std::time::Instant::now())],
+            &[],
+            Duration::from_secs(3_600),
+        )));
+        // The cancel committed while the book was loading.
+        let (book_tx, book_rx) = mpsc::channel(1);
+        book_tx
+            .try_send(BookUpdate {
+                removed: Vec::new(),
+                active: Vec::new(),
+                maker_updates: vec![MakerUpdate::CutoffRaised {
+                    maker_id: 7,
+                    scope: CutoffScope::all(),
+                    cutoff: 2,
+                }],
+            })
+            .unwrap();
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices: prices_rx,
+            config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_matcher(
+            book_rx,
+            exec_tx,
+            Duration::from_secs(1),
+            snapshot_tx,
+            runtime,
+            cancel.clone(),
+        ));
+        snapshot_rx.changed().await.unwrap();
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "the cancelled quote never reached clearing"
+        );
+        assert_eq!(
+            snapshot_rx.borrow().len(),
+            1,
+            "only the buyer's side is left"
+        );
+        // The ordered book stream remains open for subsequent updates.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        snapshot_rx.changed().await.unwrap();
+        assert!(!task.is_finished());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn rfq_backpressure_or_closed_channel_leaves_orders_active() {
         for closed in [false, true] {
@@ -412,13 +647,19 @@ mod tests {
         let order = fixture(false, 10, 18, 1, &mut rng);
         let (routing, mut route_rx) = routing_fixture(&order);
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
-        assert!(bootstrap_tx.send(vec![order.clone()]).is_ok());
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![order.clone()],
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
         // No price snapshot: direct clearing cannot match, but RFQ still can.
         let (_, prices) = watch::channel(Arc::new(crate::price::PriceSnapshot::default()));
         let runtime = ClearingRuntime {
             bootstrap,
             prices,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: Some(routing),
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
@@ -465,7 +706,10 @@ mod tests {
         let (routing, mut route_rx) = routing_fixture(&seller);
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
         assert!(bootstrap_tx
-            .send(vec![seller.clone(), buyer.clone()])
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                cutoffs: Vec::new(),
+            })
             .is_ok());
         let (_, prices_rx) = watch::channel(Arc::new(crate::price::PriceSnapshot::for_tests(
             &[(pair.0, pair.1, "2", std::time::Instant::now())],
@@ -476,6 +720,7 @@ mod tests {
             bootstrap,
             prices: prices_rx,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: Some(routing),
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
@@ -539,6 +784,7 @@ mod tests {
                 bootstrap,
                 prices,
                 config,
+                maker_settlement_buffer_ms: 0,
                 routing: None,
             };
             let (_book_tx, book_rx) = mpsc::channel(1);
@@ -673,6 +919,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: vec![parent.id()],
             active: vec![child.clone()],
+            maker_updates: Vec::new(),
         });
         assert_eq!(admit(&book, false, 100)[0].order().id(), child.id());
     }
@@ -680,12 +927,18 @@ mod tests {
     #[tokio::test]
     async fn clearer_propagates_closed_update_channel() {
         let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
-        assert!(bootstrap_tx.send(Vec::new()).is_ok());
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: Vec::new(),
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
         let (_price_tx, prices) = watch::channel(Arc::new(crate::price::PriceSnapshot::default()));
         let runtime = ClearingRuntime {
             bootstrap,
             prices,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let (book_tx, book_rx) = mpsc::channel(1);
@@ -733,6 +986,7 @@ mod tests {
                 protocol_fee_ppm: crate::clearing::PPM_DENOMINATOR,
                 ..ClearingConfig::default()
             },
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let (_book_tx, book_rx) = mpsc::channel(1);
@@ -774,6 +1028,7 @@ mod tests {
             bootstrap,
             prices,
             config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
             routing: None,
         };
         let (book_tx, book_rx) = mpsc::channel(4);
@@ -792,7 +1047,12 @@ mod tests {
         book_tx.send(buyer.clone().into()).await.unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(exec_rx.try_recv().is_err());
-        assert!(bootstrap_tx.send(vec![seller.clone()]).is_ok());
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone()],
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
         let first = tokio::time::timeout(Duration::from_secs(1), exec_rx.recv())
             .await
             .unwrap()
@@ -872,6 +1132,7 @@ mod tests {
         book.apply(BookUpdate {
             removed: Vec::new(),
             active: vec![holder.clone(), stale.clone(), other.clone()],
+            maker_updates: Vec::new(),
         });
 
         assert!(book.orders.contains_key(&holder.id()));
@@ -879,5 +1140,83 @@ mod tests {
         assert!(!book.orders.contains_key(&stale.id()));
         let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
         assert_eq!(indexed, 2, "the slot still belongs to the holder");
+    }
+    #[test]
+    fn expiry_removes_active_orders_but_preserves_selected_work_and_checks_givebacks() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut quote = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        quote.maker.as_mut().unwrap().expires_at_unix_ms = Some(1000);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&quote);
+        book.remove_expired(899, 100);
+        assert!(book.orders.contains_key(&quote.id()));
+        book.deactivate(quote.id());
+        book.remove_expired(900, 100);
+        assert!(
+            book.orders.contains_key(&quote.id()),
+            "selected work continues"
+        );
+        book.apply(BookUpdate::from(quote.clone()));
+        book.remove_expired(900, 100);
+        assert!(
+            !book.orders.contains_key(&quote.id()),
+            "expired giveback cannot be selected again"
+        );
+        assert!(book.best_levels_snapshot().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_maker_order_is_not_selected_after_hydration() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut seller = tagged(fixture(false, 11, 18, 1, &mut rng), 7, 1);
+        seller.maker.as_mut().unwrap().expires_at_unix_ms = Some(now_millis() + 100);
+        let buyer = fixture(true, 22, 10, 2, &mut rng);
+        let pair = Order::from_book_order(&seller).unwrap().index_key().0;
+        let (bootstrap_tx, bootstrap) = tokio::sync::oneshot::channel();
+        assert!(bootstrap_tx
+            .send(ClearingBootstrap {
+                orders: vec![seller.clone(), buyer.clone()],
+                cutoffs: Vec::new(),
+            })
+            .is_ok());
+        let (_, prices_rx) = watch::channel(Arc::new(crate::price::PriceSnapshot::for_tests(
+            &[(pair.0, pair.1, "2", std::time::Instant::now())],
+            &[],
+            Duration::from_secs(3_600),
+        )));
+        let (_book_tx, book_rx) = mpsc::channel(1);
+        let runtime = ClearingRuntime {
+            bootstrap,
+            prices: prices_rx,
+            config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 100,
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_matcher(
+            book_rx,
+            exec_tx,
+            Duration::from_secs(1),
+            snapshot_tx,
+            runtime,
+            cancel.clone(),
+        ));
+        snapshot_rx.changed().await.unwrap();
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "the expired quote never reached clearing"
+        );
+        assert_eq!(
+            snapshot_rx.borrow().len(),
+            1,
+            "only the buyer's side is left"
+        );
+        // The ordered book stream remains open for subsequent updates.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        snapshot_rx.changed().await.unwrap();
+        assert!(!task.is_finished());
+        cancel.cancel();
+        task.await.unwrap().unwrap();
     }
 }

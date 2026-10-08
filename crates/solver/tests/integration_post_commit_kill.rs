@@ -60,7 +60,7 @@ async fn crash_worker() -> Result<()> {
     book_tx.send(BookUpdate::default()).await?;
     pool.write_book(&book_tx, move |conn| {
         // Active orders load in FIFO order.
-        let parent = postgres_db::load_active_orders_tx(conn)?
+        let parent = postgres_db::load_live_orders_tx(conn)?
             .into_iter()
             .next()
             .ok_or(DbError::Corrupt("crash fixture has no active parent"))?;
@@ -71,6 +71,7 @@ async fn crash_worker() -> Result<()> {
         Ok(BookUpdate {
             removed: vec![id],
             active: Vec::new(),
+            maker_updates: Vec::new(),
         })
     })
     .await?;
@@ -156,7 +157,7 @@ async fn process_kill_after_commit_restores_book() -> Result<()> {
     .await
     .context("new solver could not reacquire PostgreSQL ownership")?;
     restarted.readiness_check().await?;
-    let restored = restarted.read(postgres_db::load_active_orders_tx).await?;
+    let restored = restarted.read(postgres_db::load_live_orders_tx).await?;
     assert_eq!(restored.len(), 1, "startup hydration used stale book state");
     assert_eq!(restored[0].id(), survivor_id);
     assert_ne!(restored[0].id().to_bytes(), parent_id);

@@ -619,6 +619,124 @@ struct Writer {
     backend: Backend,
 }
 
+/// The maker intake's session: group-commit transactions of maker commands
+/// beside the core writer, never through it. Maker commands only append facts
+/// (commands, lineage claims, cutoffs, stops) and never move orders or
+/// settlements, so it needs no ownership lock. Cancels and reservations still
+/// serialize through the maker control row, which works across sessions.
+pub struct IntakeSession {
+    url: String,
+    application_name: String,
+    conn: Option<PgConnection>,
+    fatal_db: CancellationToken,
+    deadline: Duration,
+    publish_order: Arc<Mutex<()>>,
+    #[cfg(test)]
+    drop_next_commit_reply: bool,
+}
+
+pub(crate) struct PublicationGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    fatal_db: CancellationToken,
+    complete: bool,
+}
+
+impl PublicationGuard {
+    pub(crate) fn complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            // A cancelled or panicked publisher may have committed without publishing.
+            // Stop the solver so hydration restores the durable state.
+            self.fatal_db.cancel();
+        }
+    }
+}
+
+impl IntakeSession {
+    #[cfg(test)]
+    pub(crate) fn simulate_lost_commit_reply(&mut self) {
+        self.drop_next_commit_reply = true;
+    }
+
+    /// Serialize the intake commit and publication with all book writers.
+    pub(crate) fn publication_guard(
+        &self,
+    ) -> impl std::future::Future<Output = PublicationGuard> + Send + 'static {
+        let lock = self.publish_order.clone();
+        let fatal_db = self.fatal_db.clone();
+        async move {
+            PublicationGuard {
+                _guard: lock.lock_owned().await,
+                fatal_db,
+                complete: false,
+            }
+        }
+    }
+
+    /// Run `work` as one transaction on a blocking worker, connecting first
+    /// if needed. Refuses once the pool is fatal. An error may mean COMMIT
+    /// succeeded without a reply, so it stops the solver for hydration before
+    /// the maker retries the same request ID.
+    pub async fn transaction<T, F>(&mut self, work: F) -> DbResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PgConnection) -> DbResult<T> + Send + 'static,
+    {
+        if self.fatal_db.is_cancelled() {
+            return Err(DbError::WriterUnsafe);
+        }
+        let conn = self.conn.take();
+        let (url, application_name) = (self.url.clone(), self.application_name.clone());
+        let outcome = blocking("intake", self.deadline, move || {
+            let mut conn = match conn {
+                Some(conn) => conn,
+                None => {
+                    let mut conn = postgres_migrations::connect(&url)?;
+                    configure_session(&mut conn, &application_name)?;
+                    conn
+                }
+            };
+            let result = conn.transaction(work);
+            Ok((conn, result))
+        })
+        .await;
+        let (conn, result) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error @ (DbError::Deadline { .. } | DbError::WorkerStopped(_))) => {
+                // The blocking worker may still commit after the deadline.
+                // Continuing would let a later book publication overtake it.
+                self.fatal_db.cancel();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        if self.drop_next_commit_reply && result.is_ok() {
+            self.drop_next_commit_reply = false;
+            // The transaction really committed. Model losing the response
+            // before intake can publish its matcher update.
+            self.fatal_db.cancel();
+            return Err(DbError::Corrupt("simulated lost COMMIT response"));
+        }
+        if result.is_ok() {
+            self.conn = Some(conn);
+        } else {
+            // A failed COMMIT response is indistinguishable here from an
+            // earlier transaction error. The transaction may have committed
+            // without its maker update being published. Stop the solver so
+            // startup hydration reconciles the durable state before another
+            // command can be acknowledged.
+            self.fatal_db.cancel();
+        }
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct PgPool {
     writer: Arc<Mutex<Writer>>,
@@ -730,6 +848,21 @@ impl PgPool {
     /// A database failure requiring coordinated shutdown and startup hydration.
     pub fn fatal_token(&self) -> CancellationToken {
         self.fatal_db.clone()
+    }
+
+    /// The maker intake's own session (ADR 0003). It connects on first use,
+    /// with the writer's URL and session settings but not its ownership lock.
+    pub fn intake_session(&self) -> IntakeSession {
+        IntakeSession {
+            url: self.writer_config.url.clone(),
+            application_name: format!("{}/intake", self.writer_config.application_name),
+            conn: None,
+            fatal_db: self.fatal_db.clone(),
+            deadline: self.operation_deadline,
+            publish_order: self.publish_order.clone(),
+            #[cfg(test)]
+            drop_next_commit_reply: false,
+        }
     }
 
     /// A read for the public price API. It waits for a public slot first, so
@@ -861,6 +994,10 @@ impl PgPool {
             }
         }
         .await;
+        if result.is_ok() {
+            // Maker events committed: wake their streams.
+            crate::maker::EventWake::notify_if_appended();
+        }
         self.finish(Access::Write, started, operation_name, result)
     }
 
@@ -954,15 +1091,38 @@ impl PgPool {
     where
         F: FnOnce(&mut PgConnection) -> DbResult<BookUpdate> + Send + 'static,
     {
-        let _publish = self.publish_order.lock().await;
-        let update = self.write(operation).await?;
-        if !update.is_empty() {
-            sender
-                .send(update)
-                .await
-                .map_err(|_| DbError::MatcherStopped)?;
-        }
-        Ok(())
+        let pool = self.clone();
+        let sender = sender.clone();
+        // The owned task keeps the guard through send even if its caller is
+        // aborted after commit. Otherwise a later maker cancel could overtake
+        // an update whose database transaction already committed.
+        tokio::spawn(async move {
+            let mut publication = PublicationGuard {
+                _guard: pool.publish_order.clone().lock_owned().await,
+                fatal_db: pool.fatal_db.clone(),
+                complete: false,
+            };
+            let result = async {
+                let update = pool
+                    .write(move |conn| {
+                        let update = operation(conn)?;
+                        super::postgres_db::live_book_update_tx(conn, update)
+                    })
+                    .await?;
+                if !update.is_empty() {
+                    sender
+                        .send(update)
+                        .await
+                        .map_err(|_| pool.stop(DbError::MatcherStopped))?;
+                }
+                Ok(())
+            }
+            .await;
+            publication.complete();
+            result
+        })
+        .await
+        .map_err(|panicked| self.stop(DbError::WriterPanicked(panicked)))?
     }
 
     /// Readiness proves the read pool answers and the original writer backend
@@ -1129,6 +1289,7 @@ mod tests {
                     Ok(BookUpdate {
                         removed: vec![order_id],
                         active: Vec::new(),
+                        maker_updates: Vec::new(),
                     })
                 })
                 .await
@@ -1217,6 +1378,7 @@ mod tests {
                     Ok(BookUpdate {
                         removed: vec![first_id],
                         active: Vec::new(),
+                        maker_updates: Vec::new(),
                     })
                 })
                 .await
@@ -1229,8 +1391,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        assert!(
+            first.await.is_err(),
+            "the caller was cancelled after commit"
+        );
 
-        // The second publisher cannot commit and overtake the first send.
+        // The owned publication still holds the guard, so the second writer
+        // cannot commit and overtake the first send.
         let second_pool = pool.clone();
         let second_sender = sender.clone();
         let second = tokio::spawn(async move {
@@ -1242,6 +1410,7 @@ mod tests {
                     Ok(BookUpdate {
                         removed: vec![second_id],
                         active: Vec::new(),
+                        maker_updates: Vec::new(),
                     })
                 })
                 .await
@@ -1258,7 +1427,6 @@ mod tests {
         assert_eq!(delivered.removed, vec![first_id]);
         let delivered = receiver.recv().await.context("missing second update")?;
         assert_eq!(delivered.removed, vec![second_id]);
-        first.await??;
         second.await??;
         Ok(())
     }
@@ -1280,6 +1448,7 @@ mod tests {
                 Ok(BookUpdate {
                     removed: vec![order_id],
                     active: Vec::new(),
+                    maker_updates: Vec::new(),
                 })
             })
             .await
@@ -1393,6 +1562,76 @@ mod tests {
         })
         .await??;
         assert_eq!(stored, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn uncertain_intake_commit_stops_later_book_publications() -> Result<()> {
+        let fixture = TestSchema::migrated()?;
+        let pool = PgPool::open(
+            fixture.url.clone(),
+            fixture.url.clone(),
+            1,
+            "solver/intake-timeout".into(),
+        )
+        .await?;
+        let mut session = pool.intake_session();
+        session.transaction(|_| Ok(())).await?;
+        session.deadline = Duration::from_millis(100);
+        let error = session
+            .transaction(|conn| {
+                diesel::update(sync_state::table.find(1_i16))
+                    .set(sync_state::last_fetched_block.eq(77_i64))
+                    .execute(conn)?;
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            })
+            .await
+            .expect_err("the intake commit outcome is uncertain at its deadline");
+        assert!(matches!(
+            error,
+            DbError::Deadline {
+                operation: "intake",
+                ..
+            }
+        ));
+        assert!(pool.fatal_token().is_cancelled());
+        let (book_tx, _book_rx) = mpsc::channel(1);
+        assert!(matches!(
+            pool.write_book(&book_tx, |_| Ok(BookUpdate::default()))
+                .await,
+            Err(DbError::WriterUnsafe)
+        ));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a disposable PostgreSQL database"]
+    async fn failed_intake_transaction_requires_hydration_before_more_commands() -> Result<()> {
+        let fixture = TestSchema::migrated()?;
+        let pool = PgPool::open(
+            fixture.url.clone(),
+            fixture.url.clone(),
+            1,
+            "solver/intake-error".into(),
+        )
+        .await?;
+        let mut session = pool.intake_session();
+        let error = session
+            .transaction(|_| Err::<(), _>(DbError::Corrupt("simulated intake failure")))
+            .await
+            .expect_err("an intake error must fail closed");
+        assert!(matches!(
+            error,
+            DbError::Corrupt("simulated intake failure")
+        ));
+        assert!(pool.fatal_token().is_cancelled());
+        assert!(matches!(
+            session.transaction(|_| Ok(())).await,
+            Err(DbError::WriterUnsafe)
+        ));
         Ok(())
     }
 

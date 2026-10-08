@@ -17,7 +17,7 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PriceSnapshot;
 use crate::router::{QuotesSnapshot, RouteBatch};
 use crate::swap_eta::SettlementStats;
-use crate::types::{BookOrder, BookUpdate, ExecutionBatch, TokenId};
+use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
 /// batches, consumed-note notifications), used by `create_channels`.
@@ -326,7 +326,7 @@ pub async fn spawn_ingest_tasks(
     cancel: CancellationToken,
     last_sync_unix_seconds: Arc<AtomicU64>,
     solver_id: miden_protocol::account::AccountId,
-    clearing_bootstrap: oneshot::Sender<Vec<BookOrder>>,
+    clearing_bootstrap: oneshot::Sender<matcher::ClearingBootstrap>,
 ) -> Result<crate::start::ClientTasks> {
     // Subscribe to all registered token pairs (uses the ingest client).
     subscribe_all_pairs(&db_pool, &mut *adapter.lock().await).await?;
@@ -389,8 +389,22 @@ pub async fn spawn_ingest_tasks(
 async fn reconcile_clearing_book(
     pool: &db::DbPool,
     client: &mut dyn MidenClient,
-) -> Result<Vec<BookOrder>> {
-    let mut orders = pool.read(db::postgres_db::load_active_orders_tx).await?;
+) -> Result<matcher::ClearingBootstrap> {
+    let backfilled = pool.write(db::postgres_db::backfill_order_keys_tx).await?;
+    if backfilled > 0 {
+        tracing::info!(
+            backfilled,
+            "filled order keys of orders stored before maker support"
+        );
+    }
+    // Cutoffs only rise, so reading them after the orders can only stop more.
+    let (mut orders, cutoffs) = pool
+        .read(|conn| {
+            let orders = db::postgres_db::load_live_orders_tx(conn)?;
+            let cutoffs = db::maker_db::load_cutoffs_tx(conn)?;
+            Ok((orders, cutoffs))
+        })
+        .await?;
     let notes: Vec<_> = orders
         .iter()
         .map(|order| order.note.as_ref().clone())
@@ -407,7 +421,7 @@ async fn reconcile_clearing_book(
         .await?;
         orders.retain(|order| !consumed.contains(&order.id()));
     }
-    Ok(orders)
+    Ok(matcher::ClearingBootstrap { orders, cutoffs })
 }
 
 #[cfg(test)]
@@ -491,17 +505,17 @@ mod tests {
         let pool = &test_db.pool;
         let ids = persist_clearing_notes(pool).await;
         let before = pool
-            .read(db::postgres_db::load_active_orders_tx)
+            .read(db::postgres_db::load_live_orders_tx)
             .await
             .unwrap();
         let mut client = MockMidenClient::new();
         client.mark_consumed_silent(vec![ids[0]]);
         let bootstrap = reconcile_clearing_book(&pool, &mut client).await.unwrap();
-        assert_eq!(bootstrap.len(), 1);
-        assert_eq!(bootstrap[0].id(), ids[1]);
-        assert_eq!(bootstrap[0].priority_seq, before[1].priority_seq);
+        assert_eq!(bootstrap.orders.len(), 1);
+        assert_eq!(bootstrap.orders[0].id(), ids[1]);
+        assert_eq!(bootstrap.orders[0].priority_seq, before[1].priority_seq);
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_tx)
+            pool.read(db::postgres_db::load_live_orders_tx)
                 .await
                 .unwrap()
                 .len(),
@@ -519,7 +533,7 @@ mod tests {
         client.fail_consumed_check = true;
         assert!(reconcile_clearing_book(&pool, &mut client).await.is_err());
         assert_eq!(
-            pool.read(db::postgres_db::load_active_orders_tx)
+            pool.read(db::postgres_db::load_live_orders_tx)
                 .await
                 .unwrap()
                 .len(),

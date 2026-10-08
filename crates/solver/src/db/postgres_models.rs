@@ -12,8 +12,11 @@ use miden_protocol::crypto::utils::{Deserializable, Serializable, SliceReader};
 use miden_protocol::note::Note;
 
 use super::error::{DbError, DbResult};
-use super::postgres_schema::{orders, registered_tokens, settlement_attempts, settlement_inputs};
-use crate::types::{BookOrder, Order, OrderId, TokenId};
+use super::postgres_schema::{
+    live_orders, orders, registered_tokens, settlement_attempts, settlement_inputs,
+};
+use crate::maker::MakerTag;
+use crate::types::{BookOrder, Order, OrderId, OrderKeys, TokenId};
 
 /// An unresolved settlement, stored as its snake_case name. Confirmed and
 /// released attempts are deleted.
@@ -66,7 +69,78 @@ impl OrderRow {
             priority_seq,
             arrival_unix: u64::try_from(self.arrival_unix)?,
             note: Arc::new(note),
+            maker: None,
         })
+    }
+}
+
+/// The order keys every insert stores, computed from the note.
+#[derive(Insertable, AsChangeset, Debug, Clone)]
+#[diesel(table_name = orders)]
+pub struct OrderKeyColumns {
+    pub lineage_id: Vec<u8>,
+    pub depth: i64,
+    pub market: Vec<u8>,
+    pub direction: Vec<u8>,
+}
+
+impl OrderKeyColumns {
+    pub fn of(note: &Note) -> DbResult<Self> {
+        let keys = OrderKeys::from_note(note)?;
+        Ok(Self {
+            lineage_id: keys.lineage_id,
+            depth: keys.depth.into(),
+            market: keys.market,
+            direction: keys.direction,
+        })
+    }
+}
+
+/// A row of the `live_orders` view: an order that can trade now, with the
+/// maker that claimed its lineage, if any.
+#[derive(Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = live_orders)]
+pub struct LiveOrderRow {
+    pub note_id: Vec<u8>,
+    pub raw_data: Vec<u8>,
+    pub arrival_unix: i64,
+    pub status: String,
+    pub priority_seq: i64,
+    pub maker_id: Option<i64>,
+    pub root_seq: Option<i64>,
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+impl LiveOrderRow {
+    pub fn into_book_order(self) -> DbResult<BookOrder> {
+        let maker = maker_tag(self.maker_id, self.root_seq, self.expires_at_unix_ms)?;
+        let mut order = OrderRow {
+            note_id: self.note_id,
+            raw_data: self.raw_data,
+            arrival_unix: self.arrival_unix,
+            status: self.status,
+            priority_seq: self.priority_seq,
+        }
+        .into_book_order()?;
+        order.maker = maker;
+        Ok(order)
+    }
+}
+
+/// The view's maker columns: both set for a claimed lineage, both NULL else.
+pub fn maker_tag(
+    maker_id: Option<i64>,
+    root_seq: Option<i64>,
+    expires_at_unix_ms: Option<i64>,
+) -> DbResult<Option<MakerTag>> {
+    match (maker_id, root_seq) {
+        (Some(maker_id), Some(root_seq)) => Ok(Some(MakerTag {
+            maker_id,
+            root_seq: u64::try_from(root_seq)?,
+            expires_at_unix_ms: expires_at_unix_ms.map(u64::try_from).transpose()?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(DbError::Corrupt("lineage claim without maker or sequence")),
     }
 }
 
@@ -77,6 +151,8 @@ pub struct NewOrderRow {
     pub note_id: Vec<u8>,
     pub raw_data: Vec<u8>,
     pub arrival_unix: i64,
+    #[diesel(embed)]
+    pub keys: OrderKeyColumns,
 }
 
 /// A settlement child inherits the exact FIFO slot and arrival time of its
@@ -88,6 +164,8 @@ pub struct NewRemainderOrderRow {
     pub raw_data: Vec<u8>,
     pub arrival_unix: i64,
     pub priority_seq: i64,
+    #[diesel(embed)]
+    pub keys: OrderKeyColumns,
 }
 
 impl NewOrderRow {
@@ -103,6 +181,7 @@ impl NewOrderRow {
             note_id: note.id().to_bytes().to_vec(),
             raw_data: note.to_bytes(),
             arrival_unix: i64::try_from(arrival_unix)?,
+            keys: OrderKeyColumns::of(note)?,
         })
     }
 }
@@ -138,6 +217,9 @@ pub struct SettlementInputRow {
     pub parent_note_id: Vec<u8>,
     pub child_note_id: Option<Vec<u8>>,
     pub child_note_data: Option<Vec<u8>>,
+    /// Requested-asset units this input is filled with (its payback amount);
+    /// `None` only for attempts prepared before fills were recorded.
+    pub fill_amount: Option<i64>,
 }
 
 #[derive(Queryable, Selectable, Insertable, Debug, Clone)]

@@ -245,20 +245,19 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                 false
             };
 
-            // 9. Phase 3: drive the chain until the solver's ingest syncs past
-            //    the consumption and retires the order as terminal.
+            // 9. Phase 3: wait until the solver's ingest syncs past the
+            //    consumption and retires the order as terminal. The consumption
+            //    is already in a block; proving more would only give a slow
+            //    ingest more blocks to catch up on. Bounded by wall-clock time.
             let mut final_status = order_status(&solver_db_path, &note_key).await;
             if consumed_ok {
-                for _ in 0..600 {
-                    if solver_handle.is_finished() {
-                        break;
-                    }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                while std::time::Instant::now() < deadline && !solver_handle.is_finished() {
                     final_status = order_status(&solver_db_path, &note_key).await;
                     if final_status.as_deref() == Some("onchain_nullified") {
                         break;
                     }
-                    rpc.prove_block();
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
 

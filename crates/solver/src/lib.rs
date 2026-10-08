@@ -1,4 +1,6 @@
 pub mod types;
+pub mod maker;
+pub mod gateway;
 pub mod matching;
 pub mod db;
 pub mod ingest;

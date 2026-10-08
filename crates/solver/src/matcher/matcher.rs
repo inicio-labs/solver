@@ -1,60 +1,47 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use strum::{EnumCount, IntoEnumIterator};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::clearing_book::{ClearingBook, ClearingBootstrap};
+use super::clearing_book::ClearingBook;
 use super::error::MatcherError;
-use crate::clearing::{
-    self, ClearingConfig, ClearingError, ClearingOutcome, PairMatcher, ReferencePrice, SkipReason,
-};
+use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::PreciseSnapshot;
+use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
+    [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
 }
 
-/// Worker inputs for pair clearing and optional RFQ routing. Missing or stale
-/// oracle prices pause clearing, but do not disable fixed-limit RFQ selection.
-pub struct ClearingRuntime {
-    pub bootstrap: oneshot::Receiver<ClearingBootstrap>,
-    pub prices: watch::Receiver<PreciseSnapshot>,
-    pub pairs: Vec<(TokenId, TokenId)>,
-    pub config: ClearingConfig,
-    pub max_price_age_ms: u64,
-    pub max_source_age_ms: u64,
-    pub max_source_skew_ms: u64,
-    pub routing: Option<crate::router::Routing>,
+/// Pairs skipped for want of a usable price, per reason.
+pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
+    PriceUnavailable::iter().map(|reason| {
+        (
+            reason.into(),
+            PRICE_SKIPS[reason as usize].load(Ordering::Relaxed),
+        )
+    })
 }
 
-impl ClearingRuntime {
-    /// An order belongs to one unordered pair. Reject duplicate markets once,
-    /// so clearing needs no per-tick set to prevent double selection.
-    fn validate(&self) -> Result<(), ClearingError> {
-        self.config.validate()?;
-        let mut pairs = HashSet::with_capacity(self.pairs.len());
-        for &(base, quote) in &self.pairs {
-            if base == quote {
-                return Err(ClearingError::IdenticalPairAssets);
-            }
-            let pair = if base < quote {
-                (base, quote)
-            } else {
-                (quote, base)
-            };
-            if !pairs.insert(pair) {
-                return Err(ClearingError::DuplicatePair);
-            }
-        }
-        Ok(())
-    }
+/// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
+/// visits every clearing pair (all confirmed at startup) and clears those with
+/// a fresh price; the others pause alone and are counted. RFQ selection uses
+/// fixed note limits and needs no price.
+pub struct ClearingRuntime {
+    /// The active orders, sent once after ingestion reconciles persisted notes
+    /// against the chain.
+    pub bootstrap: oneshot::Receiver<Vec<BookOrder>>,
+    pub prices: watch::Receiver<Arc<PriceSnapshot>>,
+    pub config: ClearingConfig,
+    pub routing: Option<crate::router::Routing>,
 }
 
 /// Apply lifecycle updates immediately; match the active book on timer ticks.
@@ -83,10 +70,10 @@ pub(super) async fn run_worker(
     mut runtime: ClearingRuntime,
 ) -> Result<(), MatcherError> {
     // Configuration is frozen for this worker; validate before admitting orders.
-    runtime.validate()?;
+    runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
     let mut book = ClearingBook::default();
-    for order in &bootstrap.orders {
+    for order in &bootstrap {
         book.insert_or_skip(order);
     }
     let mut interval = tokio::time::interval(match_interval);
@@ -107,7 +94,7 @@ pub(super) async fn run_worker(
                 // skip the whole tick: routing would otherwise send external
                 // fillers orders that should cross internally next tick.
                 if executor_accepting(&exec_tx)? {
-                    internal_clear(&mut book, &bootstrap.decimals, &runtime, &exec_tx, now)?;
+                    internal_clear(&mut book, &runtime, &exec_tx)?;
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
@@ -137,50 +124,18 @@ pub(super) fn executor_accepting(
     Ok(accepting)
 }
 
-fn fresh_reference_prices(
-    prices: &PreciseSnapshot,
-    base: TokenId,
-    quote: TokenId,
-    now_ms: u64,
-    max_observation_age_ms: u64,
-    max_source_age_ms: u64,
-    max_source_skew_ms: u64,
-) -> Option<(ReferencePrice, ReferencePrice)> {
-    let base_price = prices.get(&base)?;
-    let quote_price = prices.get(&quote)?;
-    let observed = base_price.observed_at_unix_ms;
-    if observed == 0
-        || observed != quote_price.observed_at_unix_ms
-        || now_ms.saturating_sub(observed) > max_observation_age_ms
-    {
-        return None;
-    }
-    let base_source = base_price.source_updated_at_unix_ms?;
-    let quote_source = quote_price.source_updated_at_unix_ms?;
-    if base_source == 0
-        || quote_source == 0
-        || base_source > now_ms
-        || quote_source > now_ms
-        || now_ms - base_source > max_source_age_ms
-        || now_ms - quote_source > max_source_age_ms
-        || base_source.abs_diff(quote_source) > max_source_skew_ms
-    {
-        return None;
-    }
-    Some((base_price.exact_reference?, quote_price.exact_reference?))
-}
-
 /// Solve all pairs from the live book using one frozen price snapshot and
-/// send the combined batch to the executor. A pair that fails to clear is
-/// logged and skipped; an empty batch sends nothing.
+/// send the combined batch to the executor. A pair without a usable price or
+/// that fails to clear is logged and skipped; an empty batch sends nothing.
 pub(super) fn internal_clear(
     book: &mut ClearingBook,
-    decimals: &HashMap<TokenId, u8>,
     runtime: &ClearingRuntime,
     exec_tx: &mpsc::Sender<ExecutionBatch>,
-    now_ms: u64,
 ) -> Result<(), MatcherError> {
+    // One snapshot and one clock reading for the whole tick: a later quote
+    // cannot reprice fills selected here or an in-flight settlement.
     let prices = runtime.prices.borrow().clone();
+    let now = Instant::now();
 
     // Each independently solvent pair stays indivisible when the executor
     // splits the combined tick into protocol-sized transactions.
@@ -189,31 +144,20 @@ pub(super) fn internal_clear(
         group_ends: Vec::new(),
     };
     let mut included_pairs = 0usize;
-    for &(base, quote) in &runtime.pairs {
-        let Some((base_price, quote_price)) = fresh_reference_prices(
-            &prices,
-            base,
-            quote,
-            now_ms,
-            runtime.max_price_age_ms,
-            runtime.max_source_age_ms,
-            runtime.max_source_skew_ms,
-        ) else {
-            continue;
+    // Each clearing pair is one unordered market (checked when the plan was
+    // built), so no order can be selected twice in a tick.
+    for (base, quote) in prices.markets().clearing_pairs() {
+        let price = match prices.pair_price(base, quote, now) {
+            Ok(price) => price,
+            Err(reason) => {
+                PRICE_SKIPS[reason as usize].fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%base, %quote, %reason, "no usable Binance price; pair skipped");
+                continue;
+            }
         };
-        let (Some(&base_decimals), Some(&quote_decimals)) =
-            (decimals.get(&base), decimals.get(&quote))
-        else {
-            continue;
-        };
-        let batch = clearing::BatchPrice::from_reference_prices(
-            base_price,
-            quote_price,
-            base_decimals,
-            quote_decimals,
-        )
-        .and_then(|price| book.build_pair_batch(base, quote, price, &runtime.config));
-        let batch = match batch {
+        // The price is already in base units: the market plan knows both
+        // tokens' decimals.
+        let batch = match book.build_pair_batch(base, quote, price, &runtime.config) {
             Ok(batch) => batch,
             Err(error) => {
                 tracing::error!(%base, %quote, %error, "clearing admission failed");
@@ -297,9 +241,10 @@ pub(super) fn internal_clear(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::db;
-    use crate::price::PriceData;
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -314,49 +259,6 @@ mod tests {
     }
     fn ieth() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap()
-    }
-
-    #[test]
-    fn clearing_requires_one_fresh_exact_price_snapshot() {
-        let exact = ReferencePrice::from_decimal("2.01").unwrap();
-        let mut prices = PreciseSnapshot::new();
-        prices.insert(
-            imiden(),
-            PriceData {
-                usd: 2.01,
-                exact_reference: Some(exact),
-                source_updated_at_unix_ms: Some(1_000),
-                observed_at_unix_ms: 1_000,
-            },
-        );
-        prices.insert(
-            iusdt(),
-            PriceData {
-                usd: 1.0,
-                exact_reference: Some(ReferencePrice::from_decimal("1").unwrap()),
-                source_updated_at_unix_ms: Some(1_000),
-                observed_at_unix_ms: 1_000,
-            },
-        );
-        assert_eq!(
-            fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0),
-            Some((exact, ReferencePrice::from_decimal("1").unwrap()))
-        );
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_501, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().observed_at_unix_ms = 1_001;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().observed_at_unix_ms = 1_000;
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = Some(1_001);
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = None;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().source_updated_at_unix_ms = Some(1_000);
-        prices.get_mut(&iusdt()).unwrap().exact_reference = None;
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 0).is_none());
-        prices.get_mut(&iusdt()).unwrap().exact_reference =
-            Some(ReferencePrice::from_decimal("1").unwrap());
-        prices.get_mut(&imiden()).unwrap().source_updated_at_unix_ms = Some(999);
-        assert!(fresh_reference_prices(&prices, imiden(), iusdt(), 1_500, 500, 500, 1).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -416,7 +318,7 @@ mod tests {
         ];
         pool.write(move |conn| {
             for token in [imiden(), iusdt(), ieth()] {
-                db::postgres_db::register_token_tx(conn, token, None)?;
+                db::postgres_db::register_token_tx(conn, token)?;
                 db::postgres_db::set_token_metadata_tx(conn, token, Some(0), None)?;
             }
             let order_rows: Vec<_> = notes
@@ -436,39 +338,33 @@ mod tests {
         for order in &persisted {
             book.insert(order).unwrap();
         }
-        let decimals = [(imiden(), 0), (iusdt(), 0), (ieth(), 0)]
-            .into_iter()
-            .collect();
-        let mut prices = PreciseSnapshot::new();
-        for (token, decimal) in [(imiden(), "2"), (iusdt(), "1"), (ieth(), "2")] {
-            prices.insert(
-                token,
-                PriceData {
-                    usd: decimal.parse().unwrap(),
-                    exact_reference: Some(ReferencePrice::from_decimal(decimal).unwrap()),
-                    source_updated_at_unix_ms: Some(1_000),
-                    observed_at_unix_ms: 1_000,
-                },
-            );
-        }
-        let (_prices_tx, prices_rx) = watch::channel(prices);
+        // Both pairs at 2 quote per base, each quote received at its time.
+        let ttl = Duration::from_secs(30);
+        let prices = |miden_at: Instant, eth_at: Instant| {
+            Arc::new(PriceSnapshot::for_tests(
+                &[
+                    (imiden(), iusdt(), "2", miden_at),
+                    (ieth(), iusdt(), "2", eth_at),
+                ],
+                &[],
+                ttl,
+            ))
+        };
+        // A quote received a full TTL ago is stale.
+        let stale = Instant::now().checked_sub(ttl).unwrap();
+        let (prices_tx, prices_rx) = watch::channel(prices(stale, stale));
         let runtime = ClearingRuntime {
             bootstrap: oneshot::channel().1,
             prices: prices_rx,
-            pairs: vec![(imiden(), iusdt()), (ieth(), iusdt())],
             config: ClearingConfig::default(),
-            max_price_age_ms: 1_000,
-            max_source_age_ms: 1_000,
-            max_source_skew_ms: 0,
             routing: None,
         };
-        runtime.validate().unwrap();
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let clear = |book: &mut ClearingBook, exec_tx: &mpsc::Sender<ExecutionBatch>| {
             if executor_accepting(exec_tx).unwrap() {
-                internal_clear(book, &decimals, &runtime, exec_tx, 1_500).unwrap();
+                internal_clear(book, &runtime, exec_tx).unwrap();
             }
         };
         assert!(matches!(
@@ -494,31 +390,54 @@ mod tests {
         );
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
+        let stale_skips = PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed);
         clear(&mut book, &exec_tx);
-        let execution = exec_rx.try_recv().unwrap();
-        assert_eq!(execution.filled_notes.len(), 4);
-        assert_eq!(execution.group_ends, vec![2, 4]);
-        for filled in &execution.filled_notes {
+        assert!(exec_rx.try_recv().is_err(), "a stale price must not clear");
+        assert_eq!(book.best_levels_snapshot().len(), 4);
+        assert!(
+            PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed)
+                >= stale_skips + 2
+        );
+
+        // Only the pair with a fresh quote clears; the other keeps its orders.
+        prices_tx.send_replace(prices(Instant::now(), stale));
+        clear(&mut book, &exec_tx);
+        let miden = exec_rx.try_recv().unwrap();
+        assert_eq!(miden.group_ends, vec![2]);
+        assert_eq!(book.best_levels_snapshot().len(), 2);
+        prices_tx.send_replace(prices(Instant::now(), Instant::now()));
+        clear(&mut book, &exec_tx);
+        let eth = exec_rx.try_recv().unwrap();
+        assert_eq!(eth.group_ends, vec![2]);
+        let sent: HashMap<_, _> = miden
+            .filled_notes
+            .iter()
+            .chain(&eth.filled_notes)
+            .map(|filled| (filled.note_id, filled))
+            .collect();
+        assert_eq!(sent.len(), 4);
+        for filled in sent.values() {
             let source = persisted
                 .iter()
                 .find(|order| order.id() == filled.note_id)
                 .unwrap();
             assert!(Arc::ptr_eq(&filled.note, &source.note));
         }
-        assert!(exec_rx.try_recv().is_err());
         assert!(book.best_levels_snapshot().is_empty());
         clear(&mut book, &exec_tx);
         assert!(
             exec_rx.try_recv().is_err(),
             "pending orders must not be dispatched twice"
         );
+        // Reactivated orders clear again, both pairs in one batch.
         for order in &persisted {
             book.insert(order).unwrap();
         }
         clear(&mut book, &exec_tx);
         let retried = exec_rx.try_recv().unwrap();
-        for (first, next) in execution.filled_notes.iter().zip(&retried.filled_notes) {
-            assert_eq!(first.note_id, next.note_id);
+        assert_eq!(retried.group_ends, vec![2, 4]);
+        for next in &retried.filled_notes {
+            let first = sent[&next.note_id];
             assert_eq!(first.arrival_unix, next.arrival_unix);
             assert!(Arc::ptr_eq(&first.note, &next.note));
         }
@@ -526,13 +445,8 @@ mod tests {
         // A full executor queue must not stop the worker from receiving a
         // committed book update. Once capacity returns, the next tick clears
         // only against the updated book.
-        let mut fresh_prices = runtime.prices.borrow().clone();
-        let observed_at = now_millis();
-        for data in fresh_prices.values_mut() {
-            data.observed_at_unix_ms = observed_at;
-            data.source_updated_at_unix_ms = Some(observed_at);
-        }
-        let (_fresh_prices_tx, fresh_prices_rx) = watch::channel(fresh_prices);
+        let (_fresh_prices_tx, fresh_prices_rx) =
+            watch::channel(prices(Instant::now(), Instant::now()));
         let (bootstrap_tx, bootstrap_rx) = oneshot::channel();
         let (book_tx, book_rx) = mpsc::channel(1);
         let (exec_tx, mut exec_rx) = mpsc::channel(1);
@@ -546,11 +460,7 @@ mod tests {
         let worker_runtime = ClearingRuntime {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
-            pairs: runtime.pairs.clone(),
             config: runtime.config,
-            max_price_age_ms: 30_000,
-            max_source_age_ms: 30_000,
-            max_source_skew_ms: 0,
             routing: None,
         };
         let removed_id = persisted[0].id();
@@ -564,12 +474,7 @@ mod tests {
                     snapshot_tx,
                     worker_runtime,
                 ));
-                assert!(bootstrap_tx
-                    .send(ClearingBootstrap {
-                        orders: persisted,
-                        decimals,
-                    })
-                    .is_ok());
+                assert!(bootstrap_tx.send(persisted).is_ok());
                 snapshot_rx.changed().await.unwrap();
                 assert_eq!(snapshot_rx.borrow().len(), 4);
 
@@ -593,5 +498,144 @@ mod tests {
                 assert!(worker.await.unwrap_err().is_cancelled());
             })
             .await;
+    }
+    /// A pair listed the other way round on Binance, with unequal token
+    /// decimals, clears at the pair price: USDC (6 decimals) / ETH (18
+    /// decimals), approved on `ETHUSDC`, at 2500 USDC per ETH, i.e. 0.0004 ETH
+    /// per USDC. Both orders are eligible only within 0.1% of that price, so
+    /// any mispricing leaves them in the book. Swapping the two decimals at
+    /// the conversion would misprice by 10^24 and clear nothing, so the second
+    /// half checks that too.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_reversed_market_with_unequal_decimals_clears_at_the_exact_price() {
+        use crate::db::postgres_models::NewOrderRow;
+        use crate::db::postgres_test::TestDb;
+        use miden_protocol::asset::{AssetAmount, FungibleAsset};
+        use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+        use miden_protocol::note::{Note, NoteType};
+        use miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
+        use miden_protocol::Word;
+        use miden_standards::note::{PswapNote, PswapNoteStorage};
+
+        let (usdc, eth) = (iusdt(), ieth());
+        const USDC_DECIMALS: u8 = 6;
+        const ETH_DECIMALS: u8 = 18;
+        // 2.5 USDC is worth 0.001 ETH at the market; the orders' limits sit
+        // 0.1% on either side of it.
+        const USDC_2_5: u64 = 2_500_000;
+        const MILLI_ETH: u64 = 1_000_000_000_000_000;
+        const MILLI_ETH_MINUS: u64 = 999_000_000_000_000;
+        const MILLI_ETH_PLUS: u64 = 1_001_000_000_000_000;
+
+        let test_db = TestDb::new().await.unwrap();
+        let pool = &test_db.pool;
+        let solver_id =
+            AccountId::try_from(ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE).unwrap();
+        let mut rng = RandomCoin::new(Word::default());
+        let creator =
+            miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PRIVATE_ACCOUNT_UPDATABLE_CODE
+                .try_into()
+                .unwrap();
+        let mut make_note = |offered, requested| -> Note {
+            let storage = PswapNoteStorage::builder()
+                .min_requested_asset(requested)
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build();
+            PswapNote::builder()
+                .sender(solver_id)
+                .storage(storage)
+                .serial_number(rng.draw_word())
+                .note_type(NoteType::Public)
+                .offered_asset(offered)
+                .build()
+                .unwrap()
+                .into()
+        };
+        // Seller of USDC: 2.5 USDC for at least 0.999 milli-ETH (asks 0.1%
+        // below the market). Buyer: 1.001 milli-ETH for at least 2.5 USDC
+        // (pays up to 0.1% above the market).
+        let notes = [
+            make_note(
+                FungibleAsset::new(usdc, USDC_2_5).unwrap(),
+                FungibleAsset::new(eth, MILLI_ETH_MINUS).unwrap(),
+            ),
+            make_note(
+                FungibleAsset::new(eth, MILLI_ETH_PLUS).unwrap(),
+                FungibleAsset::new(usdc, USDC_2_5).unwrap(),
+            ),
+        ];
+        let seller_id = notes[0].id();
+        let buyer_id = notes[1].id();
+        pool.write(move |conn| {
+            for token in [usdc, eth] {
+                db::postgres_db::register_token_tx(conn, token)?;
+            }
+            let order_rows: Vec<_> = notes
+                .iter()
+                .map(|note| NewOrderRow::ingested(note, 1).unwrap())
+                .collect();
+            db::postgres_db::insert_orders_batch_tx(conn, &order_rows, 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let persisted = pool
+            .read(db::postgres_db::load_active_orders_tx)
+            .await
+            .unwrap();
+        let book = || {
+            let mut book = ClearingBook::default();
+            for order in &persisted {
+                book.insert(order).unwrap();
+            }
+            book
+        };
+        // The market plan carries the tokens' decimals.
+        let runtime = |decimals: &[(TokenId, u8)]| ClearingRuntime {
+            bootstrap: oneshot::channel().1,
+            prices: watch::channel(Arc::new(PriceSnapshot::for_tests_reversed(
+                &[(usdc, eth, "0.0004", Instant::now())],
+                decimals,
+                Duration::from_secs(30),
+            )))
+            .1,
+            config: ClearingConfig::default(),
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+
+        // Right decimals: both orders cross within 0.1% of the market, so each
+        // receives at least what it asked and at most the market's value.
+        let right_decimals = runtime(&[(usdc, USDC_DECIMALS), (eth, ETH_DECIMALS)]);
+        let mut right = book();
+        internal_clear(&mut right, &right_decimals, &exec_tx).unwrap();
+        let batch = exec_rx.try_recv().expect("the pair clears");
+        assert_eq!(batch.group_ends, vec![2]);
+        let filled: HashMap<_, _> = batch
+            .filled_notes
+            .iter()
+            .map(|filled| (filled.note_id, filled.requested_filled))
+            .collect();
+        assert!(
+            (MILLI_ETH_MINUS..=MILLI_ETH).contains(&filled[&seller_id]),
+            "seller received {} ETH units",
+            filled[&seller_id]
+        );
+        assert!(
+            (USDC_2_5 - 2_500..=USDC_2_5 + 2_500).contains(&filled[&buyer_id]),
+            "buyer received {} USDC units",
+            filled[&buyer_id]
+        );
+
+        // Swapped decimals: the price is wrong by 10^24 and nothing is eligible.
+        let swapped = runtime(&[(usdc, ETH_DECIMALS), (eth, USDC_DECIMALS)]);
+        let mut wrong = book();
+        internal_clear(&mut wrong, &swapped, &exec_tx).unwrap();
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "swapped decimals must not produce a batch"
+        );
     }
 }

@@ -144,7 +144,6 @@ pub struct SettlementInputRow {
 #[diesel(table_name = registered_tokens)]
 pub struct RegisteredTokenRow {
     pub token_id: Vec<u8>,
-    pub external_symbol: Option<String>,
     pub decimals: Option<i32>,
     pub ticker: Option<String>,
 }

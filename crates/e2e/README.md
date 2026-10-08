@@ -27,8 +27,8 @@ cargo run -p e2e --release -- provision
 #     MTB->MTA) that the solver can match.
 cargo run -p e2e --release -- load --rounds 1
 
-# 3. Run the solver in-process against devnet (deterministic fixed prices — no
-#    CoinGecko key needed). First provision a fresh PostgreSQL application
+# 3. Run the solver in-process against devnet (deterministic fixed prices from
+#    an in-process mock Binance). First provision a fresh PostgreSQL application
 #    schema; use distinct migration, writer, and reader roles in deployment.
 export SOLVER_MIGRATION_DATABASE_URL='postgresql://migration-role@host/database'
 cargo run -p solver-bin --release -- migrate-db
@@ -64,10 +64,11 @@ cargo run -p e2e --release -- fund --amount 50000000
 * **The matcher pairs two opposing user orders** (it is not a single-order
   inventory filler), so `load` always creates A→B and B→A pairs. Each offers
   more than the counterparty requests, leaving a spread the solver captures.
-* **Fixed prices in `run`.** `run` injects a `MockPriceClient` (both tokens at
-  $1.00) via the solver's `make_price_client` seam, so matching is deterministic
-  and needs no CoinGecko key. The faucet `external_symbol`s in the generated
-  config (`tether`/`ethereum`) only matter if you run the real `solver-bin`
-  against CoinGecko instead.
+* **Fixed prices in `run`.** `run` starts an in-process `mock-binance` quoting
+  the pair's market (`ETHUSDT`, MTB as ETH and MTA as USDT) at a mid of 1 and
+  points the generated config's `[binance]` endpoints at it, so matching is
+  deterministic and exercises the real price feed. To run the real `solver-bin`
+  with the generated `solver.devnet.toml`, start `cargo run -p mock-binance --
+  --market ETHUSDT=ETH/USDT:1/1` first (it listens on `127.0.0.1:8089`).
 * The solver buffer (provisioned inventory) lets the executor bridge fills
   during settlement.

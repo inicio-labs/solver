@@ -21,6 +21,7 @@
 //!   probes to stop routing traffic during transient degradation WITHOUT
 //!   restarting the process.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -29,10 +30,11 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::db::postgres_pool::{LatencySnapshot, LATENCY_BUCKET_US};
 use crate::db::DbPool;
+use crate::price::{FeedMetrics, PriceSnapshot};
 use crate::types::{now_unix, BookUpdate, ExecutionBatch};
 
 /// Shared observability state.
@@ -48,6 +50,9 @@ pub struct ObsState {
     /// Read only for their remaining capacity in `/metrics`.
     book_tx: mpsc::Sender<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
+    /// Latest Binance quotes, for per-symbol age in `/metrics`.
+    prices: watch::Receiver<Arc<PriceSnapshot>>,
+    feed_metrics: Arc<FeedMetrics>,
 }
 
 impl ObsState {
@@ -56,6 +61,8 @@ impl ObsState {
         readiness_freshness_secs: u64,
         book_tx: mpsc::Sender<BookUpdate>,
         exec_tx: mpsc::Sender<ExecutionBatch>,
+        prices: watch::Receiver<Arc<PriceSnapshot>>,
+        feed_metrics: Arc<FeedMetrics>,
     ) -> Self {
         Self {
             db_pool,
@@ -63,6 +70,8 @@ impl ObsState {
             readiness_freshness_secs,
             book_tx,
             exec_tx,
+            prices,
+            feed_metrics,
         }
     }
 
@@ -87,8 +96,6 @@ async fn health() -> (StatusCode, &'static str) {
 }
 
 fn append_latency(body: &mut String, metric: &str, latency: &LatencySnapshot) {
-    use std::fmt::Write;
-
     let bounds = LATENCY_BUCKET_US
         .iter()
         .map(|us| (*us as f64 / 1_000_000.0).to_string())
@@ -98,6 +105,18 @@ fn append_latency(body: &mut String, metric: &str, latency: &LatencySnapshot) {
     }
     let _ = writeln!(body, "{metric}_sum {}", latency.sum_us as f64 / 1_000_000.0);
     let _ = writeln!(body, "{metric}_count {}", latency.buckets[8]);
+}
+
+/// Price feed health and per-symbol quote state (rendered by the feed), and
+/// pairs the matcher skipped for want of a usable price.
+fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceSnapshot) {
+    feed.render(snapshot, body);
+    for (reason, count) in crate::matcher::price_skips() {
+        let _ = writeln!(
+            body,
+            "solver_matcher_price_skips_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
 }
 
 async fn metrics(
@@ -146,6 +165,8 @@ async fn metrics(
     ] {
         append_latency(&mut body, metric, latency);
     }
+    let snapshot = state.prices.borrow().clone();
+    append_price_metrics(&mut body, &state.feed_metrics, &snapshot);
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
@@ -184,12 +205,63 @@ async fn readyz(State(state): State<ObsState>) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use crate::db::postgres_test::TestDb;
+    use crate::price::test_support::{eth, usdt};
     use axum_test::TestServer;
+    use std::time::{Duration, Instant};
+
+    /// A valid quote older than the TTL is `valid` but not `fresh`: alerts on
+    /// `fresh` see a stalled feed.
+    #[test]
+    fn price_metrics_report_feed_health_and_quote_freshness() {
+        let feed = FeedMetrics::new(["wss://a.test".into(), "wss://a.test".into()]);
+        feed.connected[1].store(true, Ordering::Relaxed);
+        feed.connections[1].store(3, Ordering::Relaxed);
+        feed.frames[0].store(7, Ordering::Relaxed);
+        feed.conflicting_updates.store(4, Ordering::Relaxed);
+        feed.last_publish_delay_us.store(1_500, Ordering::Relaxed);
+        let received = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let snapshot = PriceSnapshot::for_tests(
+            &[(eth(), usdt(), "2000", received)],
+            &[],
+            Duration::from_secs(1),
+        );
+        let symbol = snapshot.quotes().next().unwrap().0.to_string();
+        let mut body = String::new();
+        append_price_metrics(&mut body, &feed, &snapshot);
+        for line in [
+            // Two readers on one endpoint stay apart by position.
+            "solver_price_feed_connected{reader=\"0\",endpoint=\"wss://a.test\"} 0".to_string(),
+            "solver_price_feed_connected{reader=\"1\",endpoint=\"wss://a.test\"} 1".to_string(),
+            "solver_price_feed_connections_total{reader=\"1\",endpoint=\"wss://a.test\"} 3"
+                .to_string(),
+            "solver_price_feed_frames_total{reader=\"0\",endpoint=\"wss://a.test\"} 7".to_string(),
+            "solver_price_feed_conflicting_updates_total 4".to_string(),
+            "solver_price_feed_publish_delay_seconds 0.0015".to_string(),
+            format!("solver_price_quote_valid{{symbol=\"{symbol}\"}} 1"),
+            format!("solver_price_quote_fresh{{symbol=\"{symbol}\"}} 0"),
+            "solver_matcher_price_skips_total{reason=\"stale\"} ".to_string(),
+        ] {
+            assert!(body.contains(&line), "missing {line:?} in:\n{body}");
+        }
+        let prefix = format!("solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} ");
+        let age = body
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap();
+        assert!(age.parse::<f64>().unwrap() >= 5.0);
+    }
 
     fn test_state(db: &TestDb) -> ObsState {
         let (book_tx, _) = tokio::sync::mpsc::channel(1);
         let (exec_tx, _) = tokio::sync::mpsc::channel(1);
-        ObsState::new(db.pool.clone(), 60, book_tx, exec_tx)
+        ObsState::new(
+            db.pool.clone(),
+            60,
+            book_tx,
+            exec_tx,
+            watch::channel(Arc::new(PriceSnapshot::default())).1,
+            Arc::new(FeedMetrics::default()),
+        )
     }
 
     #[tokio::test]
@@ -254,7 +326,14 @@ mod tests {
         let db = TestDb::new().await.unwrap();
         let (book_tx, _book_rx) = tokio::sync::mpsc::channel(3);
         let (exec_tx, _exec_rx) = tokio::sync::mpsc::channel(2);
-        let state = ObsState::new(db.pool.clone(), 60, book_tx, exec_tx);
+        let state = ObsState::new(
+            db.pool.clone(),
+            60,
+            book_tx,
+            exec_tx,
+            watch::channel(Arc::new(PriceSnapshot::default())).1,
+            Arc::new(FeedMetrics::default()),
+        );
         db.pool.read(|_| Ok(())).await.unwrap();
         let server = TestServer::new(state.router());
         let response = server.get("/metrics").await;

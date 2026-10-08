@@ -1,8 +1,7 @@
 //! Price-API tests against an isolated PostgreSQL schema.
 
-use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
@@ -14,12 +13,15 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
-use crate::config::PricePrecision;
 use crate::db;
 use crate::db::postgres_test::TestDb;
 use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
-use crate::price::{PreciseSnapshot, PriceData};
+use crate::price::PricePrecision;
+use crate::price::PriceSnapshot;
 use crate::swap_eta::SettlementStats;
+
+/// Long enough that a slow database setup cannot make a fresh quote stale.
+const TTL: Duration = Duration::from_secs(3_600);
 
 fn faucet_a() -> AccountId {
     AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET).unwrap()
@@ -32,6 +34,14 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+/// Receipt time of a quote that is still fresh, or already stale.
+fn received(fresh: bool) -> Instant {
+    if fresh {
+        Instant::now()
+    } else {
+        Instant::now().checked_sub(2 * TTL).unwrap()
+    }
 }
 
 struct Harness {
@@ -46,10 +56,8 @@ fn cfg() -> PriceApiConfig {
         max_inflight: 64,
         max_batch: 3,
         timeout_ms: 2000,
-        vs_currency: "usd".into(),
+        vs_currency: "usdt".into(),
         precision: "full".into(),
-        staleness_secs: 60,
-        price_interval_ms: 5000,
         swap_matching_trigger_ms: 1000,
         swap_sync_ms: 5000,
         swap_proving_ms: 2000,
@@ -58,22 +66,12 @@ fn cfg() -> PriceApiConfig {
     }
 }
 
-/// Build a harness (quote currency `usd`). `registered` = (faucet, decimals,
-/// ticker) rows; `prices` = (faucet, usd) precise-snapshot entries; `last_update`
-/// = freshness.
-async fn harness(
+/// Seed `registered` = (faucet, decimals, ticker) rows and serve `snapshot`.
+async fn serve(
     registered: &[(AccountId, Option<u8>, Option<&str>)],
-    prices: &[(AccountId, f64)],
-    last_update: i64,
-) -> Harness {
-    harness_vs(registered, prices, last_update, "usd").await
-}
-
-async fn harness_vs(
-    registered: &[(AccountId, Option<u8>, Option<&str>)],
-    prices: &[(AccountId, f64)],
-    last_update: i64,
-    vs: &str,
+    snapshot: PriceSnapshot,
+    book: SwapBookSnapshot,
+    stats: SettlementStats,
 ) -> Harness {
     let test_db = TestDb::new().await.unwrap();
     let pool = test_db.pool.clone();
@@ -83,115 +81,84 @@ async fn harness_vs(
         .collect();
     pool.write(move |conn| {
         for (id, dec, tick) in rows {
-            db::postgres_db::register_token_tx(conn, id, Some("usd-coin"))?;
+            db::postgres_db::register_token_tx(conn, id)?;
             db::postgres_db::set_token_metadata_tx(conn, id, dec, tick.as_deref())?;
         }
         Ok(())
     })
     .await
     .unwrap();
-    let mut snap = PreciseSnapshot::new();
-    for (id, usd) in prices {
-        snap.insert(
-            *id,
-            PriceData {
-                usd: *usd,
-                exact_reference: None,
-                source_updated_at_unix_ms: None,
-                observed_at_unix_ms: 0,
-            },
-        );
-    }
-    let (_tx, rx) = watch::channel(snap); // rx retains the value after _tx drops
-    let (_stx, swap_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
-    let (_stats_tx, stats_rx) = watch::channel(Arc::new(SettlementStats::new()));
+    // The receivers keep the values after their senders drop.
+    let (_tx, prices) = watch::channel(Arc::new(snapshot));
+    let (_stx, swap_rx) = watch::channel(Arc::new(book));
+    let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
     let state = PriceApiState {
-        precise_rx: rx,
+        prices,
         pool,
-        last_price_update: Arc::new(AtomicI64::new(last_update)),
-        vs_currency: vs.into(),
+        vs_currency: "usdt".into(),
         default_precision: PricePrecision::Full,
-        staleness_secs: 60,
         max_batch: 3,
         swap_rx,
         stats_rx,
         swap_eta_secs: 14, // 5000+1000+2000+6000 ms → 14s (matches cfg())
         swap_offmarket_tol_bps: 50,
     };
-    let mut c = cfg();
-    c.vs_currency = vs.into();
-    Harness {
-        server: TestServer::new(build_app(state, &c)),
-        _db: test_db,
-    }
-}
-
-/// Build a server for the `/v1/swap-eta` tests: seeds registered tokens (with
-/// decimals), oracle prices, a top-of-book snapshot, and the settlement window.
-#[allow(clippy::type_complexity)]
-async fn swap_server(
-    registered: &[(AccountId, Option<u8>)],
-    prices: &[(AccountId, f64)],
-    snapshot: SwapBookSnapshot,
-    stats: SettlementStats,
-) -> Harness {
-    swap_server_with_update(now(), registered, prices, snapshot, stats).await
-}
-
-/// Like [`swap_server`] but with an explicit `last_price_update` timestamp, so a
-/// test can drive the staleness gate on the oracle side of `/v1/swap-eta`.
-#[allow(clippy::type_complexity)]
-async fn swap_server_with_update(
-    last_update: i64,
-    registered: &[(AccountId, Option<u8>)],
-    prices: &[(AccountId, f64)],
-    snapshot: SwapBookSnapshot,
-    stats: SettlementStats,
-) -> Harness {
-    let test_db = TestDb::new().await.unwrap();
-    let pool = test_db.pool.clone();
-    let rows: Vec<_> = registered.to_vec();
-    pool.write(move |conn| {
-        for (id, dec) in rows {
-            db::postgres_db::register_token_tx(conn, id, Some("usd-coin"))?;
-            db::postgres_db::set_token_metadata_tx(conn, id, dec, None)?;
-        }
-        Ok(())
-    })
-    .await
-    .unwrap();
-    let mut snap = PreciseSnapshot::new();
-    for (id, usd) in prices {
-        snap.insert(
-            *id,
-            PriceData {
-                usd: *usd,
-                exact_reference: None,
-                source_updated_at_unix_ms: None,
-                observed_at_unix_ms: 0,
-            },
-        );
-    }
-    let (_tx, precise_rx) = watch::channel(snap);
-    let (_stx, swap_rx) = watch::channel(Arc::new(snapshot));
-    let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState {
-        precise_rx,
-        pool,
-        last_price_update: Arc::new(AtomicI64::new(last_update)),
-        vs_currency: "usd".into(),
-        default_precision: PricePrecision::Full,
-        staleness_secs: 60,
-        max_batch: 3,
-        swap_rx,
-        stats_rx,
-        swap_eta_secs: 14,
-        swap_offmarket_tol_bps: 50,
-    };
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
         _db: test_db,
     }
+}
+
+/// A harness for the price endpoints: `prices` values tokens (whole USDT per
+/// whole token; `None` = the token is USDT itself), received fresh or stale.
+async fn harness(
+    registered: &[(AccountId, Option<u8>, Option<&str>)],
+    prices: &[(AccountId, Option<&str>)],
+    fresh: bool,
+) -> Harness {
+    let received_at = received(fresh);
+    let valuations: Vec<_> = prices
+        .iter()
+        .map(|(id, raw)| (*id, raw.map(|raw| (raw, received_at))))
+        .collect();
+    let snapshot = PriceSnapshot::for_tests(&[], &valuations, TTL);
+    serve(
+        registered,
+        snapshot,
+        SwapBookSnapshot::new(),
+        SettlementStats::new(),
+    )
+    .await
+}
+
+/// A harness for `/v1/swap-eta`: `market` is the A/B clearing pair's price in
+/// whole B per whole A (`None` = no market), received fresh or stale.
+async fn swap_server_at(
+    fresh: bool,
+    registered: &[(AccountId, Option<u8>)],
+    market: Option<&str>,
+    book: SwapBookSnapshot,
+    stats: SettlementStats,
+) -> Harness {
+    let registered: Vec<_> = registered
+        .iter()
+        .map(|(id, dec)| (*id, *dec, None))
+        .collect();
+    let pairs: Vec<_> = market
+        .map(|raw| (faucet_a(), faucet_b(), raw, received(fresh)))
+        .into_iter()
+        .collect();
+    let snapshot = PriceSnapshot::for_tests(&pairs, &[], TTL);
+    serve(&registered, snapshot, book, stats).await
+}
+
+async fn swap_server(
+    registered: &[(AccountId, Option<u8>)],
+    market: Option<&str>,
+    book: SwapBookSnapshot,
+    stats: SettlementStats,
+) -> Harness {
+    swap_server_at(true, registered, market, book, stats).await
 }
 
 /// Query string for the swap-eta endpoint.
@@ -229,7 +196,7 @@ fn url(faucet: AccountId, q: &str) -> String {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unknown_faucet_is_404() {
-    let h = harness(&[], &[], now()).await;
+    let h = harness(&[], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::NOT_FOUND);
 }
@@ -237,7 +204,7 @@ async fn unknown_faucet_is_404() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn registered_but_unpriced_is_503() {
-    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], now()).await;
+    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -247,8 +214,8 @@ async fn registered_but_unpriced_is_503() {
 async fn happy_path_returns_price_decimals_ticker() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDC"))],
-        &[(faucet_a(), 0.99987)],
-        now(),
+        &[(faucet_a(), Some("0.99987"))],
+        true,
     )
     .await;
     let r = h.server.get(&url(faucet_a(), "?precision=full")).await;
@@ -257,7 +224,8 @@ async fn happy_path_returns_price_decimals_ticker() {
     assert_eq!(v["price"].as_str().unwrap(), "0.99987");
     assert_eq!(v["decimals"].as_u64().unwrap(), 6);
     assert_eq!(v["ticker"].as_str().unwrap(), "USDC");
-    assert_eq!(v["vs_currency"].as_str().unwrap(), "usd");
+    assert_eq!(v["vs_currency"].as_str().unwrap(), "usdt");
+    assert_eq!(v["source"].as_str().unwrap(), "binance");
     assert!(!v["stale"].as_bool().unwrap());
 }
 
@@ -266,8 +234,8 @@ async fn happy_path_returns_price_decimals_ticker() {
 async fn precision_formatting_and_subcent_preserved() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
-        &[(faucet_a(), 0.0034)],
-        now(),
+        &[(faucet_a(), Some("0.0034"))],
+        true,
     )
     .await;
     // Fixed precision rounds for display...
@@ -288,7 +256,12 @@ async fn precision_formatting_and_subcent_preserved() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn decimals_null_until_fetched() {
-    let h = harness(&[(faucet_a(), None, None)], &[(faucet_a(), 1.0)], now()).await;
+    let h = harness(
+        &[(faucet_a(), None, None)],
+        &[(faucet_a(), Some("1"))],
+        true,
+    )
+    .await;
     let v: Value = h.server.get(&url(faucet_a(), "")).await.json();
     assert!(v["decimals"].is_null());
     assert!(v.get("ticker").map(|t| t.is_null()).unwrap_or(true));
@@ -299,15 +272,30 @@ async fn decimals_null_until_fetched() {
 async fn stale_fails_closed_unless_allowed() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
-        &[(faucet_a(), 1.0)],
-        now() - 10_000,
+        &[(faucet_a(), Some("1"))],
+        false,
     )
     .await;
     let r = h.server.get(&url(faucet_a(), "")).await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"].as_str().unwrap(), "stale");
     let r2 = h.server.get(&url(faucet_a(), "?allow_stale=true")).await;
     assert_eq!(r2.status_code(), StatusCode::OK);
-    assert!(r2.json::<Value>()["stale"].as_bool().unwrap());
+    let v: Value = r2.json();
+    assert!(v["stale"].as_bool().unwrap());
+    // `as_of` is the receipt time: two TTLs ago.
+    let expected = now() - 2 * TTL.as_secs() as i64;
+    assert!((v["as_of"].as_i64().unwrap() - expected).abs() <= 5, "{v}");
+}
+
+/// A token without any Binance market gets a distinct, non-retryable code.
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn unpriced_token_distinguishes_no_market_from_no_quote() {
+    let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
+    let r = h.server.get(&url(faucet_a(), "")).await;
+    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"].as_str().unwrap(), "no_market");
 }
 
 #[tokio::test]
@@ -318,8 +306,8 @@ async fn batch_returns_map_and_caps_size() {
             (faucet_a(), Some(6), Some("USDC")),
             (faucet_b(), Some(8), Some("ETH")),
         ],
-        &[(faucet_a(), 1.0), (faucet_b(), 3000.0)],
-        now(),
+        &[(faucet_a(), Some("1")), (faucet_b(), Some("3000"))],
+        true,
     )
     .await;
     let ids = format!("{},{}", faucet_a().to_hex(), faucet_b().to_hex());
@@ -338,8 +326,8 @@ async fn batch_returns_map_and_caps_size() {
 async fn precision_boundaries_and_config_default() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
-        &[(faucet_a(), 0.99987)],
-        now(),
+        &[(faucet_a(), Some("0.99987"))],
+        true,
     )
     .await;
     // precision=0 → integer string (rounds 0.99987 → "1").
@@ -350,7 +338,7 @@ async fn precision_boundaries_and_config_default() {
     let r18 = h.server.get(&url(faucet_a(), "?precision=18")).await;
     assert_eq!(r18.status_code(), StatusCode::OK);
     assert_eq!(r18.json::<Value>()["precision"].as_str().unwrap(), "18");
-    // precision=19 is out of CoinGecko's range → 400.
+    // precision=19 is out of range → 400.
     let r19 = h.server.get(&url(faucet_a(), "?precision=19")).await;
     assert_eq!(r19.status_code(), StatusCode::BAD_REQUEST);
     // Negative → 400.
@@ -365,7 +353,12 @@ async fn precision_boundaries_and_config_default() {
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn malformed_faucet_id_is_400() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now()).await;
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), Some("1"))],
+        true,
+    )
+    .await;
     // Not 404: a syntactically invalid id is a client error, distinct from an
     // unknown (but well-formed) faucet.
     let r = h.server.get("/v1/price/not-a-hex-id").await;
@@ -383,11 +376,11 @@ async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
             (faucet_a(), Some(6), Some("USDC")),
             (faucet_b(), Some(8), Some("ETH")),
         ],
-        &[(faucet_a(), 1.0)],
-        now(),
+        &[(faucet_a(), Some("1"))],
+        true,
     )
     .await;
-    // ids = priced + unpriced → only the priced one appears (CoinGecko-style omit).
+    // ids = priced + unpriced → only the priced one appears.
     let ids = format!("{},{}", faucet_a().to_hex(), faucet_b().to_hex());
     let v: Value = h.server.get(&format!("/v1/prices?ids={ids}")).await.json();
     let obj = v.as_object().unwrap();
@@ -402,23 +395,48 @@ async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
 
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn vs_currency_is_configurable_and_reflected() {
-    let h = harness_vs(
-        &[(faucet_a(), Some(6), Some("USDC"))],
-        &[(faucet_a(), 0.92)],
-        now(),
-        "eur",
+async fn valuation_quote_asset_is_worth_exactly_one() {
+    let h = harness(
+        &[(faucet_a(), Some(6), Some("USDT"))],
+        &[(faucet_a(), None)],
+        true,
     )
     .await;
     let v: Value = h.server.get(&url(faucet_a(), "")).await.json();
-    assert_eq!(v["vs_currency"].as_str().unwrap(), "eur");
-    assert_eq!(v["price"].as_str().unwrap(), "0.92");
+    assert_eq!(v["price"].as_str().unwrap(), "1");
+    assert!(!v["stale"].as_bool().unwrap());
+    assert!((v["as_of"].as_i64().unwrap() - now()).abs() <= 5);
+}
+
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn batch_omits_stale_unless_allowed() {
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), Some("1"))],
+        false,
+    )
+    .await;
+    let ids = format!("/v1/prices?ids={}", faucet_a().to_hex());
+    let v: Value = h.server.get(&ids).await.json();
+    assert!(v.as_object().unwrap().is_empty());
+    let v: Value = h
+        .server
+        .get(&format!("{ids}&allow_stale=true"))
+        .await
+        .json();
+    assert!(v[faucet_a().to_hex()]["stale"].as_bool().unwrap());
 }
 
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn routing_is_v1_scoped_and_get_only() {
-    let h = harness(&[(faucet_a(), Some(6), None)], &[(faucet_a(), 1.0)], now()).await;
+    let h = harness(
+        &[(faucet_a(), Some(6), None)],
+        &[(faucet_a(), Some("1"))],
+        true,
+    )
+    .await;
     // Unknown route under /v1 → 404.
     let r1 = h.server.get("/v1/bogus").await;
     assert_eq!(r1.status_code(), StatusCode::NOT_FOUND);
@@ -443,8 +461,8 @@ async fn cors_header_present_for_browser_clients() {
     // carry Access-Control-Allow-Origin, else the browser blocks it.
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDC"))],
-        &[(faucet_a(), 1.0)],
-        now(),
+        &[(faucet_a(), Some("1"))],
+        true,
     )
     .await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -464,10 +482,10 @@ async fn swap_eta_has_liquidity_crosses_with_eta() {
     let mut snap = SwapBookSnapshot::new();
     let (k, v) = level(faucet_b(), faucet_a(), 100, 300, 300);
     snap.insert(k, v);
-    // User: offer 100 A ($2 ea), want 200 B ($1 ea) → fair → not off-market.
+    // User: offer 100 A, want 200 B at a market of 2 B per A → not off-market.
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        Some("2"),
         snap,
         SettlementStats::new(),
     )
@@ -480,7 +498,7 @@ async fn swap_eta_has_liquidity_crosses_with_eta() {
     assert!(v["canFill"].as_bool().unwrap());
     assert_eq!(v["estimatedSeconds"].as_u64().unwrap(), 14);
     assert_eq!(v["offMarket"].as_bool().unwrap(), false);
-    assert_eq!(v["marketPrice"].as_str().unwrap(), "2"); // usd_a/usd_b = 2
+    assert_eq!(v["marketPrice"].as_str().unwrap(), "2");
     assert!(v["median24hSeconds"].is_null());
 }
 
@@ -493,7 +511,7 @@ async fn swap_eta_no_cross_not_fillable() {
     snap.insert(k, val);
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[],
+        None,
         snap,
         SettlementStats::new(),
     )
@@ -517,7 +535,7 @@ async fn swap_eta_crosses_but_thin_volume() {
     snap.insert(k, val);
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[],
+        None,
         snap,
         SettlementStats::new(),
     )
@@ -535,7 +553,7 @@ async fn swap_eta_crosses_but_thin_volume() {
 async fn swap_eta_empty_book_not_fillable() {
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[],
+        None,
         SwapBookSnapshot::new(),
         SettlementStats::new(),
     )
@@ -556,10 +574,10 @@ async fn swap_eta_median_present_and_off_market_true() {
     for d in [10u64, 30, 20] {
         stats.record((faucet_a(), faucet_b()), now() as u64, d);
     }
-    // Greedy order: offer 100 A ($2), request 500 B ($5 > $2) → off-market.
+    // Greedy order: offer 100 A, request 500 B at 2 B per A → off-market.
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        Some("2"),
         SwapBookSnapshot::new(),
         stats,
     )
@@ -575,15 +593,14 @@ async fn swap_eta_median_present_and_off_market_true() {
 
 #[tokio::test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_stale_oracle_fails_closed_to_null() {
-    // Same greedy, priced order as the off-market test, but with a price feed
-    // older than `staleness_secs`: the oracle verdict must fail closed to null
-    // rather than flag off-market from a dead feed. (Regression guard for the
-    // stale-oracle gate in `get_swap_eta`.)
-    let h = swap_server_with_update(
-        now() - 3600, // > staleness_secs (60)
+async fn swap_eta_stale_market_fails_closed_to_null() {
+    // Same greedy order as the off-market test, but the pair's quote is at
+    // least the TTL old: the verdict must fail closed to null rather than
+    // flag off-market from a dead feed.
+    let h = swap_server_at(
+        false,
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        Some("2"),
         SwapBookSnapshot::new(),
         SettlementStats::new(),
     )
@@ -595,12 +612,33 @@ async fn swap_eta_stale_oracle_fails_closed_to_null() {
         .json();
     assert!(
         v["offMarket"].is_null(),
-        "stale oracle → offMarket null, not a stale verdict"
+        "stale market → offMarket null, not a stale verdict"
     );
     assert!(
         v["marketPrice"].is_null(),
-        "stale oracle → marketPrice null"
+        "stale market → marketPrice null"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn swap_eta_reads_the_pair_in_either_direction() {
+    // The pair is configured as A/B at 2 B per A; an order offering B for A
+    // sees the reciprocal, 0.5 A per B.
+    let h = swap_server(
+        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        Some("2"),
+        SwapBookSnapshot::new(),
+        SettlementStats::new(),
+    )
+    .await;
+    let v: Value = h
+        .server
+        .get(&swap_url(faucet_b(), 200, faucet_a(), 100))
+        .await
+        .json();
+    assert_eq!(v["marketPrice"].as_str().unwrap(), "0.5");
+    assert!(!v["offMarket"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -610,7 +648,7 @@ async fn swap_eta_response_is_not_cached() {
     // `no-store`, since its fields come from independently-updated snapshots.
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[(faucet_a(), 2.0), (faucet_b(), 1.0)],
+        Some("2"),
         SwapBookSnapshot::new(),
         SettlementStats::new(),
     )
@@ -626,7 +664,7 @@ async fn swap_eta_response_is_not_cached() {
             .to_str()
             .unwrap(),
         "no-store",
-        "swap-eta must not inherit the router's price-interval max-age",
+        "swap-eta must not inherit the router's max-age",
     );
 }
 
@@ -635,7 +673,7 @@ async fn swap_eta_response_is_not_cached() {
 async fn swap_eta_bad_input() {
     let h = swap_server(
         &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        &[],
+        None,
         SwapBookSnapshot::new(),
         SettlementStats::new(),
     )

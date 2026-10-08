@@ -11,13 +11,6 @@ pub struct BatchPrice {
     pub(crate) base_units: U256,
 }
 
-/// An exact whole-token price in a common reference currency.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReferencePrice {
-    pub(crate) numerator: U256,
-    pub(crate) denominator: U256,
-}
-
 #[derive(Clone, Debug)]
 pub enum ClearingOutcome {
     Accepted(Box<SettlementPlan>),
@@ -44,14 +37,8 @@ pub enum InvalidOrderReason {
 pub enum ClearingError {
     #[error("invalid clearing configuration")]
     InvalidConfig,
-    #[error("a clearing pair must contain different assets")]
-    IdenticalPairAssets,
-    #[error("duplicate clearing pair")]
-    DuplicatePair,
     #[error("invalid clearing price")]
     InvalidPrice,
-    #[error("invalid oracle price or token decimals")]
-    InvalidOraclePrice,
     #[error("invalid order {note_id}: {reason:?}")]
     InvalidOrder {
         note_id: NoteId,

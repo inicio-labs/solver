@@ -35,29 +35,28 @@ ingest_store_path = "./ingest_store.sqlite3"      # keyless ingest miden-client 
 # Defaults to 4 if omitted.
 read_pool_size = 4
 
-# One [[pairs]] block per trading pair the solver should watch. faucet IDs
-# and external symbols are network-specific — replace the placeholders.
+# One [[pairs]] block per trading pair the solver should watch. Faucet IDs are
+# network-specific — replace the placeholders. Each faucet maps to the Binance
+# asset it represents; `binance_symbol` approves the direct Binance market that
+# prices the pair for internal clearing (a pair without it never clears
+# internally). At startup Binance's exchangeInfo must list the symbol with
+# exactly these two assets and status TRADING; which side is Binance's base
+# comes from that listing (here ETH, so USDT/ETH clears at 1 / mid).
 [[pairs]]
 name = "USDT-ETH"
 asset_x_faucet_id = "0x<asset_x_faucet_id_hex>"
-asset_x_external_symbol = "tether"
+asset_x_binance_asset = "USDT"
 asset_y_faucet_id = "0x<asset_y_faucet_id_hex>"
-asset_y_external_symbol = "ethereum"
+asset_y_binance_asset = "ETH"
+binance_symbol = "ETHUSDT"
 
 [engine]
 pulse_interval_ms = 5000
 fetch_interval_ms = 3000
-# 5s polling will exhaust the CoinGecko Demo free tier (10K/mo) in ~5 days.
-# After that, fetches will 429 and the matcher will operate on the last good
-# price snapshot until the budget resets. For sustained production, either
-# bump this interval, switch providers, or upgrade to a paid CoinGecko tier.
-price_interval_ms = 5000
-# Exact-price PSWAP pair clearing requires fresh provider prices and on-chain
-# token decimals. Missing/stale prices leave the pair's orders in the live book.
+# Exact-price PSWAP pair clearing requires a fresh Binance quote and on-chain
+# token decimals. A missing or stale price leaves the pair's orders in the live book.
 # Protocol fee and minimum price edge in ppm; zero disables fees.
 clearing_fee_ppm = 0
-# clearing_max_source_age_secs = 60  # provider timestamp age, not HTTP fetch age
-# clearing_max_source_skew_secs = 30 # difference between the two asset timestamps
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
 admin_port = 3001
 # debug_mode is ignored since Miden 0.16 (miden-client removed debug mode); a
@@ -76,18 +75,11 @@ admin_port = 3001
 # under normal conditions.
 # readiness_freshness_secs = 60
 
-# Override the price-API base URL. Defaults to the public CoinGecko endpoint.
-# The solver always uses its normal HttpPriceClient — only the URL changes, and
-# pairs still map tokens -> ids via asset_*_external_symbol. For devnet/local
-# where the faucet tokens aren't listed and no COINGECKO_API_KEY is available,
-# run the mock CoinGecko service (`cargo run -p mock-price`) and point here.
-# Leave commented to use the public CoinGecko API. Do NOT pin a mock on mainnet.
-# price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
-
 # ── Public price-query API (wallets fetch token prices) ──────────────────────
 # Read-only HTTP endpoint, runs on its own thread. GET /v1/price/{faucet_id} and
 # GET /v1/prices?ids=a,b → {faucet_id, ticker, vs_currency, price, precision,
-# decimals, as_of, stale, source}. Decimals + ticker are fetched on-chain.
+# decimals, as_of, stale, source}. A token is priced by its <ASSET><QUOTE>
+# Binance market (see [binance]); decimals + ticker are fetched on-chain.
 # price_query_port = 8080
 # price_query_bind = "127.0.0.1"     # "0.0.0.0" to expose publicly (front w/ a proxy)
 # price_query_max_inflight = 128     # concurrent requests; excess → 503
@@ -95,8 +87,6 @@ admin_port = 3001
 # price_query_timeout_ms = 3000
 # price_precision = "full"           # decimals of the PRICE number: "full" or 0..=18
 #                                    # (per-request override: ?precision=). NOT the token's decimals.
-# price_vs_currency = "usd"          # CoinGecko vs_currency (usd/eur/...; NOT "usdt")
-# price_staleness_secs = 30          # older than this → 503 (use ?allow_stale=true to override)
 
 # External RFQ routing hands unmatched whole notes to allow-listed DEXes.
 # Set SOLVER_ROUTER_TOKENS to comma-separated bearer tokens when enabling it.
@@ -107,3 +97,38 @@ admin_port = 3001
 # router_max_msg_bytes = 16384
 # router_quote_ttl_ms = 20000
 # router_inflight_ttl_ms = 30000 # must exceed expected external settlement latency
+
+# ── Binance Spot public market data (the only price source) ─────────────────
+# Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.
+# No API key. For devnet/local, run `cargo run -p mock-binance -- --market
+# ETHUSDT=ETH/USDT:2718.65/2718.66` and point the stream and REST endpoints at
+# it. A misspelled key in this section is an error, not a silent default.
+[binance]
+# A quote is usable while younger than this, measured from local receipt, for
+# clearing, swap guidance and wallet prices alike. Required: choose it per
+# deployment. At most 60000: this is what pauses clearing when both readers
+# stall.
+quote_ttl_ms = 2000
+# Widest accepted spread, 10_000 × (ask − bid) / mid, inclusive. Required.
+max_spread_bps = 50
+# min_notional = "5000"              # least displayed quantity × price per side, in the quote asset
+# One reader on the market-data-only endpoint, one on the main one: separate
+# front ends, so one endpoint failing does not take out both readers. Binance
+# refuses some regions on the main endpoint (observed for the US): there, use
+# the market-data endpoint for both readers. Scheme and host only; plaintext
+# ws:// and http:// are accepted for loopback hosts only.
+# stream_endpoints = ["wss://data-stream.binance.vision:443", "wss://stream.binance.com:443"]
+# rest_endpoint = "https://data-api.binance.vision"   # exchangeInfo checks
+# valuation_quote_asset = "USDT"     # the price API values tokens in this asset
+# connect_timeout_ms = 10000
+# request_timeout_ms = 10000
+# idle_timeout_ms = 60000            # no frame at all → reconnect (Binance pings every 20 s)
+# data_idle_timeout_ms = 60000       # no quote on a live connection → reconnect
+# connection_lifetime_secs = 82800   # longest connection, below 24 h; each lasts a random 50–100% of it
+# retry_min_ms = 500
+# retry_max_ms = 60000
+# max_connection_attempts = 30       # per 5 minutes, both readers; Binance's 300 per IP counts every process on it
+# validation_timeout_secs = 60       # startup retries failed exchangeInfo lookups this long, then fails
+# stable_connection_secs = 60        # a connection lasting this long (with a quote) resets the backoff
+# shutdown_timeout_ms = 5000         # the feed's tasks get this long to stop at shutdown
+# log_interval_secs = 10             # repeated feed warnings: at most one line per interval

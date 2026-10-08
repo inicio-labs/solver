@@ -26,6 +26,8 @@ miden-standards.workspace = true
 
 # The solver library — `run` boots the real pipeline in-process via solver::start.
 solver = { path = "../solver" }
+# In-process Binance stand-in for `run`.
+mock-binance = { path = "../mock-binance", default-features = false }
 
 anyhow = "1.0"
 async-trait = "0.1"

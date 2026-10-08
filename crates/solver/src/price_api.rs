@@ -7,16 +7,16 @@
 //! cannot starve fund settlement. Protections: a tokio-`Semaphore` concurrency
 //! limiter (sheds excess with `503`), request timeout, body cap, batch cap.
 //!
-//! Prices come from the precise side-channel ([`crate::price::PreciseSnapshot`],
-//! full CoinGecko precision); decimals + ticker from the DB (fetched on-chain by
-//! ingest). The matcher's integer-cents path is untouched.
+//! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
+//! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
+//! while younger than the quote TTL. Decimals + ticker come from the DB
+//! (fetched on-chain by ingest).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -35,14 +35,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::config::PricePrecision;
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::db::{self, DbPool};
 use crate::matching::types::SwapBookSnapshot;
-use crate::price::PreciseSnapshot;
+use crate::price::PricePrecision;
+use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{eval_can_fill, eval_off_market, SettlementStats};
 
-/// Knobs for the price-query server (sourced from `EngineConfig`).
+/// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
 #[derive(Debug, Clone)]
 pub struct PriceApiConfig {
     pub bind: String,
@@ -50,12 +50,10 @@ pub struct PriceApiConfig {
     pub max_inflight: usize,
     pub max_batch: usize,
     pub timeout_ms: u64,
+    /// The valuation quote asset, as reported in responses (e.g. `"usdt"`).
     pub vs_currency: String,
     /// Default precision (`"full"` or `"0".."18"`); overridable per request.
     pub precision: String,
-    pub staleness_secs: u64,
-    /// Used for the `Cache-Control: max-age` of responses.
-    pub price_interval_ms: u64,
     // ── swap-eta terms ──
     /// Matcher tick interval (ms) — a term of the next-batch ETA.
     pub swap_matching_trigger_ms: u64,
@@ -67,19 +65,17 @@ pub struct PriceApiConfig {
     pub swap_block_ms: u64,
     /// Tolerance, in basis points, the `/v1/swap-eta` off-market check allows
     /// before it sets `offMarket: true`. E.g. `50` ⇒ an order priced within 0.5%
-    /// of the oracle mid still counts as "at market"; worse than that is flagged.
+    /// of the Binance mid still counts as "at market"; worse than that is flagged.
     pub swap_offmarket_tol_bps: u64,
 }
 
 /// Shared (Send+Sync) state — no `!Send` client, so it lives on its own thread.
 #[derive(Clone)]
 pub struct PriceApiState {
-    precise_rx: watch::Receiver<PreciseSnapshot>,
+    prices: watch::Receiver<Arc<PriceSnapshot>>,
     pool: DbPool,
-    last_price_update: Arc<AtomicI64>,
     vs_currency: String,
     default_precision: PricePrecision,
-    staleness_secs: i64,
     max_batch: usize,
     // ── swap-eta ──
     /// Top-of-book snapshot from the matcher (read lock-free).
@@ -105,10 +101,10 @@ struct PriceResponse {
     precision: String,
     /// Token's on-chain decimals (null until ingest has fetched it).
     decimals: Option<u8>,
-    /// Unix secs of the last successful price refresh.
+    /// Unix secs the quote was received (now, for the quote asset itself).
     as_of: i64,
     stale: bool,
-    source: String,
+    source: &'static str,
 }
 
 enum ApiError {
@@ -116,6 +112,9 @@ enum ApiError {
     BadAmount(String),
     BadRequest(String),
     UnknownFaucet,
+    /// Registered, but no Binance market values it: nothing to wait for.
+    NoMarket,
+    /// Has a market, but no valid quote right now.
     NoPrice,
     Stale(i64),
     BadPrecision(String),
@@ -134,17 +133,22 @@ impl IntoResponse for ApiError {
                 "unknown_faucet",
                 "faucet not registered".into(),
             ),
+            ApiError::NoMarket => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_market",
+                "no Binance market is configured for this token; it has no price until the \
+                 solver's configuration changes"
+                    .into(),
+            ),
             ApiError::NoPrice => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_price",
-                "no price for this token yet".into(),
+                "no valid price for this token right now".into(),
             ),
             ApiError::Stale(as_of) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "stale",
-                format!(
-                    "prices are stale; last update {as_of} (use ?allow_stale=true to override)"
-                ),
+                format!("price is stale; last update {as_of} (use ?allow_stale=true to override)"),
             ),
             ApiError::BadPrecision(m) => (StatusCode::BAD_REQUEST, "bad_precision", m),
             ApiError::BatchTooLarge(max) => (
@@ -178,14 +182,6 @@ fn precision_label(p: PricePrecision) -> String {
     }
 }
 
-fn format_price(usd: f64, p: PricePrecision) -> String {
-    match p {
-        // Shortest round-trippable representation (preserves CoinGecko's value).
-        PricePrecision::Full => format!("{usd}"),
-        PricePrecision::Fixed(n) => format!("{usd:.*}", n as usize),
-    }
-}
-
 fn resolve_precision(
     state: &PriceApiState,
     q: &HashMap<String, String>,
@@ -204,43 +200,46 @@ fn wants_stale(q: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Current snapshot age. Returns `(as_of, is_stale)`.
-fn staleness(state: &PriceApiState) -> (i64, bool) {
-    let as_of = state.last_price_update.load(Ordering::Relaxed);
-    (
-        as_of,
-        now_secs().saturating_sub(as_of) > state.staleness_secs,
-    )
-}
-
-/// Resolve one faucet → quote. `404` if unregistered, `503` if registered but
-/// unpriced. Staleness is gated by the caller (it's a global property).
+/// One token's price from `snapshot`. `NoMarket` when nothing values it,
+/// `NoPrice` when its market has no valid quote; `Stale` when its quote is at
+/// least the TTL old and the caller did not allow that.
 fn quote_from_row(
     state: &PriceApiState,
+    snapshot: &PriceSnapshot,
     account_id: AccountId,
     row: RegisteredTokenRow,
     precision: PricePrecision,
-    as_of: i64,
-    stale: bool,
+    allow_stale: bool,
 ) -> Result<PriceResponse, ApiError> {
-    // Price from the precise side-channel.
-    let usd = {
-        let snap = state.precise_rx.borrow();
-        snap.get(&account_id).map(|d| d.usd)
+    // One clock reading: freshness and `as_of` describe the same instant.
+    let now = Instant::now();
+    let Valued {
+        price,
+        received_at,
+        fresh,
+    } = snapshot.valuation(account_id, now).map_err(|reason| {
+        tracing::debug!(faucet = %account_id, %reason, "no price for token");
+        match reason {
+            PriceUnavailable::NoMarket => ApiError::NoMarket,
+            _ => ApiError::NoPrice,
+        }
+    })?;
+    let age = received_at.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+    let as_of = now_secs().saturating_sub(i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
+    if !fresh && !allow_stale {
+        return Err(ApiError::Stale(as_of));
     }
-    .ok_or(ApiError::NoPrice)?;
-
     let decimals = row.token_decimals();
     Ok(PriceResponse {
         faucet_id: account_id.to_hex(),
         ticker: row.ticker,
         vs_currency: state.vs_currency.clone(),
-        price: format_price(usd, precision),
+        price: precision.format(price),
         precision: precision_label(precision),
         decimals,
         as_of,
-        stale,
-        source: "coingecko".to_string(),
+        stale: !fresh,
+        source: "binance",
     })
 }
 
@@ -253,23 +252,25 @@ async fn get_price(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<PriceResponse>, ApiError> {
     let precision = resolve_precision(&state, &q)?;
-    let (as_of, stale) = staleness(&state);
-    if stale && !wants_stale(&q) {
-        return Err(ApiError::Stale(as_of));
-    }
     let account_id = AccountId::from_hex(&faucet_id)
         .map_err(|error| ApiError::BadFaucetId(error.to_string()))?;
     let row = token_rows(&state, vec![account_id])
         .await?
         .remove(&account_id)
         .ok_or(ApiError::UnknownFaucet)?;
+    let snapshot = state.prices.borrow().clone();
     Ok(Json(quote_from_row(
-        &state, account_id, row, precision, as_of, stale,
+        &state,
+        &snapshot,
+        account_id,
+        row,
+        precision,
+        wants_stale(&q),
     )?))
 }
 
 /// `GET /v1/prices?ids=a,b,c&precision=&allow_stale=` → `{ "<faucet_id>": {..} }`
-/// (CoinGecko-style: unknown/unpriced ids are omitted).
+/// Unknown, unpriced, and (unless `allow_stale`) stale ids are omitted.
 async fn get_prices(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
@@ -286,21 +287,20 @@ async fn get_prices(
         return Err(ApiError::BatchTooLarge(state.max_batch));
     }
     let precision = resolve_precision(&state, &q)?;
-    let (as_of, stale) = staleness(&state);
-    if stale && !wants_stale(&q) {
-        return Err(ApiError::Stale(as_of));
-    }
+    let allow_stale = wants_stale(&q);
     let accounts: Vec<_> = ids
         .into_iter()
         .filter_map(|id| AccountId::from_hex(id).ok())
         .collect();
     let mut rows = token_rows(&state, accounts.clone()).await?;
+    let snapshot = state.prices.borrow().clone();
     let mut out = HashMap::new();
     for account_id in accounts {
         let Some(row) = rows.remove(&account_id) else {
             continue;
         };
-        if let Ok(resp) = quote_from_row(&state, account_id, row, precision, as_of, stale) {
+        if let Ok(resp) = quote_from_row(&state, &snapshot, account_id, row, precision, allow_stale)
+        {
             out.insert(resp.faucet_id.clone(), resp);
         }
     }
@@ -310,7 +310,7 @@ async fn get_prices(
 // ── swap-eta ─────────────────────────────────────────────────────────────────
 
 /// Response for `GET /v1/swap-eta`. Two independent liquidity signals — the live
-/// book (`can_fill` + `estimated_seconds`) and the real-time oracle (`off_market`
+/// book (`can_fill` + `estimated_seconds`) and the Binance midpoint (`off_market`
 /// + `market_price`) — plus the historical in-memory median. All optional fields
 /// serialise as `null` (stable shape for the wallet), never omitted.
 #[derive(Serialize)]
@@ -322,11 +322,13 @@ struct SwapEtaResponse {
     requested_amount: String,
     /// Book: crosses the best opposite-pair rate AND that level has the depth.
     can_fill: bool,
-    /// Oracle: order priced worse than market (why it won't fill). `null` if unpriced.
+    /// Market: order priced worse than the Binance mid (why it won't fill).
+    /// `null` if the pair has no fresh market price.
     off_market: Option<bool>,
     /// Next-batch ETA (secs); `null` when `can_fill` is false.
     estimated_seconds: Option<u64>,
-    /// Oracle fair rate (requested-per-offered); `null` if unpriced.
+    /// Binance mid in whole requested tokens per whole offered token, at the
+    /// clearing freshness rule; `null` if unpriced.
     market_price: Option<String>,
     /// In-memory rolling per-pair median settlement secs; `null` when no samples.
     median24h_seconds: Option<u64>,
@@ -373,7 +375,7 @@ fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, Api
 /// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=`
 ///
 /// Given a prospective order (offer A / request B, raw base-unit amounts), report
-/// whether it can fill in the next batch against the live book, the oracle price
+/// whether it can fill in the next batch against the live book, the market price
 /// verdict, and the in-memory 24h median settlement time for the pair.
 async fn get_swap_eta(
     State(state): State<PriceApiState>,
@@ -389,7 +391,7 @@ async fn get_swap_eta(
     let offered_amount = parse_amount(&q, "offered_amount")?;
     let requested_amount = parse_amount(&q, "requested_amount")?;
 
-    // Registration gate + decimals (for the oracle compare).
+    // Registration gate + decimals (for the market compare).
     let rows = token_rows(&state, vec![a, b]).await?;
     let row_a = rows.get(&a).ok_or(ApiError::UnknownFaucet)?;
     let row_b = rows.get(&b).ok_or(ApiError::UnknownFaucet)?;
@@ -406,23 +408,17 @@ async fn get_swap_eta(
         None
     };
 
-    // Oracle check (advisory; independent of the book). Fail closed on a stale
-    // feed: if the price snapshot is older than the staleness bound, treat both
-    // prices as unavailable so `off_market`/`market_price` are never derived from
-    // stale data. The book-based `can_fill` is unaffected.
-    let (usd_a, usd_b) = if staleness(&state).1 {
-        (None, None)
-    } else {
-        let snap = state.precise_rx.borrow();
-        (snap.get(&a).map(|d| d.usd), snap.get(&b).map(|d| d.usd))
-    };
+    // Market check (advisory; independent of the book): the clearing pair's
+    // Binance mid under the same freshness rule the matcher uses. This does not
+    // promise the next batch's price. The book-based `can_fill` is unaffected.
+    let snapshot = state.prices.borrow().clone();
+    let market = snapshot.market_price(a, b, Instant::now()).ok();
     let (off_market, market_price) = eval_off_market(
         offered_amount,
         d_a,
-        usd_a,
         requested_amount,
         d_b,
-        usd_b,
+        market,
         state.swap_offmarket_tol_bps,
     );
 
@@ -441,7 +437,7 @@ async fn get_swap_eta(
         market_price,
         median24h_seconds,
     });
-    // Don't let the router-level `max-age=<price interval>` layer cache this:
+    // Don't let the router-level `max-age` layer cache this:
     // can_fill, off_market, and median24h_seconds come from independently-updated
     // snapshots, so a shared max-age would serve stale fillability. `no-store`
     // wins because the layer is `if_not_present`.
@@ -472,9 +468,8 @@ async fn concurrency_guard(
 /// Build the full router (used by the server thread AND unit tests).
 pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     let sem = Arc::new(Semaphore::new(cfg.max_inflight.max(1)));
-    let cache = format!("public, max-age={}", (cfg.price_interval_ms / 1000).max(1));
-    let cache_value =
-        HeaderValue::from_str(&cache).unwrap_or_else(|_| HeaderValue::from_static("no-store"));
+    // Quotes move continuously; let shared caches hold a response briefly.
+    let cache_value = HeaderValue::from_static("public, max-age=1");
 
     let v1 = Router::new()
         .route("/price/{faucet_id}", get(get_price))
@@ -510,14 +505,12 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
 /// Spawn the price-query server on its OWN OS thread + multi-thread runtime.
 /// Returns the thread handle and a readiness oneshot (Ok once bound, Err on a
 /// bind/runtime failure) so startup can gate on it like the ingest thread.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_price_api_thread(
     cfg: PriceApiConfig,
-    precise_rx: watch::Receiver<PreciseSnapshot>,
+    prices: watch::Receiver<Arc<PriceSnapshot>>,
     swap_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pool: DbPool,
-    last_price_update: Arc<AtomicI64>,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -543,12 +536,10 @@ pub fn spawn_price_api_thread(
                     + cfg.swap_block_ms)
                     .div_ceil(1000);
                 let state = PriceApiState {
-                    precise_rx,
+                    prices,
                     pool,
-                    last_price_update,
                     vs_currency: cfg.vs_currency.clone(),
                     default_precision,
-                    staleness_secs: cfg.staleness_secs as i64,
                     max_batch: cfg.max_batch,
                     swap_rx,
                     stats_rx,

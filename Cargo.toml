@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-price", "crates/mock-binance", "crates/mock-mirror", "crates/lp-sdk"]
+members = ["crates/solver", "crates/consume-script", "crates/e2e", "crates/mock-binance", "crates/mock-mirror", "crates/lp-sdk"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -38,9 +38,6 @@ rand = "0.9"
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "env"] }
-toml = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi", "std"] }
 

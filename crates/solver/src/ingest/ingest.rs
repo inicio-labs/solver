@@ -509,7 +509,7 @@ pub(crate) fn spawn_ingest_thread(
     ingest_interval: Duration,
     last_sync: Arc<AtomicU64>,
     solver_id: AccountId,
-    clearing_bootstrap: oneshot::Sender<crate::matcher::ClearingBootstrap>,
+    clearing_bootstrap: oneshot::Sender<Vec<crate::types::BookOrder>>,
 ) -> anyhow::Result<(thread::JoinHandle<()>, crate::start::ClientReady)> {
     use anyhow::Context;
     let task_cancel = cancel.clone();

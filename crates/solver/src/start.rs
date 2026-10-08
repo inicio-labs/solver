@@ -4,16 +4,16 @@
 //!
 //! L2 threading model: `Client<AUTH>` is `!Send`, so each client lives on its
 //! own OS thread (own `current_thread` runtime + `LocalSet`), built there via
-//! the factory. The `Send` services (matcher, price, admin, obs) stay on the
-//! caller's LocalSet — the "main coordination thread". They are connected only
-//! by `Send` channels.
+//! the factory. The `Send` services (matcher, admin, obs) stay on the caller's
+//! LocalSet — the "main coordination thread". The Binance price feed has its
+//! own thread so a long clearing pass cannot stall its sockets. They are
+//! connected only by `Send` channels.
 //!
 //! Lives in the library so `main.rs` stays tiny — its only jobs are to load
 //! `solver.toml`, construct a `ClientFactory`, set up the Ctrl-C handler, and
 //! hand off to `start`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -28,7 +28,7 @@ use crate::config::SolverConfig;
 use crate::db;
 use crate::matcher::ClearingRuntime;
 use crate::pipeline::{self, PipelineConfig};
-use crate::price::{PriceClient, SharedTokenMap};
+use crate::price::{spawn_price_feed_thread, FeedMetrics};
 use crate::types::TokenId;
 
 #[derive(Debug, Error)]
@@ -37,27 +37,16 @@ struct CriticalWorkerStopped;
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 
-async fn join_client_threads(
-    ingest: std::thread::JoinHandle<()>,
-    executor: std::thread::JoinHandle<()>,
-    price_api: std::thread::JoinHandle<()>,
-    router: Option<std::thread::JoinHandle<()>>,
-) -> Result<()> {
+/// Worker OS threads, named for the shutdown log.
+type Workers = Vec<(&'static str, std::thread::JoinHandle<()>)>;
+
+/// Join every worker thread, bounded by [`SHUTDOWN_DEADLINE`].
+async fn join_threads(threads: Workers) -> Result<()> {
     let joined = tokio::task::spawn_blocking(move || {
         let mut failed = false;
-        for (name, handle) in [
-            ("ingest", ingest),
-            ("executor", executor),
-            ("price-api", price_api),
-        ] {
+        for (name, handle) in threads {
             if let Err(error) = handle.join() {
                 tracing::error!(thread = name, ?error, "solver worker panicked");
-                failed = true;
-            }
-        }
-        if let Some(router) = router {
-            if let Err(error) = router.join() {
-                tracing::error!(thread = "router", ?error, "solver worker panicked");
                 failed = true;
             }
         }
@@ -71,6 +60,20 @@ async fn join_client_threads(
         .await
         .context("solver workers did not stop within fifteen seconds; supervisor must restart")?
         .context("solver worker join task stopped")?
+}
+
+/// After a startup failure: stop and join the threads started so far, so
+/// nothing outlives `start`, and return `error`.
+async fn abort_startup(
+    cancel: &CancellationToken,
+    threads: Workers,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    cancel.cancel();
+    if let Err(join_error) = join_threads(threads).await {
+        tracing::error!(%join_error, "solver workers did not stop cleanly");
+    }
+    error
 }
 
 /// Wait for a worker thread's readiness report.
@@ -171,25 +174,19 @@ pub(crate) fn run_on_local_runtime<F: std::future::Future<Output = ()>>(thread_n
 /// uses `spawn_local` for all tasks because `Client<FilesystemKeyStore>` is
 /// `!Send` (upstream `Arc<dyn Trait>` fields without `Send + Sync` bounds).
 ///
-/// Owns: DB pool, shared-symbol-map for price feed, all pipeline tasks, and
-/// the ingest and executor client threads (each builds its own Miden client).
+/// Owns: DB pool, all pipeline tasks, the Binance price-feed thread, and the
+/// ingest and executor client threads (each builds its own Miden client).
 ///
 /// Reads from env:
 /// - `SOLVER_ADMIN_TOKEN` — bearer token for admin endpoints. When unset, admin
 ///   routes return 404 (server still binds for symmetry with handles).
-/// - `COINGECKO_API_KEY` — sent as `x-cg-demo-api-key`. Optional; without it,
-///   public-tier rate limits apply.
 ///
 /// Exposes (all 127.0.0.1 only):
-/// - `admin_port` — auth-gated POST/PATCH/DELETE for token registry.
+/// - `admin_port` — auth-gated GET/POST/DELETE for token registry.
 /// - `obs_port`   — auth-free `GET /health` (liveness) and `GET /readyz`
 ///   (readiness, gated on DB reachability + `last successful sync` age).
 pub async fn start(
     factory: Arc<dyn ClientFactory>,
-    make_price_client: impl FnOnce(
-        SharedTokenMap,
-        Option<String>,
-    ) -> Result<Box<dyn PriceClient + Send + Sync>>,
     solver_id: AccountId,
     config: SolverConfig,
     cancel: CancellationToken,
@@ -198,7 +195,7 @@ pub async fn start(
     // Cancelling this child stops the pipeline without cancelling its parent.
     let shutdown_requested = cancel;
     let cancel = shutdown_requested.child_token();
-    // 1. DB pool (caller-owned so HttpPriceClient + executor can share it).
+    // 1. DB pool, shared by the pipeline, the executor and the price API.
     let writer_url = std::env::var("SOLVER_DATABASE_URL")
         .context("set SOLVER_DATABASE_URL for the PostgreSQL application database")?;
     let reader_url = std::env::var("SOLVER_READ_DATABASE_URL")
@@ -219,69 +216,60 @@ pub async fn start(
     if admin_token.is_none() {
         tracing::warn!(
             "SOLVER_ADMIN_TOKEN not set — admin endpoints disabled (all /admin/* paths return 404). \
-             Set this env var to enable token registration and symbol updates without a restart."
+             Set this env var to enable token registration without a restart."
         );
     }
-    let coingecko_api_key = std::env::var("COINGECKO_API_KEY").ok();
 
-    // 3. Shared symbol map. `prepare_db` hydrates it from DB after seeding,
-    //    so initialising with an empty map is fine.
-    let token_map = Arc::new(RwLock::new(HashMap::new()));
+    // 3. Binance markets from config: faucet asset codes, approved clearing
+    //    symbols, wallet valuation. `SolverConfig::load` already validated the
+    //    mapping; the feed checks every market against `exchangeInfo` once,
+    //    and startup waits for that check (step 13).
+    let market_plan = config
+        .market_plan()
+        .context("invalid Binance market configuration")?;
 
-    // 4. Price client built via the injected builder (prod = HttpPriceClient
-    //    with this symbol map + API key; tests inject a MockPriceClient).
-    //    `start` keeps ownership of `token_map` (shared with admin) and only
-    //    hands a clone to the builder.
-    let price_client =
-        make_price_client(token_map.clone(), coingecko_api_key).context("build price client")?;
+    // 4. Configured tokens to register. A pair with an approved Binance symbol
+    //    clears internally; the matcher reads its price from the snapshot.
+    let initial_tokens: Vec<TokenId> = config
+        .faucet_pairs()
+        .context("invalid pair faucet ids")?
+        .into_iter()
+        .flat_map(|(x, y)| [x, y])
+        .collect();
 
-    // 5. Flatten configured pairs → token list with optional symbols.
-    let mut initial_tokens: Vec<(TokenId, Option<String>)> = Vec::new();
-    let mut pairs = Vec::with_capacity(config.pairs.len());
-    for pair in &config.pairs {
-        let x = AccountId::from_hex(&pair.asset_x_faucet_id)
-            .with_context(|| format!("invalid asset_x_faucet_id for pair {}", pair.name))?;
-        let y = AccountId::from_hex(&pair.asset_y_faucet_id)
-            .with_context(|| format!("invalid asset_y_faucet_id for pair {}", pair.name))?;
-        pairs.push((x, y));
-        initial_tokens.push((x, pair.asset_x_external_symbol.clone()));
-        initial_tokens.push((y, pair.asset_y_external_symbol.clone()));
-    }
-
-    // 6. Each Miden client is built on its own OS thread below (a `!Send`
+    // 5. Each Miden client is built on its own OS thread below (a `!Send`
     //    `Client` cannot cross threads); `factory` carries only `Send` config.
 
-    // 7. Build the channels and observability state. The shared `last_sync` atomic is
+    // 6. Build the channels and observability state. The shared `last_sync` atomic is
     //    initialised to `now()` here so /readyz is healthy during the boot
     //    grace period before the first sync completes.
     let channels = pipeline::create_channels();
+    let feed_metrics = Arc::new(FeedMetrics::new(config.binance.stream_endpoints.clone()));
     let obs_state = crate::obs::ObsState::new(
         db_pool.clone(),
         config.engine.readiness_freshness_secs,
         channels.book_tx.clone(),
         channels.exec_tx.clone(),
+        channels.prices_rx.clone(),
+        feed_metrics.clone(),
     );
     let last_sync_handle = obs_state.last_sync_handle();
 
-    // 8. Build the PipelineConfig.
+    // 7. Build the PipelineConfig.
+    let binance_tokens = market_plan.tokens().collect();
     let pipeline_config = PipelineConfig::new(
         &config.engine,
         db_pool.clone(),
         initial_tokens,
+        binance_tokens,
         admin_token,
-        token_map,
         cancel.clone(),
     );
 
-    // 9. DB-only boot work (no client) on this thread.
+    // 8. DB-only boot work (no client) on this thread.
     pipeline::prepare_db(&pipeline_config)
         .await
         .context("prepare_db")?;
-
-    // Last successful price-refresh timestamp (shared: bumped by the price feed,
-    // read by the price-query API for staleness). Init to 0 so the API reports
-    // stale until the first real fetch (no fabricated-fresh empty snapshot).
-    let last_price_update = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
     let (clearing_bootstrap, bootstrap_rx) = tokio::sync::oneshot::channel();
     let routing = config.engine.router_enabled.then(|| {
@@ -294,38 +282,25 @@ pub async fn start(
     let clearing = ClearingRuntime {
         bootstrap: bootstrap_rx,
         routing,
-        prices: channels.precise_rx.clone(),
-        pairs,
+        prices: channels.prices_rx.clone(),
         config: crate::clearing::ClearingConfig {
             protocol_fee_ppm: config.engine.clearing_fee_ppm,
             ..crate::clearing::ClearingConfig::default()
         },
-        max_price_age_ms: config.engine.price_staleness_secs.saturating_mul(1_000),
-        max_source_age_ms: config
-            .engine
-            .clearing_max_source_age_secs
-            .saturating_mul(1_000),
-        max_source_skew_ms: config
-            .engine
-            .clearing_max_source_skew_secs
-            .saturating_mul(1_000),
     };
 
-    // 10. Spawn the `Send` services (price, matcher, admin) on THIS thread's
+    // 9. Spawn the `Send` services (matcher, admin) on THIS thread's
     //     LocalSet — the main coordination thread.
     let core = pipeline::spawn_core_services(
         &pipeline_config,
-        price_client,
         channels.book_rx,
-        channels.precise_tx,
-        last_price_update.clone(),
         channels.exec_tx,
         channels.swap_snapshot_tx,
         channels.subscribe_tx,
         clearing,
     );
 
-    // 11. Observability server (Send; on the main thread).
+    // 10. Observability server (Send; on the main thread).
     let obs_port = config.engine.obs_port;
     let obs_cancel = cancel.clone();
     let obs_router = obs_state.router();
@@ -345,7 +320,7 @@ pub async fn start(
         }
     });
 
-    // 12. INGEST THREAD (keyless) and 13. EXECUTOR THREAD (keystore): each
+    // 11. INGEST THREAD (keyless) and 12. EXECUTOR THREAD (keystore): each
     //     gets its own OS thread with a `current_thread` runtime + `LocalSet`;
     //     the `!Send` `Client` is built on-thread and never crosses a boundary.
     //     Both report readiness (or a build/spawn error) on a oneshot so a
@@ -370,18 +345,12 @@ pub async fn start(
         ready = ready(ingest_ready_rx, "ingest") => ready,
         _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during ingest startup")),
     };
+    let mut threads: Workers = vec![("ingest", ingest_thread)];
     if let Err(error) = ingest_ready {
-        cancel.cancel();
-        let joined = tokio::task::spawn_blocking(move || ingest_thread.join());
-        if tokio::time::timeout(SHUTDOWN_DEADLINE, joined)
-            .await
-            .is_err()
-        {
-            tracing::error!("ingest thread did not stop within shutdown deadline");
-        }
-        return Err(error).context("ingest startup recovery failed");
+        let error = error.context("ingest startup recovery failed");
+        return Err(abort_startup(&cancel, threads, error).await);
     }
-    let (executor_thread, exec_ready_rx) = crate::executor::spawn_executor_thread(
+    let spawned = crate::executor::spawn_executor_thread(
         factory.clone(),
         db_pool.clone(),
         cancel.clone(),
@@ -391,42 +360,97 @@ pub async fn start(
         channels.stats_tx,
         Duration::from_millis(config.engine.fetch_interval_ms),
         Duration::from_millis(config.engine.verify_interval_ms),
-    )?;
+    );
+    let exec_ready_rx = match spawned {
+        Ok((thread, ready_rx)) => {
+            threads.push(("executor", thread));
+            ready_rx
+        }
+        Err(error) => return Err(abort_startup(&cancel, threads, error).await),
+    };
 
-    // 13b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +
+    // 12a. PRICE-FEED THREAD: Binance readers and publisher on their own
+    //      runtime. A pair stays paused until fresh quotes arrive. The thread
+    //      cancels `cancel` when it ends, so a feed failure stops the solver.
+    //      Pair prices are in base units, so the plan takes the tokens'
+    //      on-chain decimals, which ingest startup has just recorded; a
+    //      clearing token without them fails the market check.
+    let decimals = match db_pool.read(db::postgres_db::load_token_decimals_tx).await {
+        Ok(decimals) => decimals,
+        Err(error) => {
+            let error = anyhow::Error::from(error).context("load token decimals");
+            return Err(abort_startup(&cancel, threads, error).await);
+        }
+    };
+    let spawned = spawn_price_feed_thread(
+        config.binance.clone(),
+        market_plan.with_decimals(decimals),
+        channels.prices_tx,
+        feed_metrics,
+        cancel.clone(),
+    );
+    let feed_ready = match spawned {
+        Ok((thread, ready)) => {
+            threads.push(("price-feed", thread));
+            ready
+        }
+        Err(error) => return Err(abort_startup(&cancel, threads, error).await),
+    };
+    // The feed checks every configured Binance market once. A market Binance
+    // rejects, or a lookup that cannot succeed, fails startup at the gate
+    // below with the full list, to be fixed in solver.toml.
+    let feed_ready = async move {
+        match feed_ready.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(anyhow!("Binance market check failed: {message}")),
+            Err(_) => Err(anyhow!(
+                "price feed stopped during the Binance market check"
+            )),
+        }
+    };
+
+    // 12b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +
     //      multi-thread runtime so wallet traffic can't starve settlement. Reads
-    //      the precise price side-channel + DB; never touches a `!Send` client.
+    //      the Binance snapshot + DB; never touches a `!Send` client.
     let price_api_cfg = crate::price_api::PriceApiConfig {
         bind: config.engine.price_query_bind.clone(),
         port: config.engine.price_query_port,
         max_inflight: config.engine.price_query_max_inflight,
         max_batch: config.engine.price_query_max_batch,
         timeout_ms: config.engine.price_query_timeout_ms,
-        vs_currency: config.engine.price_vs_currency.clone(),
+        vs_currency: config
+            .binance
+            .valuation_quote_asset
+            .to_string()
+            .to_ascii_lowercase(),
         precision: config.engine.price_precision.clone(),
-        staleness_secs: config.engine.price_staleness_secs,
-        price_interval_ms: config.engine.price_interval_ms,
         swap_matching_trigger_ms: config.engine.pulse_interval_ms,
         swap_sync_ms: config.engine.fetch_interval_ms,
         swap_proving_ms: config.engine.swap_proving_estimate_ms,
         swap_block_ms: config.engine.swap_block_time_ms,
         swap_offmarket_tol_bps: config.engine.swap_offmarket_tolerance_bps,
     };
-    let (price_api_thread, price_api_ready_rx) = crate::price_api::spawn_price_api_thread(
+    let spawned = crate::price_api::spawn_price_api_thread(
         price_api_cfg,
-        channels.precise_rx,
+        channels.prices_rx,
         channels.swap_snapshot_rx,
         channels.stats_rx,
         db_pool.clone(),
-        last_price_update,
         cancel.clone(),
-    )?;
+    );
+    let price_api_ready_rx = match spawned {
+        Ok((thread, ready_rx)) => {
+            threads.push(("price-api", thread));
+            ready_rx
+        }
+        Err(error) => return Err(abort_startup(&cancel, threads, error).await),
+    };
 
-    // 13c. ROUTER THREAD (external liquidity RFQ websocket): its own OS thread +
+    // 12c. ROUTER THREAD (external liquidity RFQ websocket): its own OS thread +
     //      multi-thread runtime (like the price-API) so DEX traffic can't stall
     //      settlement. Only spawned when enabled; allow-list tokens come from the
     //      `SOLVER_ROUTER_TOKENS` env var (comma-separated).
-    let (router_thread, router_ready_rx) = if config.engine.router_enabled {
+    let router_ready_rx = if config.engine.router_enabled {
         let auth_tokens: Vec<String> = std::env::var("SOLVER_ROUTER_TOKENS")
             .unwrap_or_default()
             .split(',')
@@ -452,58 +476,56 @@ pub async fn start(
             channels.route_rx,
             cancel.clone(),
         ) {
-            Ok((t, r)) => (Some(t), Some(r)),
-            Err(e) => {
-                // Router failed to start — tear down the already-spawned services
-                // (same cancel + join path as a startup-gate failure) so nothing is
-                // left running after `start` returns.
-                cancel.cancel();
-                if let Err(join_error) =
-                    join_client_threads(ingest_thread, executor_thread, price_api_thread, None)
-                        .await
-                {
-                    tracing::error!(%join_error, "solver workers did not stop cleanly");
-                }
-                return Err(e).context("router startup failed");
+            Ok((thread, ready_rx)) => {
+                threads.push(("router", thread));
+                Some(ready_rx)
+            }
+            Err(error) => {
+                let error = error.context("router startup failed");
+                return Err(abort_startup(&cancel, threads, error).await);
             }
         }
     } else {
-        (None, None)
+        None
     };
 
-    // 14. Startup gate: both client threads must report ready (client built +
-    //     tasks spawned) before startup is considered successful. Any build /
-    //     subscribe failure -> cancel everything, join, return the error.
-    let startup: Result<()> = tokio::select! {
-      result = async {
-        ready(exec_ready_rx, "executor").await?;
-        ready(price_api_ready_rx, "price-api").await?;
-        if let Some(rx) = router_ready_rx {
-            ready(rx, "router").await?;
+    // 13. Startup gate: every worker must report ready (client built and
+    //     tasks spawned, the Binance market check passed) before startup is
+    //     considered successful. The first failure cancels everything, joins
+    //     and returns its error. A worker that stops meanwhile (the feed
+    //     thread cancels `cancel` when it ends) fails startup at once instead
+    //     of being masked by a later "solver running". A failing worker
+    //     reports before it stops, so the readiness results are checked first
+    //     (`biased`): the real error wins over the generic one.
+    let router_ready = async move {
+        match router_ready_rx {
+            Some(rx) => ready(rx, "router").await,
+            None => Ok(()),
         }
-        Ok(())
+    };
+    let startup: Result<()> = tokio::select! {
+      biased;
+      result = async {
+        tokio::try_join!(
+            ready(exec_ready_rx, "executor"),
+            feed_ready,
+            ready(price_api_ready_rx, "price-api"),
+            router_ready,
+        )
+        .map(|_| ())
       } => result,
       _ = db_fatal.cancelled() => Err(anyhow!("critical PostgreSQL failure during startup")),
+      _ = cancel.cancelled() => Err(anyhow!("a solver worker stopped during startup")),
     };
 
-    if let Err(e) = startup {
-        cancel.cancel();
-        if let Err(join_error) = join_client_threads(
-            ingest_thread,
-            executor_thread,
-            price_api_thread,
-            router_thread,
-        )
-        .await
-        {
-            tracing::error!(%join_error, "solver workers did not stop cleanly");
-        }
-        return Err(e).context("startup failed");
+    if let Err(error) = startup {
+        let error = error.context("startup failed");
+        return Err(abort_startup(&cancel, threads, error).await);
     }
-    tracing::info!("ingest + executor + price-api threads ready; solver running");
+    tracing::info!("ingest + executor + price-feed + price-api threads ready; solver running");
 
-    // 15. Await shutdown: cancellation, or any main-thread Send service
-    //     exiting. The client threads are joined in step 16.
+    // 14. Await shutdown: cancellation, or any main-thread Send service
+    //     exiting. The client threads are joined in step 15.
     tokio::select! {
         _ = db_fatal.cancelled() => {
             tracing::error!("critical PostgreSQL failure; stopping the whole solver");
@@ -514,9 +536,6 @@ pub async fn start(
         res = core.matcher_handle => {
             tracing::info!(?res, "matcher task exited");
         }
-        res = core.price_handle => {
-            tracing::info!(?res, "price task exited");
-        }
         res = core.admin_handle => {
             tracing::info!(?res, "admin task exited");
         }
@@ -525,16 +544,10 @@ pub async fn start(
         }
     }
 
-    // 16. Trigger cancel (idempotent) and join the client threads so their
+    // 15. Trigger cancel (idempotent) and join the client threads so their
     //     runtimes drain before the process exits.
     cancel.cancel();
-    join_client_threads(
-        ingest_thread,
-        executor_thread,
-        price_api_thread,
-        router_thread,
-    )
-    .await?;
+    join_threads(threads).await?;
     if !shutdown_requested.is_cancelled() {
         return Err(CriticalWorkerStopped.into());
     }

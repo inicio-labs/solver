@@ -6,7 +6,7 @@
 use crate::matching::engine::MatchingEngine;
 use crate::matching::order_book::OrderBook;
 use crate::matching::price_feed::PriceFeed;
-use crate::price::WatchPriceFeed;
+use crate::matching::price_feed::FixedPriceFeed;
 use crate::matching::types::*;
 use super::{eth, usdc, sol, btc, matic, NoteIdGen, make_note_id};
 
@@ -137,7 +137,7 @@ fn protocol_surplus_non_negative_after_match() {
     let mut seed: u64 = 777888;
 
     for trial in 0..2_000 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         feed.set_price_cents(eth(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
         feed.set_price_cents(usdc(), 100 + (pseudo_rand(&mut seed) % 1000) as u64);
 
@@ -171,7 +171,7 @@ fn protocol_surplus_non_negative_after_match() {
 /// Engine should handle gracefully without hanging or panicking.
 #[test]
 fn dust_order_attack() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     let tokens = [eth(), usdc(), sol(), btc(), matic()];
     for &t in &tokens { feed.set_price_cents(t, 100); }
 
@@ -202,7 +202,7 @@ fn dust_order_attack() {
 /// Total surplus extracted should be similar (not exploitable via splitting).
 #[test]
 fn order_splitting_no_extra_surplus() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -235,7 +235,7 @@ fn order_splitting_no_extra_surplus() {
 /// to capture surplus from two existing orders.
 #[test]
 fn targeted_cycle_surplus_extraction() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -279,7 +279,7 @@ fn targeted_cycle_surplus_extraction() {
 /// Both should be discoverable.
 #[test]
 fn reverse_cycle_discovered() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -309,7 +309,7 @@ fn reverse_cycle_discovered() {
 /// The engine should terminate in bounded time.
 #[test]
 fn no_infinite_loop_zero_effect_cycles() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -337,7 +337,7 @@ fn no_infinite_loop_zero_effect_cycles() {
 /// contain entries referencing those orders. Should skip gracefully.
 #[test]
 fn stale_heap_entries_handled() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 100);
@@ -374,7 +374,7 @@ fn stale_heap_entries_handled() {
 ///   order_b.offered_released == order_a.fill + surplus_b
 #[test]
 fn settlement_token_balance_pairwise() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
 
@@ -425,7 +425,7 @@ fn settlement_token_balance_pairwise() {
 /// unfilled capacity that should remain available.
 #[test]
 fn triangle_surplus_is_real_not_unfilled_capacity() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 200_000);
     feed.set_price_cents(usdc(), 100);
     feed.set_price_cents(sol(), 15_000);
@@ -471,7 +471,7 @@ fn triangle_surplus_is_real_not_unfilled_capacity() {
 /// They should be stored and retrieved correctly (not lost or confused).
 #[test]
 fn f64_rate_collision() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -551,7 +551,7 @@ fn match_with_partially_filled_self() {
 /// match_with where both orders have the exact same rate (no surplus possible).
 #[test]
 fn match_with_identical_rates() {
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(eth(), 100);
     feed.set_price_cents(usdc(), 100);
 
@@ -581,7 +581,7 @@ fn fuzz_adversarial_mix_500_trials() {
     let mut seed: u64 = 2718281828;
 
     for trial in 0..500 {
-        let mut feed = WatchPriceFeed::new();
+        let mut feed = FixedPriceFeed::new();
         for i in 0..5 { feed.set_price_cents(tokens[i], prices[i]); }
 
         let mut book = OrderBook::new(feed);

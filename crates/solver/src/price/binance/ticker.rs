@@ -142,10 +142,9 @@ fn is_server_shutdown(text: &str) -> bool {
     })
 }
 
-/// A positive decimal sent as a JSON string, read exactly: digits with one
-/// decimal point at most, no sign, exponent or escape.
-fn positive_decimal(raw: Option<&RawValue>) -> Option<Decimal> {
-    let text: &str = serde_json::from_str(raw?.get()).ok()?;
+/// A positive decimal written as digits with one decimal point at most (no
+/// sign, exponent or separator), read exactly.
+pub(crate) fn parse_positive_decimal(text: &str) -> Option<Decimal> {
     if !text
         .bytes()
         .all(|byte| byte.is_ascii_digit() || byte == b'.')
@@ -154,6 +153,11 @@ fn positive_decimal(raw: Option<&RawValue>) -> Option<Decimal> {
     }
     let value = Decimal::from_str_exact(text).ok()?;
     (value > Decimal::ZERO).then(|| value.normalize())
+}
+
+/// A positive decimal sent as a JSON string without escapes.
+fn positive_decimal(raw: Option<&RawValue>) -> Option<Decimal> {
+    parse_positive_decimal(serde_json::from_str(raw?.get()).ok()?)
 }
 
 impl BookTicker<'_> {

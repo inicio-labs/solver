@@ -32,7 +32,7 @@ use miden_protocol::account::AccountType;
 use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::crypto::utils::Serializable;
 use miden_testing::MockChain;
-use solver::config::{AssetPairConfig, EngineConfig, RpcConfig, SolverAccountConfig, SolverConfig};
+use solver::config::{RpcConfig, SolverAccountConfig, SolverConfig};
 use tokio_util::sync::CancellationToken;
 
 use common::{build_test_client, temp_paths, vault_balance, MockClientFactory, PgSchema};
@@ -178,6 +178,12 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
             //    no reciprocal order → the solver tracks it but can never
             //    match/settle it. No race.
             let solver_db_path = pg.url.clone();
+            // ETHUSDT and USDCUSDT value the two tokens; startup checks them too.
+            let binance = common::BinanceStub::start(&[
+                ("ETHUSDC", "ETH", "USDC", "1"),
+                ("ETHUSDT", "ETH", "USDT", "1"),
+                ("USDCUSDT", "USDC", "USDT", "1"),
+            ]);
             let config = SolverConfig {
                 rpc: RpcConfig {
                     endpoint: "http://unused".into(),
@@ -191,63 +197,17 @@ async fn already_consumed_pswap_is_retired_not_settled() -> Result<()> {
                     ingest_store_path: ingest_store_path.clone(),
                     read_pool_size: 2,
                 },
-                pairs: vec![AssetPairConfig {
-                    name: "USDC-ETH".into(),
-                    asset_x_faucet_id: usdc_id.to_hex(),
-                    asset_x_external_symbol: None,
-                    asset_y_faucet_id: eth_id.to_hex(),
-                    asset_y_external_symbol: None,
-                }],
-                engine: EngineConfig {
-                    pulse_interval_ms: 200,
-                    fetch_interval_ms: 100,
-                    price_interval_ms: 60_000,
-                    clearing_fee_ppm: 0,
-                    clearing_max_source_age_secs: 60,
-                    clearing_max_source_skew_secs: 30,
-                    admin_port: 0,
-                    debug_mode: false,
-                    obs_port: 0,
-                    readiness_freshness_secs: 60,
-                    verify_interval_ms: 5_000,
-                    price_api_base_url: None,
-                    price_query_port: 8080,
-                    price_query_bind: "127.0.0.1".to_string(),
-                    price_query_max_inflight: 128,
-                    price_query_max_batch: 50,
-                    price_query_timeout_ms: 3000,
-                    price_precision: "full".to_string(),
-                    price_vs_currency: "usd".to_string(),
-                    price_staleness_secs: 30,
-                    swap_proving_estimate_ms: 2000,
-                    swap_block_time_ms: 6000,
-                    swap_offmarket_tolerance_bps: 50,
-                    router_enabled: false,
-                    router_bind: "127.0.0.1".to_string(),
-                    router_port: 0,
-                    router_max_connections: 64,
-                    router_max_msg_bytes: 16384,
-                    router_quote_ttl_ms: 20_000,
-                    router_inflight_ttl_ms: 30_000,
-                },
+                pairs: vec![common::pair_config(
+                    "USDC-ETH", usdc_id, "USDC", eth_id, "ETH", "ETHUSDC",
+                )],
+                engine: common::engine_config(),
+                binance: binance.config(),
             };
 
             let cancel = CancellationToken::new();
             let solver_cancel = cancel.clone();
-            let price_map: std::collections::HashMap<_, u64> =
-                [(usdc_id, 100), (eth_id, 100)].into_iter().collect();
             let mut solver_handle = tokio::task::spawn_local(async move {
-                solver::start(
-                    factory,
-                    move |_sm, _key| {
-                        Ok(Box::new(solver::price::MockPriceClient::new(price_map))
-                            as Box<dyn solver::price::PriceClient + Send + Sync>)
-                    },
-                    solver_id,
-                    config,
-                    solver_cancel,
-                )
-                .await
+                solver::start(factory, solver_id, config, solver_cancel).await
             });
 
             // 7. Phase 1: drive the chain until the solver has discovered +

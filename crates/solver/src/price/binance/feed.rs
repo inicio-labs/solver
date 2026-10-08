@@ -23,17 +23,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::market::{Listing, MarketPlan, Markets, Symbol};
+use super::market::{AssetCode, Listing, MarketPlan, Markets, Symbol};
 use super::reader::{run_connection, stream_url, Exit, ReaderContext, ReaderLatest};
 use super::rest::{fetch_listing, LookupError, MAX_RETRY_AFTER};
-use super::snapshot::{Offer, PriceSnapshot};
-use super::ticker::QuoteLimits;
+use super::snapshot::{Offer, PriceSnapshot, SymbolQuote};
+use super::ticker::{parse_positive_decimal, QuoteLimits};
 
 /// The feed keeps this many readers, each on its own configured endpoint;
 /// logs and metrics identify a reader by that endpoint.
@@ -78,49 +79,179 @@ impl Backoff {
     }
 }
 
-/// Runtime settings of the feed; the operator-facing documentation of each
-/// value is on the `[binance]` configuration section.
-#[derive(Clone, Debug)]
-pub struct FeedConfig {
-    /// Stream base URL of each reader.
+/// The `[binance]` section of `solver.toml`, which is also the feed's
+/// configuration (ADR 0004). Every key but `quote_ttl_ms` and
+/// `max_spread_bps` has a default; those two must be chosen per deployment.
+/// Durations are written in the unit their key names. A misspelled key is an
+/// error, not a silent fallback to the default.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BinanceConfig {
+    /// Stream base URLs of the two readers (scheme and host only); logs and
+    /// metrics name each reader by its endpoint. By default one uses the
+    /// market-data-only endpoint and the other the main one, so one endpoint
+    /// failing does not take out both. Binance refuses some regions on the
+    /// main endpoint (observed for the US): point both at the market-data one.
     pub stream_endpoints: [String; READERS],
+    /// REST base URL of the startup `exchangeInfo` check (scheme and host only).
     pub rest_endpoint: String,
-    pub limits: QuoteLimits,
-    /// A quote is fresh while younger than this, for clearing and wallet
-    /// valuation alike.
+    /// A quote is usable, for clearing, swap guidance and wallet prices alike,
+    /// while younger than this, measured from local receipt. Required; at most
+    /// 60 s, since this is what pauses clearing when both readers stall.
+    #[serde(rename = "quote_ttl_ms", with = "duration::ms")]
     pub quote_ttl: Duration,
+    /// Widest accepted spread, `10_000 × (ask − bid) / mid`, inclusive. A
+    /// wider quote makes its market invalid until the next valid one. Required.
+    pub max_spread_bps: u32,
+    /// Least displayed notional (`quantity × price`, in the symbol's quote
+    /// asset, e.g. `"5000"`) on each side of a quote, so a one-lot top of book
+    /// cannot set the price. Unset accepts any positive size.
+    pub min_notional: Option<String>,
+    /// Asset the price API values tokens in (`<ASSET><QUOTE>` markets).
+    pub valuation_quote_asset: AssetCode,
+    #[serde(rename = "connect_timeout_ms", with = "duration::ms")]
     pub connect_timeout: Duration,
+    #[serde(rename = "request_timeout_ms", with = "duration::ms")]
     pub request_timeout: Duration,
     /// Reconnect when no frame at all, not even a ping, arrives for this long:
     /// the connection is dead even if the socket has not noticed.
+    #[serde(rename = "idle_timeout_ms", with = "duration::ms")]
     pub idle_timeout: Duration,
     /// Reconnect when no quote arrives for this long although Binance still
     /// answers pings. A stalled stream server keeps the socket alive but sends
     /// no prices; a new connection usually lands on a healthy one.
+    #[serde(rename = "data_idle_timeout_ms", with = "duration::ms")]
     pub data_idle_timeout: Duration,
-    /// Longest planned connection; each lasts a random 50–100% of it.
+    /// Longest planned connection, below Binance's 24-hour limit; each lasts a
+    /// random 50–100% of it, so the two readers renew apart.
+    #[serde(rename = "connection_lifetime_secs", with = "duration::secs")]
     pub connection_lifetime: Duration,
-    pub retry: RetryPolicy,
-    /// Connection attempts per five minutes, both readers together; positive.
+    /// Backoff for reconnects and failed lookups: the step doubles from this...
+    #[serde(rename = "retry_min_ms", with = "duration::ms")]
+    pub retry_min: Duration,
+    /// ...up to this, and each wait is a random 50–100% of the step.
+    #[serde(rename = "retry_max_ms", with = "duration::ms")]
+    pub retry_max: Duration,
+    /// Connection attempts per 5 minutes, both readers together. Binance
+    /// allows 300 per IP, counted over every process behind that IP, so the
+    /// sum across processes must stay below 300.
     pub max_connection_attempts: usize,
-    /// At startup, how long failed `exchangeInfo` lookups are retried before
-    /// startup fails.
+    /// At startup, how long temporary `exchangeInfo` failures are retried
+    /// before startup fails.
+    #[serde(rename = "validation_timeout_secs", with = "duration::secs")]
     pub validation_timeout: Duration,
     /// A connection that delivered a valid quote and lasted this long resets
     /// its reader's backoff; one that drops sooner keeps backing off, so a
     /// flapping endpoint cannot drain the connection-attempt budget.
+    #[serde(rename = "stable_connection_secs", with = "duration::secs")]
     pub stable_connection: Duration,
-    /// How long the feed's tasks get to stop before they are aborted.
+    /// How long the feed's tasks get to stop at shutdown before they are
+    /// aborted, so a stuck DNS lookup cannot hold the process.
+    #[serde(rename = "shutdown_timeout_ms", with = "duration::ms")]
     pub shutdown_timeout: Duration,
     /// Repeated warnings (rejected quotes, reconnects) are logged at most once
     /// per this interval, with a count of the ones skipped.
+    #[serde(rename = "log_interval_secs", with = "duration::secs")]
     pub log_interval: Duration,
 }
 
+impl Default for BinanceConfig {
+    fn default() -> Self {
+        Self {
+            stream_endpoints: [
+                "wss://data-stream.binance.vision:443".to_string(),
+                "wss://stream.binance.com:443".to_string(),
+            ],
+            rest_endpoint: "https://data-api.binance.vision".to_string(),
+            quote_ttl: Duration::ZERO,
+            max_spread_bps: 0,
+            min_notional: None,
+            valuation_quote_asset: AssetCode::parse("USDT").expect("valid asset code"),
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(10),
+            // Three of Binance's 20 s ping intervals.
+            idle_timeout: Duration::from_secs(60),
+            data_idle_timeout: Duration::from_secs(60),
+            connection_lifetime: Duration::from_secs(23 * 60 * 60),
+            retry_min: Duration::from_millis(500),
+            retry_max: Duration::from_secs(60),
+            max_connection_attempts: 30,
+            validation_timeout: Duration::from_secs(60),
+            stable_connection: Duration::from_secs(60),
+            shutdown_timeout: Duration::from_secs(5),
+            log_interval: Duration::from_secs(10),
+        }
+    }
+}
+
+impl BinanceConfig {
+    /// What makes a quote usable; `min_notional` was checked when the
+    /// configuration loaded.
+    pub(crate) fn quote_limits(&self) -> QuoteLimits {
+        QuoteLimits {
+            max_spread_bps: self.max_spread_bps,
+            min_notional: self
+                .min_notional
+                .as_deref()
+                .and_then(parse_positive_decimal),
+        }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            min_delay: self.retry_min,
+            max_delay: self.retry_max,
+        }
+    }
+}
+
+/// `Duration`s written in `solver.toml` as whole milliseconds or seconds.
+mod duration {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub mod ms {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &Duration,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_u64(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Duration, D::Error> {
+            u64::deserialize(deserializer).map(Duration::from_millis)
+        }
+    }
+
+    pub mod secs {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &Duration,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_u64(value.as_secs())
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Duration, D::Error> {
+            u64::deserialize(deserializer).map(Duration::from_secs)
+        }
+    }
+}
+
 /// Feed counters for `/metrics`. Per-reader counters are indexed like
-/// [`FeedConfig::stream_endpoints`].
+/// [`BinanceConfig::stream_endpoints`].
 #[derive(Debug, Default)]
 pub struct FeedMetrics {
+    /// Each reader's stream endpoint, the label of its metrics.
+    pub(crate) endpoints: [String; READERS],
     pub(crate) connected: [AtomicBool; READERS],
     /// Successful handshakes per reader.
     pub(crate) connections: [AtomicU64; READERS],
@@ -135,14 +266,95 @@ pub struct FeedMetrics {
     pub(crate) conflicting_updates: AtomicU64,
     /// Receipt-to-publication delay of the newest quote in the last publication.
     pub(crate) last_publish_delay_us: AtomicU64,
-    /// Failed `exchangeInfo` lookups.
-    pub(crate) lookup_failures: AtomicU64,
     /// Attempts the shared connection budget delayed.
     pub(crate) budget_waits: AtomicU64,
-    /// Symbols the readers subscribe.
-    pub(crate) markets_confirmed: AtomicU64,
-    /// Configured uses of a symbol that is subscribed but not trading.
-    pub(crate) halted_markets: AtomicU64,
+}
+
+impl FeedMetrics {
+    /// Append the feed's metrics in Prometheus text format: reader health,
+    /// market confirmation, publication, and each symbol's quote state. A
+    /// quote is `valid` when its newest update passed validation and `fresh`
+    /// when it is also younger than the clearing TTL; alerts belong on `fresh`.
+    pub(crate) fn render(&self, snapshot: &PriceSnapshot, body: &mut String) {
+        use std::fmt::Write;
+
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            // The position keeps two readers on one endpoint apart.
+            let reader = format!("reader=\"{index}\",endpoint=\"{endpoint}\"");
+            let connected = u8::from(self.connected[index].load(Ordering::Relaxed));
+            let _ = writeln!(body, "solver_price_feed_connected{{{reader}}} {connected}");
+            for (metric, counters) in [
+                ("solver_price_feed_connections_total", &self.connections),
+                ("solver_price_feed_frames_total", &self.frames),
+                (
+                    "solver_price_feed_discarded_frames_total",
+                    &self.discarded_frames,
+                ),
+                (
+                    "solver_price_feed_rejected_quotes_total",
+                    &self.rejected_quotes,
+                ),
+            ] {
+                let _ = writeln!(body, "{metric}{{{reader}}} {}", load(&counters[index]));
+            }
+        }
+        for (metric, counter) in [
+            ("solver_price_feed_reader_panics_total", &self.reader_panics),
+            (
+                "solver_price_feed_server_shutdowns_total",
+                &self.server_shutdowns,
+            ),
+            ("solver_price_feed_publications_total", &self.publications),
+            (
+                "solver_price_feed_conflicting_updates_total",
+                &self.conflicting_updates,
+            ),
+            ("solver_price_feed_budget_waits_total", &self.budget_waits),
+        ] {
+            let _ = writeln!(body, "{metric} {}", load(counter));
+        }
+        let delay = Duration::from_micros(load(&self.last_publish_delay_us));
+        let _ = writeln!(
+            body,
+            "solver_price_feed_publish_delay_seconds {}",
+            delay.as_secs_f64()
+        );
+        let now = Instant::now();
+        for (symbol, quote) in snapshot.quotes() {
+            let (valid, fresh, age) = match quote {
+                SymbolQuote::Valid(quote) => {
+                    let age = now.saturating_duration_since(quote.received_at);
+                    (1, u8::from(age < snapshot.ttl()), Some(age.as_secs_f64()))
+                }
+                SymbolQuote::Missing | SymbolQuote::Invalid { .. } => (0, 0, None),
+            };
+            let _ = writeln!(
+                body,
+                "solver_price_quote_valid{{symbol=\"{symbol}\"}} {valid}"
+            );
+            let _ = writeln!(
+                body,
+                "solver_price_quote_fresh{{symbol=\"{symbol}\"}} {fresh}"
+            );
+            if let Some(age) = age {
+                let _ = writeln!(
+                    body,
+                    "solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} {age}"
+                );
+            }
+        }
+    }
+}
+
+impl FeedMetrics {
+    /// Counters for readers on `endpoints`.
+    pub fn new(endpoints: [String; READERS]) -> Self {
+        Self {
+            endpoints,
+            ..Self::default()
+        }
+    }
 }
 
 /// Failures that stop the feed, and with it the solver.
@@ -334,13 +546,12 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, FeedError> {
 async fn confirm_markets(
     plan: &MarketPlan,
     http: &reqwest::Client,
-    config: &FeedConfig,
+    config: &BinanceConfig,
     gate: &Gate,
-    metrics: &FeedMetrics,
     cancel: &CancellationToken,
 ) -> Result<Option<Markets>, FeedError> {
     let deadline = tokio::time::Instant::now() + config.validation_timeout;
-    let mut backoff = Backoff::new(config.retry);
+    let mut backoff = Backoff::new(config.retry_policy());
     let mut listings: HashMap<Symbol, Option<Listing>> = HashMap::new();
     let mut pending: Vec<Symbol> = plan.symbols().into_iter().collect();
     let unreachable = |pending: usize, error: Option<LookupError>| FeedError::BinanceUnreachable {
@@ -370,7 +581,6 @@ async fn confirm_markets(
                     listings.insert(symbol, listing);
                 }
                 Ok(Some(Err(error))) => {
-                    metrics.lookup_failures.fetch_add(1, Ordering::Relaxed);
                     if !error.is_transient() {
                         return Err(FeedError::LookupFailed {
                             symbol,
@@ -412,12 +622,6 @@ async fn confirm_markets(
     for issue in &halted {
         tracing::warn!(%issue, "Binance market not trading; subscribed, paused until it trades");
     }
-    metrics
-        .markets_confirmed
-        .store(markets.symbols().len() as u64, Ordering::Relaxed);
-    metrics
-        .halted_markets
-        .store(halted.len() as u64, Ordering::Relaxed);
     tracing::info!(
         symbols = markets.symbols().len(),
         halted = halted.len(),
@@ -581,7 +785,7 @@ pub(super) static PANIC_ON_ENDPOINT: Mutex<Option<String>> = Mutex::new(None);
 /// Run the feed until `cancel`. `ready` gets the outcome of the startup
 /// market check. An error is irrecoverable: the caller stops the solver.
 pub(super) async fn run_feed(
-    config: FeedConfig,
+    config: BinanceConfig,
     plan: MarketPlan,
     output: watch::Sender<Arc<PriceSnapshot>>,
     metrics: Arc<FeedMetrics>,
@@ -604,7 +808,7 @@ pub(super) async fn run_feed(
         .timeout(config.request_timeout)
         .build()?;
     let gate = Arc::new(Gate::new(config.max_connection_attempts, ATTEMPT_WINDOW));
-    let markets = match confirm_markets(&plan, &http, &config, &gate, &metrics, &cancel).await {
+    let markets = match confirm_markets(&plan, &http, &config, &gate, &cancel).await {
         Ok(Some(markets)) => Arc::new(markets),
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -638,7 +842,7 @@ pub(super) async fn run_feed(
             endpoint: endpoint.clone(),
             url: stream_url(&endpoint, &markets),
             markets: markets.clone(),
-            limits: config.limits,
+            limits: config.quote_limits(),
             tls: tls.clone(),
             connect_timeout: config.connect_timeout,
             idle_timeout: config.idle_timeout,
@@ -654,7 +858,7 @@ pub(super) async fn run_feed(
             endpoint,
             move |lifetime| run_connection(context.clone(), lifetime),
             gate.clone(),
-            config.retry,
+            config.retry_policy(),
             config.connection_lifetime,
             config.log_interval,
             metrics.clone(),
@@ -710,7 +914,7 @@ pub(crate) type FeedReady = oneshot::Receiver<Result<(), String>>;
 /// However the thread ends — an irrecoverable error, a panic, or after
 /// `cancel` — it cancels `cancel`, so a failed feed stops the solver.
 pub(crate) fn spawn_price_feed_thread(
-    config: FeedConfig,
+    config: BinanceConfig,
     plan: MarketPlan,
     output: watch::Sender<Arc<PriceSnapshot>>,
     metrics: Arc<FeedMetrics>,

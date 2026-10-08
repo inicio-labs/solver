@@ -641,14 +641,9 @@ pub fn fetch_token_rows_tx(
         .collect())
 }
 
-pub fn register_token_tx(
-    conn: &mut PgConnection,
-    token: TokenId,
-    external_symbol: Option<&str>,
-) -> DbResult<bool> {
+pub fn register_token_tx(conn: &mut PgConnection, token: TokenId) -> DbResult<bool> {
     let row = RegisteredTokenRow {
         token_id: token.to_bytes(),
-        external_symbol: external_symbol.map(str::to_owned),
         decimals: None,
         ticker: None,
     };
@@ -677,31 +672,8 @@ pub fn set_token_metadata_tx(
     )
 }
 
-pub fn update_token_symbol_tx(
-    conn: &mut PgConnection,
-    token: TokenId,
-    symbol: Option<&str>,
-) -> DbResult<bool> {
-    Ok(
-        diesel::update(registered_tokens::table.find(token.to_bytes()))
-            .set(registered_tokens::external_symbol.eq(symbol.map(str::to_owned)))
-            .execute(conn)?
-            == 1,
-    )
-}
-
 pub fn unregister_token_tx(conn: &mut PgConnection, token: TokenId) -> DbResult<bool> {
     Ok(diesel::delete(registered_tokens::table.find(token.to_bytes())).execute(conn)? == 1)
-}
-
-pub fn load_token_symbols_tx(conn: &mut PgConnection) -> DbResult<HashMap<TokenId, String>> {
-    let mut result = HashMap::new();
-    for row in get_registered_tokens_tx(conn)? {
-        if let Some(symbol) = &row.external_symbol {
-            result.insert(row.token()?, symbol.clone());
-        }
-    }
-    Ok(result)
 }
 
 /// On-chain decimals of every registered token that has them.
@@ -722,12 +694,9 @@ pub fn load_registered_tokens_tx(conn: &mut PgConnection) -> DbResult<Vec<TokenI
         .collect()
 }
 
-pub fn seed_tokens_from_config_tx(
-    conn: &mut PgConnection,
-    tokens: &[(TokenId, Option<String>)],
-) -> DbResult<()> {
-    for (token, symbol) in tokens {
-        register_token_tx(conn, *token, symbol.as_deref())?;
+pub fn seed_tokens_from_config_tx(conn: &mut PgConnection, tokens: &[TokenId]) -> DbResult<()> {
+    for token in tokens {
+        register_token_tx(conn, *token)?;
     }
     Ok(())
 }
@@ -1217,9 +1186,9 @@ mod tests {
         let second: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into()?;
         let first_id = first.to_bytes();
         let second_id = second.to_bytes();
-        assert!(register_token_tx(conn, first, Some("usd-coin"))?);
-        assert!(!register_token_tx(conn, first, Some("ignored"))?);
-        assert!(register_token_tx(conn, second, None)?);
+        assert!(register_token_tx(conn, first)?);
+        assert!(!register_token_tx(conn, first)?);
+        assert!(register_token_tx(conn, second)?);
         assert!(set_token_metadata_tx(conn, first, Some(6), Some("USDC"))?);
         assert!(set_token_metadata_tx(conn, second, Some(18), Some("WETH"))?);
 
@@ -1227,12 +1196,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[&first_id].decimals, Some(6));
         assert_eq!(rows[&first_id].ticker.as_deref(), Some("USDC"));
-        assert_eq!(rows[&first_id].external_symbol.as_deref(), Some("usd-coin"));
-        assert!(update_token_symbol_tx(conn, first, Some("usd-coin-new"))?);
-        assert_eq!(
-            load_token_symbols_tx(conn)?.get(&first).map(String::as_str),
-            Some("usd-coin-new")
-        );
         assert!(unregister_token_tx(conn, second)?);
         assert!(!unregister_token_tx(conn, second)?);
         Ok(())

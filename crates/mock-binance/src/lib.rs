@@ -381,6 +381,11 @@ impl MockBinance {
         lock(&self.shared.rest_failures).push_back(failure);
     }
 
+    /// `exchangeInfo` failures queued by [`Self::fail_rest`] and not served yet.
+    pub fn rest_failures_left(&self) -> usize {
+        lock(&self.shared.rest_failures).len()
+    }
+
     /// Answer the next `exchangeInfo` request about `symbol` with `failure`;
     /// requests about other symbols are unaffected.
     pub fn fail_rest_for(&self, symbol: &str, failure: Failure) {

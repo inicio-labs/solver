@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use consume_script::ConsumeAssetScript;
 use solver::matching::engine::MatchingEngine;
 use solver::matching::order_book::OrderBook;
-use solver::price::WatchPriceFeed;
+use solver::matching::price_feed::FixedPriceFeed;
 use miden_protocol::account::auth::AuthScheme;
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
@@ -102,7 +102,7 @@ async fn phase1_match_and_execute_multiple_orders() -> anyhow::Result<()> {
     let mock_chain = builder.build()?;
 
     // ── Run matching engine ──
-    let mut feed = WatchPriceFeed::new();
+    let mut feed = FixedPriceFeed::new();
     feed.set_price_cents(usdc_faucet.id(), 1);
     feed.set_price_cents(eth_faucet.id(), 2000);
 

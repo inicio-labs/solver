@@ -21,18 +21,20 @@ flowchart TB
         NODE["RPC node<br/>(rpc.&lt;net&gt;.miden.io)"]
         PROVER["tx-prover<br/>(remote, optional)"]
     end
-    CG["CoinGecko<br/>(USD prices)"]
+    BIN["Binance Spot<br/>(bookTicker, exchangeInfo)"]
     OPS["Operator / monitoring"]
 
     subgraph proc["solver-bin process"]
         subgraph main["main thread — current_thread runtime + LocalSet (Send services)"]
             MATCH["Matcher<br/>pairwise batch clearing"]
-            PRICE["Price feed task"]
             ADMIN["Admin HTTP<br/>127.0.0.1:3001"]
             OBS["Obs HTTP<br/>127.0.0.1:9090"]
         end
         subgraph ingestthr["ingest OS thread — !Send KEYLESS client"]
             INGEST["Ingest<br/>sync chain, parse PSWAP notes,<br/>detect consumed nullifiers"]
+        end
+        subgraph pricethr["price-feed OS thread — own runtime"]
+            PRICE["Two bookTicker readers<br/>+ publisher"]
         end
         subgraph exethr["executor OS thread — !Send KEYSTORE client"]
             EXEC["Executor<br/>build + submit settlement tx,<br/>capture surplus"]
@@ -44,7 +46,8 @@ flowchart TB
     NODE <-->|sync notes / nullifiers| INGEST
     NODE <-->|submit settlement| EXEC
     EXEC -.->|prove| PROVER
-    CG -->|prices| PRICE
+    BIN -->|bookTicker / exchangeInfo| PRICE
+    PRICE -->|price snapshot| MATCH
     OPS -->|Bearer token| ADMIN
     OPS -->|/health /readyz /metrics| OBS
 
@@ -56,21 +59,21 @@ flowchart TB
     INGEST <--> DB
     MATCH <--> DB
     EXEC <--> DB
-    PRICE --> DB
     ADMIN --> DB
     OBS --> DB
 ```
 
 ### Execution model (L2 threading)
 
-A miden `Client` is `!Send`, so the process is split across **three execution
+A miden `Client` is `!Send`, so the process is split across **four execution
 contexts** connected only by `Send` channels:
 
 | Context | Client | Role |
 |---|---|---|
 | **ingest OS thread** | keyless (no authenticator) | syncs the chain, parses PSWAP notes into orders, detects consumed-note nullifiers. Holds **no keys**. |
 | **executor OS thread** | keystore-backed | builds & submits the settlement transaction that consumes matched notes; captures surplus. The **only** signing path. |
-| **main thread** (`current_thread` runtime + `LocalSet`) | — | hosts the `Send` services: matcher, price feed, admin HTTP, obs HTTP. |
+| **price-feed OS thread** (own runtime) | — | two Binance `bookTicker` readers and the publisher of the price snapshot ([ADR 0004](docs/adr/0004-binance-bookticker-prices.md)). Kept off the main thread so a long clearing pass cannot stall its sockets. |
+| **main thread** (`current_thread` runtime + `LocalSet`) | — | hosts the `Send` services: matcher, admin HTTP, obs HTTP. |
 
 Data flow: `ingest → matcher` (new orders + consumed-note events) → `matcher →
 executor` (matched batches) → `executor → matcher` (re-feed of orders that
@@ -86,7 +89,7 @@ authoritative — the chain nullifier is the source of truth).
 | `crates/solver` | the engine: matching, ingest, executor, admin, obs, price, db. |
 | `crates/consume-script` | the MASM "consume-asset" tx script (sweeps surplus into the solver vault). |
 | `crates/e2e` | standalone devnet end-to-end harness (provision/fund/load/run). See [crates/e2e/README.md](crates/e2e/README.md). |
-| `crates/mock-price` | standalone mock CoinGecko price service (devnet/local pricing). Tiny, no miden deps. |
+| `crates/mock-binance` | local stand-in for Binance Spot market data (`exchangeInfo` + combined `bookTicker` stream) for devnet/local runs and tests. Tiny, no miden deps. |
 | `crates/mock-mirror` | devnet liquidity harness: posts favorable PSWAP counter-orders so the solver matches. See [crates/mock-mirror/README.md](crates/mock-mirror/README.md). |
 | `crates/lp-sdk` | `pswap-lp-sdk`: client SDK external DEXes (liquidity providers) use to receive and fill routed orders over the RFQ websocket. Standalone — no solver or `miden-client` dependency. See [crates/lp-sdk/README.md](crates/lp-sdk/README.md). |
 
@@ -138,11 +141,11 @@ SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integrat
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_already_consumed -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_three_user_direct -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_partial_fill -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_unpriced_direct -- --ignored
 ```
 
-The separate `integration_unpriced_direct` test is intentionally red for the
-pre-existing unpriced-token audit finding C2 and is not part of this migration
-gate; running `cargo test -p solver -- --ignored` without `--lib` includes it.
+`integration_unpriced_direct` locks audit finding C2: a pair whose Binance
+market is not confirmed never settles. CI runs all six.
 Deploy and rollback order for later schema changes is in
 [docs/postgres-runbook.md](docs/postgres-runbook.md#schema-migrations).
 
@@ -167,20 +170,20 @@ Deploy and rollback order for later schema changes is in
 |---|---|---|
 | `name` | ✅ | Human label, e.g. `"USDC-ETH"`. |
 | `asset_x_faucet_id` | ✅ | Hex faucet id of token X. |
-| `asset_x_external_symbol` | — | CoinGecko id for X (e.g. `"usd-coin"`). Needed for USD pricing; tokens without it aren't priced and won't match. |
+| `asset_x_binance_asset` | — | Binance asset code of X (e.g. `"ETH"`). The price API values X by the `<ASSET><valuation quote>` market; without it X has no price. |
 | `asset_y_faucet_id` | ✅ | Hex faucet id of token Y. |
-| `asset_y_external_symbol` | — | CoinGecko id for Y (e.g. `"ethereum"`). |
+| `asset_y_binance_asset` | — | Binance asset code of Y (e.g. `"USDT"`). |
+| `binance_symbol` | — | Approved Binance Spot symbol of the direct X/Y market (e.g. `"ETHUSDT"`); needs both asset codes. Without it the pair never clears internally. Orientation comes from Binance's listing. |
 
 ### `[engine]`
 | Field | Req | Default | Description |
 |---|---|---|---|
 | `pulse_interval_ms` | ✅ | — | Matcher tick interval. |
 | `fetch_interval_ms` | ✅ | — | Chain sync interval (ingest + executor). |
-| `price_interval_ms` | ✅ | — | How often the price task polls CoinGecko. |
-| `clearing_fee_ppm` | — | `0` | Protocol fee and minimum eligibility edge in ppm. Clearing always uses fresh exact reference prices. |
+| `clearing_fee_ppm` | — | `0` | Protocol fee and minimum eligibility edge in ppm. Clearing always uses a fresh, exact Binance midpoint. |
 | `admin_port` | — | `3001` | Admin HTTP port (binds `127.0.0.1` only). |
 | `obs_port` | — | `9090` | Observability HTTP port (binds `127.0.0.1` only). |
-| `debug_mode` | — | `false` | MASM debug instrumentation. **MUST be `false` on mainnet.** |
+| `debug_mode` | — | `false` | Ignored since Miden 0.16 (miden-client removed debug mode); a warning is logged if set. |
 | `readiness_freshness_secs` | — | `60` | `/readyz` returns 503 if the last successful sync is older than this. |
 | `verify_interval_ms` | — | `5000` | In verification mode (cannot settle: no fee headroom, RPC or PostgreSQL down), how often the executor re-checks before accepting batches again. |
 | `router_enabled` | — | `false` | Must remain disabled: the clearing matcher does not route notes externally. |
@@ -189,71 +192,82 @@ Deploy and rollback order for later schema changes is in
 > [docs/external-liquidity-routing.md](docs/external-liquidity-routing.md). DEX-side
 > integration + the `pswap-lp-sdk`: [docs/filler-integration.md](docs/filler-integration.md).
 
-### Price feed — devnet without CoinGecko
+### `[binance]` — the price source
 
-The matcher needs a USD price for **both** tokens of a pair. The solver always
-uses its real `HttpPriceClient`; only the **base URL** is configurable via
-`[engine].price_api_base_url` (default: public CoinGecko). On **devnet/local**
-the faucet tokens aren't listed and you may have no `COINGECKO_API_KEY`, so run
-the bundled **mock CoinGecko** service and point the solver at it — exercising
-the exact same price path, no test-only code:
+Binance Spot public market data is the solver's only price source
+([ADR 0004](docs/adr/0004-binance-bookticker-prices.md)); no API key. Two readers
+each stream every configured symbol's `<symbol>@bookTicker`; the publisher keeps
+the highest update ID per symbol and publishes the exact midpoint
+`(bid + ask) / 2`. The matcher clears a pair only while its quote is younger
+than `quote_ttl_ms`; the price API applies the same TTL.
 
-The solver queries the price API by each pair's `asset_*_external_symbol`. For
-your own faucets the simplest convention is **`external_symbol = the faucet id
-hex`** — then the price "id" *is* the faucet id, so you price a faucet by its id:
+| Field | Req | Default | Description |
+|---|---|---|---|
+| `quote_ttl_ms` | ✅ | — | A quote is usable — for clearing, swap guidance and wallet prices alike — while `now − received_at < quote_ttl_ms` (local receipt time). At most `60000`: the TTL is what pauses clearing when both readers stall. |
+| `max_spread_bps` | ✅ | — | Widest accepted spread `10_000 × (ask − bid) / mid`, inclusive. A wider or crossed quote makes the symbol invalid until a newer valid one. |
+| `min_notional` | — | unset | Least displayed notional (`quantity × price`, in the symbol's quote asset, e.g. `"5000"`) on each side of a quote; a thinner side makes the quote invalid, so a one-lot top of book cannot set the price. Unset accepts any positive size. |
+| `stream_endpoints` | — | `["wss://data-stream.binance.vision:443", "wss://stream.binance.com:443"]` | Stream base URLs (scheme and host only) of the two readers; logs and metrics name each reader by its endpoint. Different endpoints by default, so one endpoint failing does not take out both readers. Binance refuses some regions on the main endpoint (observed for the US); there, point both readers at the market-data endpoint. Plaintext `ws://` is accepted for loopback hosts only. |
+| `rest_endpoint` | — | `https://data-api.binance.vision` | `exchangeInfo` checks (scheme and host only), one request per symbol. |
+| `valuation_quote_asset` | — | `"USDT"` | The price API values each token by `<ASSET><QUOTE>`; the quote asset itself is worth 1. |
+| `connect_timeout_ms` / `request_timeout_ms` | — | `10000` | Handshake and HTTP timeouts. |
+| `idle_timeout_ms` | — | `60000` | Reconnect a stream with no frame at all; Binance pings every 20 s. |
+| `data_idle_timeout_ms` | — | `60000` | Reconnect a stream that stays up but delivers no quote (a stalled backend keeps pinging). |
+| `connection_lifetime_secs` | — | `82800` | Longest connection, below Binance's 24 h limit; each lasts a random 50–100% of it, so the readers renew apart. |
+| `retry_min_ms` / `retry_max_ms` | — | `500` / `60000` | Jittered exponential backoff (each delay a random 50–100% of its step, capped) for reconnects and `exchangeInfo` retries. |
+| `max_connection_attempts` | — | `30` | Connection attempts per 5 minutes, both readers together. Binance allows 300 per IP counted over every process behind that IP, so the sum across your processes must stay below 300 (each value 1–299). |
+| `validation_timeout_secs` | — | `60` | How long startup retries failed `exchangeInfo` lookups before it fails. |
+| `stable_connection_secs` | — | `60` | A connection that delivered a quote and lasted this long resets its reader's backoff, so a flapping endpoint keeps backing off. |
+| `shutdown_timeout_ms` | — | `5000` | How long the feed's tasks get to stop at shutdown before they are aborted, so a stuck DNS lookup cannot hold the process. |
+| `log_interval_secs` | — | `10` | Repeated feed warnings (rejected quotes, reconnects) are logged at most once per interval, with a count of the skipped ones. |
 
+At startup every configured market is checked once through `exchangeInfo`,
+and startup fails on any problem, with all of them listed, so the
+configuration is fixed before the solver runs:
+
+- a symbol Binance does not list, lists with other assets, or lists with spot
+  trading disallowed. This includes the wallet-valuation market of every
+  token with a Binance asset code, `<ASSET><valuation_quote_asset>` (e.g.
+  `USDCUSDT`);
+- a clearing pair whose token has no on-chain decimals yet (startup reads them
+  from the database once ingest has fetched them);
+- a lookup that cannot succeed (a wrong REST path, another bad request, an
+  unreadable answer): startup fails at once;
+- a lookup still failing for a temporary reason (a network failure or
+  timeout, a rate limit, a Binance server error) at `validation_timeout_secs`:
+  such lookups are retried with backoff until then.
+
+A symbol in a temporary state (`BREAK`, `HALT`) is subscribed with a warning
+instead: its book sends nothing until trading resumes, so the TTL pauses the
+pair, and it resumes on its own. Markets are static configuration: a new market
+means a change to `solver.toml` and a restart.
+
+Binance's `serverShutdown` event, which precedes a disconnect, reconnects at
+once; a connection that keeps answering pings but delivers no quote is replaced
+after `data_idle_timeout_ms`.
+
+**Devnet / local.** Faucet tokens have no Binance market of their own, so run
+the bundled mock (`crates/mock-binance`) and point both endpoints at it:
+
+```bash
+cargo run -p mock-binance --release -- \
+  --market ETHUSDT=ETH/USDT:2718.65/2718.66 --market BTCUSDT=BTC/USDT:86369.99/86370
+# change a quote at runtime / inspect them
+curl "http://127.0.0.1:8089/set?symbol=ETHUSDT&bid=3000&ask=3000.5"
+curl  "http://127.0.0.1:8089/markets"
+```
 ```toml
-# solver.toml
-[[pairs]]
-name = "TOK_A-TOK_B"
-asset_x_faucet_id       = "0x<faucetA>"
-asset_x_external_symbol = "0x<faucetA>"   # id == faucet id
-asset_y_faucet_id       = "0x<faucetB>"
-asset_y_external_symbol = "0x<faucetB>"
-
-[engine]
-price_api_base_url = "http://127.0.0.1:8089/api/v3/simple/price"
+[binance]
+stream_endpoints = ["ws://127.0.0.1:8089", "ws://127.0.0.1:8089"]
+rest_endpoint = "http://127.0.0.1:8089"
+quote_ttl_ms = 30000
+max_spread_bps = 100
 ```
-
-> **id vs usd:** in every entry (`--price <id>=<usd>`, `/set?id=&usd=`, and the
-> response `{"<id>":{"usd":<n>}}`) the **id/left side is the faucet id**, and
-> **`usd` is the price field** — its value is the price (a plain number), and the
-> field name stays `usd` because that's what the solver reads. Don't put a faucet
-> id in the price value. The numbers only need a **consistent scale** — the
-> matcher compares ratios, not real dollars (e.g. A=2.5, B=1.0 ⇒ 1 A = 2.5 B).
-
-Run the standalone **mock CoinGecko** crate (`crates/mock-price` — tiny, no miden
-deps). It's fully runtime-configurable — **keep adding faucets without restarting**:
-
-```bash
-# A live JSON config file (id -> usd). Re-read on EVERY request, so editing it
-# to add/change faucets takes effect immediately. Created if missing.
-cargo run -p mock-price --release -- --port 8089 --prices-file prices.json
-
-# also accepts inline seeds and a catch-all default:
-#   --price 0x<faucetA>=2.50 --price 0x<faucetB>=3000   (seed specific ids)
-#   --default-usd 1.0                                   (price ANY id, zero config)
-#   --drift-bps 50                                      (jitter each request)
-```
-
-Add or change a faucet two ways, anytime, no restart:
-
-```bash
-# 1) edit prices.json  ->  {"0x<faucetA>": 2.5, "0x<faucetC>": 4.0, ...}
-# 2) over HTTP (also persisted back into prices.json if --prices-file is set):
-curl "http://127.0.0.1:8089/set?id=0x<faucetC>&usd=4.0"
-curl  "http://127.0.0.1:8089/prices"     # inspect the current table
-```
-
-The endpoint the solver calls is `GET /api/v3/simple/price?ids=<csv>&vs_currencies=usd`
-→ `{"<id>":{"usd":<f64>}}`. `e2e provision` writes `price_api_base_url`
-automatically. Leave it unset for live CoinGecko. **Don't pin a mock on mainnet.**
+`e2e provision` writes this section; **don't point a mainnet solver at a mock.**
 
 ### Environment variables
 | Var | Description |
 |---|---|
 | `SOLVER_ADMIN_TOKEN` | Bearer token for `/admin/*`. **If unset, all admin routes return 404** (token management disabled). |
-| `COINGECKO_API_KEY` | Sent as `x-cg-demo-api-key`. Without it the public free tier applies (rate-limited / may 403). |
 | `RUST_LOG` | Log filter. Default `info,solver=info`. Use `solver=debug` for per-tick matcher detail. |
 | `LOG_FORMAT` | `pretty` (default) or `json` for log aggregators. |
 | `SOLVER_CONFIG` | Config path (overridden by `--config`). |
@@ -283,37 +297,34 @@ the keystore, and emits a ready config.
 
 ## Adding a trading pair
 
-A "pair" is just two tokens the solver tracks + prices. Two ways:
-
-**1. Static (config, requires restart)** — add a `[[pairs]]` block:
+A "pair" is two tokens the solver tracks, priced by an approved Binance market.
+Pairs and their markets are **static configuration** (restart to change) — add a
+`[[pairs]]` block:
 ```toml
 [[pairs]]
-name = "USDC-ETH"
-asset_x_faucet_id = "0x…usdc_faucet"
-asset_x_external_symbol = "usd-coin"
-asset_y_faucet_id = "0x…eth_faucet"
-asset_y_external_symbol = "ethereum"
+name = "ETH-USDC"
+asset_x_faucet_id = "0x…eth_faucet"
+asset_x_binance_asset = "ETH"
+asset_y_faucet_id = "0x…usdc_faucet"
+asset_y_binance_asset = "USDC"
+binance_symbol = "ETHUSDC"
 ```
 
-**2. Runtime (admin API, no restart)** — register each token (requires
-`SOLVER_ADMIN_TOKEN`). Registering a token both **subscribes ingest** to its
-notes and **enables pricing**:
+The admin API (requires `SOLVER_ADMIN_TOKEN`) registers a token at runtime, which
+**subscribes ingest** to its notes. It accepts only a token mapped to a Binance
+asset in `solver.toml` (others get `422`), since prices come from that file
+alone:
 ```bash
 curl -X POST http://127.0.0.1:3001/admin/tokens \
   -H "Authorization: Bearer $SOLVER_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"token_id":"0x…usdc_faucet","external_symbol":"usd-coin"}'
-
-curl -X POST http://127.0.0.1:3001/admin/tokens \
-  -H "Authorization: Bearer $SOLVER_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"token_id":"0x…eth_faucet","external_symbol":"ethereum"}'
+  -d '{"token_id":"0x…eth_faucet"}'
 ```
-Other admin routes: `GET /admin/tokens` (list), `PATCH /admin/tokens` (update
-symbol), `DELETE /admin/tokens` (remove) — same body shape, all Bearer-auth.
+Other admin routes: `GET /admin/tokens` (list) and `DELETE /admin/tokens`
+(remove) — same body shape, all Bearer-auth.
 
-Once both tokens of a pair are registered and priced, the matcher will pair any
-crossing orders between them automatically.
+Once a configured pair's Binance market is confirmed and quoting, the matcher
+clears crossing orders between the two tokens automatically.
 
 ---
 
@@ -321,7 +332,8 @@ crossing orders between them automatically.
 
 - `GET http://127.0.0.1:9090/health` — liveness (always 200 while the process is up).
 - `GET http://127.0.0.1:9090/readyz` — readiness: 200 only if a PostgreSQL read answers, the writer still holds its ownership lock, and the last sync is recent; otherwise 503. The schema is verified once at startup.
-- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure.
+- `GET http://127.0.0.1:9090/metrics` — Prometheus text counters and gauges for PostgreSQL operations, writer ownership, channel capacity, and matching ticks skipped under executor backpressure. For the Binance feed, per reader (`{reader="0"|"1",endpoint="…"}`, the position and endpoint in `stream_endpoints`): `solver_price_feed_connected`, `_connections_total`, `_frames_total`, `_discarded_frames_total`, `_rejected_quotes_total`; overall: `_reader_panics_total`, `_server_shutdowns_total`, `_publications_total`, `_conflicting_updates_total` (the two endpoints disagreed on one update ID), `_budget_waits_total` (attempts the shared connection budget delayed), `solver_price_feed_publish_delay_seconds`; per symbol: `solver_price_quote_valid{symbol}` (the newest update passed validation), `solver_price_quote_fresh{symbol}` (and is younger than the TTL — alert on this one), `solver_price_quote_age_seconds{symbol}`; and for the matcher `solver_matcher_price_skips_total{reason}` (`no_market`, `no_quote`, `invalid`, `stale`, `future_receipt`).
+  Suggested alerts: `solver_price_quote_fresh == 0` for a configured symbol longer than a few TTLs; `solver_price_feed_connected == 0` on both readers; `solver_price_feed_conflicting_updates_total` rising (endpoint divergence); `rate(solver_matcher_price_skips_total{reason="stale"})` while orders wait.
 
 ---
 
@@ -338,20 +350,25 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
 ```
 ```jsonc
 // GET /v1/price/0x8fe0…?precision=4
-{ "faucet_id":"0x8fe0…", "ticker":"USDC", "vs_currency":"usd",
-  "price":"1.0000",      // price of ONE WHOLE token; value a base-unit amount via (units / 10^decimals) * price
+{ "faucet_id":"0x8fe0…", "ticker":"ETH", "vs_currency":"usdt",
+  "price":"2718.6550",   // price of ONE WHOLE token; value a base-unit amount via (units / 10^decimals) * price
   "precision":"4",       // decimals of the PRICE number (config `price_precision` or ?precision=full|0-18)
   "decimals":8,          // the TOKEN's on-chain decimals (fetched on-chain; null until known) — distinct from `precision`
-  "as_of":1781896971, "stale":false, "source":"coingecko" }
+  "as_of":1781896971, "stale":false, "source":"binance" }
 ```
-- **404** unknown faucet · **503** registered-but-no-price, or stale (older than
-  `price_staleness_secs`; pass `?allow_stale=true` to get a 200 with `stale:true`)
-  · **400** bad faucet id / precision / over-`price_query_max_batch`.
-- Prices come from the same feed the matcher uses (CoinGecko or the `mock-price`
-  service via `price_api_base_url`); `decimals`/`ticker` are fetched on-chain
+- **404** unknown faucet · **503** `no_market` (no Binance market configured for
+  the token — nothing to retry), `no_price` (its market has no valid quote right
+  now), or `stale` (quote at least `quote_ttl_ms` old; pass
+  `?allow_stale=true` to get a 200 with `stale:true`) · **400** bad faucet id /
+  precision / over-`price_query_max_batch`.
+- A token's price is the exact Binance midpoint of `<ASSET><QUOTE>` (its
+  `asset_*_binance_asset` against `[binance].valuation_quote_asset`, default
+  USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   **once, when a token is registered** (config tokens at boot, admin-added tokens
-  via the subscribe relay), then cached — never re-polled. Quote currency is
-  `price_vs_currency` (default `usd`; not `usdt`).
+  via the subscribe relay), then cached — never re-polled.
+- `/v1/swap-eta` reports `marketPrice` (exact, up to 18 places) and
+  `offMarket` from the pair's clearing market under the same TTL the matcher
+  uses (`null` without a fresh quote).
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).
@@ -378,19 +395,24 @@ cargo test -p consume-script       # MASM script compiles + behaves
     price yet → `503` (not a misleading 404).
   - **Faithful price:** a sub-$1 value (`0.0034`) is preserved at `full`, never
     rounded to `0.00`.
-  - **Precision (mirrors CoinGecko):** `?precision=2` formats to 2 dp; `0` → an
+  - **Precision:** `?precision=2` rounds half up to 2 dp; `0` → an
     integer; `18` is accepted; `19`, `-1`, and garbage → `400`; omitting the
     param falls back to the configured `price_precision` default.
   - **Token decimals & ticker:** served from the on-chain-fetched DB columns
     (populated once at registration); `null` (never a fabricated default) until
     that fetch lands.
-  - **Staleness fails closed:** an old snapshot → `503`, unless
+  - **Staleness fails closed:** a quote at least the TTL old → `503`, unless
     `?allow_stale=true` (then `200` with `"stale":true`).
   - **Batch (`/v1/prices`):** returns a map, caps the id count (`> max_batch` →
-    `400`), and omits unknown/unpriced ids CoinGecko-style (empty `ids` → empty map).
+    `400`), and omits unknown, unpriced and stale ids (empty `ids` → empty map).
   - **Surface hardening:** malformed faucet id → `400` with a JSON error body;
-    routes are `/v1`-scoped (no prefix → `404`) and GET-only (`POST` → `405`);
-    `vs_currency` is config-driven and echoed back.
+    routes are `/v1`-scoped (no prefix → `404`) and GET-only (`POST` → `405`).
+- **Binance price feed** (`crates/solver/src/price/binance`): exact midpoint,
+  orientation, spread and TTL boundaries (incl. proptests), and the feed's two
+  readers against `mock-binance` — reconnects, `Retry-After`, invalid quotes,
+  frame limits, a blocked caller thread, reader panics. A live check against
+  Binance's public endpoints:
+  `cargo test -p solver --lib live_binance -- --ignored --nocapture`.
 - **Live devnet end-to-end:** see [crates/e2e/README.md](crates/e2e/README.md)
   (`provision → load → run`, verifies on-chain settlement). The price API was
   also verified live on devnet — the ingest thread fetched MTA's on-chain
@@ -413,13 +435,12 @@ cargo run -p e2e --release -- provision
 # 3. Create and fill the config.
 cp solver.toml.example solver.toml
 #    Set: [rpc] endpoint/timeout; [solver] account_id + the keystore/3 store
-#    paths; one or more [[pairs]] with faucet ids + CoinGecko symbols;
-#    [engine] intervals/ports. (See the Configuration tables above.)
+#    paths; one or more [[pairs]] with faucet ids, Binance asset codes and
+#    the approved binance_symbol; [engine] intervals/ports; [binance]
+#    quote_ttl_ms + max_spread_bps. (See the Configuration tables above.)
 
-# 4. Provide secrets via env (admin token enables runtime token management;
-#    CoinGecko key avoids free-tier 403s).
+# 4. Provide secrets via env (admin token enables runtime token management).
 export SOLVER_ADMIN_TOKEN="$(openssl rand -hex 32)"
-export COINGECKO_API_KEY="<your-key>"
 
 # 5. Run.
 ./target/release/solver-bin --config solver.toml

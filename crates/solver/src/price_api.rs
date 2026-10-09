@@ -12,9 +12,11 @@
 //!
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
-//! while younger than the quote TTL. Decimals + ticker come from the DB
-//! (fetched on-chain by ingest). The book depth for swap quotes comes from
-//! [`mirror_depth`], which this thread runs: the matcher only sends changes.
+//! while younger than the quote TTL. The registered tokens (config only), with
+//! their decimals and tickers, are read from the DB once at startup and kept in
+//! memory, so public traffic never touches PostgreSQL. The book depth for swap
+//! quotes comes from [`mirror_depth`], which this thread runs: the matcher only
+//! sends changes.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,7 +32,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use miden_protocol::account::AccountId;
-use miden_protocol::crypto::utils::Serializable;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
@@ -40,7 +41,6 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::db::postgres_models::RegisteredTokenRow;
-use crate::db::{self, DbPool};
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
@@ -80,7 +80,8 @@ pub struct PriceApiConfig {
 #[derive(Clone)]
 pub struct PriceApiState {
     prices: watch::Receiver<Arc<PriceSnapshot>>,
-    pool: DbPool,
+    /// The registered tokens, loaded once at startup.
+    tokens: Arc<HashMap<AccountId, RegisteredTokenRow>>,
     vs_currency: String,
     default_precision: PricePrecision,
     max_batch: usize,
@@ -98,13 +99,17 @@ impl PriceApiState {
     pub fn new(
         cfg: &PriceApiConfig,
         prices: watch::Receiver<Arc<PriceSnapshot>>,
-        pool: DbPool,
+        tokens: Vec<RegisteredTokenRow>,
         book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
         stats_rx: watch::Receiver<Arc<SettlementStats>>,
     ) -> Self {
+        let tokens = tokens
+            .into_iter()
+            .filter_map(|row| Some((row.token().ok()?, row)))
+            .collect();
         Self {
             prices,
-            pool,
+            tokens: Arc::new(tokens),
             vs_currency: cfg.vs_currency.clone(),
             default_precision: PricePrecision::parse(&cfg.precision)
                 .unwrap_or(PricePrecision::Full),
@@ -156,7 +161,6 @@ enum ApiError {
     Stale(i64),
     BadPrecision(String),
     BatchTooLarge(usize),
-    Internal,
 }
 
 impl IntoResponse for ApiError {
@@ -192,11 +196,6 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "batch_too_large",
                 format!("at most {max} ids per request"),
-            ),
-            ApiError::Internal => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "internal error".into(),
             ),
         };
         (status, Json(json!({ "error": code, "message": message }))).into_response()
@@ -258,7 +257,7 @@ fn quote_from_row(
     state: &PriceApiState,
     snapshot: &PriceSnapshot,
     account_id: AccountId,
-    row: RegisteredTokenRow,
+    row: &RegisteredTokenRow,
     precision: PricePrecision,
     allow_stale: bool,
 ) -> Result<PriceResponse, ApiError> {
@@ -280,7 +279,7 @@ fn quote_from_row(
     let decimals = row.token_decimals();
     Ok(PriceResponse {
         faucet_id: account_id.to_hex(),
-        ticker: row.ticker,
+        ticker: row.ticker.clone(),
         vs_currency: state.vs_currency.clone(),
         price: precision.format(price),
         precision: precision_label(precision),
@@ -302,9 +301,9 @@ async fn get_price(
     let precision = resolve_precision(&state, &q)?;
     let account_id = AccountId::from_hex(&faucet_id)
         .map_err(|error| ApiError::BadFaucetId(error.to_string()))?;
-    let row = token_rows(&state, vec![account_id])
-        .await?
-        .remove(&account_id)
+    let row = state
+        .tokens
+        .get(&account_id)
         .ok_or(ApiError::UnknownFaucet)?;
     let snapshot = state.prices.borrow().clone();
     Ok(Json(quote_from_row(
@@ -340,11 +339,10 @@ async fn get_prices(
         .into_iter()
         .filter_map(|id| AccountId::from_hex(id).ok())
         .collect();
-    let mut rows = token_rows(&state, accounts.clone()).await?;
     let snapshot = state.prices.borrow().clone();
     let mut out = HashMap::new();
     for account_id in accounts {
-        let Some(row) = rows.remove(&account_id) else {
+        let Some(row) = state.tokens.get(&account_id) else {
             continue;
         };
         if let Ok(resp) = quote_from_row(&state, &snapshot, account_id, row, precision, allow_stale)
@@ -401,24 +399,6 @@ struct SwapEtaResponse {
     median24h_seconds: Option<u64>,
 }
 
-/// Registered-token rows for `tokens`, in one read; unregistered ones are
-/// absent. Any database failure is a 500.
-async fn token_rows(
-    state: &PriceApiState,
-    tokens: Vec<AccountId>,
-) -> Result<HashMap<AccountId, RegisteredTokenRow>, ApiError> {
-    let keys: Vec<_> = tokens.iter().map(Serializable::to_bytes).collect();
-    let mut rows = state
-        .pool
-        .read_public(move |conn| db::postgres_db::fetch_token_rows_tx(conn, &keys))
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    Ok(tokens
-        .into_iter()
-        .filter_map(|token| Some((token, rows.remove(&token.to_bytes())?)))
-        .collect())
-}
-
 /// A required positive base-unit amount.
 fn required_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
     parse_amount(q, key)?.ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))
@@ -458,13 +438,12 @@ fn pair_ids(q: &HashMap<String, String>) -> Result<(AccountId, AccountId), ApiEr
 }
 
 /// Both tokens' on-chain decimals; `404` unless both are registered.
-async fn registered_decimals(
+fn registered_decimals(
     state: &PriceApiState,
     a: AccountId,
     b: AccountId,
 ) -> Result<(Option<u8>, Option<u8>), ApiError> {
-    let rows = token_rows(state, vec![a, b]).await?;
-    match (rows.get(&a), rows.get(&b)) {
+    match (state.tokens.get(&a), state.tokens.get(&b)) {
         (Some(row_a), Some(row_b)) => Ok((row_a.token_decimals(), row_b.token_decimals())),
         _ => Err(ApiError::UnknownFaucet),
     }
@@ -481,7 +460,7 @@ async fn get_pair_price(
 ) -> Result<Json<PairPriceResponse>, ApiError> {
     let (a, b) = pair_ids(&q)?;
     // 404 unless both are registered; the decimals come with the market.
-    registered_decimals(&state, a, b).await?;
+    registered_decimals(&state, a, b)?;
     let now = Instant::now();
     let market = state.prices.borrow().order_market(a, b, now)?;
     let fee_ppm = state.verdict_terms.fee_ppm;
@@ -513,7 +492,7 @@ async fn get_swap_eta(
         min_fill_step: parse_amount(&q, "min_fill_step")?,
     };
     // 404 unless both are registered.
-    registered_decimals(&state, a, b).await?;
+    registered_decimals(&state, a, b)?;
 
     // One price snapshot, one book snapshot, one clock reading.
     let book = state.book_rx.borrow().clone();
@@ -630,7 +609,7 @@ async fn get_swap_eta_v1(
     let (a, b) = pair_ids(&q)?;
     let offered_amount = required_amount(&q, "offered_amount")?;
     let requested_amount = required_amount(&q, "requested_amount")?;
-    let (d_a, d_b) = registered_decimals(&state, a, b).await?;
+    let (d_a, d_b) = registered_decimals(&state, a, b)?;
 
     // Book check — the incoming order (offer A, request B) crosses against the
     // top of the OPPOSITE pair (offer B, request A).
@@ -760,7 +739,7 @@ pub fn spawn_price_api_thread(
     prices: watch::Receiver<Arc<PriceSnapshot>>,
     depth_rx: mpsc::UnboundedReceiver<DepthChange>,
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
-    pool: DbPool,
+    tokens: Vec<RegisteredTokenRow>,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -780,7 +759,7 @@ pub fn spawn_price_api_thread(
             rt.block_on(async move {
                 let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
                 tokio::spawn(mirror_depth(depth_rx, book_tx));
-                let state = PriceApiState::new(&cfg, prices, pool, book_rx, stats_rx);
+                let state = PriceApiState::new(&cfg, prices, tokens, book_rx, stats_rx);
                 let app = build_app(state, &cfg);
 
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {

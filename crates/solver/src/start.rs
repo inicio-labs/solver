@@ -438,12 +438,25 @@ pub async fn start(
         swap_offmarket_tolerance_bps: config.engine.swap_offmarket_tolerance_bps,
         clearing_fee_ppm: config.engine.clearing_fee_ppm,
     };
+    // The registered tokens (config only) with the decimals and tickers ingest
+    // startup has just recorded: the price API keeps them in memory, so public
+    // traffic never reads PostgreSQL.
+    let tokens = match db_pool
+        .read(db::postgres_db::get_registered_tokens_tx)
+        .await
+    {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            let error = anyhow::Error::from(error).context("load registered tokens");
+            return Err(abort_startup(&cancel, threads, error).await);
+        }
+    };
     let spawned = crate::price_api::spawn_price_api_thread(
         price_api_cfg,
         channels.prices_rx,
         channels.depth_rx,
         channels.stats_rx,
-        db_pool.clone(),
+        tokens,
         cancel.clone(),
     );
     let price_api_ready_rx = match spawned {

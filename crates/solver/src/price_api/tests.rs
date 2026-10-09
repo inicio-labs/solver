@@ -1,4 +1,4 @@
-//! Price-API tests against an isolated PostgreSQL schema.
+//! Price-API tests, in memory: the API reads no database.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use miden_protocol::account::AccountId;
+use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
 };
@@ -13,13 +14,12 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
-use crate::db;
-use crate::db::postgres_test::TestDb;
+use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::PriceSnapshot;
 use crate::swap_eta::SettlementStats;
 
-/// Long enough that a slow database setup cannot make a fresh quote stale.
+/// Long enough that a slow test cannot make a fresh quote stale.
 const TTL: Duration = Duration::from_secs(3_600);
 
 fn faucet_a() -> AccountId {
@@ -45,7 +45,6 @@ fn received(fresh: bool) -> Instant {
 
 struct Harness {
     server: TestServer,
-    _db: TestDb,
 }
 
 fn cfg() -> PriceApiConfig {
@@ -66,36 +65,28 @@ fn cfg() -> PriceApiConfig {
     }
 }
 
-/// Seed `registered` = (faucet, decimals, ticker) rows and serve `snapshot`.
+/// Register `registered` = (faucet, decimals, ticker) and serve `snapshot`.
 async fn serve(
     registered: &[(AccountId, Option<u8>, Option<&str>)],
     snapshot: PriceSnapshot,
     book: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
-    let test_db = TestDb::new().await.unwrap();
-    let pool = test_db.pool.clone();
-    let rows: Vec<_> = registered
+    let tokens = registered
         .iter()
-        .map(|(id, dec, tick)| (*id, *dec, tick.map(str::to_owned)))
+        .map(|(id, decimals, ticker)| RegisteredTokenRow {
+            token_id: id.to_bytes(),
+            decimals: decimals.map(i32::from),
+            ticker: ticker.map(str::to_owned),
+        })
         .collect();
-    pool.write(move |conn| {
-        for (id, dec, tick) in rows {
-            db::postgres_db::register_token_tx(conn, id)?;
-            db::postgres_db::set_token_metadata_tx(conn, id, dec, tick.as_deref())?;
-        }
-        Ok(())
-    })
-    .await
-    .unwrap();
     // The receivers keep the values after their senders drop.
     let (_tx, prices) = watch::channel(Arc::new(snapshot));
     let (_book_tx, book_rx) = watch::channel(Arc::new(book));
     let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState::new(&cfg(), prices, pool, book_rx, stats_rx);
+    let state = PriceApiState::new(&cfg(), prices, tokens, book_rx, stats_rx);
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
-        _db: test_db,
     }
 }
 
@@ -183,7 +174,6 @@ fn url(faucet: AccountId, q: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unknown_faucet_is_404() {
     let h = harness(&[], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -191,7 +181,6 @@ async fn unknown_faucet_is_404() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn registered_but_unpriced_is_503() {
     let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -199,7 +188,6 @@ async fn registered_but_unpriced_is_503() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn happy_path_returns_price_decimals_ticker() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDC"))],
@@ -219,7 +207,6 @@ async fn happy_path_returns_price_decimals_ticker() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_formatting_and_subcent_preserved() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -243,7 +230,6 @@ async fn precision_formatting_and_subcent_preserved() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn decimals_null_until_fetched() {
     let h = harness(
         &[(faucet_a(), None, None)],
@@ -257,7 +243,6 @@ async fn decimals_null_until_fetched() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn stale_fails_closed_unless_allowed() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -279,7 +264,6 @@ async fn stale_fails_closed_unless_allowed() {
 
 /// A token without any Binance market gets a distinct, non-retryable code.
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unpriced_token_distinguishes_no_market_from_no_quote() {
     let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -288,7 +272,6 @@ async fn unpriced_token_distinguishes_no_market_from_no_quote() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_returns_map_and_caps_size() {
     let h = harness(
         &[
@@ -311,7 +294,6 @@ async fn batch_returns_map_and_caps_size() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_boundaries_and_config_default() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -340,7 +322,6 @@ async fn precision_boundaries_and_config_default() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn malformed_faucet_id_is_400() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -357,7 +338,6 @@ async fn malformed_faucet_id_is_400() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
     // faucet_a: registered + priced; faucet_b: registered but UNPRICED.
     let h = harness(
@@ -383,7 +363,6 @@ async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn valuation_quote_asset_is_worth_exactly_one() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDT"))],
@@ -398,7 +377,6 @@ async fn valuation_quote_asset_is_worth_exactly_one() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_omits_stale_unless_allowed() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -418,7 +396,6 @@ async fn batch_omits_stale_unless_allowed() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn routing_is_v1_scoped_and_get_only() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -452,7 +429,6 @@ async fn routing_is_v1_scoped_and_get_only() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn cors_header_present_for_browser_clients() {
     // A browser wallet / extension fetches cross-origin → the response must
     // carry Access-Control-Allow-Origin, else the browser blocks it.
@@ -501,7 +477,6 @@ fn a_for_b(rest: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_quotes_a_full_fill_at_market() {
     let h = swap_server(&registered(), Some("2"), buyers(3_000_000), running()).await;
     let v = swap_get(
@@ -528,7 +503,6 @@ async fn swap_eta_quotes_a_full_fill_at_market() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
     let h = swap_server(&registered(), Some("2"), buyers(1_000_000), running()).await;
     let v = swap_get(
@@ -551,7 +525,6 @@ async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
     // The executor has not started, or is in verification mode: the book
     // still fills the order, but not now.
@@ -568,7 +541,6 @@ async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_tolerates_a_small_gap_and_flags_a_large_one() {
     let mut stats = running();
     for d in [10u64, 30, 20] {
@@ -599,7 +571,6 @@ async fn swap_eta_tolerates_a_small_gap_and_flags_a_large_one() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_without_a_price_fills_nothing() {
     // No market for the pair at all.
     let h = swap_server(
@@ -639,7 +610,6 @@ async fn swap_eta_without_a_price_fills_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_reads_the_pair_in_either_direction() {
     // The pair is configured as A/B at 2 B per A; an order offering B for A
     // sees the reciprocal and takes the buyer's side. Sellers of A asking
@@ -658,7 +628,6 @@ async fn swap_eta_reads_the_pair_in_either_direction() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_responses_are_not_cached() {
     // Both versions must override the router-level `max-age` cache layer with
     // `no-store`, since their fields come from independently-updated snapshots.
@@ -688,7 +657,6 @@ async fn swap_eta_responses_are_not_cached() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn swap_eta_bad_input() {
     let h = swap_server(
         &registered(),
@@ -730,7 +698,6 @@ async fn swap_eta_bad_input() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn a_reversed_binance_listing_prices_and_quotes_the_same() {
     // Binance lists the pair the other way round (its base is B): the
     // stream carries 0.5, and both endpoints still see 2 B per A.
@@ -767,7 +734,6 @@ fn pair_url(offered: AccountId, requested: AccountId) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn pair_price_gives_each_side_its_fill_price() {
     let h = swap_server(
         &registered(),
@@ -795,7 +761,6 @@ async fn pair_price_gives_each_side_its_fill_price() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn pair_price_fails_closed_without_a_fresh_price() {
     async fn error(h: &Harness, url: String) -> (StatusCode, Value) {
         let r = h.server.get(&url).await;
@@ -856,7 +821,6 @@ fn v1_url(off: AccountId, off_amt: u64, req: AccountId, req_amt: u64) -> String 
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_has_liquidity_crosses_with_eta() {
     // Opposite book (offer B, request A) top level: 300 B for 100 A, depth 300.
     let snap = book(faucet_b(), faucet_a(), 100, 300, 300);
@@ -875,7 +839,6 @@ async fn v1_swap_eta_has_liquidity_crosses_with_eta() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_no_cross_not_fillable() {
     // Opposite top gives only 150 B per 100 A → user wanting 200 B doesn't cross.
     let snap = book(faucet_b(), faucet_a(), 100, 150, 1000);
@@ -890,7 +853,6 @@ async fn v1_swap_eta_no_cross_not_fillable() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_crosses_but_thin_volume() {
     // Crosses on rate but only 50 B available < 200 requested → not fillable,
     // and no threshold (price is fine, depth is the blocker).
@@ -905,7 +867,6 @@ async fn v1_swap_eta_crosses_but_thin_volume() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_empty_book_not_fillable() {
     let h = swap_server(
         &registered(),
@@ -924,7 +885,6 @@ async fn v1_swap_eta_empty_book_not_fillable() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_median_present_and_off_market_true() {
     let mut stats = SettlementStats::new();
     for d in [10u64, 30, 20] {
@@ -942,7 +902,6 @@ async fn v1_swap_eta_median_present_and_off_market_true() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_stale_market_fails_closed_to_null() {
     // Same greedy order as the off-market test, but the pair's quote is at
     // least the TTL old: the verdict must fail closed to null rather than
@@ -971,7 +930,6 @@ async fn v1_swap_eta_stale_market_fails_closed_to_null() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_reads_the_pair_in_either_direction() {
     // The pair is configured as A/B at 2 B per A; an order offering B for A
     // sees the reciprocal, 0.5 A per B.
@@ -992,7 +950,6 @@ async fn v1_swap_eta_reads_the_pair_in_either_direction() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn v1_swap_eta_bad_input() {
     let h = swap_server(
         &registered(),

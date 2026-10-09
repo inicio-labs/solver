@@ -762,23 +762,6 @@ pub fn get_registered_token_tx(
         .optional()?)
 }
 
-/// Serve a whole public price batch in one PostgreSQL query.
-pub fn fetch_token_rows_tx(
-    conn: &mut PgConnection,
-    token_ids: &[Vec<u8>],
-) -> DbResult<HashMap<Vec<u8>, RegisteredTokenRow>> {
-    if token_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    Ok(registered_tokens::table
-        .filter(registered_tokens::token_id.eq_any(token_ids))
-        .select(RegisteredTokenRow::as_select())
-        .load::<RegisteredTokenRow>(conn)?
-        .into_iter()
-        .map(|row| (row.token_id.clone(), row))
-        .collect())
-}
-
 pub fn register_token_tx(conn: &mut PgConnection, token: TokenId) -> DbResult<bool> {
     let row = RegisteredTokenRow {
         token_id: token.to_bytes(),
@@ -1364,23 +1347,23 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn token_registry_bulk_lookup_and_validation() -> Result<()> {
+    fn token_registry_lookup_and_validation() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let conn = &mut fixture.conn;
         let first: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into()?;
         let second: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into()?;
         let first_id = first.to_bytes();
-        let second_id = second.to_bytes();
         assert!(register_token_tx(conn, first)?);
         assert!(!register_token_tx(conn, first)?);
         assert!(register_token_tx(conn, second)?);
         assert!(set_token_metadata_tx(conn, first, Some(6), Some("USDC"))?);
         assert!(set_token_metadata_tx(conn, second, Some(18), Some("WETH"))?);
 
-        let rows = fetch_token_rows_tx(conn, &[first_id.clone(), second_id.clone()])?;
+        let rows = get_registered_tokens_tx(conn)?;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[&first_id].decimals, Some(6));
-        assert_eq!(rows[&first_id].ticker.as_deref(), Some("USDC"));
+        let first_row = rows.iter().find(|row| row.token_id == first_id).unwrap();
+        assert_eq!(first_row.decimals, Some(6));
+        assert_eq!(first_row.ticker.as_deref(), Some("USDC"));
         assert!(unregister_token_tx(conn, second)?);
         assert!(!unregister_token_tx(conn, second)?);
         Ok(())

@@ -865,7 +865,7 @@ impl PgPool {
         }
     }
 
-    /// A read for the public price API. It waits for a public slot first, so
+    /// A read for public traffic (the maker gateway). It waits for a public slot first, so
     /// a traffic burst queues here instead of taking every read connection
     /// from ingest, the executor and `/readyz`.
     pub async fn read_public<T, F>(&self, operation: F) -> DbResult<T>

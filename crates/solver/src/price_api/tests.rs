@@ -1,4 +1,4 @@
-//! Price-API tests against an isolated PostgreSQL schema.
+//! Price-API tests, in memory: the API reads no database.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use miden_protocol::account::AccountId;
+use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
 };
@@ -13,14 +14,12 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
-use crate::db;
-use crate::db::postgres_test::TestDb;
-use crate::matching::types::{BestLevel, RateKey, SwapBookSnapshot};
-use crate::price::PricePrecision;
+use crate::db::postgres_models::RegisteredTokenRow;
+use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::PriceSnapshot;
 use crate::swap_eta::SettlementStats;
 
-/// Long enough that a slow database setup cannot make a fresh quote stale.
+/// Long enough that a slow test cannot make a fresh quote stale.
 const TTL: Duration = Duration::from_secs(3_600);
 
 fn faucet_a() -> AccountId {
@@ -46,7 +45,6 @@ fn received(fresh: bool) -> Instant {
 
 struct Harness {
     server: TestServer,
-    _db: TestDb,
 }
 
 fn cfg() -> PriceApiConfig {
@@ -62,50 +60,33 @@ fn cfg() -> PriceApiConfig {
         swap_sync_ms: 5000,
         swap_proving_ms: 2000,
         swap_block_ms: 6000,
-        swap_offmarket_tol_bps: 50,
+        swap_offmarket_tolerance_bps: 50,
+        clearing_fee_ppm: 1_000,
     }
 }
 
-/// Seed `registered` = (faucet, decimals, ticker) rows and serve `snapshot`.
+/// Register `registered` = (faucet, decimals, ticker) and serve `snapshot`.
 async fn serve(
     registered: &[(AccountId, Option<u8>, Option<&str>)],
     snapshot: PriceSnapshot,
     book: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
-    let test_db = TestDb::new().await.unwrap();
-    let pool = test_db.pool.clone();
-    let rows: Vec<_> = registered
+    let tokens = registered
         .iter()
-        .map(|(id, dec, tick)| (*id, *dec, tick.map(str::to_owned)))
+        .map(|(id, decimals, ticker)| RegisteredTokenRow {
+            token_id: id.to_bytes(),
+            decimals: decimals.map(i32::from),
+            ticker: ticker.map(str::to_owned),
+        })
         .collect();
-    pool.write(move |conn| {
-        for (id, dec, tick) in rows {
-            db::postgres_db::register_token_tx(conn, id)?;
-            db::postgres_db::set_token_metadata_tx(conn, id, dec, tick.as_deref())?;
-        }
-        Ok(())
-    })
-    .await
-    .unwrap();
     // The receivers keep the values after their senders drop.
     let (_tx, prices) = watch::channel(Arc::new(snapshot));
-    let (_stx, swap_rx) = watch::channel(Arc::new(book));
+    let (_book_tx, book_rx) = watch::channel(Arc::new(book));
     let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState {
-        prices,
-        pool,
-        vs_currency: "usdt".into(),
-        default_precision: PricePrecision::Full,
-        max_batch: 3,
-        swap_rx,
-        stats_rx,
-        swap_eta_secs: 14, // 5000+1000+2000+6000 ms → 14s (matches cfg())
-        swap_offmarket_tol_bps: 50,
-    };
+    let state = PriceApiState::new(&cfg(), prices, tokens, book_rx, stats_rx);
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
-        _db: test_db,
     }
 }
 
@@ -125,7 +106,7 @@ async fn harness(
     serve(
         registered,
         snapshot,
-        SwapBookSnapshot::new(),
+        SwapBookSnapshot::default(),
         SettlementStats::new(),
     )
     .await
@@ -161,32 +142,31 @@ async fn swap_server(
     swap_server_at(true, registered, market, book, stats).await
 }
 
-/// Query string for the swap-eta endpoint.
-fn swap_url(off: AccountId, off_amt: u64, req: AccountId, req_amt: u64) -> String {
-    format!(
-        "/v1/swap-eta?offered_faucet={}&offered_amount={}&requested_faucet={}&requested_amount={}",
-        off.to_hex(),
-        off_amt,
-        req.to_hex(),
-        req_amt,
-    )
-}
-
-/// A top-of-book entry on directed pair `(offered, requested)`.
-fn level(
+/// A book with one level on directed pair `(offered, requested)`.
+fn book(
     offered_tok: AccountId,
     requested_tok: AccountId,
     requested: u64,
     offered: u64,
     volume: u64,
-) -> ((AccountId, AccountId), BestLevel) {
-    (
-        (offered_tok, requested_tok),
-        BestLevel {
-            rate: RateKey::new(requested, offered),
-            volume,
-        },
-    )
+) -> SwapBookSnapshot {
+    let level = BookLevel {
+        rate: RateKey::new(requested, offered),
+        volume,
+    };
+    [((offered_tok, requested_tok), vec![level])].into()
+}
+
+/// Stats from an executor that is taking batches.
+fn running() -> SettlementStats {
+    let mut stats = SettlementStats::new();
+    stats.executor_accepting = true;
+    stats
+}
+
+/// Buyers of A paying 2.14 B per A, eligible at the market of 2 B per A.
+fn buyers(volume: u64) -> SwapBookSnapshot {
+    book(faucet_b(), faucet_a(), 1_400_000, 3_000_000, volume)
 }
 
 fn url(faucet: AccountId, q: &str) -> String {
@@ -194,7 +174,6 @@ fn url(faucet: AccountId, q: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unknown_faucet_is_404() {
     let h = harness(&[], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -202,7 +181,6 @@ async fn unknown_faucet_is_404() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn registered_but_unpriced_is_503() {
     let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -210,7 +188,6 @@ async fn registered_but_unpriced_is_503() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn happy_path_returns_price_decimals_ticker() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDC"))],
@@ -230,7 +207,6 @@ async fn happy_path_returns_price_decimals_ticker() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_formatting_and_subcent_preserved() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -254,7 +230,6 @@ async fn precision_formatting_and_subcent_preserved() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn decimals_null_until_fetched() {
     let h = harness(
         &[(faucet_a(), None, None)],
@@ -268,7 +243,6 @@ async fn decimals_null_until_fetched() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn stale_fails_closed_unless_allowed() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -290,7 +264,6 @@ async fn stale_fails_closed_unless_allowed() {
 
 /// A token without any Binance market gets a distinct, non-retryable code.
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn unpriced_token_distinguishes_no_market_from_no_quote() {
     let h = harness(&[(faucet_a(), Some(6), Some("USDC"))], &[], true).await;
     let r = h.server.get(&url(faucet_a(), "")).await;
@@ -299,7 +272,6 @@ async fn unpriced_token_distinguishes_no_market_from_no_quote() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_returns_map_and_caps_size() {
     let h = harness(
         &[
@@ -322,7 +294,6 @@ async fn batch_returns_map_and_caps_size() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn precision_boundaries_and_config_default() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -351,7 +322,6 @@ async fn precision_boundaries_and_config_default() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn malformed_faucet_id_is_400() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -368,7 +338,6 @@ async fn malformed_faucet_id_is_400() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
     // faucet_a: registered + priced; faucet_b: registered but UNPRICED.
     let h = harness(
@@ -394,7 +363,6 @@ async fn batch_omits_unknown_and_unpriced_and_empty_is_empty_map() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn valuation_quote_asset_is_worth_exactly_one() {
     let h = harness(
         &[(faucet_a(), Some(6), Some("USDT"))],
@@ -409,7 +377,6 @@ async fn valuation_quote_asset_is_worth_exactly_one() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn batch_omits_stale_unless_allowed() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -429,7 +396,6 @@ async fn batch_omits_stale_unless_allowed() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn routing_is_v1_scoped_and_get_only() {
     let h = harness(
         &[(faucet_a(), Some(6), None)],
@@ -452,10 +418,17 @@ async fn routing_is_v1_scoped_and_get_only() {
         .post(&format!("/v1/price/{}", faucet_a().to_hex()))
         .await;
     assert_eq!(r3.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+    // The swap model lives under /v2 only, prices under /v1 only.
+    let r4 = h.server.get("/v1/pair-price").await;
+    assert_eq!(r4.status_code(), StatusCode::NOT_FOUND);
+    let r5 = h
+        .server
+        .get(&format!("/v2/price/{}", faucet_a().to_hex()))
+        .await;
+    assert_eq!(r5.status_code(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 async fn cors_header_present_for_browser_clients() {
     // A browser wallet / extension fetches cross-origin → the response must
     // carry Access-Control-Allow-Origin, else the browser blocks it.
@@ -473,26 +446,453 @@ async fn cors_header_present_for_browser_clients() {
     assert_eq!(acao.to_str().unwrap(), "*");
 }
 
-// ── swap-eta ──────────────────────────────────────────────────────────────
+// ── v2 swap-eta ───────────────────────────────────────────────────────────
+// The A/B market is 2 B per A (both tokens 0 decimals in the market plan);
+// fee 0.1%, tolerance 0.5% (see `serve`).
+
+fn registered() -> [(AccountId, Option<u8>); 2] {
+    [(faucet_a(), Some(8)), (faucet_b(), Some(8))]
+}
+
+async fn swap_status(h: &Harness, query: &str) -> StatusCode {
+    h.server
+        .get(&format!("/v2/swap-eta?{query}"))
+        .await
+        .status_code()
+}
+
+async fn swap_get(h: &Harness, query: &str) -> Value {
+    let r = h.server.get(&format!("/v2/swap-eta?{query}")).await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// `offered_faucet=A&requested_faucet=B` plus `rest`.
+fn a_for_b(rest: &str) -> String {
+    format!(
+        "offered_faucet={}&requested_faucet={}&{rest}",
+        faucet_a().to_hex(),
+        faucet_b().to_hex()
+    )
+}
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_has_liquidity_crosses_with_eta() {
-    // Opposite book (offer B, request A) top level: 300 B for 100 A, depth 300.
-    let mut snap = SwapBookSnapshot::new();
-    let (k, v) = level(faucet_b(), faucet_a(), 100, 300, 300);
-    snap.insert(k, v);
-    // User: offer 100 A, want 200 B at a market of 2 B per A → not off-market.
+async fn swap_eta_quotes_a_full_fill_at_market() {
+    let h = swap_server(&registered(), Some("2"), buyers(3_000_000), running()).await;
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "full");
+    assert!(v["reason"].is_null());
+    assert_eq!(v["fillableOfferedAmount"], "1000000");
+    assert_eq!(v["fillableRequestedAmount"], "1990000");
+    assert_eq!(v["expectedRequestedAmount"], "1998000");
+    assert_eq!(v["feePpm"], 1_000);
+    assert_eq!(v["feeAmount"], "2000");
+    assert_eq!(v["marketPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+    // The book takes 3_000_000 B: 1_500_000 A, more than this order.
+    assert_eq!(v["maxOfferedAmount"], "1500000");
+    assert_eq!(v["settlementsRunning"], true);
+    assert!(v.get("canFill").is_none() && v.get("offMarket").is_none());
+    assert_eq!(v["estimatedSeconds"], 14);
+    assert!(v["median24hSeconds"].is_null());
+}
+
+#[tokio::test]
+async fn swap_eta_quotes_a_partial_fill_and_respects_the_min_fill_step() {
+    let h = swap_server(&registered(), Some("2"), buyers(1_000_000), running()).await;
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["fillStatus"], "partial");
+    assert_eq!(v["fillableOfferedAmount"], "500000");
+    assert_eq!(v["fillableRequestedAmount"], "995000");
+    assert_eq!(v["maxOfferedAmount"], "500000");
+    assert_eq!(v["estimatedSeconds"], 14);
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000&min_fill_step=1000000"),
+    )
+    .await;
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "liquidity");
+}
+
+#[tokio::test]
+async fn swap_eta_has_no_eta_while_the_solver_cannot_settle() {
+    // The executor has not started, or is in verification mode: the book
+    // still fills the order, but not now.
+    let paused = SettlementStats::new();
+    let h = swap_server(&registered(), Some("2"), buyers(3_000_000), paused).await;
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(v["settlementsRunning"], false);
+    assert!(v["estimatedSeconds"].is_null());
+}
+
+#[tokio::test]
+async fn swap_eta_tolerates_a_small_gap_and_flags_a_large_one() {
+    let mut stats = running();
+    for d in [10u64, 30, 20] {
+        stats.record((faucet_a(), faucet_b()), now() as u64, d);
+    }
+    let h = swap_server(&registered(), Some("2"), buyers(3_000_000), stats).await;
+    // 2.005 B per A: above the 1.998 fill price, inside the tolerance.
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=2005000"),
+    )
+    .await;
+    assert_eq!(v["priceBand"], "tolerated");
+    assert_eq!(v["fillStatus"], "full");
+    assert!(v["estimatedSeconds"].is_null());
+    // 2.1 B per A: past it.
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=2100000"),
+    )
+    .await;
+    assert_eq!(v["priceBand"], "off_market");
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "price");
+    assert_eq!(v["fillableOfferedAmount"], "0");
+    assert!(v["maxOfferedAmount"].is_null());
+    assert_eq!(v["median24hSeconds"], 20); // median of 10, 20, 30
+}
+
+#[tokio::test]
+async fn swap_eta_without_a_price_fills_nothing() {
+    // No market for the pair at all.
     let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        Some("2"),
-        snap,
+        &registered(),
+        None,
+        buyers(3_000_000),
         SettlementStats::new(),
     )
     .await;
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert!(v["priceBand"].is_null());
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "no_market");
+    assert!(v["marketPrice"].is_null());
+    assert!(v["maxOfferedAmount"].is_null());
+
+    // A market whose quote is at least the TTL old fails closed.
+    let h = swap_server_at(
+        false,
+        &registered(),
+        Some("2"),
+        buyers(3_000_000),
+        SettlementStats::new(),
+    )
+    .await;
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["reason"], "no_price");
+    assert!(v["marketPrice"].is_null());
+}
+
+#[tokio::test]
+async fn v2_answers_carry_every_documented_key() {
+    // A missing key also reads as null, so compare the key sets themselves.
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+    let mut swap_keys = vec![
+        "offeredFaucet",
+        "requestedFaucet",
+        "offeredAmount",
+        "requestedAmount",
+        "priceBand",
+        "fillStatus",
+        "reason",
+        "fillableOfferedAmount",
+        "fillableRequestedAmount",
+        "maxOfferedAmount",
+        "expectedRequestedAmount",
+        "feePpm",
+        "feeAmount",
+        "marketPrice",
+        "fillPrice",
+        "settlementsRunning",
+        "estimatedSeconds",
+        "median24hSeconds",
+    ];
+    swap_keys.sort_unstable();
+    // `min_fill_step=0` is PSWAP's "no step", not a bad amount.
+    let order = a_for_b("offered_amount=1000000&requested_amount=1990000&min_fill_step=0");
+    for market in [Some("2"), None] {
+        let h = swap_server(&registered(), market, buyers(3_000_000), running()).await;
+        let v = swap_get(&h, &order).await;
+        assert_eq!(keys(&v), swap_keys, "{v}");
+        if market.is_none() {
+            for key in ["expectedRequestedAmount", "feeAmount", "fillPrice"] {
+                assert!(v[key].is_null(), "{key}: {v}");
+            }
+        }
+    }
+
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        running(),
+    )
+    .await;
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    let mut pair_keys = vec![
+        "offeredFaucet",
+        "requestedFaucet",
+        "marketPrice",
+        "fillPrice",
+        "feePpm",
+        "offeredDecimals",
+        "requestedDecimals",
+        "asOf",
+    ];
+    pair_keys.sort_unstable();
+    assert_eq!(keys(&v), pair_keys, "{v}");
+}
+
+#[tokio::test]
+async fn swap_eta_reads_the_pair_in_either_direction() {
+    // The pair is configured as A/B at 2 B per A; an order offering B for A
+    // sees the reciprocal and takes the buyer's side. Sellers of A asking
+    // 1.9 B per A fill it.
+    let sellers = book(faucet_a(), faucet_b(), 1_900_000, 1_000_000, 1_000_000);
+    let h = swap_server(&registered(), Some("2"), sellers, SettlementStats::new()).await;
+    let query = format!(
+        "offered_faucet={}&requested_faucet={}&offered_amount=2000000&requested_amount=999000",
+        faucet_b().to_hex(),
+        faucet_a().to_hex()
+    );
+    let v = swap_get(&h, &query).await;
+    assert_eq!(v["marketPrice"], "0.5");
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "full");
+}
+
+#[tokio::test]
+async fn swap_eta_responses_are_not_cached() {
+    // Both versions must override the router-level `max-age` cache layer with
+    // `no-store`, since their fields come from independently-updated snapshots.
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    for version in ["v1", "v2"] {
+        let url = format!(
+            "/{version}/swap-eta?{}",
+            a_for_b("offered_amount=100&requested_amount=200")
+        );
+        let r = h.server.get(&url).await;
+        let cache = r.headers().get("cache-control").cloned();
+        assert_eq!(
+            cache
+                .expect("cache-control header present")
+                .to_str()
+                .unwrap(),
+            "no-store",
+            "{version} swap-eta must not inherit the router's max-age",
+        );
+    }
+}
+
+#[tokio::test]
+async fn swap_eta_bad_input() {
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    // a zero or missing amount, or a malformed min fill step → 400
+    for query in [
+        "offered_amount=0&requested_amount=200",
+        "offered_amount=100&requested_amount=200&min_fill_step=x",
+        "offered_amount=100",
+        "requested_amount=200",
+        "min_fill_step=5",
+    ] {
+        assert_eq!(
+            swap_status(&h, &a_for_b(query)).await,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+    // same faucet → 400
+    let same = format!(
+        "offered_faucet={0}&requested_faucet={0}&offered_amount=1&requested_amount=1",
+        faucet_a().to_hex()
+    );
+    assert_eq!(swap_status(&h, &same).await, StatusCode::BAD_REQUEST);
+    // bad hex → 400
+    let bad = "offered_faucet=nothex&offered_amount=1&requested_faucet=nothex2&requested_amount=1";
+    assert_eq!(swap_status(&h, bad).await, StatusCode::BAD_REQUEST);
+    // unknown (well-formed) faucet → 404
+    let unknown = format!(
+        "offered_faucet={}&requested_faucet={}&offered_amount=100&requested_amount=200",
+        faucet_unregistered().to_hex(),
+        faucet_b().to_hex()
+    );
+    assert_eq!(swap_status(&h, &unknown).await, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_reversed_binance_listing_prices_and_quotes_the_same() {
+    // Binance lists the pair the other way round (its base is B): the
+    // stream carries 0.5, and both endpoints still see 2 B per A.
+    let pairs = [(faucet_a(), faucet_b(), "2", received(true))];
+    let decimals = [(faucet_a(), 0), (faucet_b(), 0)];
+    let snapshot = PriceSnapshot::for_tests_reversed(&pairs, &decimals, TTL);
+    let registered: Vec<_> = registered()
+        .iter()
+        .map(|(id, dec)| (*id, *dec, None))
+        .collect();
+    let h = serve(&registered, snapshot, buyers(3_000_000), running()).await;
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["marketPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+    let v = swap_get(
+        &h,
+        &a_for_b("offered_amount=1000000&requested_amount=1990000"),
+    )
+    .await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(v["maxOfferedAmount"], "1500000");
+}
+
+// ── pair-price ────────────────────────────────────────────────────────────
+
+/// `/v2/pair-price` for an order offering `offered` for `requested`.
+fn pair_url(offered: AccountId, requested: AccountId) -> String {
+    format!(
+        "/v2/pair-price?offered_faucet={}&requested_faucet={}",
+        offered.to_hex(),
+        requested.to_hex()
+    )
+}
+
+#[tokio::test]
+async fn pair_price_gives_each_side_its_fill_price() {
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    // Selling A: 2 B per A less the 0.1% fee.
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["marketPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+    assert_eq!(v["feePpm"], 1_000);
+    // The market's own decimals (0 in these fixtures), not the registered tokens'.
+    assert_eq!(v["offeredDecimals"], 0);
+    assert_eq!(v["requestedDecimals"], 0);
+    assert!((v["asOf"].as_i64().unwrap() - now()).abs() <= 5, "{v}");
+    // Buying A with B: 0.5 A per B divided by 1.001.
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["marketPrice"], "0.5");
+    assert!(
+        v["fillPrice"].as_str().unwrap().starts_with("0.4995004995"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn pair_price_fails_closed_without_a_fresh_price() {
+    async fn error(h: &Harness, url: String) -> (StatusCode, Value) {
+        let r = h.server.get(&url).await;
+        (r.status_code(), r.json::<Value>()["error"].clone())
+    }
+    let h = swap_server(
+        &registered(),
+        None,
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_b())).await,
+        (StatusCode::SERVICE_UNAVAILABLE, Value::from("no_market"))
+    );
+    assert_eq!(
+        error(&h, pair_url(faucet_unregistered(), faucet_b()))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_a())).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let h = swap_server_at(
+        false,
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    assert_eq!(
+        error(&h, pair_url(faucet_a(), faucet_b())).await,
+        (StatusCode::SERVICE_UNAVAILABLE, Value::from("no_price"))
+    );
+}
+
+fn faucet_unregistered() -> AccountId {
+    use miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2;
+    AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap()
+}
+
+// ── v1 swap-eta (frozen) ──────────────────────────────────────────────────
+// The frozen endpoint must keep answering as it always has.
+
+/// Query string for the v1 swap-eta endpoint.
+fn v1_url(off: AccountId, off_amt: u64, req: AccountId, req_amt: u64) -> String {
+    format!(
+        "/v1/swap-eta?offered_faucet={}&offered_amount={}&requested_faucet={}&requested_amount={}",
+        off.to_hex(),
+        off_amt,
+        req.to_hex(),
+        req_amt,
+    )
+}
+
+#[tokio::test]
+async fn v1_swap_eta_has_liquidity_crosses_with_eta() {
+    // Opposite book (offer B, request A) top level: 300 B for 100 A, depth 300.
+    let snap = book(faucet_b(), faucet_a(), 100, 300, 300);
+    // User: offer 100 A, want 200 B at a market of 2 B per A → not off-market.
+    let h = swap_server(&registered(), Some("2"), snap, SettlementStats::new()).await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 200))
         .await
         .json();
     assert!(v["canFill"].as_bool().unwrap());
@@ -503,22 +903,13 @@ async fn swap_eta_has_liquidity_crosses_with_eta() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_no_cross_not_fillable() {
+async fn v1_swap_eta_no_cross_not_fillable() {
     // Opposite top gives only 150 B per 100 A → user wanting 200 B doesn't cross.
-    let mut snap = SwapBookSnapshot::new();
-    let (k, val) = level(faucet_b(), faucet_a(), 100, 150, 1000);
-    snap.insert(k, val);
-    let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        None,
-        snap,
-        SettlementStats::new(),
-    )
-    .await;
+    let snap = book(faucet_b(), faucet_a(), 100, 150, 1000);
+    let h = swap_server(&registered(), None, snap, SettlementStats::new()).await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 200))
         .await
         .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
@@ -526,41 +917,31 @@ async fn swap_eta_no_cross_not_fillable() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_crosses_but_thin_volume() {
+async fn v1_swap_eta_crosses_but_thin_volume() {
     // Crosses on rate but only 50 B available < 200 requested → not fillable,
     // and no threshold (price is fine, depth is the blocker).
-    let mut snap = SwapBookSnapshot::new();
-    let (k, val) = level(faucet_b(), faucet_a(), 100, 300, 50);
-    snap.insert(k, val);
-    let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        None,
-        snap,
-        SettlementStats::new(),
-    )
-    .await;
+    let snap = book(faucet_b(), faucet_a(), 100, 300, 50);
+    let h = swap_server(&registered(), None, snap, SettlementStats::new()).await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 200))
         .await
         .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_empty_book_not_fillable() {
+async fn v1_swap_eta_empty_book_not_fillable() {
     let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &registered(),
         None,
-        SwapBookSnapshot::new(),
+        SwapBookSnapshot::default(),
         SettlementStats::new(),
     )
     .await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 200))
         .await
         .json();
     assert_eq!(v["canFill"].as_bool().unwrap(), false);
@@ -568,23 +949,16 @@ async fn swap_eta_empty_book_not_fillable() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_median_present_and_off_market_true() {
+async fn v1_swap_eta_median_present_and_off_market_true() {
     let mut stats = SettlementStats::new();
     for d in [10u64, 30, 20] {
         stats.record((faucet_a(), faucet_b()), now() as u64, d);
     }
     // Greedy order: offer 100 A, request 500 B at 2 B per A → off-market.
-    let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        Some("2"),
-        SwapBookSnapshot::new(),
-        stats,
-    )
-    .await;
+    let h = swap_server(&registered(), Some("2"), SwapBookSnapshot::default(), stats).await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 500))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 500))
         .await
         .json();
     assert_eq!(v["median24hSeconds"].as_u64().unwrap(), 20); // median of 10,20,30
@@ -592,22 +966,21 @@ async fn swap_eta_median_present_and_off_market_true() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_stale_market_fails_closed_to_null() {
+async fn v1_swap_eta_stale_market_fails_closed_to_null() {
     // Same greedy order as the off-market test, but the pair's quote is at
     // least the TTL old: the verdict must fail closed to null rather than
     // flag off-market from a dead feed.
     let h = swap_server_at(
         false,
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &registered(),
         Some("2"),
-        SwapBookSnapshot::new(),
+        SwapBookSnapshot::default(),
         SettlementStats::new(),
     )
     .await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 500))
+        .get(&v1_url(faucet_a(), 100, faucet_b(), 500))
         .await
         .json();
     assert!(
@@ -621,20 +994,19 @@ async fn swap_eta_stale_market_fails_closed_to_null() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_reads_the_pair_in_either_direction() {
+async fn v1_swap_eta_reads_the_pair_in_either_direction() {
     // The pair is configured as A/B at 2 B per A; an order offering B for A
     // sees the reciprocal, 0.5 A per B.
     let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &registered(),
         Some("2"),
-        SwapBookSnapshot::new(),
+        SwapBookSnapshot::default(),
         SettlementStats::new(),
     )
     .await;
     let v: Value = h
         .server
-        .get(&swap_url(faucet_b(), 200, faucet_a(), 100))
+        .get(&v1_url(faucet_b(), 200, faucet_a(), 100))
         .await
         .json();
     assert_eq!(v["marketPrice"].as_str().unwrap(), "0.5");
@@ -642,52 +1014,21 @@ async fn swap_eta_reads_the_pair_in_either_direction() {
 }
 
 #[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_response_is_not_cached() {
-    // `/v1/swap-eta` must override the router-level `max-age` cache layer with
-    // `no-store`, since its fields come from independently-updated snapshots.
+async fn v1_swap_eta_bad_input() {
     let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
-        Some("2"),
-        SwapBookSnapshot::new(),
-        SettlementStats::new(),
-    )
-    .await;
-    let r = h
-        .server
-        .get(&swap_url(faucet_a(), 100, faucet_b(), 200))
-        .await;
-    let cache = r.headers().get("cache-control").cloned();
-    assert_eq!(
-        cache
-            .expect("cache-control header present")
-            .to_str()
-            .unwrap(),
-        "no-store",
-        "swap-eta must not inherit the router's max-age",
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-async fn swap_eta_bad_input() {
-    let h = swap_server(
-        &[(faucet_a(), Some(8)), (faucet_b(), Some(8))],
+        &registered(),
         None,
-        SwapBookSnapshot::new(),
+        SwapBookSnapshot::default(),
         SettlementStats::new(),
     )
     .await;
     // zero amount → 400
-    let r0 = h
-        .server
-        .get(&swap_url(faucet_a(), 0, faucet_b(), 200))
-        .await;
+    let r0 = h.server.get(&v1_url(faucet_a(), 0, faucet_b(), 200)).await;
     assert_eq!(r0.status_code(), StatusCode::BAD_REQUEST);
     // same faucet → 400
     let rs = h
         .server
-        .get(&swap_url(faucet_a(), 100, faucet_a(), 200))
+        .get(&v1_url(faucet_a(), 100, faucet_a(), 200))
         .await;
     assert_eq!(rs.status_code(), StatusCode::BAD_REQUEST);
     // bad hex → 400
@@ -699,12 +1040,7 @@ async fn swap_eta_bad_input() {
     // unknown (well-formed) faucet → 404
     let ru = h
         .server
-        .get(&swap_url(faucet_unregistered(), 100, faucet_b(), 200))
+        .get(&v1_url(faucet_unregistered(), 100, faucet_b(), 200))
         .await;
     assert_eq!(ru.status_code(), StatusCode::NOT_FOUND);
-}
-
-fn faucet_unregistered() -> AccountId {
-    use miden_protocol::testing::account_id::ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2;
-    AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap()
 }

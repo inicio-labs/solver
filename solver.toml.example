@@ -87,6 +87,10 @@ admin_port = 3001
 # price_query_timeout_ms = 3000
 # price_precision = "full"           # decimals of the PRICE number: "full" or 0..=18
 #                                    # (per-request override: ?precision=). NOT the token's decimals.
+# swap_offmarket_tolerance_bps = 50  # /v2/swap-eta: an order that fills if the mid
+#                                    # moves at most this far in its favour is
+#                                    # "tolerated", further is "off_market"
+#                                    # (/v1/swap-eta: slack above the raw mid)
 
 # External RFQ routing hands unmatched whole notes to allow-listed DEXes.
 # Set SOLVER_ROUTER_TOKENS to comma-separated bearer tokens when enabling it.

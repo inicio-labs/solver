@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use super::clearing_book::{ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
 use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
-use crate::matching::types::SwapBookSnapshot;
 use crate::price::{PriceSnapshot, PriceUnavailable};
+use crate::swap_eta::DepthChange;
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -58,7 +58,7 @@ pub async fn run_matcher(
     book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
-    swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    depth_tx: mpsc::UnboundedSender<DepthChange>,
     runtime: ClearingRuntime,
     cancel: CancellationToken,
 ) -> Result<(), MatcherError> {
@@ -66,7 +66,7 @@ pub async fn run_matcher(
     // backpressure cannot block this worker from receiving book updates.
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
-        result = run_worker(book_rx, exec_tx, match_interval, swap_snapshot_tx, runtime) => result,
+        result = run_worker(book_rx, exec_tx, match_interval, depth_tx, runtime) => result,
     }
 }
 
@@ -74,13 +74,13 @@ pub(super) async fn run_worker(
     mut book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
-    snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    depth_tx: mpsc::UnboundedSender<DepthChange>,
     mut runtime: ClearingRuntime,
 ) -> Result<(), MatcherError> {
     // Configuration is frozen for this worker; validate before admitting orders.
     runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
-    let mut book = ClearingBook::default();
+    let mut book = ClearingBook::with_depth(depth_tx);
     for (maker_id, scope, cutoff) in &bootstrap.cutoffs {
         book.raise_maker_cutoff(*maker_id, scope.clone(), *cutoff);
     }
@@ -113,8 +113,6 @@ pub(super) async fn run_worker(
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
                 }
-                // Latest order-book levels for the price API's swap-ETA estimates.
-                snapshot_tx.send_replace(Arc::new(book.best_levels_snapshot()));
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -262,6 +260,8 @@ mod tests {
 
     use super::*;
     use crate::db;
+    use crate::matcher::test_ticks::{after_first_tick, after_next_tick};
+    use crate::swap_eta::DepthBook;
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -390,7 +390,7 @@ mod tests {
             Err(MatcherError::ExecutorStopped)
         ));
         assert_eq!(
-            book.best_levels_snapshot().len(),
+            book.levels().len(),
             4,
             "a stopped executor must leave orders live"
         );
@@ -402,7 +402,7 @@ mod tests {
             .unwrap();
         assert!(!executor_accepting(&exec_tx).unwrap());
         assert_eq!(
-            book.best_levels_snapshot().len(),
+            book.levels().len(),
             4,
             "a full executor queue must leave orders active for a later tick"
         );
@@ -411,7 +411,7 @@ mod tests {
         let stale_skips = PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed);
         clear(&mut book, &exec_tx);
         assert!(exec_rx.try_recv().is_err(), "a stale price must not clear");
-        assert_eq!(book.best_levels_snapshot().len(), 4);
+        assert_eq!(book.levels().len(), 4);
         assert!(
             PRICE_SKIPS[PriceUnavailable::Stale as usize].load(Ordering::Relaxed)
                 >= stale_skips + 2
@@ -422,7 +422,7 @@ mod tests {
         clear(&mut book, &exec_tx);
         let miden = exec_rx.try_recv().unwrap();
         assert_eq!(miden.group_ends, vec![2]);
-        assert_eq!(book.best_levels_snapshot().len(), 2);
+        assert_eq!(book.levels().len(), 2);
         prices_tx.send_replace(prices(Instant::now(), Instant::now()));
         clear(&mut book, &exec_tx);
         let eth = exec_rx.try_recv().unwrap();
@@ -441,7 +441,7 @@ mod tests {
                 .unwrap();
             assert!(Arc::ptr_eq(&filled.note, &source.note));
         }
-        assert!(book.best_levels_snapshot().is_empty());
+        assert!(book.levels().is_empty());
         clear(&mut book, &exec_tx);
         assert!(
             exec_rx.try_recv().is_err(),
@@ -474,7 +474,8 @@ mod tests {
                 group_ends: Vec::new(),
             })
             .unwrap();
-        let (snapshot_tx, mut snapshot_rx) = watch::channel(Arc::new(SwapBookSnapshot::new()));
+        let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
+        let mut depth = DepthBook::default();
         let worker_runtime = ClearingRuntime {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
@@ -490,7 +491,7 @@ mod tests {
                     book_rx,
                     exec_tx,
                     Duration::from_secs(1),
-                    snapshot_tx,
+                    depth_tx,
                     worker_runtime,
                 ));
                 assert!(bootstrap_tx
@@ -499,8 +500,9 @@ mod tests {
                         cutoffs: Vec::new(),
                     })
                     .is_ok());
-                snapshot_rx.changed().await.unwrap();
-                assert_eq!(snapshot_rx.borrow().len(), 4);
+                after_first_tick().await;
+                depth.drain(&mut depth_rx);
+                assert_eq!(depth.snapshot().len(), 4);
 
                 book_tx
                     .send(BookUpdate {
@@ -511,13 +513,12 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
-                tokio::time::advance(Duration::from_secs(1)).await;
-                snapshot_rx.changed().await.unwrap();
-                assert_eq!(snapshot_rx.borrow().len(), 3);
+                after_next_tick().await;
+                depth.drain(&mut depth_rx);
+                assert_eq!(depth.snapshot().len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 
-                tokio::time::advance(Duration::from_secs(1)).await;
-                snapshot_rx.changed().await.unwrap();
+                after_next_tick().await;
                 assert_eq!(exec_rx.try_recv().unwrap().filled_notes.len(), 2);
                 worker.abort();
                 assert!(worker.await.unwrap_err().is_cancelled());

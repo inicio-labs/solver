@@ -361,13 +361,16 @@ bound to `127.0.0.1` by default (`price_query_bind`).
 ```bash
 GET /v1/price/{faucet_id}?precision=&allow_stale=
 GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, … }
+GET /v2/pair-price?offered_faucet=&requested_faucet=
+GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
+GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=   # frozen
 ```
 ```jsonc
 // GET /v1/price/0x8fe0…?precision=4
 { "faucet_id":"0x8fe0…", "ticker":"ETH", "vs_currency":"usdt",
   "price":"2718.6550",   // price of ONE WHOLE token; value a base-unit amount via (units / 10^decimals) * price
   "precision":"4",       // decimals of the PRICE number (config `price_precision` or ?precision=full|0-18)
-  "decimals":8,          // the TOKEN's on-chain decimals (fetched on-chain; null until known) — distinct from `precision`
+  "decimals":8,          // the TOKEN's on-chain decimals (null if unknown at startup) — distinct from `precision`
   "as_of":1781896971, "stale":false, "source":"binance" }
 ```
 - **404** unknown faucet · **503** `no_market` (no Binance market configured for
@@ -378,15 +381,18 @@ GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, 
 - A token's price is the exact Binance midpoint of `<ASSET><QUOTE>` (its
   `asset_*_binance_asset` against `[binance].valuation_quote_asset`, default
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
-  **once, when a token is registered** (config tokens at boot, admin-added tokens
-  via the subscribe relay), then cached — never re-polled.
-- `/v1/swap-eta` reports `marketPrice` (exact, up to 18 places) and
-  `offMarket` from the pair's clearing market under the same TTL the matcher
-  uses (`null` without a fresh quote).
+  when ingest registers the config tokens at boot. The price API loads the
+  registered tokens **once at startup** and keeps them in memory, so requests
+  never read PostgreSQL. A registration change (admin API, or a token added to
+  `solver.toml`) and metadata a failed boot fetch missed show after a restart;
+  removing a token from `solver.toml` does not unregister it.
+- `/v2/pair-price` and `/v2/swap-eta` are the swap flow: the price to build an
+  ask from, then the solver's verdict on that order. `/v1/swap-eta` is the
+  original check, frozen. See `docs/price-api.md`.
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).
-- Versioned under `/v1` so a future model lands as `/v2` without breaking clients.
+- Versioned: the swap model lives under `/v2`; `/v1` keeps answering as it always has, so existing clients do not break.
 - See the `[engine]` price-query knobs in `solver.toml.example`.
 
 ---
@@ -403,8 +409,8 @@ cargo test -p consume-script       # MASM script compiles + behaves
   panics on arbitrary amounts. See the assessment in
   [docs/security/pentest-2026-06-19.md](docs/security/pentest-2026-06-19.md).
 - **Price-query API** (`crates/solver/src/price_api/tests.rs`, `axum-test`):
-  end-to-end cases against isolated PostgreSQL schemas. Run them with
-  `SOLVER_TEST_DATABASE_URL` and `cargo test -p solver price_api -- --ignored` —
+  end-to-end cases, in memory (the API reads no database):
+  `cargo test -p solver price_api` —
   - **Registered-vs-priced:** unregistered faucet → `404`; registered but no
     price yet → `503` (not a misleading 404).
   - **Faithful price:** a sub-$1 value (`0.0034`) is preserved at `full`, never
@@ -412,15 +418,15 @@ cargo test -p consume-script       # MASM script compiles + behaves
   - **Precision:** `?precision=2` rounds half up to 2 dp; `0` → an
     integer; `18` is accepted; `19`, `-1`, and garbage → `400`; omitting the
     param falls back to the configured `price_precision` default.
-  - **Token decimals & ticker:** served from the on-chain-fetched DB columns
-    (populated once at registration); `null` (never a fabricated default) until
-    that fetch lands.
+  - **Token decimals & ticker:** served from the registered tokens loaded at
+    startup; `null` (never a fabricated default) when the on-chain fetch had
+    not landed.
   - **Staleness fails closed:** a quote at least the TTL old → `503`, unless
     `?allow_stale=true` (then `200` with `"stale":true`).
   - **Batch (`/v1/prices`):** returns a map, caps the id count (`> max_batch` →
     `400`), and omits unknown, unpriced and stale ids (empty `ids` → empty map).
   - **Surface hardening:** malformed faucet id → `400` with a JSON error body;
-    routes are `/v1`-scoped (no prefix → `404`) and GET-only (`POST` → `405`).
+    routes are `/v1`- or `/v2`-scoped (no prefix → `404`) and GET-only (`POST` → `405`).
 - **Binance price feed** (`crates/solver/src/price/binance`): exact midpoint,
   orientation, spread and TTL boundaries (incl. proptests), and the feed's two
   readers against `mock-binance` — reconnects, `Retry-After`, invalid quotes,

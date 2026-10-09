@@ -13,10 +13,9 @@ use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
-use crate::matching::types::SwapBookSnapshot;
 use crate::price::PriceSnapshot;
 use crate::router::{QuotesSnapshot, RouteBatch};
-use crate::swap_eta::SettlementStats;
+use crate::swap_eta::{DepthChange, SettlementStats};
 use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -174,10 +173,11 @@ pub struct PipelineChannels {
     /// Binance quotes (price feed → matcher, price API, metrics), latest-wins.
     pub prices_tx: watch::Sender<Arc<PriceSnapshot>>,
     pub prices_rx: watch::Receiver<Arc<PriceSnapshot>>,
-    /// Top-of-book snapshot (matcher → swap-eta API), latest-wins.
-    pub swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
-    pub swap_snapshot_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
-    /// In-memory settlement-time window (executor → swap-eta API), latest-wins.
+    /// Every change to the active book (matcher → swap-eta API's depth mirror).
+    pub depth_tx: mpsc::UnboundedSender<DepthChange>,
+    pub depth_rx: mpsc::UnboundedReceiver<DepthChange>,
+    /// Settlement times and whether the executor takes batches (executor →
+    /// swap-eta API), latest-wins.
     pub stats_tx: watch::Sender<Arc<SettlementStats>>,
     pub stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pub exec_tx: mpsc::Sender<ExecutionBatch>,
@@ -189,16 +189,13 @@ pub struct PipelineChannels {
 pub fn create_channels() -> PipelineChannels {
     let (book_tx, book_rx) = mpsc::channel::<BookUpdate>(PIPELINE_CHANNEL_BUF);
     let (prices_tx, prices_rx) = watch::channel(Arc::new(PriceSnapshot::default()));
-    // Two separate swap-eta feeds, NOT one combined channel: they have two
-    // independent producers on two threads — the matcher publishes the live
-    // top-of-book each tick (fillability), the executor publishes settlement
-    // durations after each settlement (the 24h median). A `watch` value has
-    // replace semantics, so co-writing one struct from both would need a shared
-    // lock + read-modify-write (lost-update race). One channel per producer =
-    // each is the sole, lock-free writer of its own stream. Both read by the
-    // swap-eta handler in price_api.rs.
-    let (swap_snapshot_tx, swap_snapshot_rx) =
-        watch::channel::<Arc<SwapBookSnapshot>>(Arc::new(SwapBookSnapshot::new()));
+    // Two separate swap-eta feeds, one per producer: the matcher sends each
+    // change to its active book; the executor publishes settlement durations
+    // and whether it takes batches. Both are read on the price API's thread.
+    // The depth feed is unbounded so the matcher never waits on or drops a
+    // change: it only sends what its index already did, and the price API's
+    // mirror drains it (see `price_api::mirror_depth`).
+    let (depth_tx, depth_rx) = mpsc::unbounded_channel::<DepthChange>();
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(EXEC_CHANNEL_BUF);
@@ -214,8 +211,8 @@ pub fn create_channels() -> PipelineChannels {
         book_rx,
         prices_tx,
         prices_rx,
-        swap_snapshot_tx,
-        swap_snapshot_rx,
+        depth_tx,
+        depth_rx,
         stats_tx,
         stats_rx,
         exec_tx,
@@ -249,7 +246,7 @@ pub fn spawn_core_services(
     config: &PipelineConfig,
     book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
-    swap_snapshot_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    depth_tx: mpsc::UnboundedSender<DepthChange>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     clearing: matcher::ClearingRuntime,
 ) -> CoreHandles {
@@ -261,7 +258,7 @@ pub fn spawn_core_services(
             book_rx,
             exec_tx,
             match_interval,
-            swap_snapshot_tx,
+            depth_tx,
             clearing,
             matcher_cancel.clone(),
         )

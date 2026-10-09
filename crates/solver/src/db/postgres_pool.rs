@@ -747,8 +747,8 @@ pub struct PgPool {
     publish_order: Arc<Mutex<()>>,
     readers: r2d2::Pool<ConnectionManager<PgConnection>>,
     read_slots: Arc<Semaphore>,
-    /// Caps public API reads below `read_slots`, so wallet traffic always
-    /// leaves at least one read connection for the solver pipeline.
+    /// Caps public reads (the maker gateway) below `read_slots`, so public
+    /// traffic always leaves at least one read connection for the pipeline.
     public_slots: Arc<Semaphore>,
     telemetry: Arc<PoolTelemetry>,
 }
@@ -865,7 +865,7 @@ impl PgPool {
         }
     }
 
-    /// A read for the public price API. It waits for a public slot first, so
+    /// A read for public traffic (the maker gateway). It waits for a public slot first, so
     /// a traffic burst queues here instead of taking every read connection
     /// from ingest, the executor and `/readyz`.
     pub async fn read_public<T, F>(&self, operation: F) -> DbResult<T>

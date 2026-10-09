@@ -10,8 +10,11 @@ mod types;
 
 pub use config::{ClearingConfig, PPM_DENOMINATOR};
 pub use matching::{PairBatch, PairMatcher};
+pub(crate) use math::{checked_mul, mul_div_floor};
 pub use order::Order;
-pub(crate) use order::{MatchOrder, OrderKey, OrderSide};
+pub(crate) use order::{
+    eligible_units, full_fill_fee, FillInterval, FillScale, MatchOrder, OrderKey, OrderSide,
+};
 pub use types::{
     BatchPrice, CandidatePlan, ClearingError, ClearingOutcome, InvalidOrderReason, OrderExecution,
     PairAmounts, SettlementPlan, SkipReason, SolverAccruals,

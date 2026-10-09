@@ -101,10 +101,11 @@ holds its lock, a writer worker panics, or a write is still running after the
 30-second client deadline. Every other database error is returned to the
 caller and handled in place:
 
-- A failed read (including the public price API and `/readyz`) returns an
+- A failed read (including the maker gateway and `/readyz`) returns an
   error to that caller; the read pool reconnects on the next checkout. The
-  public price API may use at most `read_pool_size - 1` read connections, so
-  wallet traffic cannot starve ingest, the executor, or `/readyz`. If the
+  maker gateway may use at most `read_pool_size - 1` read connections, so
+  public traffic cannot starve ingest, the executor, or `/readyz`. The public
+  price API reads the database only once, at startup. If the
   executor cannot load its pending settlements at startup (pool busy,
   database briefly unreachable), it retries every second instead of stopping.
 - A lock or statement timeout rolls back that one transaction on a healthy

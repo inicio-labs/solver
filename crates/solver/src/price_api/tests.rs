@@ -610,6 +610,70 @@ async fn swap_eta_without_a_price_fills_nothing() {
 }
 
 #[tokio::test]
+async fn v2_answers_carry_every_documented_key() {
+    // A missing key also reads as null, so compare the key sets themselves.
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+    let mut swap_keys = vec![
+        "offeredFaucet",
+        "requestedFaucet",
+        "offeredAmount",
+        "requestedAmount",
+        "priceBand",
+        "fillStatus",
+        "reason",
+        "fillableOfferedAmount",
+        "fillableRequestedAmount",
+        "maxOfferedAmount",
+        "expectedRequestedAmount",
+        "feePpm",
+        "feeAmount",
+        "marketPrice",
+        "fillPrice",
+        "settlementsRunning",
+        "estimatedSeconds",
+        "median24hSeconds",
+    ];
+    swap_keys.sort_unstable();
+    // `min_fill_step=0` is PSWAP's "no step", not a bad amount.
+    let order = a_for_b("offered_amount=1000000&requested_amount=1990000&min_fill_step=0");
+    for market in [Some("2"), None] {
+        let h = swap_server(&registered(), market, buyers(3_000_000), running()).await;
+        let v = swap_get(&h, &order).await;
+        assert_eq!(keys(&v), swap_keys, "{v}");
+        if market.is_none() {
+            for key in ["expectedRequestedAmount", "feeAmount", "fillPrice"] {
+                assert!(v[key].is_null(), "{key}: {v}");
+            }
+        }
+    }
+
+    let h = swap_server(
+        &registered(),
+        Some("2"),
+        SwapBookSnapshot::default(),
+        running(),
+    )
+    .await;
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    let mut pair_keys = vec![
+        "offeredFaucet",
+        "requestedFaucet",
+        "marketPrice",
+        "fillPrice",
+        "feePpm",
+        "offeredDecimals",
+        "requestedDecimals",
+        "asOf",
+    ];
+    pair_keys.sort_unstable();
+    assert_eq!(keys(&v), pair_keys, "{v}");
+}
+
+#[tokio::test]
 async fn swap_eta_reads_the_pair_in_either_direction() {
     // The pair is configured as A/B at 2 B per A; an order offering B for A
     // sees the reciprocal and takes the buyer's side. Sellers of A asking
@@ -665,10 +729,10 @@ async fn swap_eta_bad_input() {
         SettlementStats::new(),
     )
     .await;
-    // a zero or missing amount, or a zero min fill step → 400
+    // a zero or missing amount, or a malformed min fill step → 400
     for query in [
         "offered_amount=0&requested_amount=200",
-        "offered_amount=100&requested_amount=200&min_fill_step=0",
+        "offered_amount=100&requested_amount=200&min_fill_step=x",
         "offered_amount=100",
         "requested_amount=200",
         "min_fill_step=5",
@@ -747,7 +811,7 @@ async fn pair_price_gives_each_side_its_fill_price() {
     assert_eq!(v["marketPrice"], "2");
     assert_eq!(v["fillPrice"], "1.998");
     assert_eq!(v["feePpm"], 1_000);
-    // The market's own decimals (0 in these fixtures), not the database's.
+    // The market's own decimals (0 in these fixtures), not the registered tokens'.
     assert_eq!(v["offeredDecimals"], 0);
     assert_eq!(v["requestedDecimals"], 0);
     assert!((v["asOf"].as_i64().unwrap() - now()).abs() <= 5, "{v}");

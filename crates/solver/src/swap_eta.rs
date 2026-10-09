@@ -249,8 +249,9 @@ pub(crate) struct VerdictTerms {
 pub(crate) struct ProposedOrder {
     pub offered: u64,
     pub requested: u64,
-    /// The note's smallest partial fill, in requested units, if it has one.
-    pub min_fill_step: Option<u64>,
+    /// The note's smallest partial fill, in requested units; 0 means none,
+    /// as in PSWAP.
+    pub min_fill_step: u64,
 }
 
 /// What the matcher would do with a [`ProposedOrder`] now. Amounts are base
@@ -341,10 +342,7 @@ pub(crate) fn judge(
     let FillInterval {
         minimum,
         maximum: worth,
-    } = scale.fill_interval(
-        AssetAmount::new(min_fill_step.unwrap_or(1))?,
-        requested_amount,
-    )?;
+    } = scale.fill_interval(AssetAmount::new(min_fill_step)?, requested_amount)?;
 
     // Both sides in requested units at `clear_at`.
     let opposite_side = side.opposite();
@@ -381,10 +379,12 @@ pub(crate) fn judge(
         // and releases what PSWAP releases for that payment.
         let paid = scale.to_payment_ceil(fill)?.as_u64();
         let released = to_u64(mul_div_floor(offered, paid, requested)?)?;
-        if released == 0 {
-            (FillStatus::None, 0, 0)
-        } else {
-            (FillStatus::Partial, released, paid)
+        match released {
+            0 => (FillStatus::None, 0, 0),
+            // Rounded up, the payment can reach the whole ask: then the
+            // whole note settles.
+            _ if paid == requested => (FillStatus::Full, offered, requested),
+            _ => (FillStatus::Partial, released, paid),
         }
     } else {
         (FillStatus::None, 0, 0)
@@ -626,7 +626,7 @@ mod tests {
         ProposedOrder {
             offered,
             requested,
-            min_fill_step: None,
+            min_fill_step: 0,
         }
     }
 
@@ -717,7 +717,7 @@ mod tests {
     fn a_partial_fill_must_reach_the_min_fill_step() {
         let with_step = |min_fill_step, buyers| {
             let order = ProposedOrder {
-                min_fill_step: Some(min_fill_step),
+                min_fill_step,
                 ..order(1_000_000, 1_990_000)
             };
             judge(
@@ -735,6 +735,26 @@ mod tests {
         // A step above the whole order means all or nothing.
         assert_eq!(with_step(5_000_000, 1_000_000).status, FillStatus::None);
         assert_eq!(with_step(5_000_000, 3_000_000).status, FillStatus::Full);
+        // 0 is PSWAP's "no step": any partial fill counts.
+        assert_eq!(with_step(0, 1_000_000).status, FillStatus::Partial);
+    }
+
+    #[test]
+    fn a_partial_fill_that_pays_the_whole_ask_is_full() {
+        // Worth 2_000 B. Buyers for 1_999 B pay ceil(1_999 / 2) = 1_000 B,
+        // the whole ask, so the whole note settles.
+        let order = order(1_000, 1_000);
+        let q = judge(
+            OrderSide::SellBase,
+            two(),
+            TERMS,
+            order,
+            &[],
+            &deep_buyers(1_999),
+        )
+        .unwrap();
+        assert_eq!(q.status, FillStatus::Full);
+        assert_eq!((q.fillable_offered, q.fillable_requested), (1_000, 1_000));
     }
 
     #[test]

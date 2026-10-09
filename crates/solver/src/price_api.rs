@@ -12,11 +12,11 @@
 //!
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
-//! while younger than the quote TTL. The registered tokens (config only), with
-//! their decimals and tickers, are read from the DB once at startup and kept in
-//! memory, so public traffic never touches PostgreSQL. The book depth for swap
-//! quotes comes from [`mirror_depth`], which this thread runs: the matcher only
-//! sends changes.
+//! while younger than the quote TTL. The registered tokens, with their
+//! decimals and tickers, are read from the DB once at startup and kept in
+//! memory, so public traffic never touches PostgreSQL; a registration change
+//! shows after a restart. The book depth for swap quotes comes from
+//! [`mirror_depth`], which this thread runs: the matcher only sends changes.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -141,7 +141,7 @@ struct PriceResponse {
     /// float ambiguity).
     price: String,
     precision: String,
-    /// Token's on-chain decimals (null until ingest has fetched it).
+    /// Token's on-chain decimals (null if unknown at startup).
     decimals: Option<u8>,
     /// Unix secs the quote was received (now, for the quote asset itself).
     as_of: i64,
@@ -401,21 +401,21 @@ struct SwapEtaResponse {
 
 /// A required positive base-unit amount.
 fn required_amount(q: &HashMap<String, String>, key: &str) -> Result<u64, ApiError> {
-    parse_amount(q, key)?.ok_or_else(|| ApiError::BadAmount(format!("missing `{key}`")))
+    match parse_amount(q, key)? {
+        None => Err(ApiError::BadAmount(format!("missing `{key}`"))),
+        Some(0) => Err(ApiError::BadAmount(format!("`{key}` must be > 0"))),
+        Some(v) => Ok(v),
+    }
 }
 
-/// An optional positive base-unit amount.
+/// An optional base-unit amount.
 fn parse_amount(q: &HashMap<String, String>, key: &str) -> Result<Option<u64>, ApiError> {
-    let Some(raw) = q.get(key) else {
-        return Ok(None);
-    };
-    let v: u64 = raw
-        .parse()
-        .map_err(|_| ApiError::BadAmount(format!("`{key}` must be a u64, got {raw:?}")))?;
-    if v == 0 {
-        return Err(ApiError::BadAmount(format!("`{key}` must be > 0")));
-    }
-    Ok(Some(v))
+    q.get(key)
+        .map(|raw| {
+            raw.parse()
+                .map_err(|_| ApiError::BadAmount(format!("`{key}` must be a u64, got {raw:?}")))
+        })
+        .transpose()
 }
 
 fn parse_faucet(q: &HashMap<String, String>, key: &str) -> Result<AccountId, ApiError> {
@@ -489,7 +489,8 @@ async fn get_swap_eta(
     let order = ProposedOrder {
         offered: required_amount(&q, "offered_amount")?,
         requested: required_amount(&q, "requested_amount")?,
-        min_fill_step: parse_amount(&q, "min_fill_step")?,
+        // As in PSWAP, 0 (the default) means no minimum.
+        min_fill_step: parse_amount(&q, "min_fill_step")?.unwrap_or(0),
     };
     // 404 unless both are registered.
     registered_decimals(&state, a, b)?;
@@ -524,13 +525,11 @@ async fn get_swap_eta(
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
     let now_unix = now_secs().max(0) as u64;
-    let (median24h_seconds, settlements_running) = {
-        let stats = state.stats_rx.borrow();
-        (
-            stats.median_secs((a, b), now_unix),
-            stats.executor_accepting,
-        )
-    };
+    // Clone the snapshot first: sorting under the borrow would hold up the
+    // executor's next publish.
+    let stats = state.stats_rx.borrow().clone();
+    let median24h_seconds = stats.median_secs((a, b), now_unix);
+    let settlements_running = stats.executor_accepting;
 
     Ok(no_store(Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
@@ -636,7 +635,8 @@ async fn get_swap_eta_v1(
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
     let now = now_secs().max(0) as u64;
-    let median24h_seconds = state.stats_rx.borrow().median_secs((a, b), now);
+    let stats = state.stats_rx.borrow().clone();
+    let median24h_seconds = stats.median_secs((a, b), now);
 
     Ok(no_store(Json(SwapEtaV1Response {
         offered_faucet: a.to_hex(),

@@ -747,8 +747,8 @@ pub struct PgPool {
     publish_order: Arc<Mutex<()>>,
     readers: r2d2::Pool<ConnectionManager<PgConnection>>,
     read_slots: Arc<Semaphore>,
-    /// Caps public API reads below `read_slots`, so wallet traffic always
-    /// leaves at least one read connection for the solver pipeline.
+    /// Caps public reads (the maker gateway) below `read_slots`, so public
+    /// traffic always leaves at least one read connection for the pipeline.
     public_slots: Arc<Semaphore>,
     telemetry: Arc<PoolTelemetry>,
 }

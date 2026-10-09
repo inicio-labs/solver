@@ -383,8 +383,9 @@ GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amo
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   when ingest registers the config tokens at boot. The price API loads the
   registered tokens **once at startup** and keeps them in memory, so requests
-  never read PostgreSQL; token changes (or metadata a failed boot fetch missed)
-  show after a restart.
+  never read PostgreSQL. A registration change (admin API, or a token added to
+  `solver.toml`) and metadata a failed boot fetch missed show after a restart;
+  removing a token from `solver.toml` does not unregister it.
 - `/v2/pair-price` and `/v2/swap-eta` are the swap flow: the price to build an
   ask from, then the solver's verdict on that order. `/v1/swap-eta` is the
   original check, frozen. See `docs/price-api.md`.
@@ -425,7 +426,7 @@ cargo test -p consume-script       # MASM script compiles + behaves
   - **Batch (`/v1/prices`):** returns a map, caps the id count (`> max_batch` →
     `400`), and omits unknown, unpriced and stale ids (empty `ids` → empty map).
   - **Surface hardening:** malformed faucet id → `400` with a JSON error body;
-    routes are `/v1`-scoped (no prefix → `404`) and GET-only (`POST` → `405`).
+    routes are `/v1`- or `/v2`-scoped (no prefix → `404`) and GET-only (`POST` → `405`).
 - **Binance price feed** (`crates/solver/src/price/binance`): exact midpoint,
   orientation, spread and TTL boundaries (incl. proptests), and the feed's two
   readers against `mock-binance` — reconnects, `Retry-After`, invalid quotes,

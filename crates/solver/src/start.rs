@@ -195,7 +195,8 @@ pub async fn start(
     // Cancelling this child stops the pipeline without cancelling its parent.
     let shutdown_requested = cancel;
     let cancel = shutdown_requested.child_token();
-    // 1. DB pool, shared by the pipeline, the executor and the price API.
+    // 1. DB pool, shared by the pipeline, the executor and the maker gateway
+    //    (the price API reads it once, at startup).
     let writer_url = std::env::var("SOLVER_DATABASE_URL")
         .context("set SOLVER_DATABASE_URL for the PostgreSQL application database")?;
     let reader_url = std::env::var("SOLVER_READ_DATABASE_URL")
@@ -417,8 +418,8 @@ pub async fn start(
     };
 
     // 12b. PRICE-QUERY API THREAD (public, read-only): its own OS thread +
-    //      multi-thread runtime so wallet traffic can't starve settlement. Reads
-    //      the Binance snapshot + DB; never touches a `!Send` client.
+    //      multi-thread runtime so wallet traffic can't starve settlement. Serves
+    //      from memory only; never touches a `!Send` client.
     let price_api_cfg = crate::price_api::PriceApiConfig {
         bind: config.engine.price_query_bind.clone(),
         port: config.engine.price_query_port,
@@ -438,9 +439,9 @@ pub async fn start(
         swap_offmarket_tolerance_bps: config.engine.swap_offmarket_tolerance_bps,
         clearing_fee_ppm: config.engine.clearing_fee_ppm,
     };
-    // The registered tokens (config only) with the decimals and tickers ingest
-    // startup has just recorded: the price API keeps them in memory, so public
-    // traffic never reads PostgreSQL.
+    // The registered tokens, with the decimals and tickers ingest startup has
+    // just recorded: the price API keeps them in memory, so public traffic
+    // never reads PostgreSQL. A registration change shows after a restart.
     let tokens = match db_pool
         .read(db::postgres_db::get_registered_tokens_tx)
         .await

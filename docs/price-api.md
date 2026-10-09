@@ -62,7 +62,7 @@ Query params (optional):
 | Field | Type | Meaning |
 |---|---|---|
 | `faucet_id` | string | canonical hex id of the token's faucet |
-| `ticker` | string \| null | on-chain token symbol (e.g. `IBTC`); `null` if unknown |
+| `ticker` | string | on-chain token symbol (e.g. `IBTC`); left out when unknown |
 | `vs_currency` | string | quote currency (`usdt`) |
 | `price` | **string** | price of **ONE WHOLE token** in `vs_currency`. Exact decimal string (no float rounding); USDT itself is `"1"`. |
 | `precision` | string | precision applied to `price` (`full` or `0`–`18`) |
@@ -163,7 +163,7 @@ by the solver's own rules, plus how long it takes.
 |---|---|---|
 | `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
 | `offered_amount`, `requested_amount` | yes | the order, in base units |
-| `min_fill_step` | no | the note's smallest partial fill, in requested-token base units. If only part of the order can fill and that part is smaller, `fillStatus` is `none` (reason `liquidity`). Send `requested_amount` for all-or-nothing |
+| `min_fill_step` | no | the note's smallest partial fill, in requested-token base units; `0` or omitted means none, as in PSWAP. If only part of the order can fill and that part is smaller, `fillStatus` is `none` (reason `liquidity`). Send `requested_amount` for all-or-nothing |
 
 **200 response** — offering 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with buyers for 3.2 ETH (8000 USDT) in the book:
 
@@ -241,12 +241,17 @@ rule.
 | Code | When |
 |---|---|
 | `200` | OK |
-| `400` | `bad_faucet_id`: malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
+| `400` | `bad_faucet_id`: missing or malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
 | `404` | `unknown_faucet`: not registered with the solver |
-| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on the swap endpoints, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override) |
+| `408` | the request took longer than `price_query_timeout_ms` (empty body) |
+| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `overloaded`: more than `price_query_max_inflight` requests in flight, retry shortly |
 
-Error body: `{"error":"unknown_faucet","message":"…"}`; the `error` codes above are
-stable, the `message` is for people. `allow_stale` does not override `no_price`.
+Without a price, both swap-eta endpoints still answer `200`: `/v2` with reason
+`no_market` or `no_price`, `/v1` with `null` market fields.
+
+Error body: `{"error":"unknown_faucet","message":"…"}` (`408` has none); the
+`error` codes above are stable, the `message` is for people. `allow_stale` does
+not override `no_price`.
 
 ---
 

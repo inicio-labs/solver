@@ -116,6 +116,21 @@ pub(crate) struct Valued {
     pub(crate) fresh: bool,
 }
 
+/// An order's clearing pair as [`PriceSnapshot::order_market`] sees it now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OrderMarket {
+    /// The side of the pair the order takes.
+    pub side: OrderSide,
+    /// The pair's clearing price in base units, exactly as the matcher uses it.
+    pub price: BatchPrice,
+    /// The mid in whole requested tokens per whole offered token.
+    pub market: Decimal,
+    /// When the solver received the quote.
+    pub received_at: Instant,
+    pub offered_decimals: u8,
+    pub requested_decimals: u8,
+}
+
 /// Latest merged quote per subscribed symbol, with the markets they price and
 /// the TTL that decides freshness. Consumers clone the `Arc` once per use.
 /// The default snapshot has no markets: everything is unavailable.
@@ -225,28 +240,6 @@ impl PriceSnapshot {
             .ok_or(PriceUnavailable::Invalid)
     }
 
-    /// The side an order offering `offered` for `requested` takes in its
-    /// clearing pair, and that pair's [`Self::pair_price`]: exactly what the
-    /// matcher would clear it at now.
-    pub(crate) fn order_price(
-        &self,
-        offered: TokenId,
-        requested: TokenId,
-        now: Instant,
-    ) -> Result<(OrderSide, BatchPrice), PriceUnavailable> {
-        if self.markets.pair(offered, requested).is_some() {
-            Ok((
-                OrderSide::SellBase,
-                self.pair_price(offered, requested, now)?,
-            ))
-        } else {
-            Ok((
-                OrderSide::BuyBase,
-                self.pair_price(requested, offered, now)?,
-            ))
-        }
-    }
-
     /// Whole `requested` tokens per whole `offered` token, for a clearing pair
     /// configured in either direction, while its quote is fresh at `now`.
     /// Where Binance quotes the other way round the price is `1 / mid`,
@@ -257,18 +250,18 @@ impl PriceSnapshot {
         requested: TokenId,
         now: Instant,
     ) -> Result<Decimal, PriceUnavailable> {
-        self.market_quote(offered, requested, now)
-            .map(|(price, _)| price)
+        Ok(self.order_market(offered, requested, now)?.market)
     }
 
-    /// [`Self::market_price`] with the time the solver received its quote.
-    pub(crate) fn market_quote(
+    /// Everything a swap answer needs about the clearing pair of an order
+    /// offering `offered` for `requested`, from one fresh quote.
+    pub(crate) fn order_market(
         &self,
         offered: TokenId,
         requested: TokenId,
         now: Instant,
-    ) -> Result<(Decimal, Instant), PriceUnavailable> {
-        let (pair, flipped) = match self.markets.pair(offered, requested) {
+    ) -> Result<OrderMarket, PriceUnavailable> {
+        let (pair, buys_base) = match self.markets.pair(offered, requested) {
             Some(pair) => (pair, false),
             None => (
                 self.markets
@@ -282,14 +275,28 @@ impl PriceSnapshot {
             return Err(PriceUnavailable::Stale);
         }
         // The midpoint prices Binance's base asset; is that `offered`?
-        let price = if (pair.orientation == Orientation::Direct) != flipped {
+        let market = if (pair.orientation == Orientation::Direct) != buys_base {
             latest.mid
         } else {
             Decimal::ONE
                 .checked_div(latest.mid)
                 .ok_or(PriceUnavailable::Invalid)?
         };
-        Ok((price, latest.received_at))
+        let (side, offered_decimals, requested_decimals) = if buys_base {
+            (OrderSide::BuyBase, pair.quote_decimals, pair.base_decimals)
+        } else {
+            (OrderSide::SellBase, pair.base_decimals, pair.quote_decimals)
+        };
+        Ok(OrderMarket {
+            side,
+            price: pair
+                .in_base_units(latest.mid)
+                .ok_or(PriceUnavailable::Invalid)?,
+            market,
+            received_at: latest.received_at,
+            offered_decimals,
+            requested_decimals,
+        })
     }
 
     /// One whole `token` in the valuation quote asset, under the same TTL as
@@ -590,24 +597,31 @@ mod tests {
             snapshot.market_price(eth(), btc(), now),
             Err(PriceUnavailable::NoMarket)
         );
-        // A quote finds the order's side of the configured pair, at the
-        // matcher's own price, and when that quote arrived.
+        // A swap answer finds the order's side of the configured pair, at
+        // the matcher's own price, with the mid and decimals in its terms.
         let clearing = snapshot.pair_price(usdt(), eth(), now).unwrap();
+        let selling = snapshot.order_market(usdt(), eth(), now).unwrap();
         assert_eq!(
-            snapshot.order_price(usdt(), eth(), now),
-            Ok((OrderSide::SellBase, clearing))
+            (
+                selling.side,
+                selling.price,
+                selling.market,
+                selling.received_at
+            ),
+            (OrderSide::SellBase, clearing, price("0.0005"), now)
+        );
+        let buying = snapshot.order_market(eth(), usdt(), now).unwrap();
+        assert_eq!(
+            (buying.side, buying.price, buying.market),
+            (OrderSide::BuyBase, clearing, price("2000"))
         );
         assert_eq!(
-            snapshot.order_price(eth(), usdt(), now),
-            Ok((OrderSide::BuyBase, clearing))
+            (buying.offered_decimals, buying.requested_decimals),
+            (selling.requested_decimals, selling.offered_decimals)
         );
         assert_eq!(
-            snapshot.order_price(eth(), btc(), now),
+            snapshot.order_market(eth(), btc(), now),
             Err(PriceUnavailable::NoMarket)
-        );
-        assert_eq!(
-            snapshot.market_quote(eth(), usdt(), now),
-            Ok((price("2000"), now))
         );
         assert_eq!(
             snapshot.valuation(usdt(), now),

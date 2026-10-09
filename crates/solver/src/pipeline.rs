@@ -176,7 +176,8 @@ pub struct PipelineChannels {
     /// Every change to the active book (matcher → swap-eta API's depth mirror).
     pub depth_tx: mpsc::UnboundedSender<DepthChange>,
     pub depth_rx: mpsc::UnboundedReceiver<DepthChange>,
-    /// In-memory settlement-time window (executor → swap-eta API), latest-wins.
+    /// Settlement times and whether the executor takes batches (executor →
+    /// swap-eta API), latest-wins.
     pub stats_tx: watch::Sender<Arc<SettlementStats>>,
     pub stats_rx: watch::Receiver<Arc<SettlementStats>>,
     pub exec_tx: mpsc::Sender<ExecutionBatch>,
@@ -189,11 +190,11 @@ pub fn create_channels() -> PipelineChannels {
     let (book_tx, book_rx) = mpsc::channel::<BookUpdate>(PIPELINE_CHANNEL_BUF);
     let (prices_tx, prices_rx) = watch::channel(Arc::new(PriceSnapshot::default()));
     // Two separate swap-eta feeds, one per producer: the matcher sends each
-    // change to its active book, the executor publishes settlement durations
-    // after each settlement (the 24h median). Both are read on the price API's
-    // thread. The depth feed is unbounded so the matcher never waits on or
-    // drops a change: it only sends what its index already did, and the price
-    // API's mirror drains it every 250 ms (see `price_api::mirror_depth`).
+    // change to its active book; the executor publishes settlement durations
+    // and whether it takes batches. Both are read on the price API's thread.
+    // The depth feed is unbounded so the matcher never waits on or drops a
+    // change: it only sends what its index already did, and the price API's
+    // mirror drains it (see `price_api::mirror_depth`).
     let (depth_tx, depth_rx) = mpsc::unbounded_channel::<DepthChange>();
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));

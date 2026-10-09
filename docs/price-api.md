@@ -87,38 +87,40 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 }
 ```
 
-### Swapping: three steps for the wallet
+### Swapping with `/v2`
 
-1. **Price.** `GET /v2/pair-price` gives the pair's `fillPrice`: the Binance
-   mid less the clearing fee, the best price an ask can name and still fill
-   right now (rounded down, so an ask built from it never overshoots).
-2. **Ask.** The wallet builds the order with the user's slippage (BigInt or a
-   decimal library, never floats):
+Only pairs configured as a Binance clearing market (for example `ETHUSDT`)
+can swap; both tokens having a `/v1/price` is not enough.
+
+1. **Price.** `GET /v2/pair-price` gives `fillPrice`: the most the order can
+   ask per whole offered token and still fill now.
+2. **Ask.** With the user's slippage as a fraction (`0.005` = 0.5%), in
+   BigInt or a decimal library, never floats:
    `requested_amount = floor(offered_amount × fillPrice × (1 − slippage) × 10^requestedDecimals / 10^offeredDecimals)`
-3. **Verdict.** `GET /v2/swap-eta` with both amounts says whether that exact
-   order fills now, partly, or not, and why. If it is off market, go back to
-   step 1 for a fresh price.
+3. **Verdict.** `GET /v2/swap-eta` with both amounts, **before the user
+   signs**. Off market: go back to step 1 for a fresh price.
 
-Slippage here protects the user against the mid moving before the next
-batch. It does not buy more liquidity: the solver fills every order at the
-mid less the fee, never at a resting order's own price.
+**What the user receives.** A full fill pays the mid less the fee
+(`expectedRequestedAmount`), whatever the slippage. A partial fill pays the
+order's own rate, so there the user gets exactly what they asked. Slippage
+protects against the mid moving before the next batch; a lower ask also
+queues ahead of orders on the same side that ask more.
 
-**Reading the verdict.** Check `acceptingOrders` first, then `priceBand`, then
-`fillStatus`:
+**Reading the verdict.** Take the first row that matches:
 
-| Outcome | Answer |
-|---|---|
-| Solver paused: orders wait | `acceptingOrders: false` (whatever the rest says) |
-| Can be filled | `at_market` + `full` |
-| Can be filled partially | `at_market` + `partial` |
-| Can't be filled due to price | `off_market` (`none`, reason `price`) |
-| Close: fills after a small price move | `tolerated`, with `fillStatus` judged at the price where the order starts to fill |
-| Not enough orders at today's price | `at_market` or `tolerated` + `none`, reason `liquidity` |
-| No price for the pair | `none`, reason `no_market` or `no_price` |
+| Outcome | Answer | Show |
+|---|---|---|
+| Settlements paused; the order waits | `settlementsRunning: false` | "Settlement delayed" |
+| No price for the pair | `none`, reason `no_market` / `no_price` | "This pair isn't traded" / "Prices are unavailable right now; try again shortly" |
+| Can't fill because of the price | `off_market` (`none`, reason `price`) | "The price moved." Get a fresh `/v2/pair-price` and rebuild the ask |
+| Not enough orders at the current price | `none`, reason `liquidity` | "Not enough orders at the current price right now" |
+| Can fill | `at_market` + `full` | "You receive ≈ `expectedRequestedAmount`, at least `requestedAmount`" |
+| Can fill partly | `at_market` + `partial` | "Only `fillableOfferedAmount` fills now; the rest waits" |
+| Close: needs a small price move | `tolerated` + `full` or `partial` | "May take longer: fills when the price moves slightly" |
 
-Ask before the user signs. Once the order is in the book, asking again counts
-it as volume ahead of itself; an order-status endpoint for the "not filling
-soon, cancel?" prompt is planned.
+Once the order is in the book, asking again counts it as volume ahead of
+itself; an order-status endpoint for the "not filling soon, cancel?" prompt
+is planned.
 
 ### `GET /v2/pair-price` — the price to build an ask from
 
@@ -126,7 +128,7 @@ soon, cancel?" prompt is planned.
 |---|---|
 | `offered_faucet`, `requested_faucet` | hex faucet ids; the order offers the first and requests the second |
 
-**200 response** — selling ETH (18 decimals) for USDT (6 decimals), mid 2500, fee 0.1%:
+**200 response** — offering ETH (18 decimals) for USDT (6 decimals), mid 2500, fee 0.1%:
 
 ```json
 {
@@ -137,32 +139,33 @@ soon, cancel?" prompt is planned.
 }
 ```
 
+Prices are per offered token, so they depend on the direction: offering USDT
+for ETH on the same market gives `marketPrice` `"0.0004"` and `fillPrice`
+`"0.000399600399600399"` (ETH per USDT; invert them for display).
+
 | Field | Meaning |
 |---|---|
-| `marketPrice` | the Binance mid of the pair's clearing market, in whole requested tokens per whole offered token |
-| `fillPrice` | the best price an ask can name and still fill now: the mid after the clearing fee as this side is charged it, rounded toward zero |
-| `feePpm` | the clearing fee |
-| `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals, to turn prices into base units (a pair is only priced once both are known) |
-| `asOf` | unix seconds the solver received this quote |
+| `marketPrice` | the Binance mid, in whole requested tokens per whole offered token |
+| `fillPrice` | the most an ask can name per whole offered token and still fill now: selling the pair's base token, mid × (1 − fee); buying it, mid ÷ (1 + fee); rounded down at 18 decimals. A limit for the ask, not the payout |
+| `feePpm` | the clearing fee in parts per million (`1000` = 0.1%; may be `0`) |
+| `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals |
+| `asOf` | unix seconds the solver received the Binance quote |
 
-It follows the solver's own freshness rule: `503` `no_market` when the pair
-has no clearing market, `503` `no_price` when its quote is missing, invalid
-or stale. `404` unknown faucet, `400` bad or equal faucet ids.
+Errors: see [Status codes](#status-codes). It follows the solver's own
+freshness rule, so a missing or stale quote is `503` `no_price`.
 
 ### `GET /v2/swap-eta` — will this order fill?
 
-What the solver would do **now** with the order the wallet is about to
-sign: where its price sits, how much of it the live book fills, and how long
-it takes. It applies the solver's own rule (fill at the mid less the fee) to
-the live book.
+What the solver would do **now** with the order the wallet is about to sign,
+by the solver's own rules, plus how long it takes.
 
 | Param | Required | Meaning |
 |---|---|---|
 | `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
 | `offered_amount`, `requested_amount` | yes | the order, in base units |
-| `min_fill_step` | no | the note's smallest partial fill, in requested-token base units. A wallet that does not allow partial fills sends the requested amount; a smaller partial answer becomes `none` |
+| `min_fill_step` | no | the note's smallest partial fill, in requested-token base units. If only part of the order can fill and that part is smaller, `fillStatus` is `none` (reason `liquidity`). Send `requested_amount` for all-or-nothing |
 
-**200 response** — selling 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with 3.2 ETH of buyers in the book:
+**200 response** — offering 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with buyers for 3.2 ETH (8000 USDT) in the book:
 
 ```json
 {
@@ -172,56 +175,47 @@ the live book.
   "fillStatus": "full",
   "reason": null,
   "fillableOfferedAmount": "1000000000000000000", "fillableRequestedAmount": "2485012500",
-  "availableOfferedAmount": "3200000000000000000",
+  "maxOfferedAmount": "3200000000000000000",
   "expectedRequestedAmount": "2497500000",
   "feePpm": 1000, "feeAmount": "2500000",
   "marketPrice": "2500", "fillPrice": "2497.5",
-  "acceptingOrders": true,
+  "settlementsRunning": true,
   "estimatedSeconds": 14, "median24hSeconds": 11
 }
 ```
 
+The whole order fills. `fillableRequestedAmount` is at the order's own rate,
+the minimum (2485.0125 USDT); a full fill pays `expectedRequestedAmount`
+(2497.5 USDT).
+
 Amounts are **base units** (strings); prices are whole requested tokens per
-whole offered token. Optional fields are `null`, never omitted.
+whole offered token.
 
 | Field | Meaning |
 |---|---|
 | `offeredAmount`, `requestedAmount` | the order, as asked |
-| `priceBand` | `at_market`: fills at today's price · `tolerated`: fills once the price moves at most `swap_offmarket_tolerance_bps` (default 0.5%) the order's way; its fill fields are judged at the price where it starts to fill · `off_market`: further than that · `null`: no fresh price |
-| `fillStatus` | `full`, `partial` or `none` |
-| `reason` | only for `none`: `price` (off market), `liquidity` (priced fine, nothing left in the book for it), `no_market` (the pair has no clearing market), `no_price` (no fresh price right now) |
-| `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order the book fills now; a partial fill pays the order's own ratio |
-| `availableOfferedAmount` | how much of the offered token the book takes now at this order's price, not capped by the order's size: "max you can swap now". `null` off market or without a price |
-| `expectedRequestedAmount` | what a **full** fill pays at today's price: the market value less the fee, never less than `requestedAmount`. Show "you receive ≈ expected, at least requested" |
-| `feePpm`, `feeAmount` | the clearing fee, and what it takes from a full fill at today's price (requested token). The fee only comes out of the surplus over the ask, so it is smaller, down to `0`, for an order that is not at market |
-| `marketPrice`, `fillPrice` | as in `/v2/pair-price`, for showing "the market is now X" |
-| `acceptingOrders` | `false` while the solver cannot settle (it is recovering from missing fee funds, or the node or database being down): orders wait |
-| `estimatedSeconds` | next-batch ETA for an `at_market` order that fills fully or partly while `acceptingOrders`; otherwise `null` |
+| `priceBand` | `at_market`: fills at the current price · `tolerated`: fills once the price moves up to 0.5% (set per deployment) in the order's favour; its fill fields are judged at the price where it starts to fill · `off_market`: further than that |
+| `fillStatus`, `reason` | `full`, `partial` or `none`; for `none`, why: `price`, `liquidity`, `no_market` or `no_price` |
+| `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order fills now, at the order's own rate |
+| `maxOfferedAmount` | the most of the offered token an order at this rate fills now, after the orders ahead of it; not capped by `offeredAmount` ("max you can swap now") |
+| `expectedRequestedAmount` | what a full fill pays at the current price: the mid less the fee, never less than `requestedAmount` |
+| `feePpm`, `feeAmount` | the clearing fee, and what it takes from that full fill (requested token). It only comes out of the surplus over the ask, so it is smaller, down to `0`, for an order that is not at market |
+| `marketPrice`, `fillPrice` | as on `/v2/pair-price` |
+| `settlementsRunning` | `false` while the solver cannot settle (missing fee funds, node or database down) or has just restarted: orders wait |
+| `estimatedSeconds` | next-batch ETA when settlements are running and the order is `at_market` and fills fully or partly; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
 
-Suggested wallet copy:
-
-| Answer | Show |
-|---|---|
-| `at_market` + `full` | no warning |
-| `at_market` + `partial` | "Only `fillableOfferedAmount` can fill now; the rest waits" |
-| `tolerated` | "May take longer: fills when the price moves slightly" |
-| `none` + `price` | "The price moved." Get a fresh `/v2/pair-price` and rebuild the ask |
-| `none` + `liquidity` | "Not enough orders at the current price right now" |
-| `none` + `no_market` | "This pair isn't traded" |
-| `none` + `no_price` | "Prices are unavailable right now; try again shortly" |
-| `acceptingOrders: false` | "Settlement delayed" (shown first) |
+Without a price, `priceBand`, `maxOfferedAmount`, `expectedRequestedAmount`,
+`feeAmount`, `marketPrice` and `fillPrice` are `null`, and the answer is still
+`200` with reason `no_market` or `no_price`. Off market, `maxOfferedAmount` is
+`null`. Optional fields are `null`, never omitted.
 
 The verdict is advisory: nothing is reserved, so two wallets can be told
 `full` for the same liquidity. It counts the solver's own book only. Not
 modelled: external liquidity routing, the per-side order cap of one batch,
 and other orders' own minimum fills (an all-or-nothing order counts in full
-even when it could not fill against this one).
-
-Errors: `400` `bad_faucet_id` (malformed id), `bad_request` (the two faucets
-are equal), `bad_amount` (missing, zero or non-numeric amount, or amounts too
-large to price); `404` `unknown_faucet`. Without a price the answer is still
-`200`, with `reason` `no_market` or `no_price`.
+even when it could not fill against this one). Errors: see
+[Status codes](#status-codes).
 
 ### `GET /v1/swap-eta` — the original check (frozen)
 
@@ -247,9 +241,9 @@ rule.
 | Code | When |
 |---|---|
 | `200` | OK |
-| `400` | `bad_faucet_id`: malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (equal faucets) and `bad_amount` |
-| `404` | faucet not registered with the solver |
-| `503` | `no_market`: registered but no Binance market is configured for the token — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, or the newest was crossed, too wide or too thin); `stale`: the quote is at least the quote TTL old (use `?allow_stale=true` to override) |
+| `400` | `bad_faucet_id`: malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
+| `404` | `unknown_faucet`: not registered with the solver |
+| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on the swap endpoints, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override) |
 
 Error body: `{"error":"unknown_faucet","message":"…"}`; the `error` codes above are
 stable, the `message` is for people. `allow_stale` does not override `no_price`.

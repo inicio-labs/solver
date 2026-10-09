@@ -28,20 +28,20 @@ pub(crate) struct ClearingBook {
     makers: MakerIndex,
     /// Where index changes go for the price API's depth mirror. Sending never
     /// blocks; a closed receiver is ignored.
-    depth: Option<mpsc::UnboundedSender<DepthChange>>,
+    depth_tx: Option<mpsc::UnboundedSender<DepthChange>>,
 }
 
 impl ClearingBook {
-    pub(super) fn with_depth(depth: mpsc::UnboundedSender<DepthChange>) -> Self {
+    pub(super) fn with_depth(depth_tx: mpsc::UnboundedSender<DepthChange>) -> Self {
         Self {
-            depth: Some(depth),
+            depth_tx: Some(depth_tx),
             ..Self::default()
         }
     }
 
     fn send_depth(&self, change: DepthChange) {
-        if let Some(depth) = &self.depth {
-            let _ = depth.send(change);
+        if let Some(depth_tx) = &self.depth_tx {
+            let _ = depth_tx.send(change);
         }
     }
 
@@ -104,13 +104,7 @@ impl ClearingBook {
         }
     }
 
-    fn remove_from_index(
-        &mut self,
-        pair: (TokenId, TokenId),
-        key: OrderKey,
-        id: NoteId,
-        volume: u64,
-    ) {
+    fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
         if let Some(index) = self.pairs.get_mut(&pair) {
             // A remainder can inherit this exact key. A stale parent event
             // must never remove the child's entry.
@@ -120,7 +114,7 @@ impl ClearingBook {
                     self.send_depth(DepthChange::Removed {
                         pair,
                         rate: key.rate,
-                        volume,
+                        volume: key.rate.offered,
                     });
                 }
             }
@@ -139,7 +133,6 @@ impl ClearingBook {
             .get(&id)
             .ok_or(ClearingError::InternalInvariant("missing order to index"))?;
         let (pair, key) = order.index_key();
-        let volume = order.offered_asset().amount().as_u64();
         let index = self.pairs.entry(pair).or_default();
         match index.entry(key) {
             btree_map::Entry::Vacant(entry) => {
@@ -147,7 +140,7 @@ impl ClearingBook {
                 self.send_depth(DepthChange::Added {
                     pair,
                     rate: key.rate,
-                    volume,
+                    volume: key.rate.offered,
                 });
             }
             btree_map::Entry::Occupied(entry) => {
@@ -166,11 +159,10 @@ impl ClearingBook {
     pub fn deactivate(&mut self, id: NoteId) {
         if let Some(order) = self.orders.get_mut(&id) {
             let (pair, key) = order.index_key();
-            let volume = order.offered_asset().amount().as_u64();
             // The order record remains for recovery, but the active index must
             // no longer expose it to matching or RFQ.
             order.deactivate();
-            self.remove_from_index(pair, key, id, volume);
+            self.remove_from_index(pair, key, id);
         }
     }
 
@@ -256,8 +248,7 @@ impl ClearingBook {
         self.makers.forget(id);
         if let Some(order) = self.orders.remove(&id) {
             let (pair, key) = order.index_key();
-            let volume = order.offered_asset().amount().as_u64();
-            self.remove_from_index(pair, key, id, volume);
+            self.remove_from_index(pair, key, id);
         }
     }
 
@@ -349,6 +340,7 @@ mod tests {
     use super::*;
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
+    use crate::matcher::test_ticks::{after_first_tick, after_next_tick};
     use crate::matcher::MatcherError;
     use crate::swap_eta::DepthBook;
     use crate::types::{now_millis, ExecutionBatch};
@@ -365,16 +357,6 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
-
-    /// With time paused the matcher ticks at 0 s, 1 s, 2 s and so on: these
-    /// return half a second after the first tick, or one tick later.
-    async fn after_first_tick() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    async fn after_next_tick() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
 
     fn fixture(
         buy: bool,

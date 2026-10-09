@@ -260,17 +260,8 @@ mod tests {
 
     use super::*;
     use crate::db;
+    use crate::matcher::test_ticks::{after_first_tick, after_next_tick};
     use crate::swap_eta::DepthBook;
-
-    /// With time paused the matcher ticks at 0 s, 1 s, 2 s and so on: these
-    /// return half a second after the first tick, or one tick later.
-    async fn after_first_tick() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    async fn after_next_tick() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,

@@ -910,11 +910,11 @@ impl Executor {
         let mut verification = Verification::default();
         let mut failed = FailedHolds::default();
         loop {
-            // Tell the quote API whether settlements run right now. Every
+            // Tell the swap API whether batches are taken right now. Every
             // entry into or exit from verification mode comes back here.
-            let settling = !verification.active;
-            if stats.settling != settling {
-                stats.settling = settling;
+            let accepting = !verification.active;
+            if stats.executor_accepting != accepting {
+                stats.executor_accepting = accepting;
                 stats_tx.send_replace(Arc::new(stats.clone()));
             }
             let held = verification.take_retries();

@@ -383,14 +383,9 @@ GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amo
   USDT); the quote asset itself is `1`. `decimals`/`ticker` are fetched on-chain
   **once, when a token is registered** (config tokens at boot, admin-added tokens
   via the subscribe relay), then cached — never re-polled.
-- `/v2/pair-price` gives a pair's clearing price (mid and mid after the fee)
-  to build an ask from; `/v2/swap-eta` judges that exact order the way the
-  matcher would clear it now: price band (`at_market` / `tolerated` /
-  `off_market`), fill status (`full` / `partial` / `none` with a reason),
-  fillable and available amounts, under the same TTL and fee as the matcher
-  (see `docs/price-api.md`).
-- `/v1/swap-eta` is the original check (top of book, raw mid), frozen for
-  wallets built against it.
+- `/v2/pair-price` and `/v2/swap-eta` are the swap flow: the price to build an
+  ask from, then the solver's verdict on that order. `/v1/swap-eta` is the
+  original check, frozen. See `docs/price-api.md`.
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block
   `http://` calls from an `https://` page (mixed content).

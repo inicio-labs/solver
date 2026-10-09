@@ -154,15 +154,14 @@ impl Order {
         };
 
         let fill_scale = FillScale::new(comparison_units, payment_units);
-        let minimum_payment = self.pswap.storage().min_fill_step().min(requested.amount());
-        let minimum = fill_scale.to_comparison_floor(minimum_payment)?;
-        let maximum = fill_scale.to_comparison_floor(requested.amount())?;
+        let comparison_fills =
+            fill_scale.fill_interval(self.pswap.storage().min_fill_step(), requested.amount())?;
 
         Ok(Some(MatchOrder {
             order: self,
             side,
             fill_scale,
-            comparison_fills: FillInterval { minimum, maximum },
+            comparison_fills,
         }))
     }
 
@@ -227,6 +226,17 @@ pub(crate) fn eligible_units(
     Ok(eligible.then_some((comparison_units, payment_units)))
 }
 
+/// The fee on a full fill worth `comparison_fill` (in the requested asset):
+/// the clearing fee, but never more than the surplus over the ask.
+pub(crate) fn full_fill_fee(
+    comparison_fill: U256,
+    requested: AssetAmount,
+    fee_ppm: u32,
+) -> Result<U256, ClearingError> {
+    let surplus = comparison_fill.saturating_sub(U256::from(requested.as_u64()));
+    Ok(surplus.min(ppm_floor(comparison_fill, fee_ppm)?))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FillInterval {
     pub minimum: U256,
@@ -242,14 +252,16 @@ impl From<RangeInclusive<u128>> for FillInterval {
     }
 }
 
+/// An order's exchange rate between comparison units (its fill, valued at the
+/// clearing price) and payment units (the requested asset it receives).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FillScale {
+pub(crate) struct FillScale {
     comparison_units: U256,
     payment_units: U256,
 }
 
 impl FillScale {
-    fn new(comparison_units: U256, payment_units: U256) -> Self {
+    pub(crate) fn new(comparison_units: U256, payment_units: U256) -> Self {
         let common = comparison_units.gcd(payment_units);
         Self {
             comparison_units: comparison_units / common,
@@ -257,11 +269,25 @@ impl FillScale {
         }
     }
 
+    /// The comparison fills an order may take: from its minimum partial fill
+    /// (`min_fill_step`, at most the whole ask) up to the whole order.
+    pub(crate) fn fill_interval(
+        self,
+        min_fill_step: AssetAmount,
+        requested: AssetAmount,
+    ) -> Result<FillInterval, ClearingError> {
+        Ok(FillInterval {
+            minimum: self.to_comparison_floor(min_fill_step.min(requested))?,
+            maximum: self.to_comparison_floor(requested)?,
+        })
+    }
+
     fn to_comparison_floor(self, payment: AssetAmount) -> Result<U256, ClearingError> {
         mul_div_floor(payment.as_u64(), self.comparison_units, self.payment_units)
     }
 
-    fn to_payment_ceil(self, comparison: U256) -> Result<AssetAmount, ClearingError> {
+    /// What a partial fill pays, rounded up.
+    pub(crate) fn to_payment_ceil(self, comparison: U256) -> Result<AssetAmount, ClearingError> {
         to_asset_amount(mul_div_ceil(
             comparison,
             self.payment_units,
@@ -308,8 +334,7 @@ impl MatchOrder<'_> {
         let requested = self.order.requested_asset();
         let (payment_amount, protocol_fee_target) =
             if comparison_fill == self.comparison_fills.maximum {
-                let surplus = comparison_fill - U256::from(requested.amount().as_u64());
-                let fee = surplus.min(ppm_floor(comparison_fill, fee_ppm)?);
+                let fee = full_fill_fee(comparison_fill, requested.amount(), fee_ppm)?;
                 (to_asset_amount(comparison_fill - fee)?, fee)
             } else {
                 (

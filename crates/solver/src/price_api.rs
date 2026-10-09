@@ -45,8 +45,8 @@ use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
 use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    eval_can_fill, eval_off_market, fill_price, quote, DepthBook, DepthChange, FillStatus,
-    NoFillReason, PriceBand, QuoteOrder, QuoteTerms, SettlementStats,
+    eval_can_fill, eval_off_market, fill_price, judge, DepthBook, DepthChange, FillStatus,
+    NoFillReason, PriceBand, ProposedOrder, SettlementStats, VerdictTerms,
 };
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -70,10 +70,8 @@ pub struct PriceApiConfig {
     pub swap_proving_ms: u64,
     /// Estimated block time (ms) — a term of the ETA.
     pub swap_block_ms: u64,
-    /// How far (bps) the price may still have to move an order's way for
-    /// `/v2/swap-eta` to call it `tolerated` rather than `off_market` (and
-    /// `/v1/swap-eta`'s slack before `offMarket` against the raw mid).
-    pub swap_offmarket_tol_bps: u64,
+    /// `engine.swap_offmarket_tolerance_bps` (see there).
+    pub swap_offmarket_tolerance_bps: u64,
     /// The matcher's clearing fee, so quotes apply the same rule.
     pub clearing_fee_ppm: u32,
 }
@@ -93,7 +91,37 @@ pub struct PriceApiState {
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     /// Next-batch ETA (secs) = ceil((sync + trigger + proving + block)/1000).
     swap_eta_secs: u64,
-    quote_terms: QuoteTerms,
+    verdict_terms: VerdictTerms,
+}
+
+impl PriceApiState {
+    pub fn new(
+        cfg: &PriceApiConfig,
+        prices: watch::Receiver<Arc<PriceSnapshot>>,
+        pool: DbPool,
+        book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+        stats_rx: watch::Receiver<Arc<SettlementStats>>,
+    ) -> Self {
+        Self {
+            prices,
+            pool,
+            vs_currency: cfg.vs_currency.clone(),
+            default_precision: PricePrecision::parse(&cfg.precision)
+                .unwrap_or(PricePrecision::Full),
+            max_batch: cfg.max_batch,
+            book_rx,
+            stats_rx,
+            swap_eta_secs: (cfg.swap_sync_ms
+                + cfg.swap_matching_trigger_ms
+                + cfg.swap_proving_ms
+                + cfg.swap_block_ms)
+                .div_ceil(1000),
+            verdict_terms: VerdictTerms {
+                fee_ppm: cfg.clearing_fee_ppm,
+                tolerance_bps: cfg.swap_offmarket_tolerance_bps,
+            },
+        }
+    }
 }
 
 // ── Response / error ─────────────────────────────────────────────────────────
@@ -329,68 +357,47 @@ async fn get_prices(
 
 // ── swap-eta ─────────────────────────────────────────────────────────────────
 
-/// Response for `GET /v1/pair-price`: the price a wallet builds its ask from.
-/// Prices are whole requested tokens per whole offered token.
+/// Response for `GET /v2/pair-price`: the price a wallet builds its ask from.
+/// Field meanings: docs/price-api.md.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PairPriceResponse {
     offered_faucet: String,
     requested_faucet: String,
-    /// The Binance mid of the pair's clearing market.
     market_price: String,
-    /// The best price an ask can name and still fill now: the mid after the
-    /// clearing fee as this side is charged it, rounded toward zero.
+    /// [`fill_price`]: a limit for the ask, not the payout.
     fill_price: String,
     fee_ppm: u32,
-    /// On-chain decimals, to turn whole-token prices into base units. A pair
-    /// is only priced once both are known.
-    offered_decimals: Option<u8>,
-    requested_decimals: Option<u8>,
-    /// Unix secs the solver received this quote.
+    offered_decimals: u8,
+    requested_decimals: u8,
+    /// Unix secs the solver received the Binance quote.
     as_of: i64,
 }
 
-/// Response for `GET /v2/swap-eta`: what the matcher would do with the order
-/// now (see [`crate::swap_eta::quote`]), plus time estimates. Amounts are base
-/// units, prices whole requested tokens per whole offered token. Optional
-/// fields serialise as `null` (stable shape for the wallet), never omitted.
+/// Response for `GET /v2/swap-eta`: the [`crate::swap_eta::Verdict`] on the order, plus time
+/// estimates. Field meanings: docs/price-api.md. Optional fields serialise as
+/// `null` (stable shape for the wallet), never omitted.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SwapEtaResponse {
     offered_faucet: String,
     requested_faucet: String,
-    /// The order, as asked.
     offered_amount: String,
     requested_amount: String,
-    /// `at_market`, `tolerated` or `off_market`; `null` without a fresh price.
     price_band: Option<PriceBand>,
-    /// `full`, `partial` or `none`.
     fill_status: FillStatus,
-    /// Why `none`: `price`, `liquidity`, `no_market` or `no_price`.
     reason: Option<NoFillReason>,
-    /// How much of the order the book fills now.
     fillable_offered_amount: String,
     fillable_requested_amount: String,
-    /// How much of the offered token the book takes at this order's price,
-    /// not capped by its size; `null` off market or without a price.
-    available_offered_amount: Option<String>,
-    /// What a full fill pays now: market value minus the fee, at least the ask.
+    max_offered_amount: Option<String>,
     expected_requested_amount: Option<String>,
     fee_ppm: u32,
-    /// The fee on a full fill now, in the requested token.
     fee_amount: Option<String>,
-    /// The Binance mid.
     market_price: Option<String>,
-    /// The best price an ask can name and still fill now, as on
-    /// `/v2/pair-price`.
     fill_price: Option<String>,
-    /// Whether the solver is settling: `false` before its executor starts and
-    /// while it is in verification mode (no fee headroom, node or database down).
-    accepting_orders: bool,
-    /// Next-batch ETA (secs) for an order the book fills at the market price
-    /// while the solver is settling; otherwise `null`.
+    /// The executor's own [`SettlementStats::executor_accepting`].
+    settlements_running: bool,
     estimated_seconds: Option<u64>,
-    /// In-memory rolling per-pair median settlement secs; `null` when no samples.
     median24h_seconds: Option<u64>,
 }
 
@@ -463,105 +470,112 @@ async fn registered_decimals(
     }
 }
 
-/// `GET /v1/pair-price?offered_faucet=&requested_faucet=`
+/// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
 ///
 /// The pair's clearing price, under the same freshness rule and fee as the
 /// matcher. The wallet builds its ask from `fill_price` and the user's
-/// slippage, then asks `/v1/swap-eta` about that exact order.
+/// slippage, then asks `/v2/swap-eta` about that exact order.
 async fn get_pair_price(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<PairPriceResponse>, ApiError> {
     let (a, b) = pair_ids(&q)?;
-    let (offered_decimals, requested_decimals) = registered_decimals(&state, a, b).await?;
-    let prices = state.prices.borrow().clone();
+    // 404 unless both are registered; the decimals come with the market.
+    registered_decimals(&state, a, b).await?;
     let now = Instant::now();
-    let (side, _) = prices.order_price(a, b, now)?;
-    let (market, received_at) = prices.market_quote(a, b, now)?;
-    let fee_ppm = state.quote_terms.fee_ppm;
-    let fill = fill_price(side, market, fee_ppm).ok_or(ApiError::NoPrice)?;
+    let market = state.prices.borrow().order_market(a, b, now)?;
+    let fee_ppm = state.verdict_terms.fee_ppm;
+    let fill = fill_price(market.side, market.market, fee_ppm).ok_or(ApiError::NoPrice)?;
     Ok(Json(PairPriceResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
-        market_price: PricePrecision::Full.format(market),
+        market_price: PricePrecision::Full.format(market.market),
         fill_price: PricePrecision::Full.format(fill),
         fee_ppm,
-        offered_decimals,
-        requested_decimals,
-        as_of: received_secs(now.saturating_duration_since(received_at)),
+        offered_decimals: market.offered_decimals,
+        requested_decimals: market.requested_decimals,
+        as_of: received_secs(now.saturating_duration_since(market.received_at)),
     }))
 }
 
-/// `GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=`
+/// `GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=`
 ///
-/// Judge the order a wallet is about to sign (offer A / request B, base
-/// units): where its price sits, how much of it the live book fills, and the
-/// time estimates.
+/// The [`crate::swap_eta::Verdict`] on the order a wallet is about to sign (offer A / request
+/// B, base units), plus the time estimates.
 async fn get_swap_eta(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (a, b) = pair_ids(&q)?;
-    let order = QuoteOrder {
+    let order = ProposedOrder {
         offered: required_amount(&q, "offered_amount")?,
         requested: required_amount(&q, "requested_amount")?,
         min_fill_step: parse_amount(&q, "min_fill_step")?,
     };
+    // 404 unless both are registered.
     registered_decimals(&state, a, b).await?;
 
     // One price snapshot, one book snapshot, one clock reading.
-    let prices = state.prices.borrow().clone();
     let book = state.book_rx.borrow().clone();
-    let now = Instant::now();
-    let terms = state.quote_terms;
-    let market = prices.market_price(a, b, now).ok();
-    let (quoted, fill, unpriced) = match prices.order_price(a, b, now) {
-        Ok((side, price)) => {
+    let terms = state.verdict_terms;
+    let market = state.prices.borrow().order_market(a, b, Instant::now());
+    let (verdict, market_price, fill, unpriced) = match market {
+        Ok(market) => {
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
-            let quoted = quote(side, price, terms, order, levels((a, b)), levels((b, a)))
-                .map_err(|error| ApiError::BadAmount(format!("cannot price: {error}")))?;
-            let fill = market.and_then(|market| fill_price(side, market, terms.fee_ppm));
-            (Some(quoted), fill, None)
+            let verdict = judge(
+                market.side,
+                market.price,
+                terms,
+                order,
+                levels((a, b)),
+                levels((b, a)),
+            )
+            .map_err(|error| ApiError::BadAmount(format!("cannot price: {error}")))?;
+            let fill = fill_price(market.side, market.market, terms.fee_ppm);
+            (Some(verdict), Some(market.market), fill, None)
         }
         // Without a price nothing fills.
-        Err(PriceUnavailable::NoMarket) => (None, None, Some(NoFillReason::NoMarket)),
-        Err(_) => (None, None, Some(NoFillReason::NoPrice)),
+        Err(PriceUnavailable::NoMarket) => (None, None, None, Some(NoFillReason::NoMarket)),
+        Err(_) => (None, None, None, Some(NoFillReason::NoPrice)),
     };
-    let band = quoted.map(|q| q.band);
-    let status = quoted.map_or(FillStatus::None, |q| q.status);
+    let band = verdict.map(|v| v.band);
+    let status = verdict.map_or(FillStatus::None, |v| v.status);
     let price = |value| PricePrecision::Full.format(value);
     let amount = |value: Option<u64>| value.map(|value| value.to_string());
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
-    // `settling` is the executor's own word on whether it takes batches.
     let now_unix = now_secs().max(0) as u64;
-    let (median24h_seconds, settling) = {
+    let (median24h_seconds, settlements_running) = {
         let stats = state.stats_rx.borrow();
-        (stats.median_secs((a, b), now_unix), stats.settling)
+        (
+            stats.median_secs((a, b), now_unix),
+            stats.executor_accepting,
+        )
     };
-    let fills_now = band == Some(PriceBand::AtMarket) && settling;
 
-    let body = Json(SwapEtaResponse {
+    Ok(no_store(Json(SwapEtaResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         offered_amount: order.offered.to_string(),
         requested_amount: order.requested.to_string(),
         price_band: band,
         fill_status: status,
-        reason: quoted.map_or(unpriced, |q| q.reason()),
-        fillable_offered_amount: quoted.map_or(0, |q| q.fillable_offered).to_string(),
-        fillable_requested_amount: quoted.map_or(0, |q| q.fillable_requested).to_string(),
-        available_offered_amount: amount(quoted.and_then(|q| q.available_offered)),
-        expected_requested_amount: amount(quoted.map(|q| q.expected_requested)),
+        reason: verdict.map_or(unpriced, |v| v.reason()),
+        fillable_offered_amount: verdict.map_or(0, |v| v.fillable_offered).to_string(),
+        fillable_requested_amount: verdict.map_or(0, |v| v.fillable_requested).to_string(),
+        max_offered_amount: amount(verdict.and_then(|v| v.max_offered)),
+        expected_requested_amount: amount(verdict.map(|v| v.expected_requested)),
         fee_ppm: terms.fee_ppm,
-        fee_amount: amount(quoted.map(|q| q.fee)),
-        market_price: market.map(price),
+        fee_amount: amount(verdict.map(|v| v.fee)),
+        market_price: market_price.map(price),
         fill_price: fill.map(price),
-        accepting_orders: settling,
-        estimated_seconds: (fills_now && status != FillStatus::None).then_some(state.swap_eta_secs),
+        settlements_running,
+        estimated_seconds: (settlements_running
+            && band == Some(PriceBand::AtMarket)
+            && status != FillStatus::None)
+            .then_some(state.swap_eta_secs),
         median24h_seconds,
-    });
-    Ok(no_store(body))
+    })))
 }
 
 /// Don't let the router-level `max-age` layer cache a swap answer: it comes
@@ -638,7 +652,7 @@ async fn get_swap_eta_v1(
         requested_amount,
         d_b,
         market,
-        state.quote_terms.tolerance_bps,
+        state.verdict_terms.tolerance_bps,
     );
 
     // Median — same direction (A → B) the note settles as; purely in-memory.
@@ -766,27 +780,7 @@ pub fn spawn_price_api_thread(
             rt.block_on(async move {
                 let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
                 tokio::spawn(mirror_depth(depth_rx, book_tx));
-                let default_precision =
-                    PricePrecision::parse(&cfg.precision).unwrap_or(PricePrecision::Full);
-                let swap_eta_secs = (cfg.swap_sync_ms
-                    + cfg.swap_matching_trigger_ms
-                    + cfg.swap_proving_ms
-                    + cfg.swap_block_ms)
-                    .div_ceil(1000);
-                let state = PriceApiState {
-                    prices,
-                    pool,
-                    vs_currency: cfg.vs_currency.clone(),
-                    default_precision,
-                    max_batch: cfg.max_batch,
-                    book_rx,
-                    stats_rx,
-                    swap_eta_secs,
-                    quote_terms: QuoteTerms {
-                        fee_ppm: cfg.clearing_fee_ppm,
-                        tolerance_bps: cfg.swap_offmarket_tol_bps,
-                    },
-                };
+                let state = PriceApiState::new(&cfg, prices, pool, book_rx, stats_rx);
                 let app = build_app(state, &cfg);
 
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {

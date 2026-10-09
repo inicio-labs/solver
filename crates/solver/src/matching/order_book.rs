@@ -302,30 +302,6 @@ impl<F: PriceFeed> OrderBook<F> {
             .map_or(false, |&c| c > 0)
     }
 
-    /// Top-of-book for a directed pair: the front (best/lowest) rate level plus
-    /// the summed `offered_remaining()` of the ACTIVE orders at that level.
-    /// Read-only (`&self`), so — unlike `best_order` — it can't lazily prune;
-    /// it filters inactive ids inline and skips a fully-inactive front level.
-    pub fn best_level(&self, offered: TokenId, requested: TokenId) -> Option<(RateKey, Amount)> {
-        let btree = self.pair_index.get(&(offered, requested))?;
-        for (&key, ids) in btree.iter() {
-            let mut volume: Amount = 0;
-            let mut any = false;
-            for id in ids {
-                if let Some(o) = self.orders.get(id) {
-                    if o.is_active() {
-                        any = true;
-                        volume = volume.saturating_add(o.offered_remaining());
-                    }
-                }
-            }
-            if any {
-                return Some((key, volume));
-            }
-        }
-        None
-    }
-
     /// Tokens that have orders offering `offered` (outgoing neighbors).
     pub fn neighbors(&self, offered: TokenId) -> Vec<TokenId> {
         self.user_adjacency

@@ -165,6 +165,8 @@ enum ApiError {
     NoMarket,
     /// Has a market, but no valid quote right now.
     NoPrice,
+    /// Startup has not confirmed the Binance markets yet.
+    NotReady,
     Stale(i64),
     BadPrecision(String),
     BatchTooLarge(usize),
@@ -192,6 +194,11 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_price",
                 "no valid price for this token or pair right now".into(),
+            ),
+            ApiError::NotReady => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not_ready",
+                "the solver is still confirming its Binance markets".into(),
             ),
             ApiError::Stale(as_of) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -360,7 +367,7 @@ async fn get_prices(
     Ok(Json(out))
 }
 
-// ── swap-eta ─────────────────────────────────────────────────────────────────
+// ── pairs ────────────────────────────────────────────────────────────────────
 
 /// Response for `GET /v2/pairs`: the tokens the solver swaps, each once, and
 /// the pairs between them. Field meanings: docs/price-api.md.
@@ -389,8 +396,10 @@ struct Pair {
 
 impl PairsResponse {
     /// Every configured clearing pair, in configuration order, and its tokens
-    /// in order of first appearance. Startup fails unless Binance confirms
-    /// every one of these pairs, so all of them clear.
+    /// in order of first appearance. Binance confirms each of these pairs at
+    /// startup or the solver does not start; whether one is trading right now
+    /// is `/v2/pair-price`'s answer. Startup also requires on-chain decimals
+    /// for each token, so `ticker` and `decimals` are set in practice.
     fn new(markets: &MarketPlan, tokens: &HashMap<AccountId, RegisteredTokenRow>) -> Self {
         let mut listed: Vec<AccountId> = Vec::new();
         let pairs = markets
@@ -419,14 +428,16 @@ impl PairsResponse {
                     decimals: row.and_then(RegisteredTokenRow::token_decimals),
                     binance_asset: markets
                         .asset_code(token)
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
+                        .expect("MarketPlan::new requires an asset code for every clearing token")
+                        .to_string(),
                 }
             })
             .collect();
         Self { tokens, pairs }
     }
 }
+
+// ── swap-eta ─────────────────────────────────────────────────────────────────
 
 /// Response for `GET /v2/pair-price`: the price a wallet builds its ask from.
 /// Field meanings: docs/price-api.md.
@@ -523,15 +534,27 @@ fn registered_decimals(
 }
 
 /// `GET /v2/pairs`: what the solver swaps. It changes only with a restart, so
-/// shared caches may keep it for five minutes.
-async fn get_pairs(State(state): State<PriceApiState>) -> impl IntoResponse {
-    (
+/// shared caches may keep it for five minutes. Until the price feed has
+/// confirmed the markets at startup it answers `503 not_ready`, so a list a
+/// failing startup would reject is never served or cached.
+async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoResponse, ApiError> {
+    let confirmed = state
+        .prices
+        .borrow()
+        .markets()
+        .clearing_pairs()
+        .next()
+        .is_some();
+    if !confirmed && !state.pairs.pairs.is_empty() {
+        return Err(ApiError::NotReady);
+    }
+    Ok((
         [(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=300"),
         )],
         Json(PairsResponse::clone(&state.pairs)),
-    )
+    ))
 }
 
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`

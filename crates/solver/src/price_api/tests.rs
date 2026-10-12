@@ -816,17 +816,29 @@ fn pair_url(offered: AccountId, requested: AccountId) -> String {
 }
 
 #[tokio::test]
+async fn pairs_wait_for_the_binance_market_check() {
+    // Before the feed confirms the markets the snapshot has none: the list is
+    // not yet true, so it is neither served nor cached.
+    let h = harness(&[(eth(), Some(18), Some("ETH"))], &[], true).await;
+    let r = h.server.get("/v2/pairs").await;
+    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"], "not_ready");
+}
+
+#[tokio::test]
 async fn pairs_list_each_token_once_and_every_clearing_pair() {
-    // USDT is in both pairs but listed once. BTC has no on-chain metadata:
-    // its ticker and decimals are null, never left out.
-    let h = harness(
+    // USDT is in both pairs but listed once. BTC without on-chain metadata
+    // (which startup would refuse) pins null over a missing key.
+    let confirmed = PriceSnapshot::for_tests(&[(eth(), usdt(), "2", received(true))], &[], TTL);
+    let h = serve(
         &[
             (eth(), Some(18), Some("ETH")),
             (usdt(), Some(6), Some("USDT")),
             (btc(), None, None),
         ],
-        &[],
-        true,
+        confirmed,
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
     )
     .await;
     let r = h.server.get("/v2/pairs").await;

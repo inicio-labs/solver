@@ -10,7 +10,9 @@ jobs:
     timeout-minutes: 120
     services:
       postgres:
-        image: postgres:16
+        # Docker's official image, from its AWS mirror (same digest as Docker
+        # Hub): Docker Hub's anonymous pull limit fails shared runners.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_DB: solver_test
           POSTGRES_USER: solver

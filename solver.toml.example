@@ -13,6 +13,10 @@ endpoint = "https://rpc.testnet.miden.io"
 timeout_ms = 10000
 # Remote prover URL (offload proof gen). Omit to prove locally. Recommended on small hosts.
 # prover_endpoint = "https://tx-prover.devnet.miden.io"
+# How long to wait for the remote prover per transaction (default 45000). Keep it
+# under the transaction's expiry: one that moves a policy-managed token (testnet
+# USDCx) expires 20 blocks (~60 s) after its reference block.
+# prover_timeout_ms = 45000
 
 [solver]
 # Hex account ID of the solver's on-chain account. REQUIRED — replace with

@@ -29,6 +29,8 @@ const MAX_QUOTE_TTL: Duration = Duration::from_secs(60);
 pub(crate) enum ConfigError {
     #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
     InvalidPricePrecision(String),
+    #[error("rpc.prover_timeout_ms must be at least 1")]
+    ZeroProverTimeout,
     #[error("binance.{0} must be set to a positive value")]
     ZeroBinanceSetting(&'static str),
     #[error("binance.{name} {url:?} must be a {}:// or {}:// URL with a host and no path or query", .schemes[0], .schemes[1])]
@@ -98,6 +100,16 @@ pub struct RpcConfig {
     /// prove locally.
     #[serde(default)]
     pub prover_endpoint: Option<String>,
+    /// How long the executor waits for the remote prover per transaction, in
+    /// milliseconds. Keep it below the transaction's expiry: a transaction that
+    /// moves a policy-managed token (testnet USDCx) expires 20 blocks, about
+    /// 60 s, after its reference block, so a later proof is rejected anyway.
+    #[serde(default = "default_prover_timeout_ms")]
+    pub prover_timeout_ms: u64,
+}
+
+fn default_prover_timeout_ms() -> u64 {
+    45_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -467,6 +479,9 @@ impl SolverConfig {
     /// Validate fields that have constrained domains (fail fast at boot),
     /// including the Binance market mapping of the pairs.
     fn validate(&self) -> std::result::Result<(), ConfigError> {
+        if self.rpc.prover_timeout_ms == 0 {
+            return Err(ConfigError::ZeroProverTimeout);
+        }
         if PricePrecision::parse(&self.engine.price_precision).is_none() {
             return Err(ConfigError::InvalidPricePrecision(
                 self.engine.price_precision.clone(),
@@ -711,6 +726,15 @@ mod tests {
         );
         // Either order of the two codes is a valid symbol.
         accepted(|config| config.pairs[0].binance_symbol = Some(Symbol::parse("USDTETH").unwrap()));
+    }
+
+    /// The example leaves the prover timeout out, so it gets the default,
+    /// which stays under a policy-managed token's ~60 s transaction expiry.
+    #[test]
+    fn prover_timeout_defaults_under_the_expiry_and_cannot_be_zero() {
+        assert_eq!(example().rpc.prover_timeout_ms, 45_000);
+        assert!(check(|c| c.rpc.prover_timeout_ms = 0).contains("prover_timeout_ms"));
+        accepted(|c| c.rpc.prover_timeout_ms = 1);
     }
 
     /// Only the checks that matter: the two required settings, the TTL cap,

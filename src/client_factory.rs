@@ -13,12 +13,6 @@ use miden_client_sqlite_store::ClientBuilderSqliteExt;
 
 use solver::config::SolverConfig;
 
-/// How long the executor waits for the remote prover per transaction.
-/// miden-client's 10 s default fails every settlement whose proof takes
-/// longer, and settlement proofs grow with the batch; a busy public testnet
-/// prover took over 10 s for every settlement on 2026-10-10.
-const REMOTE_PROVER_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Production [`solver::ClientFactory`]. Holds only `Send` config
 /// (endpoint string, timeout, paths) so it can be cloned into
 /// each client OS thread; `build_*` run on the owning thread and construct
@@ -31,6 +25,7 @@ pub(crate) struct ProdClientFactory {
     executor_store_path: String,
     keystore_path: String,
     prover_endpoint: Option<String>,
+    prover_timeout: Duration,
 }
 
 impl ProdClientFactory {
@@ -42,6 +37,7 @@ impl ProdClientFactory {
             executor_store_path: config.solver.executor_store_path.clone(),
             keystore_path: config.solver.keystore_path.clone(),
             prover_endpoint: config.rpc.prover_endpoint.clone(),
+            prover_timeout: Duration::from_millis(config.rpc.prover_timeout_ms),
         }
     }
 }
@@ -77,7 +73,7 @@ impl solver::ClientFactory for ProdClientFactory {
         // the only client that proves; ingest never submits transactions).
         if let Some(url) = &self.prover_endpoint {
             builder = builder.prover(Arc::new(
-                RemoteTransactionProver::new(url.clone()).with_timeout(REMOTE_PROVER_TIMEOUT),
+                RemoteTransactionProver::new(url.clone()).with_timeout(self.prover_timeout),
             ));
         }
         builder

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use miden_client::{
@@ -24,6 +25,7 @@ pub(crate) struct ProdClientFactory {
     executor_store_path: String,
     keystore_path: String,
     prover_endpoint: Option<String>,
+    prover_timeout: Duration,
 }
 
 impl ProdClientFactory {
@@ -35,6 +37,7 @@ impl ProdClientFactory {
             executor_store_path: config.solver.executor_store_path.clone(),
             keystore_path: config.solver.keystore_path.clone(),
             prover_endpoint: config.rpc.prover_endpoint.clone(),
+            prover_timeout: Duration::from_millis(config.rpc.prover_timeout_ms),
         }
     }
 }
@@ -69,7 +72,9 @@ impl solver::ClientFactory for ProdClientFactory {
         // Offload proving to a remote prover when configured (the executor is
         // the only client that proves; ingest never submits transactions).
         if let Some(url) = &self.prover_endpoint {
-            builder = builder.prover(Arc::new(RemoteTransactionProver::new(url.clone())));
+            builder = builder.prover(Arc::new(
+                RemoteTransactionProver::new(url.clone()).with_timeout(self.prover_timeout),
+            ));
         }
         builder
             .build()

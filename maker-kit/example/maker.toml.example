@@ -1,0 +1,51 @@
+# Example market maker for the Inicio solver, Miden testnet.
+# Copy to maker.toml. Paths are relative to where you run the binary.
+
+[network]
+rpc = "https://rpc.testnet.miden.io"
+rpc_timeout_ms = 30000
+# Remote prover. Keep the timeout under ~60 s: a transaction that moves USDCx
+# (the fee token) expires 20 blocks after the block it was built on.
+prover = "https://tx-prover.testnet.miden.io"
+prover_timeout_ms = 45000
+
+[gateway]
+# gRPC over TLS. Your API key goes in the file below, never in this config.
+url = "https://35-175-40-181.sslip.io"
+api_key_file = "api-key.txt"
+
+[wallet]
+store = "wallet/store.sqlite3"
+keystore = "wallet/keystore"
+
+[state]
+# Your account id, the command sequence counter, every submitted order (with
+# its note bytes) and the event cursor. Back this file up.
+journal = "wallet/journal.json"
+
+# Tokens the solver trades on testnet. Amounts on the command line are in
+# whole tokens; on the wire and on chain they are integer base units.
+[[tokens]]
+symbol = "IETH"
+faucet = "0xe33498f1176661512b5ac4ded86ec7"
+decimals = 8
+
+[[tokens]]
+symbol = "IUSDT"
+faucet = "0x094698fc4bc531d136db0866f38902"
+decimals = 8
+
+[[tokens]]
+symbol = "IBTC"
+faucet = "0xaf8444c4a7c091114666adba25c5d0"
+decimals = 8
+
+[[tokens]]
+symbol = "IMIDEN"
+faucet = "0x750052a4af10cd51141f52c0ec2ada"
+decimals = 8
+
+[[tokens]]
+symbol = "USDCX"
+faucet = "0x4cbdcaffe75f0a317482224dae6436"
+decimals = 6

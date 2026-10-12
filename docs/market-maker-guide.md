@@ -4,7 +4,7 @@
 
 This guide shows you how to connect your trading system to the Inicio solver. You send orders and cancels over gRPC, and you receive an event feed that tells you when each order goes live, when it is reserved for a settlement and when it fills.
 
-Generate your client from the `gateway.proto` file delivered with this guide (package `solver.maker.v1`, service `MakerGateway`; also on GitHub: [`gateway.proto`](https://github.com/inicio-labs/solver/blob/vaibhav/mm-gateway-store/crates/solver/proto/maker/v1/gateway.proto)). The proto is the complete field reference. This guide explains how to use it.
+Generate your client from the `gateway.proto` file delivered with this guide (package `solver.maker.v1`, service `MakerGateway`; in this repository: [`gateway.proto`](../crates/solver/proto/maker/v1/gateway.proto)). The proto is the complete field reference. This guide explains how to use it.
 
 > **Notation.** JSON examples use protobuf JSON: `bytes` fields are Base64 and 64-bit integers are strings. Endpoints, API keys, note bytes, faucet IDs and times are placeholders; use the values for your environment. Enum values are shortened in the text: `LIVE` means `ORDER_STATE_LIVE`, `FULLY_FILLED` means `RESULTING_STATUS_FULLY_FILLED`, and so on.
 
@@ -126,8 +126,10 @@ sequenceDiagram
 
 ### Compatible Miden SDK versions
 
-- `miden-client` 0.17.1
-- `miden-protocol` and `miden-standards` 0.17.0
+- `miden-client` 0.17.3
+- `miden-protocol` and `miden-standards` 0.17.1
+
+Earlier 0.17 releases cannot consume USDCX, the testnet's fee token.
 
 Your note serialization and PSWAP behaviour must match these versions. Check with us before you upgrade.
 
@@ -1013,5 +1015,5 @@ Keep raw bytes in your systems. Don't parse display strings.
 
 ### Files
 
-- [`gateway.proto`](https://github.com/inicio-labs/solver/blob/vaibhav/mm-gateway-store/crates/solver/proto/maker/v1/gateway.proto): the complete field and enum reference. Save a copy with your generated client; the file on GitHub can change.
+- [`gateway.proto`](../crates/solver/proto/maker/v1/gateway.proto): the complete field and enum reference. Save a copy with your generated client; the file in this repository can change.
 - Keep this guide, the proto and the environment details we give you together in your integration repository.

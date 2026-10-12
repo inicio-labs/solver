@@ -1,0 +1,39 @@
+[package]
+name = "inicio-maker-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Example market maker for the Inicio solver's maker gateway (Miden testnet)"
+
+# Its own workspace: building it does not touch the solver's.
+[workspace]
+
+[[bin]]
+name = "maker"
+path = "src/main.rs"
+
+[dependencies]
+# Pin the Miden SDK to the versions the network and the solver run. Client
+# 0.17.3 with protocol/standards 0.17.1 is required to consume USDCx, the
+# testnet fee token; 0.17.1 with 0.17.0 fails to claim it.
+miden-client = { version = "=0.17.3", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = "=0.17.3"
+miden-protocol = { version = "=0.17.1", default-features = false }
+miden-standards = "=0.17.1"
+
+# gRPC client for the maker gateway, over TLS with bundled root certificates.
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rand = "0.9"
+hex = "0.4"
+
+[build-dependencies]
+protox = "0.9"
+tonic-prost-build = "0.14"

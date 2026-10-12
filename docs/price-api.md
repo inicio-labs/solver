@@ -90,7 +90,8 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 ### Swapping with `/v2`
 
 Only pairs configured as a Binance clearing market (for example `ETHUSDT`)
-can swap; both tokens having a `/v1/price` is not enough.
+can swap; both tokens having a `/v1/price` is not enough. `GET /v2/pairs`
+lists them: fetch it once for the token pickers.
 
 1. **Price.** `GET /v2/pair-price` gives `fillPrice`: the most the order can
    ask per whole offered token and still fill now.
@@ -121,6 +122,43 @@ queues ahead of orders on the same side that ask more.
 Once the order is in the book, asking again counts it as volume ahead of
 itself; an order-status endpoint for the "not filling soon, cancel?" prompt
 is planned.
+
+### `GET /v2/pairs` — what the solver swaps
+
+The tokens the solver swaps, each listed once, and the pairs between them.
+It changes only when the solver restarts with a new configuration, so it is
+cacheable for five minutes (`Cache-Control: public, max-age=300`). Prices,
+fees and freshness come from `/v2/pair-price`. While the solver is still
+confirming its Binance markets at startup (up to a minute) it answers `503`
+`not_ready`.
+
+```json
+{
+  "tokens": [
+    { "faucetId": "0x…", "ticker": "ETH",  "decimals": 18, "binanceAsset": "ETH" },
+    { "faucetId": "0x…", "ticker": "USDT", "decimals": 6,  "binanceAsset": "USDT" },
+    { "faucetId": "0x…", "ticker": "BTC",  "decimals": 8,  "binanceAsset": "BTC" }
+  ],
+  "pairs": [
+    { "name": "ETH-USDT", "binanceSymbol": "ETHUSDT", "faucetIds": ["0x…", "0x…"] },
+    { "name": "BTC-USDT", "binanceSymbol": "BTCUSDT", "faucetIds": ["0x…", "0x…"] }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `tokens` | every token in at least one pair, in configuration order. A token the solver only values (`/v1/price`) but does not swap is not listed |
+| `faucetId` | hex faucet id, as every other endpoint takes it |
+| `ticker`, `decimals` | the token's on-chain symbol and decimals. Startup requires them, so they are set in practice; the type allows `null` |
+| `binanceAsset` | the Binance asset code the token is priced as (usually the ticker; a wrapped token may differ) |
+| `pairs` | every pair the solver clears internally, in configuration order: configured, and confirmed by Binance at startup. Whether a pair is trading right now is `/v2/pair-price`'s answer (`503` when it is not) |
+| `name` | the pair's name in the solver's configuration |
+| `binanceSymbol` | the Binance market that prices the pair |
+| `faucetIds` | the pair's two tokens, unordered: a pair swaps in both directions. Each is in `tokens` |
+
+A "to" picker for a chosen token lists the other token of every pair that
+contains it. Then `/v2/pair-price` gives the price in the chosen direction.
 
 ### `GET /v2/pair-price` — the price to build an ask from
 
@@ -244,7 +282,7 @@ rule.
 | `400` | `bad_faucet_id`: missing or malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
 | `404` | `unknown_faucet`: not registered with the solver |
 | `408` | the request took longer than `price_query_timeout_ms` (empty body) |
-| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `overloaded`: more than `price_query_max_inflight` requests in flight, retry shortly |
+| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `overloaded`: more than `price_query_max_inflight` requests in flight, retry shortly; `not_ready` (`/v2/pairs` only): the solver is still confirming its Binance markets at startup |
 
 Without a price, both swap-eta endpoints still answer `200`: `/v2` with reason
 `no_market` or `no_price`, `/v1` with `null` market fields.

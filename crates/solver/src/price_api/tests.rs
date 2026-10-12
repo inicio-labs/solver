@@ -10,13 +10,14 @@ use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
-use crate::price::PriceSnapshot;
+use crate::price::test_support::{asset, btc, eth, market, usdt};
+use crate::price::{MarketPlan, PriceSnapshot};
 use crate::swap_eta::SettlementStats;
 
 /// Long enough that a slow test cannot make a fresh quote stale.
@@ -65,6 +66,23 @@ fn cfg() -> PriceApiConfig {
     }
 }
 
+/// The configured clearing pairs: ETH-USDT (faucets A and B) and BTC-USDT.
+fn markets() -> MarketPlan {
+    MarketPlan::new(
+        [
+            (eth(), asset("ETH")),
+            (usdt(), asset("USDT")),
+            (btc(), asset("BTC")),
+        ],
+        vec![
+            market("ETH-USDT", eth(), usdt(), "ETHUSDT"),
+            market("BTC-USDT", btc(), usdt(), "BTCUSDT"),
+        ],
+        asset("USDT"),
+    )
+    .unwrap()
+}
+
 /// Register `registered` = (faucet, decimals, ticker) and serve `snapshot`.
 async fn serve(
     registered: &[(AccountId, Option<u8>, Option<&str>)],
@@ -84,7 +102,7 @@ async fn serve(
     let (_tx, prices) = watch::channel(Arc::new(snapshot));
     let (_book_tx, book_rx) = watch::channel(Arc::new(book));
     let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState::new(&cfg(), prices, tokens, book_rx, stats_rx);
+    let state = PriceApiState::new(&cfg(), prices, tokens, &markets(), book_rx, stats_rx);
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
     }
@@ -795,6 +813,71 @@ fn pair_url(offered: AccountId, requested: AccountId) -> String {
         offered.to_hex(),
         requested.to_hex()
     )
+}
+
+#[tokio::test]
+async fn pairs_wait_for_the_binance_market_check() {
+    // Before the feed confirms the markets the snapshot has none: the list is
+    // not yet true, so it is neither served nor cached.
+    let h = harness(&[(eth(), Some(18), Some("ETH"))], &[], true).await;
+    let r = h.server.get("/v2/pairs").await;
+    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"], "not_ready");
+}
+
+#[tokio::test]
+async fn pairs_list_each_token_once_and_every_clearing_pair() {
+    // USDT is in both pairs but listed once. BTC without on-chain metadata
+    // (which startup would refuse) pins null over a missing key.
+    let confirmed = PriceSnapshot::for_tests(&[(eth(), usdt(), "2", received(true))], &[], TTL);
+    let h = serve(
+        &[
+            (eth(), Some(18), Some("ETH")),
+            (usdt(), Some(6), Some("USDT")),
+            (btc(), None, None),
+        ],
+        confirmed,
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    let r = h.server.get("/v2/pairs").await;
+    assert_eq!(r.status_code(), StatusCode::OK);
+    assert_eq!(
+        r.headers().get("cache-control").unwrap(),
+        "public, max-age=300",
+        "the list only changes with a restart"
+    );
+    let token = |id: AccountId, ticker: Value, decimals: Value, binance: &str| {
+        json!({
+            "faucetId": id.to_hex(),
+            "ticker": ticker,
+            "decimals": decimals,
+            "binanceAsset": binance,
+        })
+    };
+    assert_eq!(
+        r.json::<Value>(),
+        json!({
+            "tokens": [
+                token(eth(), json!("ETH"), json!(18), "ETH"),
+                token(usdt(), json!("USDT"), json!(6), "USDT"),
+                token(btc(), Value::Null, Value::Null, "BTC"),
+            ],
+            "pairs": [
+                {
+                    "name": "ETH-USDT",
+                    "binanceSymbol": "ETHUSDT",
+                    "faucetIds": [eth().to_hex(), usdt().to_hex()],
+                },
+                {
+                    "name": "BTC-USDT",
+                    "binanceSymbol": "BTCUSDT",
+                    "faucetIds": [btc().to_hex(), usdt().to_hex()],
+                },
+            ],
+        })
+    );
 }
 
 #[tokio::test]

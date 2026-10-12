@@ -392,7 +392,7 @@ pub async fn start(
     };
     let spawned = spawn_price_feed_thread(
         config.binance.clone(),
-        market_plan.with_decimals(decimals),
+        market_plan.clone().with_decimals(decimals),
         channels.prices_tx,
         feed_metrics,
         cancel.clone(),
@@ -458,6 +458,7 @@ pub async fn start(
         channels.depth_rx,
         channels.stats_rx,
         tokens,
+        market_plan,
         cancel.clone(),
     );
     let price_api_ready_rx = match spawned {

@@ -273,6 +273,16 @@ impl MarketPlan {
         self.assets.keys().copied()
     }
 
+    /// Every configured clearing pair, in configuration order.
+    pub(crate) fn clearing_markets(&self) -> &[ClearingMarket] {
+        &self.clearing
+    }
+
+    /// The Binance asset code configured for `token`.
+    pub(crate) fn asset_code(&self, token: TokenId) -> Option<&AssetCode> {
+        self.assets.get(&token)
+    }
+
     /// Every configured clearing pair as `(base, quote)`.
     pub(crate) fn clearing_pairs(&self) -> impl Iterator<Item = (TokenId, TokenId)> + '_ {
         self.clearing

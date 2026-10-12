@@ -17,6 +17,8 @@
 //! memory, so public traffic never touches PostgreSQL; a registration change
 //! shows after a restart. The book depth for swap quotes comes from
 //! [`mirror_depth`], which this thread runs: the matcher only sends changes.
+//! `/v2/pairs` lists the configured clearing pairs and their tokens, built
+//! once at startup.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -43,7 +45,7 @@ use tower_http::timeout::TimeoutLayer;
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::SwapBookSnapshot;
 use crate::price::PricePrecision;
-use crate::price::{PriceSnapshot, PriceUnavailable, Valued};
+use crate::price::{MarketPlan, PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
     eval_can_fill, eval_off_market, fill_price, judge, DepthBook, DepthChange, FillStatus,
     NoFillReason, PriceBand, ProposedOrder, SettlementStats, VerdictTerms,
@@ -82,6 +84,8 @@ pub struct PriceApiState {
     prices: watch::Receiver<Arc<PriceSnapshot>>,
     /// The registered tokens, loaded once at startup.
     tokens: Arc<HashMap<AccountId, RegisteredTokenRow>>,
+    /// The `/v2/pairs` answer, built once at startup.
+    pairs: Arc<PairsResponse>,
     vs_currency: String,
     default_precision: PricePrecision,
     max_batch: usize,
@@ -100,6 +104,7 @@ impl PriceApiState {
         cfg: &PriceApiConfig,
         prices: watch::Receiver<Arc<PriceSnapshot>>,
         tokens: Vec<RegisteredTokenRow>,
+        markets: &MarketPlan,
         book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
         stats_rx: watch::Receiver<Arc<SettlementStats>>,
     ) -> Self {
@@ -107,9 +112,11 @@ impl PriceApiState {
             .into_iter()
             .filter_map(|row| Some((row.token().ok()?, row)))
             .collect();
+        let pairs = PairsResponse::new(markets, &tokens);
         Self {
             prices,
             tokens: Arc::new(tokens),
+            pairs: Arc::new(pairs),
             vs_currency: cfg.vs_currency.clone(),
             default_precision: PricePrecision::parse(&cfg.precision)
                 .unwrap_or(PricePrecision::Full),
@@ -355,6 +362,72 @@ async fn get_prices(
 
 // ── swap-eta ─────────────────────────────────────────────────────────────────
 
+/// Response for `GET /v2/pairs`: the tokens the solver swaps, each once, and
+/// the pairs between them. Field meanings: docs/price-api.md.
+#[derive(Clone, Serialize)]
+struct PairsResponse {
+    tokens: Vec<PairToken>,
+    pairs: Vec<Pair>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairToken {
+    faucet_id: String,
+    ticker: Option<String>,
+    decimals: Option<u8>,
+    binance_asset: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Pair {
+    name: String,
+    binance_symbol: String,
+    faucet_ids: [String; 2],
+}
+
+impl PairsResponse {
+    /// Every configured clearing pair, in configuration order, and its tokens
+    /// in order of first appearance. Startup fails unless Binance confirms
+    /// every one of these pairs, so all of them clear.
+    fn new(markets: &MarketPlan, tokens: &HashMap<AccountId, RegisteredTokenRow>) -> Self {
+        let mut listed: Vec<AccountId> = Vec::new();
+        let pairs = markets
+            .clearing_markets()
+            .iter()
+            .map(|market| {
+                for token in [market.base, market.quote] {
+                    if !listed.contains(&token) {
+                        listed.push(token);
+                    }
+                }
+                Pair {
+                    name: market.name.clone(),
+                    binance_symbol: market.symbol.to_string(),
+                    faucet_ids: [market.base.to_hex(), market.quote.to_hex()],
+                }
+            })
+            .collect();
+        let tokens = listed
+            .into_iter()
+            .map(|token| {
+                let row = tokens.get(&token);
+                PairToken {
+                    faucet_id: token.to_hex(),
+                    ticker: row.and_then(|row| row.ticker.clone()),
+                    decimals: row.and_then(RegisteredTokenRow::token_decimals),
+                    binance_asset: markets
+                        .asset_code(token)
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        Self { tokens, pairs }
+    }
+}
+
 /// Response for `GET /v2/pair-price`: the price a wallet builds its ask from.
 /// Field meanings: docs/price-api.md.
 #[derive(Serialize)]
@@ -447,6 +520,18 @@ fn registered_decimals(
         (Some(row_a), Some(row_b)) => Ok((row_a.token_decimals(), row_b.token_decimals())),
         _ => Err(ApiError::UnknownFaucet),
     }
+}
+
+/// `GET /v2/pairs`: what the solver swaps. It changes only with a restart, so
+/// shared caches may keep it for five minutes.
+async fn get_pairs(State(state): State<PriceApiState>) -> impl IntoResponse {
+    (
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=300"),
+        )],
+        Json(PairsResponse::clone(&state.pairs)),
+    )
 }
 
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
@@ -701,6 +786,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .route("/swap-eta", get(get_swap_eta_v1))
         .with_state(state.clone());
     let v2 = Router::new()
+        .route("/pairs", get(get_pairs))
         .route("/pair-price", get(get_pair_price))
         .route("/swap-eta", get(get_swap_eta))
         .with_state(state);
@@ -740,6 +826,7 @@ pub fn spawn_price_api_thread(
     depth_rx: mpsc::UnboundedReceiver<DepthChange>,
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     tokens: Vec<RegisteredTokenRow>,
+    markets: MarketPlan,
     cancel: CancellationToken,
 ) -> Result<(thread::JoinHandle<()>, oneshot::Receiver<Result<()>>)> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -759,7 +846,7 @@ pub fn spawn_price_api_thread(
             rt.block_on(async move {
                 let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
                 tokio::spawn(mirror_depth(depth_rx, book_tx));
-                let state = PriceApiState::new(&cfg, prices, tokens, book_rx, stats_rx);
+                let state = PriceApiState::new(&cfg, prices, tokens, &markets, book_rx, stats_rx);
                 let app = build_app(state, &cfg);
 
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {

@@ -90,7 +90,8 @@ Batch. Returns an object keyed by `faucet_id`; unknown, unpriced and (unless
 ### Swapping with `/v2`
 
 Only pairs configured as a Binance clearing market (for example `ETHUSDT`)
-can swap; both tokens having a `/v1/price` is not enough.
+can swap; both tokens having a `/v1/price` is not enough. `GET /v2/pairs`
+lists them: fetch it once for the token pickers.
 
 1. **Price.** `GET /v2/pair-price` gives `fillPrice`: the most the order can
    ask per whole offered token and still fill now.
@@ -121,6 +122,41 @@ queues ahead of orders on the same side that ask more.
 Once the order is in the book, asking again counts it as volume ahead of
 itself; an order-status endpoint for the "not filling soon, cancel?" prompt
 is planned.
+
+### `GET /v2/pairs` — what the solver swaps
+
+The tokens the solver swaps, each listed once, and the pairs between them.
+It changes only when the solver restarts with a new configuration, so it is
+cacheable for five minutes (`Cache-Control: public, max-age=300`). Prices,
+fees and freshness come from `/v2/pair-price`.
+
+```json
+{
+  "tokens": [
+    { "faucetId": "0x…", "ticker": "ETH",  "decimals": 18, "binanceAsset": "ETH" },
+    { "faucetId": "0x…", "ticker": "USDT", "decimals": 6,  "binanceAsset": "USDT" },
+    { "faucetId": "0x…", "ticker": "BTC",  "decimals": 8,  "binanceAsset": "BTC" }
+  ],
+  "pairs": [
+    { "name": "ETH-USDT", "binanceSymbol": "ETHUSDT", "faucetIds": ["0x…", "0x…"] },
+    { "name": "BTC-USDT", "binanceSymbol": "BTCUSDT", "faucetIds": ["0x…", "0x…"] }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `tokens` | every token in at least one pair, in configuration order. A token the solver only values (`/v1/price`) but does not swap is not listed |
+| `faucetId` | hex faucet id, as every other endpoint takes it |
+| `ticker`, `decimals` | the token's on-chain symbol and decimals; `null` if unknown at startup |
+| `binanceAsset` | the Binance asset code the token is priced as (usually the ticker; a wrapped token may differ) |
+| `pairs` | every pair the solver clears, in configuration order |
+| `name` | the pair's name in the solver's configuration |
+| `binanceSymbol` | the Binance market that prices the pair |
+| `faucetIds` | the pair's two tokens, unordered: a pair swaps in both directions. Each is in `tokens` |
+
+A "to" picker for a chosen token lists the other token of every pair that
+contains it. Then `/v2/pair-price` gives the price in the chosen direction.
 
 ### `GET /v2/pair-price` — the price to build an ask from
 

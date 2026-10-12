@@ -361,6 +361,7 @@ bound to `127.0.0.1` by default (`price_query_bind`).
 ```bash
 GET /v1/price/{faucet_id}?precision=&allow_stale=
 GET /v1/prices?ids=<faucet_a>,<faucet_b>          # → { "<faucet_id>": {…}, … }
+GET /v2/pairs                                     # tokens and pairs the solver swaps
 GET /v2/pair-price?offered_faucet=&requested_faucet=
 GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
 GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=   # frozen
@@ -386,8 +387,9 @@ GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amo
   never read PostgreSQL. A registration change (admin API, or a token added to
   `solver.toml`) and metadata a failed boot fetch missed show after a restart;
   removing a token from `solver.toml` does not unregister it.
-- `/v2/pair-price` and `/v2/swap-eta` are the swap flow: the price to build an
-  ask from, then the solver's verdict on that order. `/v1/swap-eta` is the
+- `/v2/pairs` lists the tokens and pairs the solver swaps (static until a
+  restart). `/v2/pair-price` and `/v2/swap-eta` are the swap flow: the price to
+  build an ask from, then the solver's verdict on that order. `/v1/swap-eta` is the
   original check, frozen. See `docs/price-api.md`.
 - **CORS** is enabled (any origin, GET) so browser wallets / extensions can
   fetch it cross-origin. Front it with HTTPS in production — browsers block

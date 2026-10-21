@@ -141,6 +141,7 @@ async fn unpriced_token_not_settled_on_direct_path() -> Result<()> {
                     endpoint: "http://unused".into(),
                     timeout_ms: 1_000,
                     prover_endpoint: None,
+                    prover_timeout_ms: 45_000,
                 },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),

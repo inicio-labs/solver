@@ -190,7 +190,12 @@ async fn partial_fill_repro() -> Result<()> {
             // IBTC/IUSDT clears at the BTCUSDT mid: 10 IUSDT per IBTC.
             let binance = common::BinanceStub::start(&[("BTCUSDT", "BTC", "USDT", "10")]);
             let config = SolverConfig {
-                rpc: RpcConfig { endpoint: "http://unused".into(), timeout_ms: 1_000, prover_endpoint: None },
+                rpc: RpcConfig {
+                    endpoint: "http://unused".into(),
+                    timeout_ms: 1_000,
+                    prover_endpoint: None,
+                    prover_timeout_ms: 45_000,
+                },
                 solver: SolverAccountConfig {
                     account_id: solver_id.to_hex(),
                     keystore_path: solver_keystore_path.to_string_lossy().into_owned(),

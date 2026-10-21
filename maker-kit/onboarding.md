@@ -12,7 +12,7 @@ This document gives you everything needed to quote on the Inicio solver on the M
 | Test-token faucet | Web: `https://faucets.forkchoice.xyz` · API: `https://faucet-api.forkchoice.xyz` |
 | Miden network | Testnet. RPC `https://rpc.testnet.miden.io` · remote prover `https://tx-prover.testnet.miden.io` |
 | Solver account | `0xf2ffdbcabb56d4511c23b524022aa2` (consumes your notes in settlements) |
-| Miden SDK | `miden-client` 0.17.3, `miden-protocol` and `miden-standards` 0.17.1 |
+| Miden SDK | `miden-client` 0.17.5, `miden-protocol` and `miden-standards` 0.17.1 |
 
 Keep the API key out of source control. We can issue more keys for the same maker (they share orders and events) and revoke a key at any time; revoking a key does not cancel your orders.
 

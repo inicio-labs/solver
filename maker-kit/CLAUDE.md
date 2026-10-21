@@ -11,7 +11,7 @@ The maker locks the tokens it offers in a **PSWAP note** (a Miden note that offe
 - Gateway: `https://35-175-40-181.sslip.io` (gRPC, TLS). Price API: same host, HTTPS JSON.
 - Miden testnet RPC `https://rpc.testnet.miden.io`, remote prover `https://tx-prover.testnet.miden.io`.
 - Test-token faucet API: `POST https://faucet-api.forkchoice.xyz/api/mint` `{token, address, amount, note_type}`.
-- SDK pins (exact): `miden-client` and `miden-client-sqlite-store` `=0.17.3`, `miden-protocol` and `miden-standards` `=0.17.1`. Other 0.17 versions cannot consume USDCX, the fee token.
+- SDK pins (exact): `miden-client` and `miden-client-sqlite-store` `=0.17.5`, `miden-protocol` and `miden-standards` `=0.17.1`. Client releases before 0.17.3 cannot consume USDCX, the fee token.
 - Token IDs and decimals: `onboarding.md` or `GET /v2/pairs`. Use base units (integers) everywhere; never floats.
 
 ## Rules that the protocol depends on

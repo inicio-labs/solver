@@ -1550,15 +1550,22 @@ mod tests {
 
         // The blocking operation is deliberately allowed to finish. A fresh
         // solver must read durable state instead of assuming the timeout
-        // rolled the transaction back.
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        // rolled the transaction back. Poll for that commit: on a loaded
+        // runner it can land well after the write's 300 ms sleep.
         let url = fixture.url.clone();
         let stored = tokio::task::spawn_blocking(move || -> Result<i64> {
             let mut conn = postgres_migrations::connect(&url)?;
-            Ok(sync_state::table
-                .find(1_i16)
-                .select(sync_state::last_fetched_block)
-                .first(&mut conn)?)
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let stored = sync_state::table
+                    .find(1_i16)
+                    .select(sync_state::last_fetched_block)
+                    .first::<i64>(&mut conn)?;
+                if stored == 42 || Instant::now() >= deadline {
+                    return Ok(stored);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         })
         .await??;
         assert_eq!(stored, 42);

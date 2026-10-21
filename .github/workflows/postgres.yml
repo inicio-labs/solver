@@ -6,24 +6,9 @@ on:
 
 jobs:
   solver:
-    runs-on: ubuntu-latest
+    # Pinned: this image ships PostgreSQL 16, which the tests run against.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
-    services:
-      postgres:
-        # Docker's official image, from its AWS mirror (same digest as Docker
-        # Hub): Docker Hub's anonymous pull limit fails shared runners.
-        image: public.ecr.aws/docker/library/postgres:16
-        env:
-          POSTGRES_DB: solver_test
-          POSTGRES_USER: solver
-          POSTGRES_PASSWORD: solver
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U solver -d solver_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       SOLVER_TEST_DATABASE_URL: postgresql://solver:solver@127.0.0.1:5432/solver_test?connect_timeout=5
       CARGO_INCREMENTAL: "0"
@@ -37,6 +22,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Native database libraries
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev
+      # Use the runner's own PostgreSQL instead of a service container: image
+      # pulls hit anonymous limits on shared runners (Docker Hub, then ECR
+      # Public's "toomanyrequests") and fail the job before any test runs.
+      # The role is a superuser, as POSTGRES_USER is in the official image:
+      # the pool sets lc_messages and terminates other backends.
+      - name: Start PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          for _ in $(seq 30); do pg_isready -q -h 127.0.0.1 -p 5432 && break; sleep 1; done
+          pg_lsclusters
+          pg_lsclusters --no-header | grep -q '^16 ' || { echo "::error::expected PostgreSQL 16"; exit 1; }
+          sudo -u postgres psql -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE solver LOGIN SUPERUSER PASSWORD 'solver'" \
+            -c "CREATE DATABASE solver_test OWNER solver"
+          pg_isready -h 127.0.0.1 -p 5432 -U solver -d solver_test
       # The pre-existing workspace has unrelated rustfmt drift. Check every
       # Rust file changed by this migration without rewriting legacy modules.
       - name: Migration formatting

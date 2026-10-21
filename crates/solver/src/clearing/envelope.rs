@@ -97,12 +97,14 @@ impl ReachableFillMap {
             .ok_or(ClearingError::InternalInvariant("invalid reachable row"))
     }
 
-    /// Find the largest buyer fill whose price-converted amount is reachable
-    /// by the seller. Integer buyer fills can leave gaps after conversion.
+    /// Find the largest buyer fill, at most `buyer_cap`, whose price-converted
+    /// amount is reachable by the seller. Integer buyer fills can leave gaps
+    /// after conversion.
     pub(crate) fn maximum_common_fill(
         &self,
         buyer_fills: &Self,
         price: BatchPrice,
+        buyer_cap: U256,
     ) -> Result<Option<(U256, U256)>, ClearingError> {
         let seller_intervals = self.fills_from(0)?;
         let buyer_intervals = buyer_fills.fills_from(0)?;
@@ -114,6 +116,14 @@ impl ReachableFillMap {
         while seller_count > 0 && buyer_count > 0 {
             let seller = seller_intervals[seller_count - 1];
             let buyer = buyer_intervals[buyer_count - 1];
+            if buyer.minimum > buyer_cap {
+                buyer_count -= 1;
+                continue;
+            }
+            let buyer = FillInterval {
+                minimum: buyer.minimum,
+                maximum: buyer.maximum.min(buyer_cap),
+            };
             let buyer_minimum_quote = price.quote_for_base_floor(buyer.minimum)?;
             let buyer_maximum_quote = price.quote_for_base_floor(buyer.maximum)?;
 
@@ -378,14 +388,16 @@ mod tests {
         // but is not a possible converted fill.
         let seller_three = map_from_mask(1 << 3);
         assert_eq!(
-            seller_three.maximum_common_fill(&buyers, price).unwrap(),
+            seller_three
+                .maximum_common_fill(&buyers, price, U256::MAX)
+                .unwrap(),
             None
         );
 
         let seller_two_or_three = map_from_mask((1 << 2) | (1 << 3));
         assert_eq!(
             seller_two_or_three
-                .maximum_common_fill(&buyers, price)
+                .maximum_common_fill(&buyers, price, U256::MAX)
                 .unwrap(),
             Some((U256::from(1u8), U256::from(2u8)))
         );
@@ -402,7 +414,9 @@ mod tests {
                         let price =
                             BatchPrice::from_ratio(u64::from(quote_units), u64::from(base_units))
                                 .unwrap();
-                        let actual = sellers.maximum_common_fill(&buyers, price).unwrap();
+                        let actual = sellers
+                            .maximum_common_fill(&buyers, price, U256::MAX)
+                            .unwrap();
                         let expected = (1..16u8).rev().find_map(|buyer_base| {
                             if buyer_mask & (1u16 << buyer_base) == 0 {
                                 return None;

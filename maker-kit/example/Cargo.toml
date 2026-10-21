@@ -14,10 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Pin the Miden SDK to the versions the network and the solver run. Client
-# 0.17.3 with protocol/standards 0.17.1 is required to consume USDCx, the
-# testnet fee token; 0.17.1 with 0.17.0 fails to claim it.
-miden-client = { version = "=0.17.3", default-features = false, features = ["std", "tonic"] }
-miden-client-sqlite-store = "=0.17.3"
+# 0.17.3 or later with protocol/standards 0.17.1 is required to consume USDCx,
+# the testnet fee token (0.17.1 with 0.17.0 fails to claim it); 0.17.5 also
+# rejects certificates from the compromised eMudhra CAs (RUSTSEC-2026-0382).
+miden-client = { version = "=0.17.5", default-features = false, features = ["std", "tonic"] }
+miden-client-sqlite-store = "=0.17.5"
 miden-protocol = { version = "=0.17.1", default-features = false }
 miden-standards = "=0.17.1"
 

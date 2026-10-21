@@ -2736,9 +2736,9 @@ dependencies = [
 
 [[package]]
 name = "miden-client"
-version = "0.17.3"
+version = "0.17.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35579ec11e02e43ffcb5e3a8248edf5eca9bb583565d5ac82c0d4fc1a5769854"
+checksum = "a15e3ac7be77423651c7ba329e73aed1debe56e982cb82520641c4e8d0f886ac"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2756,6 +2756,7 @@ dependencies = [
  "miden-testing",
  "miden-tx",
  "miden-tx-batch",
+ "miden-usdcx",
  "miette",
  "prost",
  "prost-types",
@@ -2792,9 +2793,9 @@ dependencies = [
 
 [[package]]
 name = "miden-client-sqlite-store"
-version = "0.17.3"
+version = "0.17.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ed14aea81ded38beb8f8759df00caef5721bcc3419d58469e10991f48e48371"
+checksum = "48ca5b8ccc1f06159e65f25e519f382233eda5774047b72af2d324af8145866d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3413,6 +3414,24 @@ dependencies = [
  "miden-prover",
  "miden-verifier",
  "thiserror",
+]
+
+[[package]]
+name = "miden-usdcx"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf4aa588e0224fd03ed6cc9837f7c4f0384eba222416816f53892d4f535ae72e"
+dependencies = [
+ "bon",
+ "miden-assembly",
+ "miden-core-lib",
+ "miden-package-registry",
+ "miden-protocol",
+ "miden-protocol-build-utils",
+ "miden-standards",
+ "miden-tx",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4984,9 +5003,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",

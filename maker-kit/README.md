@@ -13,7 +13,7 @@ cd solver/maker-kit
 | [`../docs/market-maker-guide.md`](../docs/market-maker-guide.md) | The maker gateway protocol in full. |
 | [`../docs/price-api.md`](../docs/price-api.md) | Prices, pairs and order checks over HTTPS. |
 | [`../crates/solver/proto/maker/v1/gateway.proto`](../crates/solver/proto/maker/v1/gateway.proto) | The gRPC contract (`solver.maker.v1.MakerGateway`). |
-| [`example/`](example/) | `maker`, a command-line maker built on miden-client 0.17.3. |
+| [`example/`](example/) | `maker`, a command-line maker built on miden-client 0.17.5. |
 | [`CLAUDE.md`](CLAUDE.md) | Briefing for a coding agent working in this kit. |
 
 ## Run the example

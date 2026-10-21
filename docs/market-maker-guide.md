@@ -126,10 +126,10 @@ sequenceDiagram
 
 ### Compatible Miden SDK versions
 
-- `miden-client` 0.17.3
+- `miden-client` 0.17.5
 - `miden-protocol` and `miden-standards` 0.17.1
 
-Earlier 0.17 releases cannot consume USDCX, the testnet's fee token.
+Client releases before 0.17.3 cannot consume USDCX, the testnet's fee token. 0.17.5 also rejects TLS certificates from the compromised eMudhra CAs ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)).
 
 Your note serialization and PSWAP behaviour must match these versions. Check with us before you upgrade.
 

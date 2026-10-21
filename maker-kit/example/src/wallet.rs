@@ -1,5 +1,5 @@
 //! The Miden side: the maker's wallet account, its order notes and its
-//! incoming notes. Built on miden-client 0.17.3.
+//! incoming notes. Built on miden-client 0.17.5.
 //!
 //! Testnet rules this module follows:
 //! - Sync before building a transaction. A transaction built on a stale block

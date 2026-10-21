@@ -5,8 +5,12 @@ use super::envelope::ReachableFillMap;
 use super::order::MatchOrder;
 use super::settlement::PairLedger;
 use super::types::{BatchPrice, ClearingError, ClearingOutcome, SkipReason};
+use ruint::aliases::U256;
 
 const PRIORITY_RETRY_PARTS: usize = 5;
+/// Re-plans after an insolvent result, each with the matched volume shaved by
+/// twice as much as the last.
+const SOLVENCY_RETRIES: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct PairBatch<'a> {
@@ -131,35 +135,72 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
                 "clearing interval limit reduced the price-time candidate set"
             );
         }
-        let Some((buyer_base_target, seller_quote_target)) =
-            seller_fills.maximum_common_fill(&buyer_fills, self.batch.clearing_price)?
-        else {
-            return Ok(ClearingOutcome::Skipped(SkipReason::NoPositiveCross));
-        };
+        // Payments round up and protocol payouts round down, and at one clearing
+        // price the batch has no spread to absorb that, so the maximum-volume
+        // plan can come out a few units short. Shave the matched volume and plan
+        // again: every accepted plan still passes the same exact solvency check.
+        let price = self.batch.clearing_price;
+        let mut buyer_cap = U256::MAX;
+        let mut shortfall = None;
+        for attempt in 0..=SOLVENCY_RETRIES {
+            let Some((buyer_base_target, seller_quote_target)) =
+                seller_fills.maximum_common_fill(&buyer_fills, price, buyer_cap)?
+            else {
+                break;
+            };
 
-        let seller_allocations =
-            seller_fills.allocate_by_priority(sell_orders, seller_quote_target)?;
-        let buyer_allocations = buyer_fills.allocate_by_priority(buy_orders, buyer_base_target)?;
-        let mut executions = Vec::new();
-        let mut ledger = PairLedger::default();
-        for (orders, allocations) in [
-            (sell_orders, &seller_allocations),
-            (buy_orders, &buyer_allocations),
-        ] {
-            for (order, &comparison_fill) in orders.iter().zip(allocations.iter()) {
-                if let Some(execution) =
-                    order.execution(comparison_fill, self.config.protocol_fee_ppm)?
-                {
-                    ledger.record(order.side(), &execution)?;
-                    executions.push(execution);
+            let seller_allocations =
+                seller_fills.allocate_by_priority(sell_orders, seller_quote_target)?;
+            let buyer_allocations =
+                buyer_fills.allocate_by_priority(buy_orders, buyer_base_target)?;
+            let mut executions = Vec::new();
+            let mut ledger = PairLedger::default();
+            for (orders, allocations) in [
+                (sell_orders, &seller_allocations),
+                (buy_orders, &buyer_allocations),
+            ] {
+                for (order, &comparison_fill) in orders.iter().zip(allocations.iter()) {
+                    if let Some(execution) =
+                        order.execution(comparison_fill, self.config.protocol_fee_ppm)?
+                    {
+                        ledger.record(order.side(), &execution)?;
+                        executions.push(execution);
+                    }
                 }
             }
+            match ledger.into_plan(executions).finalize() {
+                Ok(plan) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            attempt,
+                            %buyer_base_target,
+                            "clearing rounding shortfall resolved by shaving the matched volume"
+                        );
+                    }
+                    return Ok(ClearingOutcome::Accepted(Box::new(plan)));
+                }
+                Err(SkipReason::Insolvent {
+                    base_shortfall,
+                    quote_shortfall,
+                }) => {
+                    let quote_in_base = price.base_for_quote_ceil(U256::from(quote_shortfall))?;
+                    let shave =
+                        U256::from(base_shortfall).max(quote_in_base).max(U256::ONE) << attempt;
+                    shortfall = Some(SkipReason::Insolvent {
+                        base_shortfall,
+                        quote_shortfall,
+                    });
+                    if buyer_base_target <= shave {
+                        break;
+                    }
+                    buyer_cap = buyer_base_target - shave;
+                }
+                Err(reason) => return Ok(ClearingOutcome::Skipped(reason)),
+            }
         }
-        let candidate = ledger.into_plan(executions);
-        Ok(match candidate.finalize() {
-            Ok(plan) => ClearingOutcome::Accepted(Box::new(plan)),
-            Err(reason) => ClearingOutcome::Skipped(reason),
-        })
+        Ok(ClearingOutcome::Skipped(
+            shortfall.unwrap_or(SkipReason::NoPositiveCross),
+        ))
     }
 }
 
@@ -771,5 +812,87 @@ mod tests {
 
         let execution_batch = plan.to_execution_batch(&input).unwrap();
         assert_eq!(execution_batch.filled_notes.len(), 200);
+    }
+
+    /// Live case, 2026-10-08 testnet: users sell base for quote just under the
+    /// external mid and the mirror counters each with the full quote for 0.3%
+    /// less base. Payment and payout rounding left the maximum-volume plan a few
+    /// base units short, so the pair was skipped on every tick until the price
+    /// moved. A shaved re-plan must settle it at every price all orders accept.
+    #[test]
+    fn rounding_shortfall_is_resolved_by_shaving_volume() {
+        let (base, quote) = assets();
+        let mut rng = RandomCoin::new(Word::default());
+        let users = [(24_323_175u64, 733_570u64), (46_258_599, 1_395_300)];
+        let mut sets: Vec<Vec<Order>> = Vec::new();
+        let mut sequence = 0;
+        let mut pair = |offered: u64, requested: u64, rng: &mut RandomCoin| {
+            sequence += 2;
+            vec![
+                order(
+                    FungibleAsset::new(base, offered).unwrap(),
+                    FungibleAsset::new(quote, requested).unwrap(),
+                    0,
+                    sequence - 1,
+                    rng,
+                ),
+                order(
+                    FungibleAsset::new(quote, requested).unwrap(),
+                    FungibleAsset::new(base, offered * 9_970 / 10_000).unwrap(),
+                    0,
+                    sequence,
+                    rng,
+                ),
+            ]
+        };
+        for &(offered, requested) in &users {
+            sets.push(pair(offered, requested, &mut rng));
+        }
+        let mut combined = pair(users[0].0, users[0].1, &mut rng);
+        combined.extend(pair(users[1].0, users[1].1, &mut rng));
+        sets.push(combined);
+
+        let mut checked = 0;
+        for orders in &sets {
+            let (offered, requested) = users[0];
+            let counter = offered * 9_970 / 10_000;
+            // Fine ratios from the first seller's ask to its counter's bid, then
+            // Binance-style 0.000005 ticks across the same range.
+            let mut prices: Vec<BatchPrice> = (0..=100u64)
+                .map(|step| {
+                    BatchPrice::from_ratio(
+                        requested * (counter * 100 + (offered - counter) * step),
+                        offered * counter * 100,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            prices.extend(
+                (6_000u64..6_100).map(|tick| BatchPrice::from_ratio(tick, 200_000).unwrap()),
+            );
+            for price in prices {
+                let eligible = orders.iter().all(|order| {
+                    let side = if order.offered_asset().faucet_id() == base {
+                        OrderSide::SellBase
+                    } else {
+                        OrderSide::BuyBase
+                    };
+                    order.prepare_if_eligible(side, price, 0).unwrap().is_some()
+                });
+                if !eligible {
+                    continue;
+                }
+                checked += 1;
+                let input = batch(price, orders);
+                if let ClearingOutcome::Skipped(reason) = clear(&input, &ClearingConfig::default())
+                {
+                    panic!(
+                        "{} orders at {price:?}: skipped with {reason:?}",
+                        orders.len()
+                    );
+                }
+            }
+        }
+        assert!(checked > 50, "too few eligible prices: {checked}");
     }
 }

@@ -22,6 +22,7 @@ use miden_client::rpc::{Endpoint, EndpointError, GrpcClient, NodeRpcClient, Regi
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::auth::AuthSecretKey;
 use miden_protocol::account::AccountId;
+use miden_protocol::address::NetworkId;
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use solver::config::SolverConfig;
 use solver::ClientFactory;
@@ -65,8 +66,9 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
         .context("add solver account to the executor store")?;
 
     let id = account.id();
-    let address = match client.network_id().await {
-        Ok(network) => id.to_bech32(network),
+    let network = client.network_id().await;
+    let address = match &network {
+        Ok(network) => id.to_bech32(network.clone()),
         Err(e) => format!("(unavailable: {e})"),
     };
     println!("solver account created");
@@ -75,6 +77,11 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
         id.to_hex()
     );
     println!("  address    = {address}");
+    // The client names a network by its RPC endpoint and gives one it does not
+    // know (Cedar's) the generic `mcst` prefix; mainnet wallets expect `mm`.
+    if network.as_ref().ok() != Some(&NetworkId::Mainnet) {
+        println!("  mainnet    = {}", id.to_bech32(NetworkId::Mainnet));
+    }
     println!(
         "next: send native fee tokens to it as a PUBLIC note; the solver claims them automatically"
     );

@@ -1004,23 +1004,31 @@ pub struct ActiveMakerOrderRow {
 /// A page of the maker's active orders, ordered by exact note ID. `live_orders`
 /// applies the same cancellation rule as matching and reservation. This read
 /// does not promise that the in-memory matcher has processed the order yet.
+/// An order whose expiry is at or before `cutoff_unix_ms` is left out. The
+/// gateway passes now plus the settlement buffer, which is when the matcher
+/// stops filling the order (`MakerIndex::expired`). `live_orders` itself keeps
+/// it, because reservation must still accept work the matcher selected before
+/// then.
 pub fn active_maker_orders_page_tx(
     conn: &mut PgConnection,
     maker_id: MakerId,
     after: &[u8],
     limit: i64,
+    cutoff_unix_ms: i64,
 ) -> DbResult<Vec<ActiveMakerOrderRow>> {
     Ok(diesel::sql_query(
         "SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth, m.expires_at_unix_ms
          FROM live_orders l
          JOIN maker_lineages m ON m.lineage_id = l.lineage_id
          WHERE l.maker_id = $1 AND l.note_id > $2 AND l.depth IS NOT NULL
+           AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms > $4)
          ORDER BY l.note_id
          LIMIT $3",
     )
     .bind::<BigInt, _>(maker_id)
     .bind::<Binary, _>(after)
     .bind::<BigInt, _>(limit)
+    .bind::<BigInt, _>(cutoff_unix_ms)
     .load(conn)?)
 }
 
@@ -2534,7 +2542,7 @@ mod tests {
         let mut orders = Vec::new();
         let mut after = Vec::new();
         loop {
-            let page = active_maker_orders_page_tx(conn, alpha, &after, 1)?;
+            let page = active_maker_orders_page_tx(conn, alpha, &after, 1, 0)?;
             if page.is_empty() {
                 break;
             }
@@ -2558,7 +2566,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         );
-        assert_eq!(active_maker_orders_page_tx(conn, beta, &[], 10)?.len(), 1);
+        assert_eq!(
+            active_maker_orders_page_tx(conn, beta, &[], 10, 0)?.len(),
+            1
+        );
         Ok(())
     }
 
@@ -2643,8 +2654,10 @@ mod tests {
             CommandReply::Conflict
         );
         ingest(conn, &[&parent])?;
-        let page = active_maker_orders_page_tx(conn, alpha, &[], 10)?;
+        let page = active_maker_orders_page_tx(conn, alpha, &[], 10, 0)?;
         assert_eq!(page[0].expires_at_unix_ms, Some(1));
+        // From the cutoff on, the maker's listing leaves the order out.
+        assert!(active_maker_orders_page_tx(conn, alpha, &[], 10, 1)?.is_empty());
         let hydrated = load_live_orders_tx(conn)?;
         assert_eq!(hydrated[0].maker.unwrap().expires_at_unix_ms, Some(1));
         let (input, _, child) = fill(1, &parent, 40);

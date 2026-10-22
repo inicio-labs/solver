@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use miden_client::builder::ClientBuilder;
@@ -59,6 +60,9 @@ pub struct MakerGatewayService {
     markets: Arc<HashSet<Vec<u8>>>,
     events: EventWake,
     stream: StreamConfig,
+    /// How long before expiry the matcher stops filling an order; the
+    /// active-order listing uses the same cutoff.
+    settlement_buffer: Duration,
     event_slots: Arc<Semaphore>,
     /// Ends every event stream at shutdown, so the server can stop.
     cancel: CancellationToken,
@@ -71,6 +75,7 @@ impl MakerGatewayService {
         markets: HashSet<Vec<u8>>,
         events: EventWake,
         stream: StreamConfig,
+        settlement_buffer: Duration,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -79,6 +84,7 @@ impl MakerGatewayService {
             markets: Arc::new(markets),
             events,
             stream,
+            settlement_buffer,
             event_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
             cancel,
         }
@@ -252,10 +258,20 @@ impl MakerGateway for MakerGatewayService {
             0 => DEFAULT_ORDER_PAGE,
             size => size.min(MAX_ORDER_PAGE),
         };
+        // The matcher drops an order `settlement_buffer` before its expiry
+        // (`MakerIndex::expired`); list only what it can still fill.
+        let cutoff = unix_ms()
+            .saturating_add(i64::try_from(self.settlement_buffer.as_millis()).unwrap_or(i64::MAX));
         let page = self
             .pool
             .read_public(move |conn| {
-                maker_db::active_maker_orders_page_tx(conn, maker_id, &after, i64::from(size))
+                maker_db::active_maker_orders_page_tx(
+                    conn,
+                    maker_id,
+                    &after,
+                    i64::from(size),
+                    cutoff,
+                )
             })
             .await
             .map_err(|_| Status::unavailable("cannot read active orders now; retry"))?;
@@ -511,6 +527,7 @@ pub fn spawn_gateway_thread(
                     cfg.markets,
                     events,
                     cfg.stream,
+                    cfg.settlement_buffer,
                     cancel.clone(),
                 );
                 let serving = tonic::transport::Server::builder()
@@ -633,6 +650,7 @@ mod tests {
             HashSet::from([market_key(markets[0], markets[1])]),
             events.clone(),
             TEST_STREAM,
+            Duration::ZERO,
             stop.clone(),
         );
         service.event_slots = Arc::new(Semaphore::new(stream_limit));
@@ -1024,6 +1042,7 @@ mod tests {
             submit_queue: 4,
             cancel_queue: 4,
             stream: TEST_STREAM,
+            settlement_buffer: Duration::ZERO,
         };
         // No node answers here: watcher rounds fail and are retried.
         let rpc = || -> Arc<dyn NodeRpcClient> {

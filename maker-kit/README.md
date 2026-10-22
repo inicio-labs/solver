@@ -34,6 +34,8 @@ alias maker=./target/release/maker
 maker init
 ```
 
+On mainnet the network admits only invited accounts: set `MAKER_INVITATION_CODE` to your code before `maker init` (one code registers one account), and set `network_id = "mainnet"` in `maker.toml` so addresses print as `mm1…`.
+
 Mint test tokens to the printed address (any amount up to 1,000,000 tokens per request, as often as you like):
 
 ```bash
@@ -73,7 +75,7 @@ maker orders            # what the solver can match now
 
 ```bash
 maker cancel <lineage-hex>     # printed by `quote`
-maker reclaim <lineage-hex>    # only for an order with no fill yet
+maker reclaim <lineage-hex>    # the order's current note: the original, or the latest remainder after partial fills
 ```
 
 **5. After a fill,** `maker events` shows `SettlementPending` and `SettlementResolved`. Then `maker claim` consumes the payback note and `maker balance` shows the tokens.

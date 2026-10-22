@@ -26,4 +26,8 @@ pub struct GatewayConfig {
     pub submit_queue: usize,
     pub cancel_queue: usize,
     pub stream: StreamConfig,
+    /// How long before an order's expiry the matcher stops filling it
+    /// (`maker_settlement_buffer_ms`). The active-order listing uses the same
+    /// cutoff, so a maker never sees an order the matcher has already dropped.
+    pub settlement_buffer: Duration,
 }

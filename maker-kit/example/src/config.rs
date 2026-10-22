@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use miden_protocol::account::AccountId;
+use miden_protocol::address::NetworkId;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +22,21 @@ pub struct Network {
     pub rpc_timeout_ms: u64,
     pub prover: Option<String>,
     pub prover_timeout_ms: u64,
+    /// Address format to print: `mainnet` (mm1…), `testnet` (mtst1…, the
+    /// default), `devnet`, or another network's prefix.
+    #[serde(default)]
+    pub network_id: Option<String>,
+}
+
+impl Network {
+    pub fn address_network(&self) -> NetworkId {
+        match self.network_id.as_deref().unwrap_or("testnet") {
+            "mainnet" => NetworkId::Mainnet,
+            "testnet" => NetworkId::Testnet,
+            "devnet" => NetworkId::Devnet,
+            other => NetworkId::new(other).unwrap_or(NetworkId::Testnet),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

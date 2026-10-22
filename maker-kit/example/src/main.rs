@@ -26,7 +26,7 @@ mod wallet;
 
 use anyhow::{anyhow, bail, Context, Result};
 use miden_protocol::account::AccountId;
-use miden_protocol::address::{Address, NetworkId};
+use miden_protocol::address::Address;
 use miden_protocol::asset::FungibleAsset;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
 use miden_protocol::note::Note;
@@ -56,7 +56,7 @@ async fn run() -> Result<()> {
         "init" => init(&cfg, &mut journal).await,
         "address" => {
             let id = account(&journal)?;
-            println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(NetworkId::Testnet));
+            println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()));
             Ok(())
         }
         "claim" => {
@@ -126,8 +126,8 @@ async fn run() -> Result<()> {
             let record = journal.order(lineage).context("no order with that lineage in the journal")?;
             let note = Note::read_from_bytes(&hex::decode(&record.note)?).map_err(|e| anyhow!("decode note: {e}"))?;
             let (mut client, _) = wallet::client(&cfg).await?;
-            wallet::reclaim(&mut client, id, note).await?;
-            println!("reclaimed: the order's tokens are back in your account");
+            let depth = wallet::reclaim(&mut client, id, note).await?;
+            println!("reclaimed the order's note at depth {depth}: its tokens are back in your account");
             Ok(())
         }
         "heartbeat" => {
@@ -155,7 +155,7 @@ async fn init(cfg: &Config, journal: &mut Journal) -> Result<()> {
     let id = wallet::create_account(&mut client, &keystore).await?;
     journal.account_id = Some(id.to_hex());
     journal.save()?;
-    println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(NetworkId::Testnet));
+    println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()));
     wallet::register(cfg, &mut client, id).await?;
     println!("next: mint test tokens to this address (README), then `maker claim`");
     Ok(())

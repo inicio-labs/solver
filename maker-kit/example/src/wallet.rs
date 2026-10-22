@@ -20,6 +20,7 @@ use miden_client::block::BlockNumber;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
 use miden_client::note::NoteType;
+use miden_client::pswap::PswapLineageState;
 use miden_client::rpc::{Endpoint, EndpointError, GrpcClient, NodeRpcClient, RegisterAccountError, VerifyingRpcClient};
 use miden_client::transaction::{PswapTransactionData, TransactionRequestBuilder};
 use miden_client::{Client, RemoteTransactionProver};
@@ -77,9 +78,12 @@ pub async fn create_account(client: &mut MidenClient, keystore: &FilesystemKeySt
     Ok(id)
 }
 
-/// Register the account with the network. The testnet funds a new
+/// Register the account with the network. The network funds a new
 /// registration once with a small USDCx note (10,000 units, 0.01 USDCx) so the
 /// account can pay its first fees; `claim` then moves it into the vault.
+/// The invitation code comes from `MAKER_INVITATION_CODE`: mainnet admits only
+/// invited accounts and binds one code to one account; the public testnet
+/// accepts an empty code.
 pub async fn register(cfg: &Config, client: &mut MidenClient, id: AccountId) -> Result<()> {
     client.sync_state().await.context("sync")?;
     let (genesis, _) = client
@@ -89,7 +93,8 @@ pub async fn register(cfg: &Config, client: &mut MidenClient, id: AccountId) -> 
     let endpoint = Endpoint::try_from(cfg.network.rpc.as_str()).map_err(|e| anyhow!("rpc endpoint: {e}"))?;
     let node = GrpcClient::new(&endpoint, cfg.network.rpc_timeout_ms);
     node.set_genesis_commitment(genesis.commitment()).await.context("set genesis commitment")?;
-    match node.register_account("", id).await {
+    let code = std::env::var("MAKER_INVITATION_CODE").unwrap_or_default();
+    match node.register_account(code.trim(), id).await {
         Ok(()) => println!("registered {}: a USDCx fee note is on its way; run `maker claim` in a minute", id.to_hex()),
         Err(e)
             if matches!(
@@ -97,7 +102,15 @@ pub async fn register(cfg: &Config, client: &mut MidenClient, id: AccountId) -> 
                 Some(EndpointError::RegisterAccount(RegisterAccountError::AlreadyRegistered))
             ) =>
         {
-            println!("{} is already registered (a registration is funded only once)", id.to_hex())
+            println!("{}: the account or the invitation code is already registered (a registration is funded only once)", id.to_hex())
+        }
+        Err(e)
+            if matches!(
+                e.endpoint_error(),
+                Some(EndpointError::RegisterAccount(RegisterAccountError::InvitationNotFound))
+            ) =>
+        {
+            bail!("register {}: the network does not know this invitation code (set MAKER_INVITATION_CODE)", id.to_hex())
         }
         Err(e) => bail!("register {}: {e}", id.to_hex()),
     }
@@ -176,14 +189,25 @@ pub async fn create_order(
     Ok(note)
 }
 
-/// Take back what is left in your own order note. Cancel first and wait for
-/// any pending settlement to resolve (guide, section 10). After a partial
-/// fill, reclaim the rebuilt remainder instead of the original note.
-pub async fn reclaim(client: &mut MidenClient, id: AccountId, note: Note) -> Result<()> {
+/// Take back what is left in your own order. Cancel first and wait for any
+/// pending settlement to resolve (guide, section 10). The client tracks every
+/// order it created across fills, so this reclaims the order's current note:
+/// the original while unfilled, the latest remainder after partial fills.
+/// An order the client does not track (created before it tracked lineages)
+/// falls back to the original note. Returns the depth of the reclaimed note.
+pub async fn reclaim(client: &mut MidenClient, id: AccountId, note: Note) -> Result<u32> {
     client.sync_state().await.context("sync")?;
-    let request = TransactionRequestBuilder::new().build_consume_notes(vec![note])?;
+    let order_id = PswapNote::try_from(&note).map_err(|e| anyhow!("not a PSWAP note: {e:?}"))?.order_id();
+    let (request, depth) = match client.pswap_lineage(order_id).await.context("read the order's lineage")? {
+        Some(lineage) if lineage.state == PswapLineageState::Active => (
+            client.build_pswap_cancel_by_order(order_id).await.map_err(|e| anyhow!(e).context("build the reclaim"))?,
+            lineage.current_depth,
+        ),
+        Some(lineage) => bail!("nothing to reclaim: the order is {:?}", lineage.state),
+        None => (TransactionRequestBuilder::new().build_consume_notes(vec![note])?, 0),
+    };
     client.submit_new_transaction(id, request).await.map_err(|e| anyhow!(e).context("reclaim"))?;
-    Ok(())
+    Ok(depth)
 }
 
 /// The 47-byte lineage id: one id for an order and all its remainders.

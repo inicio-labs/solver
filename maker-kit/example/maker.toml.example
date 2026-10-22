@@ -8,6 +8,8 @@ rpc_timeout_ms = 30000
 # (the fee token) expires 20 blocks after the block it was built on.
 prover = "https://tx-prover.testnet.miden.io"
 prover_timeout_ms = 45000
+# Address format to print: "testnet" (mtst1…, the default) or "mainnet" (mm1…).
+network_id = "testnet"
 
 [gateway]
 # gRPC over TLS. Your API key goes in the file below, never in this config.

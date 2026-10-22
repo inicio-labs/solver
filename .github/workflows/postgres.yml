@@ -92,3 +92,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev
       - name: Release build with PostgreSQL and SQLite client stores
         run: cargo build --release -p solver-bin --locked
+
+  # The maker kit is its own Cargo project with its own lockfile, outside the
+  # workspace, so nothing above compiles it. Its build script generates the
+  # gateway client from crates/solver/proto, so a proto change can break it too.
+  maker-kit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: maker-kit/example
+      - name: Native SQLite library
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Build the maker kit
+        working-directory: maker-kit/example
+        run: cargo build --locked

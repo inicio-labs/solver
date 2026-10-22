@@ -255,7 +255,13 @@ impl MakerGateway for MakerGatewayService {
         let page = self
             .pool
             .read_public(move |conn| {
-                maker_db::active_maker_orders_page_tx(conn, maker_id, &after, i64::from(size))
+                maker_db::active_maker_orders_page_tx(
+                    conn,
+                    maker_id,
+                    &after,
+                    i64::from(size),
+                    unix_ms(),
+                )
             })
             .await
             .map_err(|_| Status::unavailable("cannot read active orders now; retry"))?;

@@ -75,7 +75,7 @@ fn cli() -> clap::Command {
         )
         .subcommand(
             clap::Command::new("register-account")
-                .about("Register an account with the network so it funds it with the fee asset")
+                .about("Register an account with the network so it funds it with the fee asset (invitation code from SOLVER_INVITATION_CODE)")
                 .arg(
                     clap::Arg::new("account")
                         .long("account")

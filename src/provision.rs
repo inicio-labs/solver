@@ -91,9 +91,11 @@ pub async fn provision_account(config: &SolverConfig) -> Result<()> {
 ///
 /// A node binds an invitation code to a new account with `RegisterAccount`; when its sequencer
 /// funds registrations, a new registration also sends the account a public note of the fee
-/// asset, which the solver then claims like any incoming funds. The public testnet doesn't
-/// enforce an allowlist, so any code works, including an empty one. Registering again never
-/// funds twice. Ported from inicio-faucet `register_for_funding`.
+/// asset, which the solver then claims like any incoming funds. The invitation code comes from
+/// `SOLVER_INVITATION_CODE`, kept out of argv and shell history; unset sends an empty code,
+/// which the public testnet accepts because it enforces no allowlist. A code binds to one
+/// account. Registering again never funds twice. Ported from inicio-faucet
+/// `register_for_funding`.
 ///
 /// This calls the RPC directly: `Client::register_account` returns `AccountAlreadyAllowed`
 /// without sending anything when the node already admits the account, which is always the case
@@ -119,7 +121,8 @@ pub async fn register_account(config: &SolverConfig, account: Option<&str>) -> R
         .await
         .context("set the genesis commitment")?;
 
-    match node.register_account("", account_id).await {
+    let code = std::env::var("SOLVER_INVITATION_CODE").unwrap_or_default();
+    match node.register_account(code.trim(), account_id).await {
         Ok(()) => println!(
             "registered {} with the network; if it funds registrations, a fee-asset note is on its way",
             account_id.to_hex()
@@ -130,7 +133,21 @@ pub async fn register_account(config: &SolverConfig, account: Option<&str>) -> R
                 Some(EndpointError::RegisterAccount(RegisterAccountError::AlreadyRegistered))
             ) =>
         {
-            println!("{} is already registered (registration funds an account only once)", account_id.to_hex())
+            println!(
+                "{}: the account or the invitation code is already registered (registration funds an account only once)",
+                account_id.to_hex()
+            )
+        }
+        Err(e)
+            if matches!(
+                e.endpoint_error(),
+                Some(EndpointError::RegisterAccount(RegisterAccountError::InvitationNotFound))
+            ) =>
+        {
+            bail!(
+                "register {}: the network does not know this invitation code (set SOLVER_INVITATION_CODE)",
+                account_id.to_hex()
+            )
         }
         Err(e) => bail!("register {}: {e}", account_id.to_hex()),
     }

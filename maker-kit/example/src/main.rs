@@ -56,7 +56,7 @@ async fn run() -> Result<()> {
         "init" => init(&cfg, &mut journal).await,
         "address" => {
             let id = account(&journal)?;
-            println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()));
+            println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()?));
             Ok(())
         }
         "claim" => {
@@ -155,7 +155,7 @@ async fn init(cfg: &Config, journal: &mut Journal) -> Result<()> {
     let id = wallet::create_account(&mut client, &keystore).await?;
     journal.account_id = Some(id.to_hex());
     journal.save()?;
-    println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()));
+    println!("account {}\naddress {}", id.to_hex(), Address::new(id).encode(cfg.network.address_network()?));
     wallet::register(cfg, &mut client, id).await?;
     println!("next: mint test tokens to this address (README), then `maker claim`");
     Ok(())

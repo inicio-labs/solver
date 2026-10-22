@@ -23,18 +23,19 @@ pub struct Network {
     pub prover: Option<String>,
     pub prover_timeout_ms: u64,
     /// Address format to print: `mainnet` (mm1…), `testnet` (mtst1…, the
-    /// default), `devnet`, or another network's prefix.
+    /// default) or `devnet`. Anything else is an error, so a typo cannot
+    /// print addresses in the wrong format.
     #[serde(default)]
     pub network_id: Option<String>,
 }
 
 impl Network {
-    pub fn address_network(&self) -> NetworkId {
+    pub fn address_network(&self) -> Result<NetworkId> {
         match self.network_id.as_deref().unwrap_or("testnet") {
-            "mainnet" => NetworkId::Mainnet,
-            "testnet" => NetworkId::Testnet,
-            "devnet" => NetworkId::Devnet,
-            other => NetworkId::new(other).unwrap_or(NetworkId::Testnet),
+            "mainnet" => Ok(NetworkId::Mainnet),
+            "testnet" => Ok(NetworkId::Testnet),
+            "devnet" => Ok(NetworkId::Devnet),
+            other => bail!("network_id must be mainnet, testnet or devnet, not {other:?}"),
         }
     }
 }
@@ -66,7 +67,9 @@ pub struct Token {
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
-        toml::from_str(&text).with_context(|| format!("parse {path}"))
+        let config: Self = toml::from_str(&text).with_context(|| format!("parse {path}"))?;
+        config.network.address_network().with_context(|| format!("parse {path}"))?;
+        Ok(config)
     }
 
     pub fn api_key(&self) -> Result<String> {

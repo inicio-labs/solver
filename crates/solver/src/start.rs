@@ -533,6 +533,7 @@ pub async fn start(
                 buffer: config.engine.maker_stream_buffer,
                 heartbeat: Duration::from_millis(config.engine.maker_stream_heartbeat_ms),
             },
+            settlement_buffer: Duration::from_millis(config.engine.maker_settlement_buffer_ms),
         };
         // The core writer notifies it after every commit that appended maker
         // events.

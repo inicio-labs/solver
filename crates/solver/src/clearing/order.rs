@@ -86,6 +86,21 @@ impl Order {
         self.maker = Some(tag);
     }
 
+    /// The maker that claimed this order, and its submit sequence.
+    pub(crate) fn maker_tag(&self) -> Option<MakerTag> {
+        self.maker
+    }
+
+    /// The book entry this order was built from, sharing its note.
+    pub(crate) fn to_book_order(&self) -> BookOrder {
+        BookOrder {
+            priority_seq: self.priority_sequence(),
+            arrival_unix: self.arrival_unix,
+            note: self.note.clone(),
+            maker: self.maker,
+        }
+    }
+
     pub fn id(&self) -> NoteId {
         self.note.id()
     }
@@ -134,6 +149,22 @@ impl Order {
         *self.pswap.storage().min_requested_asset()
     }
 
+    pub(crate) fn is_eligible(
+        &self,
+        side: OrderSide,
+        price: BatchPrice,
+        fee_ppm: u32,
+    ) -> Result<bool, ClearingError> {
+        Ok(eligible_units(
+            side,
+            price,
+            fee_ppm,
+            self.offered_asset().amount().as_u64(),
+            self.requested_asset().amount().as_u64(),
+        )?
+        .is_some())
+    }
+
     pub(crate) fn prepare_if_eligible(
         &self,
         side: OrderSide,
@@ -173,6 +204,7 @@ impl Order {
             requested_filled: execution.payment.amount().as_u64(),
             note: self.note.clone(),
             arrival_unix: self.arrival_unix,
+            cancel_on_reserve: Vec::new(),
         }
     }
 }

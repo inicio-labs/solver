@@ -181,6 +181,23 @@ impl MakerIndex {
             .collect()
     }
 
+    /// The book entries this maker has claimed on the pair of `a` and `b`, in
+    /// either direction. The pair is read from the entry, so the maker's
+    /// orders on other pairs never reach a book lookup.
+    pub(super) fn orders_on_pair(
+        &self,
+        maker_id: MakerId,
+        a: TokenId,
+        b: TokenId,
+    ) -> impl Iterator<Item = NoteId> + '_ {
+        self.entries_of_maker(maker_id)
+            .filter(move |(_, entry, _)| {
+                let tokens = (entry.offered, entry.requested);
+                tokens == (a, b) || tokens == (b, a)
+            })
+            .map(|(id, _, _)| id)
+    }
+
     fn entries_of_maker(
         &self,
         maker_id: MakerId,
@@ -229,7 +246,7 @@ mod tests {
     use miden_protocol::note::{Note, NoteType};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
-        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2, ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
     };
     use miden_protocol::Word;
     use miden_standards::note::{PswapNote, PswapNoteStorage};
@@ -248,6 +265,15 @@ mod tests {
     fn order(serial: u32, sell_x: bool, maker: Option<(MakerId, u64)>) -> BookOrder {
         let (x, y) = tokens();
         let (offered, requested) = if sell_x { (x, y) } else { (y, x) };
+        order_between(serial, offered, requested, maker)
+    }
+
+    fn order_between(
+        serial: u32,
+        offered: TokenId,
+        requested: TokenId,
+        maker: Option<(MakerId, u64)>,
+    ) -> BookOrder {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
             .try_into()
             .unwrap();
@@ -411,5 +437,34 @@ mod tests {
         assert!(index.expired(999, 0).is_empty());
         assert_eq!(index.expired(1000, 0), vec![expiring.id()]);
         assert_eq!(index.expired(0, 1001), vec![expiring.id()]);
+    }
+
+    #[test]
+    fn a_makers_orders_on_a_pair_cover_both_directions_and_nothing_else() {
+        let (x, y) = tokens();
+        let z = AccountId::try_from(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2).unwrap();
+        let sell = order(1, true, Some((ALPHA, 1)));
+        let buy = order(2, false, Some((ALPHA, 2)));
+        let other_pair = order_between(3, x, z, Some((ALPHA, 3)));
+        let other_maker = order(4, true, Some((BETA, 1)));
+        let public = order(5, true, None);
+        let mut index = MakerIndex::default();
+        for order in [&sell, &buy, &other_pair, &other_maker, &public] {
+            assert!(index.admit(order));
+        }
+        let on_pair = |index: &MakerIndex, a, b| -> HashSet<NoteId> {
+            index.orders_on_pair(ALPHA, a, b).collect()
+        };
+        let expected: HashSet<_> = [sell.id(), buy.id()].into();
+        assert_eq!(on_pair(&index, x, y), expected);
+        assert_eq!(
+            on_pair(&index, y, x),
+            expected,
+            "either order of the tokens"
+        );
+        assert_eq!(on_pair(&index, z, x), [other_pair.id()].into());
+        assert!(on_pair(&index, y, z).is_empty());
+        index.forget(sell.id());
+        assert_eq!(on_pair(&index, x, y), [buy.id()].into());
     }
 }

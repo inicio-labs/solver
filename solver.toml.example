@@ -118,6 +118,7 @@ admin_port = 3001
 # maker_stream_heartbeat_ms = 10000  # also ends streams of a revoked key
 # maker_settlement_buffer_ms = 30000 # selection stops this long before MM expiry
 # maker_watch_interval_ms = 1000     # maker-note watcher: new blocks, spends
+# maker_self_trade_prevention = true # ADR 0005: crossed maker orders never fill each other
 
 # ── Binance Spot public market data (the only price source) ─────────────────
 # Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.

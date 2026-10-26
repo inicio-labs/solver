@@ -203,6 +203,8 @@ enum OrderState {
   ORDER_STATE_REJECTED = 2;
   // Its note was verified spent elsewhere.
   ORDER_STATE_UNAVAILABLE = 3;
+  // Stopped by the solver; `reason` says why.
+  ORDER_STATE_CANCELLED = 4;
 }
 
 message OrderStatus {

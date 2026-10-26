@@ -264,6 +264,11 @@ pub struct FilledNote {
     /// First durable observation time, carried through re-feeds and remainders
     /// so the executor can record `settled - arrival` consistently.
     pub arrival_unix: UnixSecs,
+    /// The same maker's crossing orders that sat out this round (ADR 0005).
+    /// They are not inputs: the reservation that reserves this note cancels
+    /// them, and every give-back returns them with it. Empty for almost
+    /// every note.
+    pub cancel_on_reserve: Vec<BookOrder>,
 }
 
 impl FilledNote {
@@ -289,10 +294,23 @@ pub struct ExecutionBatch {
 }
 
 impl ExecutionBatch {
+    /// Every order this batch holds out of the book: its inputs and the
+    /// sit-outs riding with them. Give-backs return all of them.
     pub fn book_orders(&self) -> Vec<BookOrder> {
         self.filled_notes
             .iter()
-            .map(FilledNote::to_book_order)
+            .flat_map(|filled| {
+                std::iter::once(filled.to_book_order())
+                    .chain(filled.cancel_on_reserve.iter().cloned())
+            })
+            .collect()
+    }
+
+    /// Note IDs of the sit-outs to cancel when this batch is reserved.
+    pub fn self_trade_cancels(&self) -> Vec<OrderId> {
+        self.filled_notes
+            .iter()
+            .flat_map(|filled| filled.cancel_on_reserve.iter().map(BookOrder::id))
             .collect()
     }
 }

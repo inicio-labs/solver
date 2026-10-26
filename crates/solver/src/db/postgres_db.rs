@@ -236,6 +236,32 @@ pub fn prepare_settlement_tx(
     inputs: &[SettlementInputRow],
     cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<()> {
+    reserve_inputs_tx(conn, attempt, inputs, cached_fills, &[])
+}
+
+/// The executor's reservation: reserve the inputs and, in the same commit,
+/// cancel the sit-outs of the crossed makers they fill (ADR 0005). The
+/// sit-outs' makers are locked with the inputs' owners, in one maker-ID
+/// ordered pass before any write, so the cancel never takes a maker lock late.
+pub fn reserve_settlement_tx(
+    conn: &mut PgConnection,
+    attempt: &SettlementAttemptRow,
+    inputs: &[SettlementInputRow],
+    cached_fills: Option<&maker_db::SettlementFills>,
+    sit_outs: &[Vec<u8>],
+) -> DbResult<()> {
+    reserve_inputs_tx(conn, attempt, inputs, cached_fills, sit_outs)?;
+    maker_db::cancel_self_trades_tx(conn, sit_outs)
+}
+
+/// `prepare_settlement_tx`, also locking the makers of `sit_outs`.
+fn reserve_inputs_tx(
+    conn: &mut PgConnection,
+    attempt: &SettlementAttemptRow,
+    inputs: &[SettlementInputRow],
+    cached_fills: Option<&maker_db::SettlementFills>,
+    sit_outs: &[Vec<u8>],
+) -> DbResult<()> {
     if inputs.is_empty() {
         return Err(SettlementError::NoInputs.into());
     }
@@ -265,14 +291,16 @@ pub fn prepare_settlement_tx(
     }
     // Serialize with cancels: lock the control rows of the makers that own
     // these inputs, found from the locked rows (an attribution can arrive
-    // after the matcher picked a candidate), in maker-ID order. A cancel
+    // after the matcher picked a candidate), and of the makers whose
+    // sit-outs this reservation cancels, in maker-ID order. A cancel
     // raising a cutoff takes the same lock, so either it sees this
     // reservation as exposure or this check sees its cutoff.
+    let lock_ids: Vec<Vec<u8>> = parent_ids.iter().chain(sit_outs).cloned().collect();
     let owners: Vec<i64> = orders::table
         .inner_join(
             maker_lineages::table.on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
         )
-        .filter(orders::note_id.eq_any(&parent_ids))
+        .filter(orders::note_id.eq_any(&lock_ids))
         .select(maker_lineages::maker_id)
         .distinct()
         .load(conn)?;

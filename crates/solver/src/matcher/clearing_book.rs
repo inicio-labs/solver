@@ -9,7 +9,7 @@ use crate::clearing::{
 };
 use crate::maker::{CutoffScope, MakerId, MakerUpdate};
 use crate::swap_eta::DepthChange;
-use crate::types::{BookOrder, BookUpdate, TokenId};
+use crate::types::{BookOrder, BookUpdate, ExecutionBatch, TokenId};
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
@@ -259,39 +259,56 @@ impl ClearingBook {
         price: BatchPrice,
         fee_ppm: u32,
         limit: usize,
+        mut self_trade: Option<&mut SelfTrade>,
     ) -> Result<Vec<MatchOrder<'a>>, ClearingError> {
         let mut selected = Vec::new();
         if let Some(index) = self.pairs.get(&pair) {
-            for id in index.values().take(limit) {
+            for id in index.values() {
+                if selected.len() == limit {
+                    break;
+                }
                 let order = self
                     .orders
                     .get(id)
                     .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
-                match order.prepare_if_eligible(side, price, fee_ppm)? {
-                    Some(prepared) => selected.push(prepared),
-                    None => {
-                        // Eligibility is monotone in this exact price ordering.
-                        break;
+                let Some(prepared) = order.prepare_if_eligible(side, price, fee_ppm)? else {
+                    // Eligibility is monotone in this exact price ordering.
+                    break;
+                };
+                // A sit-out takes no slot: the next order in line moves up.
+                if let Some(self_trade) = self_trade.as_deref_mut() {
+                    if !self_trade.keeps(self, order, side)? {
+                        continue;
                     }
                 }
+                selected.push(prepared);
             }
         }
         Ok(selected)
     }
 
+    /// The pair's batch, and the sit-outs of every crossed maker (ADR 0005).
     pub(super) fn build_pair_batch<'a>(
         &'a self,
         base: TokenId,
         quote: TokenId,
         price: BatchPrice,
         config: &ClearingConfig,
-    ) -> Result<PairBatch<'a>, ClearingError> {
+    ) -> Result<(PairBatch<'a>, Vec<MakerDecision>), ClearingError> {
+        let mut self_trade = config.self_trade_prevention.then(|| SelfTrade {
+            base,
+            quote,
+            price,
+            fee_ppm: config.protocol_fee_ppm,
+            decided: Vec::new(),
+        });
         let sell_orders = self.admit(
             (base, quote),
             OrderSide::SellBase,
             price,
             config.protocol_fee_ppm,
             config.max_orders_per_side,
+            self_trade.as_mut(),
         )?;
         let buy_orders = self.admit(
             (quote, base),
@@ -299,8 +316,38 @@ impl ClearingBook {
             price,
             config.protocol_fee_ppm,
             config.max_orders_per_side,
+            self_trade.as_mut(),
         )?;
-        Ok(PairBatch::new(price, sell_orders, buy_orders))
+        let decisions = self_trade
+            .map(SelfTrade::into_decisions)
+            .unwrap_or_default();
+        Ok((PairBatch::new(price, sell_orders, buy_orders), decisions))
+    }
+
+    /// Give each crossed maker's sit-outs to its first filled order in the
+    /// pair, to be cancelled if that settlement is reserved. A crossed maker
+    /// has only kept orders in the batch, so any fill of its is a kept one.
+    pub(super) fn attach_self_trade_cancels(
+        &self,
+        decisions: Vec<MakerDecision>,
+        execution: &mut ExecutionBatch,
+    ) {
+        for decision in decisions {
+            let first_fill = execution.filled_notes.iter_mut().find(|filled| {
+                self.orders
+                    .get(&filled.note_id)
+                    .and_then(Order::maker_tag)
+                    .is_some_and(|tag| tag.maker_id == decision.maker_id)
+            });
+            if let Some(filled) = first_fill {
+                filled.cancel_on_reserve = decision
+                    .sit_out
+                    .iter()
+                    .filter_map(|id| self.orders.get(id))
+                    .map(Order::to_book_order)
+                    .collect();
+            }
+        }
     }
 
     /// Every non-empty directed pair's levels, best first, read straight from
@@ -330,6 +377,134 @@ impl ClearingBook {
                     }
                 }
                 (pair, levels)
+            })
+            .collect()
+    }
+}
+
+/// A crossed maker's orders on a pair that must not trade this round
+/// (ADR 0005); cancelled if a kept order of the maker fills.
+pub(super) struct MakerDecision {
+    pub(super) maker_id: MakerId,
+    pub(super) sit_out: Vec<NoteId>,
+}
+
+/// A crossed maker's side this round: its orders on `winner` newer than
+/// `cutoff` trade, every other eligible order sits out.
+struct Crossed {
+    winner: OrderSide,
+    cutoff: u64,
+    sit_out: Vec<NoteId>,
+}
+
+/// Self-trade prevention for one pair and round (ADR 0005). Each maker the
+/// walk meets is decided once, from all its eligible orders on the pair.
+struct SelfTrade {
+    base: TokenId,
+    quote: TokenId,
+    price: BatchPrice,
+    fee_ppm: u32,
+    /// A pair has a handful of makers: a linear scan, no hashing.
+    decided: Vec<(MakerId, Option<Crossed>)>,
+}
+
+impl SelfTrade {
+    /// Whether `order`, eligible on `side`, may enter matching.
+    fn keeps(
+        &mut self,
+        book: &ClearingBook,
+        order: &Order,
+        side: OrderSide,
+    ) -> Result<bool, ClearingError> {
+        let Some(tag) = order.maker_tag() else {
+            return Ok(true);
+        };
+        let at = match self
+            .decided
+            .iter()
+            .position(|(maker_id, _)| *maker_id == tag.maker_id)
+        {
+            Some(at) => at,
+            None => {
+                let crossed = self.decide(book, tag.maker_id)?;
+                self.decided.push((tag.maker_id, crossed));
+                self.decided.len() - 1
+            }
+        };
+        Ok(match &self.decided[at].1 {
+            None => true,
+            Some(crossed) => side == crossed.winner && tag.root_seq > crossed.cutoff,
+        })
+    }
+
+    /// The side of the maker's newest eligible order wins, from just after
+    /// the newest order on the other side: the same orders a replay in
+    /// submission order would leave. `None` when its eligible orders on the
+    /// pair are all on one side.
+    fn decide(
+        &self,
+        book: &ClearingBook,
+        maker_id: MakerId,
+    ) -> Result<Option<Crossed>, ClearingError> {
+        let mut eligible = Vec::new();
+        let (mut newest_sell, mut newest_buy) = (None, None);
+        for id in book.makers.orders_on_pair(maker_id, self.base, self.quote) {
+            // Inactive orders are in flight, not in the book.
+            let Some(order) = book.orders.get(&id).filter(|order| order.is_active()) else {
+                continue;
+            };
+            let Some(tag) = order.maker_tag() else {
+                continue;
+            };
+            let tokens = (
+                order.offered_asset().faucet_id(),
+                order.requested_asset().faucet_id(),
+            );
+            let side = if tokens == (self.base, self.quote) {
+                OrderSide::SellBase
+            } else if tokens == (self.quote, self.base) {
+                OrderSide::BuyBase
+            } else {
+                continue;
+            };
+            if !order.is_eligible(side, self.price, self.fee_ppm)? {
+                continue;
+            }
+            let newest = match side {
+                OrderSide::SellBase => &mut newest_sell,
+                OrderSide::BuyBase => &mut newest_buy,
+            };
+            *newest = (*newest).max(Some(tag.root_seq));
+            eligible.push((id, side, tag.root_seq));
+        }
+        let (Some(newest_sell), Some(newest_buy)) = (newest_sell, newest_buy) else {
+            return Ok(None);
+        };
+        let (winner, cutoff) = if newest_buy > newest_sell {
+            (OrderSide::BuyBase, newest_sell)
+        } else {
+            (OrderSide::SellBase, newest_buy)
+        };
+        let sit_out = eligible
+            .into_iter()
+            .filter(|&(_, side, seq)| side != winner || seq <= cutoff)
+            .map(|(id, _, _)| id)
+            .collect();
+        Ok(Some(Crossed {
+            winner,
+            cutoff,
+            sit_out,
+        }))
+    }
+
+    fn into_decisions(self) -> Vec<MakerDecision> {
+        self.decided
+            .into_iter()
+            .filter_map(|(maker_id, crossed)| {
+                Some(MakerDecision {
+                    maker_id,
+                    sit_out: crossed?.sit_out,
+                })
             })
             .collect()
     }
@@ -407,6 +582,7 @@ mod tests {
             BatchPrice::from_ratio(2, 1).unwrap(),
             0,
             limit,
+            None,
         )
         .unwrap()
     }
@@ -933,7 +1109,7 @@ mod tests {
             ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(),
             ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(),
         );
-        let batch = book
+        let (batch, decisions) = book
             .build_pair_batch(
                 base,
                 quote,
@@ -941,6 +1117,7 @@ mod tests {
                 &ClearingConfig::default(),
             )
             .unwrap();
+        assert!(decisions.is_empty());
         assert_eq!(
             batch
                 .orders()
@@ -1301,4 +1478,526 @@ mod tests {
         cancel.cancel();
         task.await.unwrap().unwrap();
     }
+
+    /// An order eligible at price 2: a buy of 10 base for 22 quote, or a
+    /// sell of 10 base for 18 quote.
+    fn eligible(buy: bool, seq: u64, rng: &mut RandomCoin) -> BookOrder {
+        if buy {
+            fixture(true, 22, 10, seq, rng)
+        } else {
+            fixture(false, 10, 18, seq, rng)
+        }
+    }
+
+    /// One self-trade round at price 2: the batch, then each crossed maker's
+    /// sit-outs, as the `seq` labels of `orders`, sorted.
+    fn stp_round(
+        orders: &[(u64, &BookOrder)],
+        config: &ClearingConfig,
+    ) -> (Vec<u64>, Vec<(MakerId, Vec<u64>)>) {
+        let mut book = ClearingBook::default();
+        for (_, order) in orders {
+            book.insert_or_skip(order);
+        }
+        stp_round_on(&book, orders, config)
+    }
+
+    fn stp_round_on(
+        book: &ClearingBook,
+        orders: &[(u64, &BookOrder)],
+        config: &ClearingConfig,
+    ) -> (Vec<u64>, Vec<(MakerId, Vec<u64>)>) {
+        let labels: HashMap<NoteId, u64> = orders
+            .iter()
+            .map(|(label, order)| (order.id(), *label))
+            .collect();
+        let label = |id: &NoteId| labels[id];
+        let (batch, decisions) = book
+            .build_pair_batch(
+                ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(),
+                ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap(),
+                BatchPrice::from_ratio(2, 1).unwrap(),
+                config,
+            )
+            .unwrap();
+        let mut into: Vec<_> = batch
+            .orders()
+            .map(|order| label(&order.order().id()))
+            .collect();
+        into.sort_unstable();
+        let mut decisions: Vec<_> = decisions
+            .into_iter()
+            .map(|decision| {
+                let mut sit_out: Vec<_> = decision.sit_out.iter().map(label).collect();
+                sit_out.sort_unstable();
+                (decision.maker_id, sit_out)
+            })
+            .collect();
+        decisions.sort_unstable();
+        (into, decisions)
+    }
+
+    #[test]
+    fn self_trade_prevention_follows_the_adr_examples() {
+        /// Maker 7's orders as (buy, root_seq), then what enters matching
+        /// and what sits out.
+        type Case = (&'static [(bool, u64)], &'static [u64], &'static [u64]);
+        let cases: &[Case] = &[
+            (&[(true, 1), (true, 2)], &[1, 2], &[]),
+            (&[(true, 1), (false, 2)], &[2], &[1]),
+            (&[(false, 1), (true, 2)], &[2], &[1]),
+            (&[(true, 1), (false, 2), (true, 3)], &[3], &[1, 2]),
+            (&[(true, 1), (true, 2), (false, 3)], &[3], &[1, 2]),
+            (&[(true, 1), (false, 2), (false, 3)], &[2, 3], &[1]),
+            (
+                &[(true, 1), (false, 2), (true, 3), (false, 4)],
+                &[4],
+                &[1, 2, 3],
+            ),
+        ];
+        let mut rng = RandomCoin::new(Word::default());
+        for (sides, into, sit_out) in cases {
+            // Book priority runs against the submission order, so the walk
+            // meets the maker's oldest orders last.
+            let orders: Vec<_> = sides
+                .iter()
+                .map(|&(buy, seq)| (seq, tagged(eligible(buy, 10 - seq, &mut rng), 7, seq)))
+                .collect();
+            let orders: Vec<_> = orders.iter().map(|(seq, order)| (*seq, order)).collect();
+            let expected = if sit_out.is_empty() {
+                Vec::new()
+            } else {
+                vec![(7, sit_out.to_vec())]
+            };
+            assert_eq!(
+                stp_round(&orders, &ClearingConfig::default()),
+                (into.to_vec(), expected),
+                "{sides:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_trade_decision_equals_a_submission_order_replay() {
+        // Every side sequence of up to 8 maker orders against the literal
+        // replay: each submit on the other side cancels the maker's older
+        // live orders, and what is left trades.
+        let mut rng = RandomCoin::new(Word::default());
+        let sides: Vec<[BookOrder; 2]> = (1..=8)
+            .map(|seq| {
+                [
+                    eligible(false, seq, &mut rng),
+                    eligible(true, seq, &mut rng),
+                ]
+            })
+            .collect();
+        for len in 1..=8usize {
+            for mask in 0..(1u32 << len) {
+                let buys: Vec<bool> = (0..len).map(|at| mask >> at & 1 == 1).collect();
+                let mut live: Vec<u64> = Vec::new();
+                for (at, &buy) in buys.iter().enumerate() {
+                    if at > 0 && buys[at - 1] != buy {
+                        live.clear();
+                    }
+                    live.push(at as u64 + 1);
+                }
+                let sit_out: Vec<u64> =
+                    (1..=len as u64).filter(|seq| !live.contains(seq)).collect();
+                let orders: Vec<_> = buys
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &buy)| {
+                        let seq = at as u64 + 1;
+                        (seq, tagged(sides[at][usize::from(buy)].clone(), 7, seq))
+                    })
+                    .collect();
+                let orders: Vec<_> = orders.iter().map(|(seq, order)| (*seq, order)).collect();
+                let expected = if sit_out.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(7, sit_out)]
+                };
+                assert_eq!(
+                    stp_round(&orders, &ClearingConfig::default()),
+                    (live, expected),
+                    "buys {buys:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_trade_prevention_leaves_other_owners_and_one_sided_makers_alone() {
+        let mut rng = RandomCoin::new(Word::default());
+        let m7_sell = tagged(eligible(false, 1, &mut rng), 7, 1);
+        let m8_buy = tagged(eligible(true, 2, &mut rng), 8, 2);
+        // The same creator account as every fixture, but no maker ID.
+        let public_buy = eligible(true, 3, &mut rng);
+        let public_sell = eligible(false, 4, &mut rng);
+        // Maker 9's buy is eligible, its newer sell is not: no conflict.
+        let m9_buy = tagged(eligible(true, 5, &mut rng), 9, 1);
+        let m9_ineligible_sell = tagged(fixture(false, 10, 21, 6, &mut rng), 9, 2);
+        let orders = [
+            (1, &m7_sell),
+            (2, &m8_buy),
+            (3, &public_buy),
+            (4, &public_sell),
+            (5, &m9_buy),
+            (6, &m9_ineligible_sell),
+        ];
+        assert_eq!(
+            stp_round(&orders, &ClearingConfig::default()),
+            (vec![1, 2, 3, 4, 5], Vec::new())
+        );
+    }
+
+    #[test]
+    fn self_trade_prevention_can_be_switched_off() {
+        let mut rng = RandomCoin::new(Word::default());
+        let buy = tagged(eligible(true, 1, &mut rng), 7, 1);
+        let sell = tagged(eligible(false, 2, &mut rng), 7, 2);
+        let off = ClearingConfig {
+            self_trade_prevention: false,
+            ..ClearingConfig::default()
+        };
+        assert_eq!(
+            stp_round(&[(1, &buy), (2, &sell)], &off),
+            (vec![1, 2], Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_order_in_flight_does_not_cross_its_maker() {
+        let mut rng = RandomCoin::new(Word::default());
+        let buy = tagged(eligible(true, 1, &mut rng), 7, 1);
+        let sell = tagged(eligible(false, 2, &mut rng), 7, 2);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&buy);
+        book.insert_or_skip(&sell);
+        book.deactivate(buy.id());
+        assert_eq!(
+            stp_round_on(&book, &[(1, &buy), (2, &sell)], &ClearingConfig::default()),
+            (vec![2], Vec::new())
+        );
+    }
+
+    #[test]
+    fn sit_outs_take_no_slot_and_a_newest_order_outside_the_window_still_decides() {
+        // Buys best first: user 1, maker B1, user 2, maker B3; maker S2 sells.
+        // A buy window of two takes both users; B3, the maker's newest order,
+        // is beyond it, yet B1 and S2 still sit out.
+        let mut rng = RandomCoin::new(Word::default());
+        let user_1 = fixture(true, 30, 10, 1, &mut rng);
+        let b1 = tagged(fixture(true, 26, 10, 2, &mut rng), 7, 1);
+        let user_2 = fixture(true, 24, 10, 3, &mut rng);
+        let b3 = tagged(fixture(true, 22, 10, 4, &mut rng), 7, 3);
+        let s2 = tagged(eligible(false, 5, &mut rng), 7, 2);
+        let orders = [(10, &user_1), (1, &b1), (20, &user_2), (3, &b3), (2, &s2)];
+        let window_of_two = ClearingConfig {
+            max_orders_per_side: 2,
+            ..ClearingConfig::default()
+        };
+        assert_eq!(
+            stp_round(&orders, &window_of_two),
+            (vec![10, 20], vec![(7, vec![1, 2])])
+        );
+        // Without the rule the window would take the stale B1 and S2.
+        let off = ClearingConfig {
+            self_trade_prevention: false,
+            ..window_of_two
+        };
+        assert_eq!(stp_round(&orders, &off), (vec![1, 2, 10], Vec::new()));
+    }
+
+    #[test]
+    fn a_kept_fill_carries_the_sit_outs_until_the_executor_answers() {
+        use crate::matcher::matcher::internal_clear;
+        use crate::price::PriceSnapshot;
+        let mut rng = RandomCoin::new(Word::default());
+        let b1 = tagged(eligible(true, 1, &mut rng), 7, 1);
+        let s2 = tagged(eligible(false, 2, &mut rng), 7, 2);
+        let user = eligible(true, 3, &mut rng);
+        let (base, quote) = Order::from_book_order(&s2).unwrap().index_key().0;
+        let runtime = ClearingRuntime {
+            bootstrap: tokio::sync::oneshot::channel().1,
+            prices: watch::channel(Arc::new(PriceSnapshot::for_tests(
+                &[(base, quote, "2", std::time::Instant::now())],
+                &[],
+                Duration::from_secs(3_600),
+            )))
+            .1,
+            config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
+            routing: None,
+        };
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&b1);
+        book.insert_or_skip(&s2);
+
+        // The kept S2 finds no buyer: nothing is sent and B1 stays live.
+        internal_clear(&mut book, &runtime, &exec_tx).unwrap();
+        assert!(exec_rx.try_recv().is_err());
+        assert!(book.orders[&b1.id()].is_active());
+
+        book.insert_or_skip(&user);
+        let round = |book: &mut ClearingBook, exec_rx: &mut mpsc::Receiver<ExecutionBatch>| {
+            internal_clear(book, &runtime, &exec_tx).unwrap();
+            exec_rx.try_recv().expect("S2 fills the user's buy")
+        };
+        let batch = round(&mut book, &mut exec_rx);
+        let filled: std::collections::HashSet<_> =
+            batch.filled_notes.iter().map(|f| f.note_id).collect();
+        assert_eq!(filled, [s2.id(), user.id()].into(), "B1 is not an input");
+        let carrier = batch
+            .filled_notes
+            .iter()
+            .find(|filled| filled.note_id == s2.id())
+            .unwrap();
+        assert_eq!(
+            carrier
+                .cancel_on_reserve
+                .iter()
+                .map(BookOrder::id)
+                .collect::<Vec<_>>(),
+            vec![b1.id()]
+        );
+        assert_eq!(batch.self_trade_cancels(), vec![b1.id()]);
+        // Held like the inputs, so no later round selects it.
+        assert!(!book.orders[&b1.id()].is_active());
+        assert!(book.levels().is_empty());
+
+        // A give-back returns it with the inputs; `write_book` reloads each
+        // one from `live_orders`, with its maker tag.
+        let stored = [&b1, &s2, &user];
+        let returned: Vec<_> = batch
+            .book_orders()
+            .iter()
+            .map(|order| {
+                (*stored
+                    .iter()
+                    .find(|stored| stored.id() == order.id())
+                    .unwrap())
+                .clone()
+            })
+            .collect();
+        assert_eq!(returned.len(), 3);
+        book.apply(BookUpdate {
+            removed: Vec::new(),
+            active: returned,
+            maker_updates: Vec::new(),
+        });
+        assert!(book.orders[&b1.id()].is_active());
+
+        // A confirmation or discard after the reservation removes it.
+        let batch = round(&mut book, &mut exec_rx);
+        book.apply(BookUpdate {
+            removed: batch
+                .filled_notes
+                .iter()
+                .map(|filled| filled.note_id)
+                .chain(batch.self_trade_cancels())
+                .collect(),
+            active: Vec::new(),
+            maker_updates: Vec::new(),
+        });
+        assert!(book.orders.is_empty());
+        assert!(book.levels().is_empty());
+    }
+
+    /// ADR 0005 through the database: maker 7 submits B1, S1, S2 in that
+    /// order, and a user buys 20. B1 and S2 are eligible at price 2; S1 is
+    /// run both ways. The book is loaded from `live_orders`, one round
+    /// clears, and that round's reservation commits.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn b1_s1_s2_through_a_clearing_round_and_its_reservation() -> anyhow::Result<()> {
+        use crate::db::maker_db::{create_maker_tx, execute_command_tx, read_events_tx};
+        use crate::db::postgres_db::{
+            insert_orders_batch_tx, load_live_orders_tx, reserve_settlement_tx, test_consumer,
+        };
+        use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
+        use crate::db::postgres_schema::{live_orders, maker_stops, orders};
+        use crate::db::postgres_test::TestSchema;
+        use crate::db::DbError;
+        use crate::gateway::proto;
+        use crate::maker::{CommandHeader, MakerCommand};
+        use crate::matcher::matcher::internal_clear;
+        use crate::price::PriceSnapshot;
+        use diesel::prelude::*;
+        use miden_protocol::crypto::utils::{Deserializable, Serializable};
+        use prost::Message as _;
+
+        for s1_eligible in [false, true] {
+            let mut schema = TestSchema::migrated()?;
+            let conn = &mut schema.conn;
+            let mut rng = RandomCoin::new(Word::from([u32::from(s1_eligible), 0, 0, 0]));
+            let b1 = fixture(true, 22, 10, 1, &mut rng);
+            let s1 = fixture(false, 10, if s1_eligible { 18 } else { 21 }, 2, &mut rng);
+            let s2 = fixture(false, 10, 18, 3, &mut rng);
+            let user = fixture(true, 44, 20, 4, &mut rng);
+            let named = [("B1", &b1), ("S1", &s1), ("S2", &s2), ("user", &user)];
+            let name = |id: &NoteId| -> &str {
+                named
+                    .iter()
+                    .find(|(_, order)| order.id() == *id)
+                    .map_or("?", |(name, _)| name)
+            };
+
+            // Maker 7 submits B1, S1, S2 with sequences 1, 2, 3; then ingest.
+            let maker = create_maker_tx(conn, "m7")?.unwrap();
+            for (seq, order) in [(1, &b1), (2, &s1), (3, &s2)] {
+                let header = CommandHeader::new(maker, format!("s{seq}"), seq)?;
+                let submit = MakerCommand::submit(order.note.as_ref().clone())?;
+                conn.transaction::<_, DbError, _>(|conn| {
+                    execute_command_tx(conn, &header, &submit)
+                })?;
+            }
+            let rows: Vec<_> = named
+                .iter()
+                .map(|(_, order)| NewOrderRow::ingested(&order.note, 1))
+                .collect::<Result<_, _>>()?;
+            conn.transaction::<_, DbError, _>(|conn| insert_orders_batch_tx(conn, &rows, 1))?;
+
+            // Startup hydration: the book holds what `live_orders` returns.
+            let mut book = ClearingBook::default();
+            for order in load_live_orders_tx(conn)? {
+                book.insert_or_skip(&order);
+            }
+            let (base, quote) = Order::from_book_order(&s2)?.index_key().0;
+            let price = BatchPrice::from_ratio(2, 1)?;
+            let (into, decisions) =
+                book.build_pair_batch(base, quote, price, &ClearingConfig::default())?;
+            let mut into: Vec<_> = into.orders().map(|o| name(&o.order().id())).collect();
+            into.sort_unstable();
+            let sat_out: Vec<_> = decisions
+                .iter()
+                .flat_map(|decision| decision.sit_out.iter().map(name))
+                .collect();
+
+            let runtime = ClearingRuntime {
+                bootstrap: tokio::sync::oneshot::channel().1,
+                prices: watch::channel(Arc::new(PriceSnapshot::for_tests(
+                    &[(base, quote, "2", std::time::Instant::now())],
+                    &[],
+                    Duration::from_secs(3_600),
+                )))
+                .1,
+                config: ClearingConfig::default(),
+                maker_settlement_buffer_ms: 0,
+                routing: None,
+            };
+            let (exec_tx, mut exec_rx) = mpsc::channel(1);
+            internal_clear(&mut book, &runtime, &exec_tx)?;
+            let batch = exec_rx.try_recv()?;
+            let mut filled: Vec<_> = batch
+                .filled_notes
+                .iter()
+                .map(|f| format!("{} {}", name(&f.note_id), f.requested_filled))
+                .collect();
+            filled.sort_unstable();
+            let cancels: Vec<_> = batch.self_trade_cancels();
+
+            // The executor's reservation: the inputs, then the cancels, in
+            // one commit.
+            let attempt = SettlementAttemptRow {
+                tx_id: vec![1; 32],
+                tx_result: vec![1],
+                status: "prepared".into(),
+            };
+            let inputs = batch
+                .filled_notes
+                .iter()
+                .map(|filled| {
+                    let pswap = miden_standards::note::PswapNote::try_from(filled.note.as_ref())?;
+                    let requested = pswap.storage().requested_faucet_id();
+                    let (_, remainder) = pswap.execute(
+                        test_consumer(),
+                        None,
+                        Some(FungibleAsset::new(requested, filled.requested_filled)?),
+                    )?;
+                    let remainder = remainder.map(Note::from);
+                    Ok(SettlementInputRow {
+                        tx_id: attempt.tx_id.clone(),
+                        parent_note_id: filled.note_id.to_bytes().to_vec(),
+                        child_note_id: remainder.as_ref().map(|n| n.id().to_bytes().to_vec()),
+                        child_note_data: remainder.as_ref().map(Serializable::to_bytes),
+                        fill_amount: Some(i64::try_from(filled.requested_filled)?),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let cancel_ids: Vec<_> = cancels.iter().map(|id| id.to_bytes().to_vec()).collect();
+            conn.transaction::<_, DbError, _>(|conn| {
+                reserve_settlement_tx(conn, &attempt, &inputs, None, &cancel_ids)
+            })?;
+
+            let live: Vec<Vec<u8>> = live_orders::table.select(live_orders::note_id).load(conn)?;
+            let stops: i64 = maker_stops::table.count().get_result(conn)?;
+            let mut after = Vec::new();
+            for (label, order) in &named {
+                let id = order.id().to_bytes().to_vec();
+                let status: String = orders::table.find(&id).select(orders::status).first(conn)?;
+                after.push(format!(
+                    "{label} {status}{}",
+                    if live.contains(&id) { ", live" } else { "" }
+                ));
+            }
+            let events: Vec<String> = read_events_tx(conn, maker, 0, 100)?
+                .into_iter()
+                .map(|event| {
+                    match proto::EventBody::decode(event.payload.as_slice())
+                        .unwrap()
+                        .kind
+                        .unwrap()
+                    {
+                        proto::event_body::Kind::OrderStatus(status) => format!(
+                            "OrderStatus {:?} {} ({})",
+                            proto::OrderState::try_from(status.state).unwrap(),
+                            name(&NoteId::read_from_bytes(&status.note_id).unwrap()),
+                            status.reason
+                        ),
+                        proto::event_body::Kind::SettlementPending(pending) => format!(
+                            "SettlementPending {}",
+                            pending.fill.as_ref().map_or("?".into(), |fill| name(
+                                &NoteId::read_from_bytes(&fill.note_id).unwrap()
+                            )
+                            .to_string())
+                        ),
+                        other => format!("{other:?}"),
+                    }
+                })
+                .collect();
+
+            println!("\n=== B1 -> S1 -> S2, S1 eligible: {s1_eligible} ===");
+            println!("into matching : {into:?}");
+            println!("sit out       : {sat_out:?}");
+            println!("filled        : {filled:?}");
+            println!(
+                "cancel if reserved: {:?}",
+                cancels.iter().map(name).collect::<Vec<_>>()
+            );
+            println!("after reservation : {after:?}");
+            println!("maker stop rows   : {stops}");
+            println!("maker 7 events    : {events:?}");
+
+            let expected_into = if s1_eligible {
+                vec!["S1", "S2", "user"]
+            } else {
+                vec!["S2", "user"]
+            };
+            assert_eq!(into, expected_into);
+            assert_eq!(sat_out, ["B1"]);
+            assert_eq!(cancels, [b1.id()]);
+            assert!(
+                !live.contains(&b1.id().to_bytes().to_vec()),
+                "B1 is stopped"
+            );
+            assert_eq!(live.contains(&s1.id().to_bytes().to_vec()), !s1_eligible);
+            assert_eq!(stops, 1);
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod stp_scale;

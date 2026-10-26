@@ -748,6 +748,59 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
     Ok(())
 }
 
+/// Stop the sit-outs of a reservation that fills a crossed maker's kept
+/// order (ADR 0005), in the reservation's transaction: a stop row per lineage,
+/// as `CancelOrder` writes, and one `OrderStatus CANCELLED` per order it
+/// stopped. Orders no longer live (cancelled by the maker or spent meanwhile)
+/// are skipped. Only `postgres_db::reserve_settlement_tx` may call it: that
+/// function locks every sit-out's maker first, and taking the lock here,
+/// after other makers', could deadlock with the maker's own `CancelOrder`.
+pub(super) fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<()> {
+    if note_ids.is_empty() {
+        return Ok(());
+    }
+    /// Note ID, maker, lineage and depth of a live maker order.
+    type Live = (Vec<u8>, i64, Option<Vec<u8>>, Option<i64>);
+    let live: Vec<Live> = live_orders::table
+        .filter(live_orders::note_id.eq_any(note_ids))
+        .filter(live_orders::maker_id.is_not_null())
+        .select((
+            live_orders::note_id,
+            live_orders::maker_id.assume_not_null(),
+            live_orders::lineage_id,
+            live_orders::depth,
+        ))
+        .load(conn)?;
+    for (note_id, maker_id, lineage_id, depth) in live {
+        // A claimed order always has its lineage.
+        let Some(lineage_id) = lineage_id else {
+            continue;
+        };
+        // A concurrent `CancelOrder` that stopped it first wins: no event.
+        let stopped = diesel::insert_into(maker_stops::table)
+            .values((
+                maker_stops::maker_id.eq(maker_id),
+                maker_stops::lineage_id.eq(&lineage_id),
+            ))
+            .on_conflict_do_nothing()
+            .execute(conn)?
+            == 1;
+        if !stopped {
+            continue;
+        }
+        let body = proto::EventBody {
+            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
+                note_id,
+                depth: u32::try_from(depth.unwrap_or(0))?,
+                state: proto::OrderState::Cancelled.into(),
+                reason: "self_trade_prevention".into(),
+            })),
+        };
+        gateway::append_event_tx(conn, maker_id, Some(&lineage_id), &body)?;
+    }
+    Ok(())
+}
+
 /// Maker orders that may still be spent elsewhere: Active or Stopped rows
 /// of a claimed lineage. Settling ones are resolved by the executor.
 pub fn watched_maker_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<Vec<u8>>> {
@@ -1077,7 +1130,7 @@ mod tests {
     use crate::db::postgres_db::{
         backfill_order_keys_tx, confirm_settlement_tx, finish_discarded_settlement_tx,
         insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
-        test_consumer,
+        reserve_settlement_tx, test_consumer,
     };
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
@@ -2075,6 +2128,185 @@ mod tests {
                 .unwrap()
         });
         (payback, remainder)
+    }
+
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_reservation_cancels_its_live_sit_outs_once_in_the_same_commit() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        // `kept` is filled; the maker already cancelled `stopped`; `public`
+        // has no maker.
+        let (kept, sit_out, stopped, public) = (note(1), note(2), note(3), note(4));
+        run(conn, alpha, "s1", 1, submit(&kept))?;
+        run(conn, alpha, "s2", 2, submit(&sit_out))?;
+        run(conn, alpha, "s3", 3, submit(&stopped))?;
+        ingest(conn, &[&kept, &sit_out, &stopped, &public])?;
+        let lineage = |note: &Note| OrderKeys::from_note(note).unwrap().lineage_id;
+        run(
+            conn,
+            alpha,
+            "x4",
+            4,
+            MakerCommand::CancelOrder {
+                lineage_id: lineage(&stopped),
+            },
+        )?;
+        let ids = |notes: &[&Note]| -> Vec<Vec<u8>> {
+            notes
+                .iter()
+                .map(|note| note.id().to_bytes().to_vec())
+                .collect()
+        };
+        let cancels = ids(&[&sit_out, &stopped, &public]);
+        let stops = |conn: &mut PgConnection| -> Result<i64> {
+            Ok(maker_stops::table.count().get_result(conn)?)
+        };
+        let (input, _, _) = fill(5, &kept, 40);
+        let attempt = |tx: u8| SettlementAttemptRow {
+            tx_id: vec![tx; 32],
+            tx_result: vec![tx],
+            status: "prepared".into(),
+        };
+
+        // A reservation that rolls back cancels nothing.
+        let rolled_back = conn.transaction::<(), DbError, _>(|conn| {
+            reserve_settlement_tx(
+                conn,
+                &attempt(5),
+                std::slice::from_ref(&input),
+                None,
+                &cancels,
+            )?;
+            Err(DbError::Corrupt("roll back"))
+        });
+        assert!(rolled_back.is_err());
+        assert_eq!(live(conn, &[&kept, &sit_out])?, [true, true]);
+        assert_eq!(stops(conn)?, 1);
+
+        conn.transaction::<_, DbError, _>(|conn| {
+            reserve_settlement_tx(
+                conn,
+                &attempt(5),
+                std::slice::from_ref(&input),
+                None,
+                &cancels,
+            )
+        })?;
+        assert_eq!(
+            live(conn, &[&sit_out, &stopped, &public])?,
+            [false, false, true],
+            "only live maker orders are stopped"
+        );
+        assert_eq!(stops(conn)?, 2);
+        let events = settlement_events(conn, alpha)?;
+        let cancelled: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, kind)| match kind {
+                proto::event_body::Kind::OrderStatus(status)
+                    if status.state == i32::from(proto::OrderState::Cancelled) =>
+                {
+                    Some((at, status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled.len(), 1, "one event, for the order it stopped");
+        let (at, status) = cancelled[0];
+        assert_eq!(status.note_id, sit_out.id().to_bytes().to_vec());
+        assert_eq!(status.reason, "self_trade_prevention");
+        assert!(
+            matches!(
+                events[at - 1],
+                proto::event_body::Kind::SettlementPending(_)
+            ),
+            "the kept order's SettlementPending comes first"
+        );
+
+        // The maker's own cancel of it afterwards stops nothing twice.
+        run(
+            conn,
+            alpha,
+            "x6",
+            6,
+            MakerCommand::CancelOrder {
+                lineage_id: lineage(&sit_out),
+            },
+        )?;
+        assert_eq!(stops(conn)?, 2);
+        assert_eq!(settlement_events(conn, alpha)?.len(), events.len());
+        Ok(())
+    }
+
+    /// The reservation locks a sit-out's maker before it writes anything, even
+    /// when that maker owns none of its inputs (the matcher never builds this
+    /// today; the lock must not depend on it). A trigger holds the
+    /// reservation between the sit-out's stop row and its event, where the
+    /// maker's own `CancelOrder` used to take the maker lock and deadlock.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_reservation_locks_a_sit_outs_maker_before_cancelling_it() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let (sit_out, public) = (note(1), note(2));
+        run(&mut fixture.conn, alpha, "s1", 1, submit(&sit_out))?;
+        ingest(&mut fixture.conn, &[&sit_out, &public])?;
+        fixture.conn.batch_execute(
+            "CREATE FUNCTION pause_after_stop() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$;
+             CREATE TRIGGER pause_after_stop AFTER INSERT ON maker_stops
+                 FOR EACH ROW EXECUTE FUNCTION pause_after_stop()",
+        )?;
+        let (input, _, _) = fill(5, &public, 40);
+        let attempt = SettlementAttemptRow {
+            tx_id: vec![5; 32],
+            tx_result: vec![5],
+            status: "prepared".into(),
+        };
+        let sit_outs = vec![sit_out.id().to_bytes().to_vec()];
+        let mut reserver = connect(&fixture)?;
+        let reserving = std::thread::spawn(move || {
+            reserver.transaction::<_, DbError, _>(|conn| {
+                reserve_settlement_tx(conn, &attempt, &[input], None, &sit_outs)
+            })
+        });
+        // Wait until the reservation sleeps after its stop row.
+        let started = Instant::now();
+        let paused = diesel::dsl::sql::<diesel::sql_types::Bool>(
+            "EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep')",
+        );
+        while !diesel::select(paused.clone()).get_result::<bool>(&mut fixture.conn)? {
+            assert!(started.elapsed() < Duration::from_secs(5), "never paused");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut canceller = connect(&fixture)?;
+        let cancel = MakerCommand::CancelOrder {
+            lineage_id: OrderKeys::from_note(&sit_out)?.lineage_id,
+        };
+        let cancelled = run(&mut canceller, alpha, "x2", 2, cancel);
+        reserving.join().expect("reserver panicked")?;
+        assert_eq!(
+            cancelled?.0,
+            CommandReply::Committed(CommandResult::Stopped { settling: 0 }),
+            "the cancel waited for the reservation instead of deadlocking"
+        );
+        assert_eq!(
+            maker_stops::table
+                .count()
+                .get_result::<i64>(&mut fixture.conn)?,
+            1
+        );
+        let cancelled_events = settlement_events(&mut fixture.conn, alpha)?
+            .into_iter()
+            .filter(|kind| {
+                matches!(kind, proto::event_body::Kind::OrderStatus(status)
+                    if status.state == i32::from(proto::OrderState::Cancelled))
+            })
+            .count();
+        assert_eq!(cancelled_events, 1, "the reservation stopped it first");
+        Ok(())
     }
 
     #[test]

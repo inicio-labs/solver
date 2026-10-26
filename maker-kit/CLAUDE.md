@@ -23,6 +23,7 @@ The maker locks the tokens it offers in a **PSWAP note** (a Miden note that offe
 5. **Cancel by lineage ID** (47 bytes: creator account ID ‖ serial words with `serial[3] − depth`). Compute it once from the original note; it is the same for all remainders. See `example/src/wallet.rs::lineage_id`.
 6. **A cancel stops matching; it does not return funds.** Reclaim the note (consume it from your own account) after any settlement counted in the cancel's `settling` has resolved.
 7. **Keep the original note bytes** of every order. You need them to reclaim, and to rebuild payback and remainder notes for private paybacks (guide, section 10).
+8. **The solver can cancel an order of yours**: when your buy and sell on one pair cross, the older side is cancelled once the newer one is reserved for a settlement, with `OrderStatus CANCELLED` (reason `self_trade_prevention`). Handle `ORDER_STATE_CANCELLED` as final, exactly like your own cancel, and reclaim the note (guide, section 12). Submit private notes; public notes are not reliably covered.
 
 ## Miden pitfalls (learned on this testnet)
 

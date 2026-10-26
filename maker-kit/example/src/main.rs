@@ -13,7 +13,8 @@
 //!   maker cancel <lineage-hex>      cancel one order and its future remainders
 //!   maker cancel-all [--market IETH,IUSDT]
 //!                                   cancel every older order, or those in one market
-//!   maker reclaim <lineage-hex>     take back an unfilled order's tokens (cancel first)
+//!   maker reclaim <lineage-hex>     take back an unfilled order's tokens (after your cancel,
+//!                                   or after the solver's OrderStatus CANCELLED)
 //!   maker heartbeat                 server time and your newest event sequence
 //!   maker get-command <request-id>  the stored reply of a command you sent
 //!

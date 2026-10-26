@@ -172,8 +172,8 @@ pub(super) fn internal_clear(
         };
         // The price is already in base units: the market plan knows both
         // tokens' decimals.
-        let batch = match book.build_pair_batch(base, quote, price, &runtime.config) {
-            Ok(batch) => batch,
+        let (batch, self_trade) = match book.build_pair_batch(base, quote, price, &runtime.config) {
+            Ok(built) => built,
             Err(error) => {
                 tracing::error!(%base, %quote, %error, "clearing admission failed");
                 continue;
@@ -202,13 +202,14 @@ pub(super) fn internal_clear(
                 continue;
             }
         };
-        let execution = match plan.to_execution_batch(&batch) {
+        let mut execution = match plan.to_execution_batch(&batch) {
             Ok(execution) => execution,
             Err(error) => {
                 tracing::error!(%base, %quote, %error, "clearing execution batch construction failed");
                 continue;
             }
         };
+        book.attach_self_trade_cancels(self_trade, &mut execution);
         tracing::info!(
             %base,
             %quote,
@@ -231,6 +232,7 @@ pub(super) fn internal_clear(
         .iter()
         .map(|filled| filled.note_id)
         .collect();
+    let self_trade_cancels = combined.self_trade_cancels();
     match exec_tx.try_send(combined) {
         Ok(()) => {}
         // Unreachable while the matcher is the only sender; if it ever
@@ -243,12 +245,15 @@ pub(super) fn internal_clear(
     }
     // Keep the parents in memory but off the matchable index. A definite
     // failure reactivates them; confirmation removes them permanently.
-    for note_id in &sent {
+    // Sit-outs waiting to be cancelled leave the index too, until the
+    // executor's final message removes or returns them (ADR 0005).
+    for note_id in sent.iter().chain(&self_trade_cancels) {
         book.deactivate(*note_id);
     }
     tracing::info!(
         pairs = included_pairs,
         orders = sent.len(),
+        self_trade_cancels = self_trade_cancels.len(),
         "combined clearing batch sent to executor"
     );
     Ok(())

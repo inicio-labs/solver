@@ -307,6 +307,12 @@ pub struct EngineConfig {
     /// Already selected settlements continue. Default 30000; zero is allowed.
     #[serde(default = "default_maker_settlement_buffer_ms")]
     pub maker_settlement_buffer_ms: u64,
+    /// Self-trade prevention for maker orders (ADR 0005): a maker whose
+    /// eligible orders cross trades only on the side of its newest order, and
+    /// its older crossing orders are cancelled once that order fills. Default
+    /// `true`; `false` matches as before.
+    #[serde(default = "default_maker_self_trade_prevention")]
+    pub maker_self_trade_prevention: bool,
 }
 
 fn default_admin_port() -> u16 {
@@ -393,6 +399,9 @@ fn default_maker_stream_heartbeat_ms() -> u64 {
 }
 fn default_maker_settlement_buffer_ms() -> u64 {
     30_000
+}
+fn default_maker_self_trade_prevention() -> bool {
+    true
 }
 fn default_maker_watch_interval_ms() -> u64 {
     1_000

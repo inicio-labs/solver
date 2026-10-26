@@ -292,6 +292,7 @@ pub async fn start(
         prices: channels.prices_rx.clone(),
         config: crate::clearing::ClearingConfig {
             protocol_fee_ppm: config.engine.clearing_fee_ppm,
+            self_trade_prevention: config.engine.maker_self_trade_prevention,
             ..crate::clearing::ClearingConfig::default()
         },
         maker_settlement_buffer_ms: config.engine.maker_settlement_buffer_ms,

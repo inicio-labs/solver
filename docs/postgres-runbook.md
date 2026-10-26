@@ -120,7 +120,7 @@ A transaction that fails the same way every time it is built (a bad note, an
 insolvent batch, an execution or proving error) is retried one pair group at
 a time, so the healthy pairs settle at once. A group that still fails on its
 own is held back from the matcher for 30 seconds, doubling on each repeat
-failure up to 30 minutes, and released once the hold is over. Watch for
+failure up to 5 minutes, and released once the hold is over. Watch for
 `pair group keeps failing; holding its orders`.
 
 When the executor cannot settle — no fee headroom, the node RPC or the

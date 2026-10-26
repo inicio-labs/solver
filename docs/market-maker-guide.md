@@ -22,9 +22,10 @@ Generate your client from the `gateway.proto` file delivered with this guide (pa
 9. [Keep-alive messages](#9-keep-alive-messages)
 10. [Settlement accounting](#10-settlement-accounting)
 11. [Order expiry](#11-order-expiry)
-12. [Errors and what to do](#12-errors-and-what-to-do)
-13. [Checklist before going live](#13-checklist-before-going-live)
-14. [Reference](#14-reference)
+12. [Self-trade prevention](#12-self-trade-prevention)
+13. [Errors and what to do](#13-errors-and-what-to-do)
+14. [Checklist before going live](#14-checklist-before-going-live)
+15. [Reference](#15-reference)
 
 ---
 
@@ -48,7 +49,7 @@ The feed carries three kinds of event. [Section 8](#8-events-what-you-receive-an
 
 | Event | Meaning |
 |---|---|
-| `OrderStatus` | Your submitted order went `LIVE`, was `REJECTED`, or became `UNAVAILABLE` because its note was spent outside the solver. |
+| `OrderStatus` | Your submitted order went `LIVE`, was `REJECTED`, became `UNAVAILABLE` because its note was spent outside the solver, or was `CANCELLED` by [self-trade prevention](#12-self-trade-prevention). |
 | `SettlementPending` | We reserved your order for a settlement transaction. Nothing is filled yet. |
 | `SettlementResolved` | That transaction committed on chain (a fill) or was voided (no fill). |
 
@@ -122,7 +123,7 @@ sequenceDiagram
 | Miden network and node endpoint | Create and commit your notes on the same chain as the solver. |
 | Supported token pairs, with each token's faucet ID and decimals | Amounts are integer token units. Orders for other pairs are rejected. |
 | Solver account ID | The account that consumes your notes. You need it to rebuild your output notes ([section 10](#10-settlement-accounting)). |
-| A test environment | Run the checklist in [section 13](#13-checklist-before-going-live) before trading. |
+| A test environment | Run the checklist in [section 14](#14-checklist-before-going-live) before trading. |
 
 ### Compatible Miden SDK versions
 
@@ -284,7 +285,7 @@ Keep the original `Note` for every order. You need it to rebuild your output not
 We accept both, and we recommend **private** notes for market makers.
 
 - **Private:** your order's terms stay off chain until it fills. Events for each order arrive in a fixed order: `LIVE` first, then the settlement events.
-- **Public:** the terms are visible to everyone. We can match a public note as soon as we see it on chain, which can be before we have verified your submit. So `SettlementPending` can arrive before `LIVE`, and if the order fills before we verify it, you may never receive `LIVE`. Your settlement events are still complete.
+- **Public:** the terms are visible to everyone. We can match a public note as soon as we see it on chain, which can be before we have verified your submit. So `SettlementPending` can arrive before `LIVE`, and if the order fills before we verify it, you may never receive `LIVE`. Your settlement events are still complete. Send `SubmitOrder` before you commit a public note: until your submit is stored, the note has no maker ID, so [self-trade prevention](#12-self-trade-prevention) cannot group it with your other orders.
 
 #### Payback note type
 
@@ -594,7 +595,7 @@ stateDiagram-v2
     Accepted --> Cancelled: you cancel (no event)
     Live --> Reserved: SettlementPending
     Live --> SpentElsewhere: OrderStatus UNAVAILABLE
-    Live --> Cancelled: you cancel (no event)
+    Live --> Cancelled: you cancel (no event), or OrderStatus CANCELLED
     Reserved --> Filled: SettlementResolved FULLY_FILLED
     Reserved --> Live: SettlementResolved LIVE
     Reserved --> Cancelled: SettlementResolved CANCELLED
@@ -613,12 +614,13 @@ stateDiagram-v2
 | Reserved → Cancelled | Your cancel covers the remainder or the returned order. |
 | Reserved → Spent elsewhere | The transaction was voided and your note was spent elsewhere, or the remainder of a committed fill was consumed outside the solver. |
 | Accepted or Live → Cancelled | Your `CancelOrder` or `CancelAll` covers the order. |
+| Live → Cancelled, with `OrderStatus CANCELLED` | [Self-trade prevention](#12-self-trade-prevention) stopped the order: it crossed your newer order on the other side, and that order was reserved. |
 
 A partial fill doesn't have its own state: it is a committed `SettlementResolved` whose result is `LIVE`, `CANCELLED` or `SPENT_ELSEWHERE`. **Book every `SettlementResolved` with `committed = true`, whatever its result.**
 
 Cancelled and Spent elsewhere end the order for the solver, but your tokens can still be in a note ([where your funds are](#where-your-funds-are)). An order that reaches its expiry stays as it is, with no event; we just stop matching it ([section 11](#11-order-expiry)).
 
-For a private note, the events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. For a public note, settlement events can come before `LIVE` ([7.1](#private-or-public-order-notes)).
+For a private note, the events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. For a public note, settlement events can come before `LIVE` ([7.1](#private-or-public-order-notes)). An `OrderStatus CANCELLED` is always the order's last event.
 
 ### Each event, and when it is sent
 
@@ -662,6 +664,21 @@ flowchart LR
 - **Typical causes:** you reclaimed the note, or someone else consumed a public note.
 - **Not sent:** for an order you had already cancelled. Once you cancel, a spend of its note produces no event.
 - **You do:** retire the order. It is not a solver fill, so don't book it as one; check the chain for what happened.
+
+#### `OrderStatus` · `CANCELLED`
+
+```mermaid
+flowchart LR
+    t["Your order crossed your newer order<br/>on the other side of the pair,<br/>and that order was reserved"] --> e(["OrderStatus CANCELLED"])
+    classDef ev fill:#eceff1,stroke:#5a6b78,color:#1f2a33
+    class e ev
+```
+
+- **Sent:** once per order the solver stops. The only reason today is `self_trade_prevention` ([section 12](#12-self-trade-prevention)).
+- **Carries:** `note_id`, `depth`, `state = CANCELLED`, `reason`, and the order's `lineage_id` on the event.
+- **Comes after:** the `SettlementPending` of your order that is trading instead.
+- **Not sent:** for an order you had already cancelled yourself.
+- **You do:** retire the order as cancelled, as if you had sent `CancelOrder` for it. Your tokens are still in its note ([where your funds are](#where-your-funds-are)).
 
 #### `SettlementPending`
 
@@ -954,7 +971,53 @@ flowchart LR
 
 ---
 
-## 12. Errors and what to do
+## 12. Self-trade prevention
+
+Your buy and your sell on the same pair never fill each other. This only matters when your orders **cross**: your bid is above your ask by more than the fee, so both are eligible at the round's price. A normal two-sided quote, bid below ask, is never touched.
+
+Orders are grouped by your maker ID, so all the accounts you trade from count as one. Orders of other makers, and orders without a maker ID, are not affected.
+
+### The rule
+
+Each round, for each pair where you have eligible orders on both sides:
+
+1. **The side of your newest eligible order wins.** Newest means the highest sequence of the `SubmitOrder` that registered the order ([section 6](#6-command-identity-request-id-and-sequence)). A remainder keeps its order's sequence.
+2. Your orders on the winning side that you submitted **after** your newest order on the other side trade as usual, with their normal price and time priority.
+3. All your other eligible orders on the pair **sit out** the round. A sit-out takes no place in the batch: the next order in line takes it.
+4. If one of your trading orders is reserved for a settlement (you receive its `SettlementPending`), every one of your sit-outs on the pair is **cancelled** in the same step: you receive `OrderStatus CANCELLED` with reason `self_trade_prevention` for each. The cancel is permanent, like `CancelOrder`, and covers the order's future remainders.
+5. If none of your trading orders is reserved, nothing is cancelled. Your sit-outs are checked again in the next round.
+
+The result is the same as replaying your submits in order, where every submit on the other side cancels your older live orders.
+
+`B` is your buy and `S` your sell, numbered in the order you submitted them. All are eligible unless noted.
+
+| Your orders | Trade this round | Cancelled if one of them is reserved |
+|---|---|---|
+| B1, B2 | B1, B2 | nothing |
+| B1, then S1 | S1 | B1 |
+| B1, then S1, then B2 | B2 | B1 and S1 |
+| B1 and B2, then S1 | S1 | B1 and B2 |
+| B1, then S1 and S2 | S1, S2 | B1 |
+| B1 eligible, S1 not eligible | B1 | nothing |
+
+A small newer order cancels larger older ones on the other side: the rule follows your latest intent, whatever the size.
+
+### What you see
+
+- `OrderStatus CANCELLED` for each cancelled order, after the `SettlementPending` of your order that trades ([section 8](#orderstatus--cancelled)).
+- The cancelled order leaves `ListActiveMakerOrders`.
+- No event while an order only sits out. It ends when your trading order is reserved, when you cancel one side, or when the price moves so that your orders no longer cross.
+- Your tokens stay in the cancelled order's note until you [reclaim it](#taking-your-funds-back). A public note can still be consumed by someone else.
+- Your client must accept the `OrderState` value `ORDER_STATE_CANCELLED` (4).
+
+### Avoiding it
+
+- Cancel an old quote before you send its replacement, or send the replacement on the same side.
+- Use private notes, or send `SubmitOrder` before you commit a public note. We match a public note as soon as we see it on chain ([7.1](#private-or-public-order-notes)); until your submit for it is stored, it has no maker ID and is not grouped with your other orders.
+
+---
+
+## 13. Errors and what to do
 
 | gRPC status | Typical cause | What to do |
 |---|---|---|
@@ -971,7 +1034,7 @@ Requests larger than 64 KiB are rejected. A PSWAP note is a few kilobytes.
 
 ---
 
-## 13. Checklist before going live
+## 14. Checklist before going live
 
 Run each of these against our test environment:
 
@@ -979,6 +1042,7 @@ Run each of these against our test environment:
 - [ ] Lose a reply on purpose and resend the identical command; you get `replayed = true`. Change the note, sequence or expiry under the same request ID and confirm `ALREADY_EXISTS`.
 - [ ] Cancel one order, one direction and a whole market. Send an older submit after a `CancelAll` and confirm it never goes live.
 - [ ] Send a cancel while one of your orders has a settlement pending. The cancel can't stop that settlement: check that the reply counts the order in `settling`, then handle both outcomes. If it commits, book the fill (any remainder comes back `CANCELLED`). If it is voided, the order comes back `CANCELLED`.
+- [ ] Cross your own quote on purpose (a buy above your ask, sent after the ask). Confirm the ask gets `OrderStatus CANCELLED` with reason `self_trade_prevention` once your buy is reserved, and that your client handles the new state.
 - [ ] Test orders with no expiry, an expiry a few seconds away, an expiry that passes while a settlement is pending, and a remainder that comes back after its expiry.
 - [ ] Disconnect after receiving an event but before saving your cursor. Reconnect and confirm the fill is not booked twice.
 - [ ] Stay connected through a quiet period of several minutes and confirm keep-alives arrive and the stream stays open.
@@ -989,7 +1053,7 @@ Run each of these against our test environment:
 
 ---
 
-## 14. Reference
+## 15. Reference
 
 ### Identifiers
 

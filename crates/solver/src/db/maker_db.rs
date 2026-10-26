@@ -752,10 +752,10 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
 /// order (ADR 0005), in the reservation's transaction: a stop row per lineage,
 /// as `CancelOrder` writes, and one `OrderStatus CANCELLED` per order it
 /// stopped. Orders no longer live (cancelled by the maker or spent meanwhile)
-/// are skipped. Call it through `postgres_db::reserve_settlement_tx`, which
-/// locks every sit-out's maker first: taking that lock here, after other
-/// makers', could deadlock with the maker's own `CancelOrder`.
-pub fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<()> {
+/// are skipped. Only `postgres_db::reserve_settlement_tx` may call it: that
+/// function locks every sit-out's maker first, and taking the lock here,
+/// after other makers', could deadlock with the maker's own `CancelOrder`.
+pub(super) fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<()> {
     if note_ids.is_empty() {
         return Ok(());
     }

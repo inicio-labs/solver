@@ -99,9 +99,9 @@ The matcher deactivates sit-outs with a pending cancel exactly as it deactivates
 
 | Failure | Executor outcome today | Sit-outs |
 |---|---|---|
-| RPC failure during execution, an input consumed while proving, a database hiccup | `GiveBack` → `release_held` (drops notes spent on chain, returns the rest through `write_book` and `live_orders`) | returned with the group; spent or maker-cancelled ones are filtered the same way |
+| RPC failure during execution, an input consumed while proving, a database failure at the reservation | `GiveBack` → `release_held` (drops notes spent on chain, returns the rest through `write_book` and `live_orders`) | returned with the group; spent or maker-cancelled ones are filtered the same way |
 | Deterministic build, proving or solvency failure | `Failed` → pair groups retried alone; a group that still fails is held with a doubling delay, then given back | held and returned with their group |
-| No fee headroom, RPC or database unavailable | `Paused` → verification mode retries the same transactions in order | stay attached; cancelled only if the retried reservation commits, skipping any no longer live |
+| No fee headroom | `Paused` → verification mode retries the same transactions in order once the fee check passes (a database or RPC failure is a give-back, above; a give-back that itself fails enters verification mode with the orders returned, not retried) | stay attached; cancelled only if the retried reservation commits, skipping any no longer live |
 | Malformed batch | held, then given back | held and returned with it |
 | Shutdown or crash before the reservation commits | nothing written; restart hydration loads live orders | loaded as live, never stopped |
 | Reservation committed, then rejected or expired | `finish_discarded_settlement_tx` releases the inputs | stay cancelled |
@@ -120,13 +120,13 @@ pub struct FilledNote {
 }
 
 // clearing: one per crossed maker, returned with the pair batch
-pub(crate) struct MakerDecision {
-    pub maker_id: MakerId,
-    pub sit_out: Vec<NoteId>,
+pub(super) struct MakerDecision {
+    pub(super) maker_id: MakerId,
+    pub(super) sit_out: Vec<NoteId>,
 }
 ```
 
-- The cancels are attached to the maker's **first** filled order in the pair, so they are written once and follow that order through every split, retry, hold and give-back. `ExecutionBatch`, `split_batch` and `pair_groups` are unchanged; `book_orders()` also returns the pending cancels' orders.
+- The cancels are attached to the maker's **first** filled order in the pair, so they are written once and follow that order through every split, retry, hold and give-back. `split_batch` and `pair_groups` are unchanged; `ExecutionBatch::book_orders()` also returns the pending cancels' orders, and `self_trade_cancels()` lists their IDs.
 - A crossed maker's only orders in the pair's batch are its kept ones, so "a kept order filled" is checked as "the maker has a fill in this pair's plan". `MakerDecision` needs no kept list.
 - During the walk, `build_pair_batch` keeps the decisions in a local `Vec<(MakerId, Option<(winning side, cutoff, sit-outs)>)>` with a linear scan (a pair has a handful of makers); an empty `Vec` does not allocate. `None` records a maker whose eligible orders are all on one side.
 - No lineage, maker or depth is carried: the reservation reads them from the sit-out's `live_orders` row, the same lookup that checks it is still live, in the query that already checks the inputs.
@@ -175,7 +175,8 @@ The `OrderStatus` event, its `reason` field and the event feed already exist. Wh
 - Orders without a maker ID are not covered: a public account can still trade with itself. Open decision D2.
 - Ingest picks up every public PSWAP note directly from the chain. If a maker's public note reaches the chain before the solver has stored its `SubmitOrder`, the note enters the book with no maker ID, and the rule cannot group it with the maker's other orders until the submit links it (guide, section 7). Private notes never have this gap: the solver only learns them through the gateway. A public note submitted before it is committed is linked from the start, because the lineage claim already exists when ingest activates it through `live_orders`. The guide therefore tells makers to use private notes, or to send `SubmitOrder` before committing a public note.
 - Accepted for public maker notes (decided 2026-10-25: makers are expected to send private orders): a public note that ingest put in the book before the watcher verified its claim can sit out and be held, and then be re-sent as active when the watcher verifies it (`maker_db::activate_tx` returns every Active row of the verified submissions). It can then trade in a later round, and if that round is reserved first, the cancel finds it no longer live and skips it: the maker trades both sides across two settlements, with no `CANCELLED`. Private notes cannot hit this, because the watcher stores a private order itself when it verifies it, so the matcher never holds one with a pending claim. Fix if public maker notes matter: have `activate_tx` return only the rows it stores itself.
-- The depth and swap-ETA mirror still counts sit-outs, so quoted depth can be slightly high on a crossed maker's losing side.
+- A sit-out rides with its carrier through a failing pair group's hold (30 s, doubling to 5 minutes per failure): it cannot trade, is not cancelled, and the maker gets no event until the group settles or is given back. Returning it early would trade it against the maker's newest order, so the hold is logged (`pair group keeps failing; holding its orders`, with `self_trade_cancels`) rather than shortened.
+- The depth and swap-ETA mirror still counts sit-outs that are skipped but not held, so quoted depth can be slightly high on a crossed maker's losing side; held sit-outs leave the mirror with their carrier.
 - Crowding the window with crossed orders is no longer free: sit-outs take no slot, users fill the freed slots, and the kept side either trades and pays fees or nothing could trade anyway. Crowding with ordinary orders is the separate per-side cap question (issue #50).
 
 ## Alternatives considered
@@ -218,13 +219,20 @@ Scripts: [`0005/check_rule.py`](0005/check_rule.py) (decision rule), [`0005/chec
 
 Run in scratch copies and not committed yet: a QA suite built from this ADR's text (54 tests, about 8,400 generated books); three end-to-end runs of the real solver against the mock chain, with private maker notes over gRPC (fill and `CANCELLED`, no counterparty, failure before the reservation, cancels racing it, node rejection after it, a restart between reservation and confirmation, and a gRPC stream receiving state 4), plus 13 executor-path tests; PostgreSQL races on real sessions (15 tests, at least 50 rounds each); mutation testing (51 mutants, 80% killed by the suite above, 92% with four added tests); an extended life-cycle model (12 scenarios); and a brute-force check that the decision equals the replay for all 1,398,100 side and eligibility sequences of up to 10 orders. Findings: the reservation's lock gap (fixed here by `reserve_settlement_tx`), the public-note limit and the in-flight limit (see *Consequences and limits*), and a pre-existing lock-order gap in the spend report (ADR 0006, a separate change). Not done: a verification-mode (fee pause) end-to-end run, because the mock chain charges no fee.
 
-## Open decisions
+## Decisions
 
-| # | Decision | Proposed default |
+Built with their proposed defaults (2026-10-25):
+
+| # | Decision | Taken |
 |---|---|---|
 | D1 | A small newer order cancels larger older opposite orders | Yes: the rule follows the maker's latest intent, whatever the size |
 | D2 | Orders without a maker ID stay uncovered | Yes, for now |
 | D3 | A public maker note that reaches the chain before its `SubmitOrder` is stored is unlinked for that time | Accept; the guide tells makers to use private notes or submit before committing |
+
+Open:
+
+| # | Decision | Proposed |
+|---|---|---|
 | D6 | Tell Pragma before release: the decision covers all eligible orders (not only the window), cancel only when a kept order's settlement is reserved, the B1 → S1 → B2 result, the `CANCELLED` event, submit before committing public notes | Yes |
 
 Decided: D4, "matched" = the settlement filling a kept order is reserved, with the cancels in the same commit (see *Durability*); D5, the configuration switch (see *Configuration*).

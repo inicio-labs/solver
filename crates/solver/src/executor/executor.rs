@@ -69,8 +69,10 @@ const SETTLEMENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// First hold for the orders of a pair group whose transaction fails the same
 /// way every time; it doubles per repeat failure, up to `MAX_FAILED_HOLD`.
+/// The cap keeps a held order, and any sit-outs riding with it (ADR 0005),
+/// out of the book for minutes, not an hour, when the cause fixes itself.
 const FAILED_HOLD: Duration = Duration::from_secs(30);
-const MAX_FAILED_HOLD: Duration = Duration::from_secs(30 * 60);
+const MAX_FAILED_HOLD: Duration = Duration::from_secs(5 * 60);
 
 /// Miden's standard transaction expiry. It bounds how long an indeterminate
 /// settlement can reserve its inputs. The custom surplus script applies the
@@ -688,9 +690,11 @@ impl FailedHolds {
         due
     }
 
+    /// The settlement landed: its inputs, and the sit-outs held with them,
+    /// start over.
     fn settled(&mut self, batch: &ExecutionBatch) {
-        for filled in &batch.filled_notes {
-            self.strikes.remove(&filled.note_id);
+        for order in batch.book_orders() {
+            self.strikes.remove(&order.id());
         }
     }
 }
@@ -1026,6 +1030,7 @@ impl Executor {
                                 let held = failed.hold(group.book_orders(), Instant::now());
                                 tracing::warn!(
                                     notes = group.filled_notes.len(),
+                                    self_trade_cancels = group.self_trade_cancels().len(),
                                     ?held,
                                     "pair group keeps failing; holding its orders"
                                 );
@@ -1944,6 +1949,20 @@ mod claim_tests {
         let held = groups[1].book_orders();
         assert_eq!(held.len(), 5);
         assert_eq!(held[1].id(), sit_out.id());
+
+        // A sit-out's strikes grow with its group's and clear when it settles.
+        let group = &groups[1];
+        let mut failed = FailedHolds::default();
+        let start = Instant::now();
+        failed.hold(group.book_orders(), start);
+        failed.hold(group.book_orders(), start);
+        assert_eq!(failed.strikes[&sit_out.id()].0, 2);
+        failed.settled(group);
+        assert!(
+            !failed.strikes.contains_key(&sit_out.id()),
+            "settling the carrier forgets the sit-out's strikes too"
+        );
+        assert_eq!(failed.hold(group.book_orders(), start), FAILED_HOLD);
     }
 
     #[test]

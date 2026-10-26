@@ -71,6 +71,8 @@ The reply carries the transaction and note IDs. The tokens arrive as a public no
 
 **Cancelling.** `CancelOrder` stops one order and all its future remainders; `CancelAll` stops everything older in a scope (all, one market, or one direction). A cancel stops matching; your tokens stay in the note until you reclaim it. Reclaim after any settlement counted in the cancel's `settling` has resolved.
 
+**Self-trade prevention.** Your buy and your sell on the same pair never fill each other. If they cross, the side of your newest order trades and your older crossing orders sit out; once the newer order is reserved for a settlement, the older ones are cancelled by the solver and you receive `OrderStatus CANCELLED` (reason `self_trade_prevention`) for each. Treat it like your own cancel: the order is final, reclaim the note. Only orders you submit as private notes are reliably covered. Section 12 of the guide has the rule and examples.
+
 **Expiry.** Optional, per order, enforced by the solver off chain. There is no expiry event, and expiry does not return funds; reclaim the note.
 
 ## 5. Integration kit
@@ -100,6 +102,6 @@ To start with Claude Code: run `claude` in `maker-kit/` and ask, for example, *"
 
 ## 7. Before you trade
 
-Run the checklist in section 13 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
+Run the checklist in section 14 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
 
 Questions: your Inicio Labs contact.

@@ -82,6 +82,11 @@ impl ClearingBook {
         max_orders_per_side: usize,
     ) -> Result<Option<BoundedPrice>, ClearingError> {
         let band = u32::from(band_bps);
+        // Config caps the band far lower; this keeps the band's bottom above
+        // zero for any caller.
+        if band >= BPS_DENOMINATOR {
+            return Err(ClearingError::InvalidConfig);
+        }
         let mut walk = Walk {
             base,
             quote,

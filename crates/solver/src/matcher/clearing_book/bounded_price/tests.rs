@@ -340,6 +340,19 @@ fn eighteen_and_six_decimals_pair_their_smallest_orders() {
 }
 
 #[test]
+fn a_band_wider_than_the_price_is_an_error_not_a_panic() {
+    let mut book = Book::new();
+    book.user("seller", SELL, -10, 1);
+    book.user("buyer", BUY, 10, 1);
+    assert!(book.walk_with(9_999, 0, 100).is_some());
+    assert!(matches!(
+        book.book
+            .bounded_price(base(), quote(), mid(), 10_000, 0, 100),
+        Err(ClearingError::InvalidConfig)
+    ));
+}
+
+#[test]
 fn an_overflow_is_an_error_not_a_panic() {
     let mut book = Book::new();
     book.user("seller", SELL, -10, 1);

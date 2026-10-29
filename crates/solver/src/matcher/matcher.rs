@@ -8,7 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{BoundedPrice, ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
-use crate::clearing::{BatchPrice, ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
+use crate::clearing::{
+    BatchPrice, ClearingConfig, ClearingError, ClearingOutcome, PairAmounts, PairMatcher,
+    SkipReason,
+};
 use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::swap_eta::DepthChange;
 use crate::types::*;
@@ -220,7 +223,7 @@ pub(super) fn internal_clear(
             .pair(base, quote)
             .map_or(0, |pair| pair.rules.band_bps);
         let execution = if band_bps == 0 {
-            clear_pair_at(book, base, quote, price, &runtime.config)
+            clear_pair_or_log(book, base, quote, price, &runtime.config)
         } else {
             clear_pair_bounded(book, base, quote, price, band_bps, &runtime.config)
         };
@@ -266,23 +269,38 @@ pub(super) fn internal_clear(
     Ok(())
 }
 
-/// One pair cleared at one price: its execution batch with the sit-outs to
-/// cancel attached, or `None` when nothing trades there. Every outcome but
-/// an accepted plan is logged here.
+/// A pair's accepted plan: its execution batch with the sit-outs to cancel
+/// attached, and what the fills release on each side.
+struct Cleared {
+    execution: ExecutionBatch,
+    released: PairAmounts,
+}
+
+/// A step of clearing one pair that failed, and the message to log it under.
+struct ClearFailure {
+    message: &'static str,
+    error: ClearingError,
+}
+
+impl ClearFailure {
+    fn at(message: &'static str) -> impl FnOnce(ClearingError) -> Box<Self> {
+        move |error| Box::new(Self { message, error })
+    }
+}
+
+/// One pair cleared at one price. `Ok(None)` when nothing trades there, with
+/// the reason logged here; `Err` when a step failed, for the caller to log,
+/// since how loud that is depends on the caller.
 fn clear_pair_at(
     book: &ClearingBook,
     base: TokenId,
     quote: TokenId,
     price: BatchPrice,
     config: &ClearingConfig,
-) -> Option<ExecutionBatch> {
-    let (batch, self_trade) = match book.build_pair_batch(base, quote, price, config) {
-        Ok(built) => built,
-        Err(error) => {
-            tracing::error!(%base, %quote, %error, "clearing admission failed");
-            return None;
-        }
-    };
+) -> Result<Option<Cleared>, Box<ClearFailure>> {
+    let (batch, self_trade) = book
+        .build_pair_batch(base, quote, price, config)
+        .map_err(ClearFailure::at("clearing admission failed"))?;
     let plan = match PairMatcher::new(&batch, config).clear() {
         Ok(ClearingOutcome::Accepted(plan)) => plan,
         Ok(ClearingOutcome::Skipped(reason)) => {
@@ -299,20 +317,13 @@ fn clear_pair_at(
                 }
                 other => tracing::debug!(%base, %quote, ?other, "pair did not clear"),
             }
-            return None;
+            return Ok(None);
         }
-        Err(error) => {
-            tracing::error!(%base, %quote, %error, "pair clearing failed");
-            return None;
-        }
+        Err(error) => return Err(ClearFailure::at("pair clearing failed")(error)),
     };
-    let mut execution = match plan.to_execution_batch(&batch) {
-        Ok(execution) => execution,
-        Err(error) => {
-            tracing::error!(%base, %quote, %error, "clearing execution batch construction failed");
-            return None;
-        }
-    };
+    let mut execution = plan.to_execution_batch(&batch).map_err(ClearFailure::at(
+        "clearing execution batch construction failed",
+    ))?;
     book.attach_self_trade_cancels(self_trade, &mut execution);
     tracing::info!(
         %base,
@@ -324,7 +335,27 @@ fn clear_pair_at(
         surplus_quote = %plan.accruals.rounding_surplus.quote,
         "clearing pair included in combined batch"
     );
-    Some(execution)
+    Ok(Some(Cleared {
+        execution,
+        released: plan.candidate.released,
+    }))
+}
+
+/// Today's path: one attempt at `price`; a failed step is an error.
+fn clear_pair_or_log(
+    book: &ClearingBook,
+    base: TokenId,
+    quote: TokenId,
+    price: BatchPrice,
+    config: &ClearingConfig,
+) -> Option<ExecutionBatch> {
+    match clear_pair_at(book, base, quote, price, config) {
+        Ok(cleared) => cleared.map(|cleared| cleared.execution),
+        Err(failure) => {
+            tracing::error!(%base, %quote, error = %failure.error, "{}", failure.message);
+            None
+        }
+    }
 }
 
 /// A pair with a band (ADR 0007): the walk's price when anything trades
@@ -339,7 +370,7 @@ fn clear_pair_bounded(
 ) -> Option<ExecutionBatch> {
     let fallback = |reason: MidFallback| {
         BOUNDED_FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
-        clear_pair_at(book, base, quote, mid, config)
+        clear_pair_or_log(book, base, quote, mid, config)
     };
     let walk = match book.bounded_price(
         base,
@@ -361,21 +392,38 @@ fn clear_pair_bounded(
     };
     WALK_SIT_OUTS.fetch_add(walk.sit_outs.len() as u64, Ordering::Relaxed);
     if walk.price == mid {
-        return clear_pair_at(book, base, quote, mid, config);
+        return clear_pair_or_log(book, base, quote, mid, config);
     }
-    let Some(execution) = clear_pair_at(book, base, quote, walk.price, config) else {
-        tracing::debug!(%base, %quote, price = ?walk.price, "nothing traded at the bounded price; clearing at the mid");
-        return fallback(MidFallback::NothingAtPrice);
+    // A step that fails at the bounded price is only a warning: the mid is
+    // tried next, and a persistent failure there is the error.
+    let cleared = match clear_pair_at(book, base, quote, walk.price, config) {
+        Ok(Some(cleared)) => cleared,
+        Ok(None) => {
+            tracing::debug!(%base, %quote, price = ?walk.price, "nothing traded at the bounded price; clearing at the mid");
+            return fallback(MidFallback::NothingAtPrice);
+        }
+        Err(failure) => {
+            tracing::warn!(
+                %base,
+                %quote,
+                error = %failure.error,
+                price = ?walk.price,
+                "{} at the bounded price; clearing at the mid",
+                failure.message
+            );
+            return fallback(MidFallback::NothingAtPrice);
+        }
     };
     BOUNDED_OFF_MID.fetch_add(1, Ordering::Relaxed);
-    let benched_filled = execution
+    let benched_filled = cleared
+        .execution
         .filled_notes
         .iter()
         .filter(|filled| walk.sit_outs.contains(&filled.note_id))
         .count();
     WALK_BENCHED_FILLED.fetch_add(benched_filled as u64, Ordering::Relaxed);
-    log_bounded_price(base, quote, mid, &walk, benched_filled);
-    Some(execution)
+    log_bounded_price(base, quote, mid, &walk, &cleared, benched_filled);
+    Some(cleared.execution)
 }
 
 fn log_bounded_price(
@@ -383,6 +431,7 @@ fn log_bounded_price(
     quote: TokenId,
     mid: BatchPrice,
     walk: &BoundedPrice,
+    cleared: &Cleared,
     benched_filled: usize,
 ) {
     tracing::info!(
@@ -394,6 +443,9 @@ fn log_bounded_price(
         sell_limit = ?walk.sell_limit,
         buy_limit = ?walk.buy_limit,
         walk_volume = %walk.volume,
+        executed_orders = cleared.execution.filled_notes.len(),
+        released_base = cleared.released.base,
+        released_quote = cleared.released.quote,
         stop = ?walk.stop,
         sit_outs = walk.sit_outs.len(),
         price_setter = ?walk.price_setter,

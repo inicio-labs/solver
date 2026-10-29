@@ -174,7 +174,8 @@ Deploy and rollback order for later schema changes is in
 | `asset_y_faucet_id` | ✅ | Hex faucet id of token Y. |
 | `asset_y_binance_asset` | — | Binance asset code of Y (e.g. `"USDT"`). |
 | `binance_symbol` | — | Approved Binance Spot symbol of the direct X/Y market (e.g. `"ETHUSDT"`); needs both asset codes. Without it the pair never clears internally. Orientation comes from Binance's listing. |
-| `band_bps` | — | Bounded clearing price ([ADR 0007](docs/adr/0007-bounded-clearing-price.md)): the batch price may move up to this many basis points either side of the Binance mid, to the price that trades the most volume (then the one closest to the mid). Default `0` clears at the mid. At most `100`. Do not set it above `0` until the price API quotes with the same rule: startup warns while it does not. |
+| `band_bps` | — | Bounded clearing price ([ADR 0007](docs/adr/0007-bounded-clearing-price.md)): the batch price may move up to this many basis points either side of the Binance mid, to the price that trades the most volume (then the one closest to the mid). Default `0` clears at the mid. At most `100`. The price API quotes with the same rule ([price API](docs/price-api.md#pairs-with-a-price-band)). |
+| `reference_amount` | with a band | The size `/v2/pair-price` quotes at on a pair with a band: a decimal number of whole `asset_y` tokens, e.g. `"0.004"` ETH for about $10. Required when `band_bps` is above `0`. |
 | `quote_ttl_ms` | — | This pair's quote freshness in milliseconds, 1 to 60,000; without it `binance.quote_ttl_ms`. The matcher and the price API both use it. |
 
 ### `[engine]`

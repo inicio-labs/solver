@@ -42,13 +42,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::clearing::{BatchPrice, OrderSide};
 use crate::db::postgres_models::RegisteredTokenRow;
-use crate::matching::types::SwapBookSnapshot;
+use crate::matching::types::{BookLevel, SwapBookSnapshot};
 use crate::price::PricePrecision;
-use crate::price::{MarketPlan, PriceSnapshot, PriceUnavailable, Valued};
+use crate::price::{MarketPlan, OrderMarket, PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    eval_can_fill, eval_off_market, fill_price, judge, DepthBook, DepthChange, FillStatus,
-    NoFillReason, PriceBand, ProposedOrder, SettlementStats, VerdictTerms,
+    eval_can_fill, eval_off_market, expected_price, fill_price, judge, whole_price, DepthBook,
+    DepthChange, FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, SettlementStats,
+    VerdictTerms,
 };
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
@@ -447,7 +449,10 @@ struct PairPriceResponse {
     offered_faucet: String,
     requested_faucet: String,
     market_price: String,
-    /// [`fill_price`]: a limit for the ask, not the payout.
+    /// The batch price an order of the pair's reference size would get now
+    /// ([`expected_price`]); the mid on a pair without a band.
+    expected_price: String,
+    /// [`fill_price`]: the expected price less the fee, to build an ask from.
     fill_price: String,
     fee_ppm: u32,
     offered_decimals: u8,
@@ -476,6 +481,8 @@ struct SwapEtaResponse {
     fee_ppm: u32,
     fee_amount: Option<String>,
     market_price: Option<String>,
+    /// The batch price with this order in the book ([`expected_price`]).
+    expected_price: Option<String>,
     fill_price: Option<String>,
     /// The executor's own [`SettlementStats::executor_accepting`].
     settlements_running: bool,
@@ -557,11 +564,44 @@ async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoRespon
     ))
 }
 
+/// The pair's sells and buys in `book`, best first, for an order offering
+/// `offered` for `requested` on `side`.
+fn pair_sides(
+    book: &SwapBookSnapshot,
+    side: OrderSide,
+    offered: AccountId,
+    requested: AccountId,
+) -> (&[BookLevel], &[BookLevel]) {
+    let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
+    let (own, other) = (levels((offered, requested)), levels((requested, offered)));
+    match side {
+        OrderSide::SellBase => (own, other),
+        OrderSide::BuyBase => (other, own),
+    }
+}
+
+/// The expected batch price, or the mid if the walk fails (an overflow on
+/// extreme amounts): what the matcher clears at in that case too.
+fn walked_or_mid(
+    market: &OrderMarket,
+    fee_ppm: u32,
+    sells: &[BookLevel],
+    buys: &[BookLevel],
+    probe: Probe,
+) -> BatchPrice {
+    expected_price(market, fee_ppm, sells, buys, probe).unwrap_or_else(|error| {
+        tracing::debug!(%error, "bounded price failed; quoting at the mid");
+        market.price
+    })
+}
+
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
 ///
-/// The pair's clearing price, under the same freshness rule and fee as the
-/// matcher. The wallet builds its ask from `fill_price` and the user's
-/// slippage, then asks `/v2/swap-eta` about that exact order.
+/// The pair's expected batch price for this direction, under the same
+/// freshness rule, band and fee as the matcher: the walk with one order of
+/// the pair's reference size added (ADR 0007). The wallet builds its ask
+/// from `fill_price` and the user's slippage, then asks `/v2/swap-eta` about
+/// that exact order.
 async fn get_pair_price(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
@@ -572,11 +612,16 @@ async fn get_pair_price(
     let now = Instant::now();
     let market = state.prices.borrow().order_market(a, b, now)?;
     let fee_ppm = state.verdict_terms.fee_ppm;
-    let fill = fill_price(market.side, market.market, fee_ppm).ok_or(ApiError::NoPrice)?;
+    let book = state.book_rx.borrow().clone();
+    let (sells, buys) = pair_sides(&book, market.side, a, b);
+    let price = walked_or_mid(&market, fee_ppm, sells, buys, Probe::Reference);
+    let expected = whole_price(&market, price).ok_or(ApiError::NoPrice)?;
+    let fill = fill_price(market.side, expected, fee_ppm).ok_or(ApiError::NoPrice)?;
     Ok(Json(PairPriceResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         market_price: PricePrecision::Full.format(market.market),
+        expected_price: PricePrecision::Full.format(expected),
         fill_price: PricePrecision::Full.format(fill),
         fee_ppm,
         offered_decimals: market.offered_decimals,
@@ -607,24 +652,37 @@ async fn get_swap_eta(
     let book = state.book_rx.borrow().clone();
     let terms = state.verdict_terms;
     let market = state.prices.borrow().order_market(a, b, Instant::now());
-    let (verdict, market_price, fill, unpriced) = match market {
+    let (verdict, market_price, expected, fill, unpriced) = match market {
         Ok(market) => {
+            let cannot_price = |error| ApiError::BadAmount(format!("cannot price: {error}"));
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
+            // The batch price with this order in the book (ADR 0007); the
+            // order is judged at it, as the matcher would clear it.
+            let (sells, buys) = pair_sides(&book, market.side, a, b);
+            let price = walked_or_mid(&market, terms.fee_ppm, sells, buys, Probe::Order(order));
             let verdict = judge(
                 market.side,
-                market.price,
+                price,
                 terms,
                 order,
                 levels((a, b)),
                 levels((b, a)),
             )
-            .map_err(|error| ApiError::BadAmount(format!("cannot price: {error}")))?;
-            let fill = fill_price(market.side, market.market, terms.fee_ppm);
-            (Some(verdict), Some(market.market), fill, None)
+            .map_err(cannot_price)?;
+            let expected = whole_price(&market, price)
+                .ok_or_else(|| ApiError::BadAmount("cannot price: the expected price".into()))?;
+            let fill = fill_price(market.side, expected, terms.fee_ppm);
+            (
+                Some(verdict),
+                Some(market.market),
+                Some(expected),
+                fill,
+                None,
+            )
         }
         // Without a price nothing fills.
-        Err(PriceUnavailable::NoMarket) => (None, None, None, Some(NoFillReason::NoMarket)),
-        Err(_) => (None, None, None, Some(NoFillReason::NoPrice)),
+        Err(PriceUnavailable::NoMarket) => (None, None, None, None, Some(NoFillReason::NoMarket)),
+        Err(_) => (None, None, None, None, Some(NoFillReason::NoPrice)),
     };
     let band = verdict.map(|v| v.band);
     let status = verdict.map_or(FillStatus::None, |v| v.status);
@@ -654,6 +712,7 @@ async fn get_swap_eta(
         fee_ppm: terms.fee_ppm,
         fee_amount: amount(verdict.map(|v| v.fee)),
         market_price: market_price.map(price),
+        expected_price: expected.map(price),
         fill_price: fill.map(price),
         settlements_running,
         estimated_seconds: (settlements_running

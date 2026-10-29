@@ -199,6 +199,9 @@ pub struct PairRules {
     pub band_bps: u16,
     /// How long the pair's quote stays fresh; `None` uses the snapshot's TTL.
     pub quote_ttl: Option<Duration>,
+    /// The size of the pretend order the price API quotes `/v2/pair-price`
+    /// with on a pair with a band, in whole tokens of the pair's quote.
+    pub reference_amount: Option<Decimal>,
 }
 
 /// The markets the configuration asks for, before Binance has confirmed them.

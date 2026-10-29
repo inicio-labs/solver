@@ -1,6 +1,6 @@
 # 7. Bounded clearing price
 
-- **Status:** Accepted. The matcher part is implemented; the price API follows in its own change, and no pair gets a band before it is live.
+- **Status:** Accepted, implemented in the matcher and the price API (`/v2/pair-price` and `/v2/swap-eta` quote with the same walk; see the price API's [Pairs with a price band](../price-api.md#pairs-with-a-price-band)).
 - **Date:** 2026-10-29
 - **Deciders:** Vaibhav Jindal.
 - **Scope:** PSWAP batch clearing in the 0.17 solver, per configured pair.
@@ -79,7 +79,9 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 
 - `[[pairs]] band_bps`: default 0, at most 100 (1%).
 - `[[pairs]] quote_ttl_ms`: the pair's own quote freshness, else `binance.quote_ttl_ms`. Both the matcher and the price API judge a pair by it.
-- Startup logs each pair's band and TTL, and warns while a band is above 0, because the price API still quotes at the mid until its update.
+- `[[pairs]] reference_amount`: the size `/v2/pair-price` quotes at on a pair with a band, in whole `asset_y` tokens; required when `band_bps` is above 0.
+- Startup logs each pair's band, TTL and reference amount.
+- The price API runs the same walk on its mirror of the book's levels, with one probe order added: the reference amount for `/v2/pair-price`, the order being checked for `/v2/swap-eta`, which is then judged at that price. Levels carry no maker identity, so the API's walk has no self-trade prevention, and a level counts as one order toward the cap (issue #64).
 - Metrics: `solver_matcher_bounded_off_mid_total`, `solver_matcher_bounded_fallback_total{reason}` (`walk_found_nothing`, `nothing_at_price`, `walk_error`), `solver_matcher_walk_sit_outs_total`, `solver_matcher_walk_benched_filled_total`.
 - A pair that clears off the mid logs the mid, `P`, the distance in bps, `s*`, `d*`, the walk's volume, its stop reason, the sit-outs and the order that set the price.
 
@@ -108,3 +110,4 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 - A Python reference model of this design: hand-written cases for blocking, wrong sit-outs or cancels, and the band's edges, plus property runs on random books. Prices never leave the band, no fill crosses its own limit, no maker fills on both sides, and nothing freezes where today trades.
 - Rust tests: the walk against a brute-force oracle on 2,000 random books (every candidate price, rule B applied pair by pair), the named books from the design review, matcher tests for the band and both fallbacks, and every existing matcher test unchanged with band 0. Four deliberate mutations of the walk each fail several tests.
 - An integration test on the mock chain (`integration_bounded_price`): a maker's ask 20 bps above the mid never settles without a band and settles at its own limit with one, with exact payback amounts.
+- Scenarios on the mock chain with real orders and the price API (`integration_bounded_price_scenarios`): both band edges, an ask just past the edge, a Binance move into the band, a remainder in the next batch, the fallback to the mid with all-or-nothing orders, a fee, a banded and an unbanded pair, a partial fill at its own limit, and a random book checked for limits, the band and conservation.

@@ -433,6 +433,7 @@ pub fn pair_config(
         binance_symbol: Some(solver::price::Symbol::parse(symbol).expect("valid symbol")),
         band_bps: 0,
         quote_ttl_ms: None,
+        reference_amount: None,
     }
 }
 
@@ -454,6 +455,7 @@ pub fn unpriced_pair_config(
         binance_symbol: None,
         band_bps: 0,
         quote_ttl_ms: None,
+        reference_amount: None,
     }
 }
 

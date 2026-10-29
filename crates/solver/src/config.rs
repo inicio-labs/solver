@@ -79,6 +79,16 @@ pub(crate) enum ConfigError {
         value: u16,
         maximum: u16,
     },
+    #[error(
+        "pair {pair}: reference_amount must be a positive decimal amount of the pair's quote token \
+         (asset_y), got {value:?}"
+    )]
+    InvalidReferenceAmount { pair: String, value: String },
+    #[error(
+        "pair {pair}: a pair with band_bps above 0 needs reference_amount, the size the price API \
+         quotes /v2/pair-price at, in whole tokens of asset_y"
+    )]
+    MissingReferenceAmount { pair: String },
     #[error("pair {pair}: quote_ttl_ms must be between 1 and {maximum}, got {value}")]
     InvalidPairTtl {
         pair: String,
@@ -178,6 +188,11 @@ pub struct AssetPairConfig {
     /// The same 60 s cap applies.
     #[serde(default)]
     pub quote_ttl_ms: Option<u64>,
+    /// The size the price API quotes `/v2/pair-price` at on a pair with a
+    /// band: a positive decimal number of whole `asset_y` tokens (for
+    /// example `"0.004"` ETH for about $10). Required when `band_bps > 0`.
+    #[serde(default)]
+    pub reference_amount: Option<String>,
 }
 
 impl AssetPairConfig {
@@ -201,9 +216,24 @@ impl AssetPairConfig {
             }
             Some(ms) => Some(Duration::from_millis(ms)),
         };
+        let reference_amount = match &self.reference_amount {
+            Some(raw) => Some(parse_positive_decimal(raw).ok_or_else(|| {
+                ConfigError::InvalidReferenceAmount {
+                    pair: self.name.clone(),
+                    value: raw.clone(),
+                }
+            })?),
+            None if self.band_bps > 0 => {
+                return Err(ConfigError::MissingReferenceAmount {
+                    pair: self.name.clone(),
+                });
+            }
+            None => None,
+        };
         Ok(PairRules {
             band_bps: self.band_bps,
             quote_ttl,
+            reference_amount,
         })
     }
 
@@ -656,6 +686,8 @@ impl SolverConfig {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+
     use super::*;
 
     const EXAMPLE: &str = include_str!("../../../solver.toml.example");
@@ -729,7 +761,7 @@ mod tests {
         assert_eq!(example().pairs[0].rules().unwrap(), PairRules::default());
         let text = EXAMPLE.replace(
             r#"binance_symbol = "ETHUSDT""#,
-            "binance_symbol = \"ETHUSDT\"\nband_bps = 30\nquote_ttl_ms = 1500",
+            "binance_symbol = \"ETHUSDT\"\nband_bps = 30\nquote_ttl_ms = 1500\nreference_amount = \"0.004\"",
         );
         let config = parsed(&text);
         config.validate().unwrap();
@@ -738,17 +770,34 @@ mod tests {
             PairRules {
                 band_bps: 30,
                 quote_ttl: Some(Duration::from_millis(1500)),
+                reference_amount: Some(Decimal::new(4, 3)),
             }
         );
         let saved = toml::to_string(&config).unwrap();
         assert!(saved.contains("band_bps = 30"), "{saved}");
-        accepted(|c| c.pairs[0].band_bps = MAX_BAND_BPS);
-        let wide = check(|c| c.pairs[0].band_bps = MAX_BAND_BPS + 1);
+        let band = |c: &mut SolverConfig, bps| {
+            c.pairs[0].band_bps = bps;
+            c.pairs[0].reference_amount = Some("10".into());
+        };
+        accepted(|c| band(c, MAX_BAND_BPS));
+        let wide = check(|c| band(c, MAX_BAND_BPS + 1));
         assert!(wide.contains("band_bps must be at most 100"), "{wide}");
         accepted(|c| c.pairs[0].quote_ttl_ms = Some(60_000));
         for bad in [0, 60_001] {
             let error = check(|c| c.pairs[0].quote_ttl_ms = Some(bad));
             assert!(error.contains("quote_ttl_ms must be between 1"), "{error}");
+        }
+        // A band needs the size the price API quotes at; without a band it
+        // is optional and only checked.
+        let missing = check(|c| c.pairs[0].band_bps = 30);
+        assert!(missing.contains("needs reference_amount"), "{missing}");
+        accepted(|c| c.pairs[0].reference_amount = Some("0.004".into()));
+        for bad in ["0", "-1", "ten", ""] {
+            let error = check(|c| c.pairs[0].reference_amount = Some(bad.into()));
+            assert!(
+                error.contains("reference_amount must be a positive"),
+                "{error}"
+            );
         }
     }
 

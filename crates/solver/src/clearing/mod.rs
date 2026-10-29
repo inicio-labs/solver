@@ -1,5 +1,6 @@
 //! Exact, bounded PSWAP pair clearing at one frozen external price.
 
+pub(crate) mod bounded;
 mod config;
 mod envelope;
 mod matching;

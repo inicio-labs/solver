@@ -228,8 +228,7 @@ pub async fn start(
     let market_plan = config
         .market_plan()
         .context("invalid Binance market configuration")?;
-    // A band lets the pair's batch price move off the mid (ADR 0007); the
-    // price API's quotes still assume the mid until they learn the same rule.
+    // A band lets the pair's batch price move off the mid (ADR 0007).
     for pair in config
         .pairs
         .iter()
@@ -238,14 +237,13 @@ pub async fn start(
         let quote_ttl_ms = pair
             .quote_ttl_ms
             .unwrap_or(config.binance.quote_ttl.as_millis() as u64);
-        tracing::info!(pair = %pair.name, band_bps = pair.band_bps, quote_ttl_ms, "pair clearing rules");
-        if pair.band_bps > 0 {
-            tracing::warn!(
-                pair = %pair.name,
-                band_bps = pair.band_bps,
-                "bounded clearing price is on for this pair; the price API still quotes at the mid"
-            );
-        }
+        tracing::info!(
+            pair = %pair.name,
+            band_bps = pair.band_bps,
+            quote_ttl_ms,
+            reference_amount = pair.reference_amount.as_deref(),
+            "pair clearing rules"
+        );
     }
 
     // 4. Configured tokens to register. A pair with an approved Binance symbol

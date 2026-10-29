@@ -180,6 +180,7 @@ async fn a_band_settles_at_the_makers_ask_where_the_mid_never_trades() -> Result
                 let mut pair =
                     common::pair_config("USDC-ETH", usdc.id(), "USDC", eth.id(), "ETH", "ETHUSDC");
                 pair.band_bps = band_bps;
+                pair.reference_amount = Some("10".into());
                 SolverConfig {
                     rpc: RpcConfig {
                         endpoint: "http://unused".into(),

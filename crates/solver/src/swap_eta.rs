@@ -9,25 +9,31 @@
 //!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
 //!    built from the [`DepthChange`]s the matcher sends as orders enter and
 //!    leave its book, so no depth work runs on the matcher.
-//!  * [`fill_price`] — the best price an ask can name and still fill now.
+//!  * [`expected_price`] — the batch price the matcher's walk finds on the
+//!    mirrored levels (ADR 0007), with a probe order added.
+//!  * [`fill_price`] — the price an ask is built from: the expected price
+//!    less the fee.
 //!  * [`judge`] — the [`Verdict`] on the order a wallet is about to sign:
-//!    where its price sits against the clearing price, and how much of it the
-//!    live book can fill.
+//!    where its price sits against the expected batch price, and how much of
+//!    it the live book can fill.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use miden_protocol::asset::AssetAmount;
 use ruint::aliases::U256;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+use crate::clearing::bounded::{self, compare, Band, Leg, Legs};
 use crate::clearing::{
-    checked_mul, eligible_units, full_fill_fee, mul_div_floor, BatchPrice, ClearingError,
-    FillInterval, FillScale, OrderSide, PPM_DENOMINATOR,
+    checked_mul, eligible_units, full_fill_fee, mul_div_floor, BatchPrice, ClearingConfig,
+    ClearingError, FillInterval, FillScale, OrderSide, PPM_DENOMINATOR,
 };
 use crate::matching::types::{Amount, BookLevel, RateKey, SwapBookSnapshot};
-use crate::price::PricePrecision;
+use crate::price::{OrderMarket, PricePrecision};
 use crate::types::{TokenId, UnixSecs};
 
 /// Retention window for settlement samples (24h).
@@ -285,8 +291,9 @@ impl Verdict {
 }
 
 /// What the matcher would do now with `order` on `side` of its clearing
-/// pair, at `price` (that pair's exact clearing price), against the resting
-/// levels on its own side and the opposite side, best first.
+/// pair, at `price` (the expected batch price, [`expected_price`]: the mid on
+/// a pair without a band), against the resting levels on its own side and
+/// the opposite side, best first.
 ///
 /// Mirrors one clearing tick with the matcher's own rules ([`eligible_units`],
 /// [`FillScale`], [`full_fill_fee`]): opposite levels eligible at the same
@@ -398,17 +405,181 @@ pub(crate) fn judge(
     })
 }
 
-/// The most an ask can name per whole offered token and still fill now, in
-/// whole requested tokens: the `market` mid after the fee as the order's side
-/// pays it (selling the base: mid × (1 − fee); buying it: mid ÷ (1 + fee)),
-/// rounded toward zero at 18 places so an ask built from it never overshoots.
-/// A limit, not the payout: a full fill pays the mid less the fee.
-pub(crate) fn fill_price(side: OrderSide, market: Decimal, fee_ppm: u32) -> Option<Decimal> {
+/// What the price API adds to the mirrored book before walking it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Probe {
+    /// `/v2/pair-price`: one order of the pair's reference size on the
+    /// asked side, its limit at the band's edge, last in its queue.
+    Reference,
+    /// `/v2/swap-eta`: the order the wallet is about to sign.
+    Order(ProposedOrder),
+}
+
+/// The batch price the matcher's walk finds now (ADR 0007) on the mirrored
+/// levels with `probe` added, or the mid when the pair has no band or nothing
+/// crosses. `sells` and `buys` are the pair's two sides, best first.
+///
+/// Levels carry no maker identity, so there is no self-trade prevention here:
+/// a maker crossed with itself can make this differ from the matcher's price.
+/// A level counts as one order toward the per-side cap (issue #64).
+pub(crate) fn expected_price(
+    market: &OrderMarket,
+    fee_ppm: u32,
+    sells: &[BookLevel],
+    buys: &[BookLevel],
+    probe: Probe,
+) -> Result<BatchPrice, ClearingError> {
+    if market.rules.band_bps == 0 {
+        return Ok(market.price);
+    }
+    let band = Band::new(market.price, market.rules.band_bps)?;
+    let extra = match probe {
+        Probe::Reference => reference_leg(market, &band)?,
+        Probe::Order(order) => {
+            let (offered, requested) = (order.offered, order.requested);
+            Some(match market.side {
+                OrderSide::SellBase => {
+                    Leg::sell((), offered, requested, offered, fee_ppm, band.mid)?
+                }
+                OrderSide::BuyBase => Leg::buy((), offered, requested, offered, fee_ppm, band.mid)?,
+            })
+        }
+    };
+    let mut legs = LevelLegs {
+        sells: sells.iter(),
+        buys: buys.iter(),
+        fee_ppm,
+        mid: band.mid,
+        extra: extra.map(|leg| (market.side, leg)),
+        peeked: [None, None],
+    };
+    // The matcher runs with the default cap; it is not configurable.
+    let cap = ClearingConfig::default().max_orders_per_side;
+    Ok(bounded::walk(&band, cap, &mut legs)?.map_or(market.price, |walked| walked.price))
+}
+
+/// The pretend order of `/v2/pair-price`: the pair's reference amount of
+/// quote, on the asked side, with its limit at the band's edge so that its
+/// own limit never sets the price. `None` without a reference amount.
+fn reference_leg(market: &OrderMarket, band: &Band) -> Result<Option<Leg<()>>, ClearingError> {
+    let Some(amount) = market.rules.reference_amount else {
+        return Ok(None);
+    };
+    let quote_decimals = match market.side {
+        OrderSide::SellBase => market.requested_decimals,
+        OrderSide::BuyBase => market.offered_decimals,
+    };
+    let units = Decimal::from(10u64.pow(u32::from(quote_decimals)))
+        .checked_mul(amount)
+        .and_then(|units| units.floor().to_u64())
+        .ok_or(ClearingError::ArithmeticOverflow)?;
+    if units == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Leg {
+        tag: (),
+        limit: match market.side {
+            OrderSide::SellBase => band.low,
+            OrderSide::BuyBase => band.high,
+        },
+        // A value of `units` quote, in the walk's units on either side.
+        remaining: checked_mul(units, band.mid.base_units)?,
+    }))
+}
+
+/// The mirrored levels as the walk's legs, with one extra leg joining its
+/// side last among the levels at its limit.
+struct LevelLegs<'a> {
+    sells: std::slice::Iter<'a, BookLevel>,
+    buys: std::slice::Iter<'a, BookLevel>,
+    fee_ppm: u32,
+    mid: BatchPrice,
+    extra: Option<(OrderSide, Leg<()>)>,
+    /// The next level of each side, sells first, once read.
+    peeked: [Option<Leg<()>>; 2],
+}
+
+impl Legs<()> for LevelLegs<'_> {
+    fn next(&mut self, side: OrderSide) -> Result<Option<Leg<()>>, ClearingError> {
+        let at = usize::from(side == OrderSide::BuyBase);
+        if self.peeked[at].is_none() {
+            let level = match side {
+                OrderSide::SellBase => self.sells.next(),
+                OrderSide::BuyBase => self.buys.next(),
+            };
+            self.peeked[at] = match level {
+                Some(level) => {
+                    let (offered, requested) = (level.rate.offered, level.rate.requested);
+                    let (fee, mid) = (self.fee_ppm, self.mid);
+                    Some(match side {
+                        OrderSide::SellBase => {
+                            Leg::sell((), offered, requested, level.volume, fee, mid)?
+                        }
+                        OrderSide::BuyBase => {
+                            Leg::buy((), offered, requested, level.volume, fee, mid)?
+                        }
+                    })
+                }
+                None => None,
+            };
+        }
+        if let Some((extra_side, extra)) = self.extra.filter(|(extra_side, _)| *extra_side == side)
+        {
+            // Strictly better than the next level: equal limits go first.
+            let first = match self.peeked[at] {
+                None => true,
+                Some(level) => {
+                    let order = compare(extra.limit, level.limit)?;
+                    match extra_side {
+                        OrderSide::SellBase => order == Ordering::Less,
+                        OrderSide::BuyBase => order == Ordering::Greater,
+                    }
+                }
+            };
+            if first {
+                self.extra = None;
+                return Ok(Some(extra));
+            }
+        }
+        Ok(self.peeked[at].take())
+    }
+}
+
+/// `price`, in quote units per base unit of the pair, as whole requested
+/// tokens per whole offered token on `market`'s side, rounded toward zero at
+/// 18 places. The mid itself comes back exactly as `market.market`.
+pub(crate) fn whole_price(market: &OrderMarket, price: BatchPrice) -> Option<Decimal> {
+    if price == market.price {
+        return Some(market.market);
+    }
+    let (requested, offered) = match market.side {
+        OrderSide::SellBase => (price.quote_units, price.base_units),
+        OrderSide::BuyBase => (price.base_units, price.quote_units),
+    };
+    let ten = |power: u8| U256::from(10u8).checked_pow(U256::from(power));
+    let scaled = requested
+        .checked_mul(ten(market.offered_decimals)?)?
+        .checked_mul(ten(18)?)?
+        / offered.checked_mul(ten(market.requested_decimals)?)?;
+    let mantissa = i128::try_from(scaled).ok()?;
+    Some(
+        Decimal::try_from_i128_with_scale(mantissa, 18)
+            .ok()?
+            .normalize(),
+    )
+}
+
+/// The price an ask is built from, per whole offered token, in whole
+/// requested tokens: `expected` (the expected batch price) after the fee as
+/// the order's side pays it (selling the base: × (1 − fee); buying it:
+/// ÷ (1 + fee)), rounded toward zero at 18 places so an ask built from it
+/// never overshoots. A full fill pays the batch price less the fee.
+pub(crate) fn fill_price(side: OrderSide, expected: Decimal, fee_ppm: u32) -> Option<Decimal> {
     let ppm = Decimal::from(PPM_DENOMINATOR);
     let fee = Decimal::from(fee_ppm);
     let fill = match side {
-        OrderSide::SellBase => market.checked_mul((ppm - fee).checked_div(ppm)?),
-        OrderSide::BuyBase => market.checked_mul(ppm.checked_div(ppm + fee)?),
+        OrderSide::SellBase => expected.checked_mul((ppm - fee).checked_div(ppm)?),
+        OrderSide::BuyBase => expected.checked_mul(ppm.checked_div(ppm + fee)?),
     }?;
     Some(
         fill.round_dp_with_strategy(18, RoundingStrategy::ToZero)
@@ -537,6 +708,56 @@ mod tests {
             rate: RateKey::new(requested, offered),
             volume,
         }
+    }
+
+    /// The A/B pair at 2 B per A, with a 30 bps band and `reference` B as
+    /// the pretend order's size (0-decimal tokens).
+    fn banded(side: OrderSide, reference: u64) -> OrderMarket {
+        OrderMarket {
+            side,
+            price: BatchPrice::from_ratio(2, 1).unwrap(),
+            market: match side {
+                OrderSide::SellBase => Decimal::from(2),
+                OrderSide::BuyBase => Decimal::new(5, 1),
+            },
+            received_at: std::time::Instant::now(),
+            offered_decimals: 0,
+            requested_decimals: 0,
+            rules: crate::price::PairRules {
+                band_bps: 30,
+                quote_ttl: None,
+                reference_amount: Some(Decimal::from(reference)),
+            },
+        }
+    }
+
+    // ── expected price ────────────────────────────────────────────────────
+    /// A bigger reference buy reaches deeper asks, so its price never falls;
+    /// its own limit at the band's top never sets the price.
+    #[test]
+    fn the_reference_buy_climbs_the_asks_and_never_sets_the_price() {
+        // Asks of 1,000 A (2,000 B at the mid) each at +5, +10 and +20 bps.
+        let asks = [
+            level(2_001, 1_000, 1_000),
+            level(2_002, 1_000, 1_000),
+            level(2_004, 1_000, 1_000),
+        ];
+        let mut last = BatchPrice::from_ratio(1, 1).unwrap();
+        let mut seen = Vec::new();
+        for reference in [10, 2_500, 4_500, 10_000] {
+            let market = banded(OrderSide::BuyBase, reference);
+            let price = expected_price(&market, 0, &asks, &[], Probe::Reference).unwrap();
+            assert_ne!(compare(price, last).unwrap(), Ordering::Less, "{reference}");
+            assert_ne!(
+                price,
+                Band::new(market.price, 30).unwrap().high,
+                "{reference}"
+            );
+            seen.push(price);
+            last = price;
+        }
+        let at = |requested| BatchPrice::from_ratio(requested, 1_000).unwrap();
+        assert_eq!(seen, [at(2_001), at(2_002), at(2_004), at(2_004)]);
     }
 
     // ── median ────────────────────────────────────────────────────────────

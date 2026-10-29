@@ -8,8 +8,8 @@ mod precision;
 #[cfg(test)]
 pub(crate) use binance::test_support;
 pub(crate) use binance::{
-    parse_positive_decimal, spawn_price_feed_thread, ClearingMarket, MarketPlan, PairRules,
-    PriceUnavailable, Valued,
+    parse_positive_decimal, spawn_price_feed_thread, ClearingMarket, MarketPlan, OrderMarket,
+    PairRules, PriceUnavailable, Valued,
 };
 pub use binance::{AssetCode, BinanceConfig, FeedMetrics, MarketError, PriceSnapshot, Symbol};
 pub use precision::PricePrecision;

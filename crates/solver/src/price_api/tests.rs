@@ -17,8 +17,9 @@ use super::{build_app, PriceApiConfig, PriceApiState};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::test_support::{asset, btc, eth, market, usdt};
-use crate::price::{MarketPlan, PriceSnapshot};
+use crate::price::{MarketPlan, PairRules, PriceSnapshot};
 use crate::swap_eta::SettlementStats;
+use rust_decimal::Decimal;
 
 /// Long enough that a slow test cannot make a fresh quote stale.
 const TTL: Duration = Duration::from_secs(3_600);
@@ -650,6 +651,7 @@ async fn v2_answers_carry_every_documented_key() {
         "feePpm",
         "feeAmount",
         "marketPrice",
+        "expectedPrice",
         "fillPrice",
         "settlementsRunning",
         "estimatedSeconds",
@@ -663,7 +665,12 @@ async fn v2_answers_carry_every_documented_key() {
         let v = swap_get(&h, &order).await;
         assert_eq!(keys(&v), swap_keys, "{v}");
         if market.is_none() {
-            for key in ["expectedRequestedAmount", "feeAmount", "fillPrice"] {
+            for key in [
+                "expectedRequestedAmount",
+                "feeAmount",
+                "expectedPrice",
+                "fillPrice",
+            ] {
                 assert!(v[key].is_null(), "{key}: {v}");
             }
         }
@@ -681,6 +688,7 @@ async fn v2_answers_carry_every_documented_key() {
         "offeredFaucet",
         "requestedFaucet",
         "marketPrice",
+        "expectedPrice",
         "fillPrice",
         "feePpm",
         "offeredDecimals",
@@ -1126,4 +1134,147 @@ async fn v1_swap_eta_bad_input() {
         .get(&v1_url(faucet_unregistered(), 100, faucet_b(), 200))
         .await;
     assert_eq!(ru.status_code(), StatusCode::NOT_FOUND);
+}
+
+// ── Bounded clearing price (ADR 0007) ───────────────────────────────────────
+
+/// The v2 endpoints on the A/B pair at 2 B per A with a band of `band_bps`
+/// and a reference size of 10 B (the test tokens have 0 decimals).
+async fn banded_server(band_bps: u16, book: SwapBookSnapshot) -> Harness {
+    let pairs = [(faucet_a(), faucet_b(), "2", received(true))];
+    let rules = PairRules {
+        band_bps,
+        quote_ttl: None,
+        reference_amount: Some(Decimal::from(10)),
+    };
+    let snapshot =
+        PriceSnapshot::for_tests(&pairs, &[], TTL).with_pair_rules(faucet_a(), faucet_b(), rules);
+    let registered: Vec<_> = registered()
+        .iter()
+        .map(|(id, dec)| (*id, *dec, None))
+        .collect();
+    serve(&registered, snapshot, book, running()).await
+}
+
+/// A maker's ask for A at 2.0013 B (+6.5 bps; +16.5 after the 0.1% fee):
+/// above the mid, inside a 30 bps band.
+fn ask_level() -> BookLevel {
+    BookLevel {
+        rate: RateKey::new(2_001_300, 1_000_000),
+        volume: 1_000_000_000,
+    }
+}
+
+fn makers_ask() -> SwapBookSnapshot {
+    [((faucet_a(), faucet_b()), vec![ask_level()])].into()
+}
+
+/// `offered_faucet=B&requested_faucet=A` plus `rest`: an order buying A.
+fn b_for_a(rest: &str) -> String {
+    format!(
+        "offered_faucet={}&requested_faucet={}&{rest}",
+        faucet_b().to_hex(),
+        faucet_a().to_hex()
+    )
+}
+
+#[tokio::test]
+async fn pair_price_with_a_band_quotes_the_makers_ask() {
+    // Buying A (offering B): the reference buy takes the maker's ask, so A
+    // costs 2.0033 B after the fee is folded in, 0.4992 A per B.
+    let h = banded_server(30, makers_ask()).await;
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["marketPrice"], "0.5");
+    assert_eq!(v["expectedPrice"], "0.499175535901663918");
+    assert_eq!(v["fillPrice"], "0.498676859042621296");
+
+    // Selling A, nothing crosses inside the band: the mid, as today.
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["expectedPrice"], "2");
+    assert_eq!(v["fillPrice"], "1.998");
+}
+
+#[tokio::test]
+async fn pair_price_without_a_band_is_todays_answer() {
+    let h = banded_server(0, makers_ask()).await;
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["marketPrice"], "0.5");
+    assert_eq!(v["expectedPrice"], "0.5");
+    assert_eq!(v["fillPrice"], "0.4995004995004995");
+}
+
+#[tokio::test]
+async fn a_dust_level_does_not_move_pair_price() {
+    // One unit of A for 2 B sits ahead of the maker's ask; the reference buy
+    // of 10 B reaches past it, so the price is still the maker's ask.
+    let dust = BookLevel {
+        rate: RateKey::new(2, 1),
+        volume: 1,
+    };
+    let book = [((faucet_a(), faucet_b()), vec![dust, ask_level()])].into();
+    let h = banded_server(30, book).await;
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["expectedPrice"], "0.499175535901663918");
+}
+
+#[tokio::test]
+async fn swap_eta_with_a_band_fills_a_buyer_at_the_makers_ask() {
+    // 1,000,000 B for at least 495,000 A: at the mid the maker's ask is out
+    // of reach, so nothing fills; with a band the batch clears at the ask.
+    let order = b_for_a("offered_amount=1000000&requested_amount=495000");
+    let h = banded_server(0, makers_ask()).await;
+    let v = swap_get(&h, &order).await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "liquidity");
+    assert_eq!(v["expectedPrice"], "0.5");
+
+    let h = banded_server(30, makers_ask()).await;
+    let v = swap_get(&h, &order).await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(v["marketPrice"], "0.5");
+    assert_eq!(v["expectedPrice"], "0.499175535901663918");
+    assert_eq!(v["fillPrice"], "0.498676859042621296");
+    // 1,000,000 B buys 499,175 A at the ask; the fee is 499 of them.
+    assert_eq!(v["expectedRequestedAmount"], "498676");
+    assert_eq!(v["feeAmount"], "499");
+    assert_eq!(v["estimatedSeconds"], 14);
+}
+
+#[tokio::test]
+async fn swap_eta_judges_the_band_against_the_expected_price() {
+    // Sellers outnumber buyers: another seller at -20 bps (after the fee)
+    // takes the only bid, at -16.5 bps, which sets the batch price below the
+    // mid. A seller at -5 bps is eligible at the mid but not at that price.
+    let other_seller = BookLevel {
+        rate: RateKey::new(1_994_000, 1_000_000),
+        volume: 3_000_000,
+    };
+    let makers_bid = BookLevel {
+        rate: RateKey::new(1_000_000, 1_998_700),
+        volume: 2_000_000,
+    };
+    let book: SwapBookSnapshot = [
+        ((faucet_a(), faucet_b()), vec![other_seller]),
+        ((faucet_b(), faucet_a()), vec![makers_bid]),
+    ]
+    .into();
+    let order = a_for_b("offered_amount=1000000&requested_amount=1997000");
+
+    // At the mid: at market, but no buyer is eligible there.
+    let h = banded_server(0, book.clone()).await;
+    let v = swap_get(&h, &order).await;
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["reason"], "liquidity");
+
+    // With a band: judged at the bid's price, the order needs the price to
+    // move, so the wallet fetches a fresh price, which is the bid's.
+    let h = banded_server(30, book).await;
+    let v = swap_get(&h, &order).await;
+    assert_eq!(v["priceBand"], "tolerated");
+    assert_eq!(v["expectedPrice"], "1.996703296703296703");
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["expectedPrice"], "1.996703296703296703");
+    assert_eq!(v["fillPrice"], "1.994706593406593406");
 }

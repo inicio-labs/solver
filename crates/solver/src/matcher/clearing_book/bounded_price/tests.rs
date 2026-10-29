@@ -556,3 +556,65 @@ fn the_walk_matches_a_brute_force_oracle() {
         "{off_mid} off the mid, {with_sit_outs} with sit-outs"
     );
 }
+
+/// The price API walks the matcher's book as levels, without self-trade
+/// prevention. With prevention off here too, both find the same price on
+/// random books: grouping equal-rate orders into a level changes nothing.
+#[test]
+fn the_price_api_walk_on_levels_matches_the_matcher() {
+    use crate::price::{OrderMarket, PairRules};
+    use crate::swap_eta::{expected_price, Probe};
+
+    let mut rng = StdRng::seed_from_u64(11);
+    let (mut off_mid, mut rounds) = (0, 0);
+    for round in 0..1_000 {
+        let mut book = Book::new();
+        for _ in 0..rng.random_range(0..10) {
+            let buy = rng.random_bool(0.5);
+            // A few distinct prices, so equal-rate orders share a level.
+            let tenths = 50 * rng.random_range(-8..8);
+            if rng.random_bool(0.4) {
+                let maker_id = rng.random_range(1..3);
+                book.maker(
+                    "maker",
+                    maker_id,
+                    round * 100 + rounds,
+                    buy,
+                    tenths,
+                    rng.random_range(1..4),
+                );
+            } else {
+                book.user("user", buy, tenths, rng.random_range(1..4));
+            }
+            rounds += 1;
+        }
+        let levels = book.book.levels();
+        let side = |pair| levels.get(&pair).map_or(&[][..], Vec::as_slice);
+        let market = OrderMarket {
+            side: OrderSide::SellBase,
+            price: mid(),
+            market: rust_decimal::Decimal::from(2),
+            received_at: std::time::Instant::now(),
+            offered_decimals: 0,
+            requested_decimals: 0,
+            // No reference size: the walk adds nothing to the levels.
+            rules: PairRules {
+                band_bps: 30,
+                quote_ttl: None,
+                reference_amount: None,
+            },
+        };
+        let api = expected_price(
+            &market,
+            0,
+            side((base(), quote())),
+            side((quote(), base())),
+            Probe::Reference,
+        )
+        .unwrap();
+        let matcher = book.walk_without_stp(30).map_or(mid(), |walk| walk.price);
+        assert_eq!(api, matcher, "round {round}");
+        off_mid += usize::from(api != mid());
+    }
+    assert!(off_mid > 100, "only {off_mid} books priced off the mid");
+}

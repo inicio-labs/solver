@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 
-use super::market::{Markets, Orientation, Symbol, Valuation};
+use super::market::{Markets, Orientation, PairSource, Symbol, Valuation};
 use super::ticker::QuoteRejection;
 use crate::clearing::{BatchPrice, OrderSide};
 use crate::types::TokenId;
@@ -196,13 +196,24 @@ impl PriceSnapshot {
         self.ttl
     }
 
+    /// A clearing pair's freshness: its own `quote_ttl_ms`, else the TTL.
+    /// The matcher and the price API both judge a pair by it.
+    fn pair_ttl(&self, pair: PairSource) -> Duration {
+        pair.rules.quote_ttl.unwrap_or(self.ttl)
+    }
+
     /// Every subscribed symbol with its current state.
     pub(crate) fn quotes(&self) -> impl Iterator<Item = (&Symbol, &SymbolQuote)> {
         self.markets.symbols().iter().zip(&self.quotes)
     }
 
-    /// The valid quote of `symbol` and whether its age is below the TTL.
-    fn quote(&self, symbol: usize, now: Instant) -> Result<(Quote, bool), PriceUnavailable> {
+    /// The valid quote of `symbol` and whether its age is below `ttl`.
+    fn quote(
+        &self,
+        symbol: usize,
+        ttl: Duration,
+        now: Instant,
+    ) -> Result<(Quote, bool), PriceUnavailable> {
         match self
             .quotes
             .get(symbol)
@@ -215,7 +226,7 @@ impl PriceSnapshot {
                 let age = now
                     .checked_duration_since(quote.received_at)
                     .ok_or(PriceUnavailable::FutureReceipt)?;
-                Ok((quote, age < self.ttl))
+                Ok((quote, age < ttl))
             }
         }
     }
@@ -232,7 +243,7 @@ impl PriceSnapshot {
             .markets
             .pair(base, quote)
             .ok_or(PriceUnavailable::NoMarket)?;
-        let (latest, fresh) = self.quote(pair.symbol, now)?;
+        let (latest, fresh) = self.quote(pair.symbol, self.pair_ttl(pair), now)?;
         if !fresh {
             return Err(PriceUnavailable::Stale);
         }
@@ -270,7 +281,7 @@ impl PriceSnapshot {
                 true,
             ),
         };
-        let (latest, fresh) = self.quote(pair.symbol, now)?;
+        let (latest, fresh) = self.quote(pair.symbol, self.pair_ttl(pair), now)?;
         if !fresh {
             return Err(PriceUnavailable::Stale);
         }
@@ -318,7 +329,7 @@ impl PriceSnapshot {
                 fresh: true,
             }),
             Valuation::Market(symbol) => {
-                let (quote, fresh) = self.quote(symbol, now)?;
+                let (quote, fresh) = self.quote(symbol, self.ttl, now)?;
                 Ok(Valued {
                     price: quote.mid,
                     received_at: Some(quote.received_at),
@@ -363,6 +374,18 @@ impl PriceSnapshot {
         Self::build_for_tests(pairs, &[], decimals, ttl, true)
     }
 
+    /// The same snapshot with one clearing pair's own rules, as its
+    /// `[[pairs]]` block would set them.
+    pub(crate) fn with_pair_rules(
+        mut self,
+        base: TokenId,
+        quote: TokenId,
+        rules: super::market::PairRules,
+    ) -> Self {
+        Arc::make_mut(&mut self.markets).set_pair_rules(base, quote, rules);
+        self
+    }
+
     fn build_for_tests(
         pairs: &[(TokenId, TokenId, &str, Instant)],
         valuations: &[(TokenId, Option<(&str, Instant)>)],
@@ -372,7 +395,9 @@ impl PriceSnapshot {
     ) -> Self {
         use std::collections::HashMap;
 
-        use super::market::{AssetCode, ClearingMarket, MarketIssue, MarketPlan, MarketUse};
+        use super::market::{
+            AssetCode, ClearingMarket, MarketIssue, MarketPlan, MarketUse, PairRules,
+        };
         use super::test_support::{asset, listing, price};
 
         let quote_asset = asset("Q");
@@ -407,6 +432,7 @@ impl PriceSnapshot {
                 name: format!("{base}/{quote}"),
                 base: *base,
                 quote: *quote,
+                rules: PairRules::default(),
                 symbol: if reversed {
                     list(
                         &codes[quote],
@@ -571,6 +597,35 @@ mod tests {
         assert_eq!(valued.price, price("2000"));
         assert!(!valued.fresh);
         assert_eq!(valued.received_at, Some(received));
+    }
+
+    /// A pair's own `quote_ttl_ms` decides its freshness for the matcher and
+    /// the price API alike; valuation keeps the snapshot's TTL.
+    #[test]
+    fn a_pair_ttl_overrides_the_snapshot_ttl() {
+        let pair_ttl = Duration::from_millis(500);
+        let rules = crate::price::PairRules {
+            band_bps: 0,
+            quote_ttl: Some(pair_ttl),
+        };
+        let mut snapshot = book().with_pair_rules(usdt(), eth(), rules);
+        let received = Instant::now();
+        snapshot.offer(&observe(1, received, Some("2000")));
+        let just_inside = received + pair_ttl - Duration::from_nanos(1);
+        assert_eq!(
+            snapshot.pair_price(usdt(), eth(), just_inside),
+            Ok(usdt_eth(2000))
+        );
+        let expired = received + pair_ttl;
+        assert_eq!(
+            snapshot.pair_price(usdt(), eth(), expired),
+            Err(PriceUnavailable::Stale)
+        );
+        assert_eq!(
+            snapshot.order_market(eth(), usdt(), expired).err(),
+            Some(PriceUnavailable::Stale)
+        );
+        assert!(snapshot.valuation(eth(), expired).unwrap().fresh);
     }
 
     #[test]

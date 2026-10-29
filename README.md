@@ -174,6 +174,8 @@ Deploy and rollback order for later schema changes is in
 | `asset_y_faucet_id` | ✅ | Hex faucet id of token Y. |
 | `asset_y_binance_asset` | — | Binance asset code of Y (e.g. `"USDT"`). |
 | `binance_symbol` | — | Approved Binance Spot symbol of the direct X/Y market (e.g. `"ETHUSDT"`); needs both asset codes. Without it the pair never clears internally. Orientation comes from Binance's listing. |
+| `band_bps` | — | Bounded clearing price ([ADR 0007](docs/adr/0007-bounded-clearing-price.md)): the batch price may move up to this many basis points either side of the Binance mid, to the price that trades the most volume (then the one closest to the mid). Default `0` clears at the mid. At most `100`. Do not set it above `0` until the price API quotes with the same rule: startup warns while it does not. |
+| `quote_ttl_ms` | — | This pair's quote freshness in milliseconds, 1 to 60,000; without it `binance.quote_ttl_ms`. The matcher and the price API both use it. |
 
 ### `[engine]`
 | Field | Req | Default | Description |

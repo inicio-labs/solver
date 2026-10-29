@@ -10,7 +10,9 @@ use miden_protocol::testing::account_id::{
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2,
 };
 
-use super::market::{AssetCode, ClearingMarket, IssueKind, Listing, MarketPlan, Markets, Symbol};
+use super::market::{
+    AssetCode, ClearingMarket, IssueKind, Listing, MarketPlan, Markets, PairRules, Symbol,
+};
 use crate::types::TokenId;
 
 pub(crate) fn eth() -> TokenId {
@@ -64,6 +66,7 @@ pub(crate) fn market(
         base,
         quote,
         symbol: symbol(symbol_name),
+        rules: PairRules::default(),
     }
 }
 

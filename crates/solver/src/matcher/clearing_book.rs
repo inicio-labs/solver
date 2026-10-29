@@ -11,6 +11,10 @@ use crate::maker::{CutoffScope, MakerId, MakerUpdate};
 use crate::swap_eta::DepthChange;
 use crate::types::{BookOrder, BookUpdate, ExecutionBatch, TokenId};
 
+mod bounded_price;
+
+pub(super) use bounded_price::BoundedPrice;
+
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {
     pub orders: Vec<BookOrder>,
@@ -533,7 +537,7 @@ mod tests {
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
-    fn fixture(
+    pub(super) fn fixture(
         buy: bool,
         offered: u64,
         requested: u64,
@@ -706,7 +710,7 @@ mod tests {
         assert!(book.levels().is_empty());
     }
 
-    fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
+    pub(super) fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
         order.maker = Some(crate::maker::MakerTag {
             maker_id,
             root_seq,

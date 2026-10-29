@@ -108,7 +108,8 @@ fn append_latency(body: &mut String, metric: &str, latency: &LatencySnapshot) {
 }
 
 /// Price feed health and per-symbol quote state (rendered by the feed), and
-/// pairs the matcher skipped for want of a usable price.
+/// pairs the matcher skipped for want of a usable price, and how pairs with
+/// a band (ADR 0007) were priced.
 fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceSnapshot) {
     feed.render(snapshot, body);
     for (reason, count) in crate::matcher::price_skips() {
@@ -117,6 +118,24 @@ fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceS
             "solver_matcher_price_skips_total{{reason=\"{reason}\"}} {count}"
         );
     }
+    let _ = writeln!(
+        body,
+        "solver_matcher_bounded_off_mid_total {}",
+        crate::matcher::bounded_off_mid()
+    );
+    for (reason, count) in crate::matcher::bounded_fallbacks() {
+        let _ = writeln!(
+            body,
+            "solver_matcher_bounded_fallback_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_matcher_walk_sit_outs_total {}\n\
+         solver_matcher_walk_benched_filled_total {}",
+        crate::matcher::walk_sit_outs(),
+        crate::matcher::walk_benched_filled()
+    );
 }
 
 async fn metrics(
@@ -242,6 +261,12 @@ mod tests {
             format!("solver_price_quote_valid{{symbol=\"{symbol}\"}} 1"),
             format!("solver_price_quote_fresh{{symbol=\"{symbol}\"}} 0"),
             "solver_matcher_price_skips_total{reason=\"stale\"} ".to_string(),
+            "solver_matcher_bounded_off_mid_total ".to_string(),
+            "solver_matcher_bounded_fallback_total{reason=\"walk_found_nothing\"} ".to_string(),
+            "solver_matcher_bounded_fallback_total{reason=\"nothing_at_price\"} ".to_string(),
+            "solver_matcher_bounded_fallback_total{reason=\"walk_error\"} ".to_string(),
+            "solver_matcher_walk_sit_outs_total ".to_string(),
+            "solver_matcher_walk_benched_filled_total ".to_string(),
         ] {
             assert!(body.contains(&line), "missing {line:?} in:\n{body}");
         }

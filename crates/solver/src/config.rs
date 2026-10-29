@@ -13,8 +13,8 @@ use thiserror::Error;
 
 pub use crate::price::BinanceConfig;
 use crate::price::{
-    parse_positive_decimal, AssetCode, ClearingMarket, MarketError, MarketPlan, PricePrecision,
-    Symbol,
+    parse_positive_decimal, AssetCode, ClearingMarket, MarketError, MarketPlan, PairRules,
+    PricePrecision, Symbol,
 };
 use crate::types::TokenId;
 
@@ -24,6 +24,9 @@ const BINANCE_CONNECTION_ATTEMPT_LIMIT: usize = 300;
 /// The TTL is what pauses clearing when both readers stall; a typo that makes
 /// it minutes long would clear at a frozen price.
 const MAX_QUOTE_TTL: Duration = Duration::from_secs(60);
+/// A pair's band is a few tens of basis points; above 1% a typo would let a
+/// batch clear far from the market.
+const MAX_BAND_BPS: u16 = 100;
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
@@ -69,6 +72,18 @@ pub(crate) enum ConfigError {
         symbol: Symbol,
         forward: Symbol,
         reverse: Symbol,
+    },
+    #[error("pair {pair}: band_bps must be at most {maximum}, got {value}")]
+    BandTooWide {
+        pair: String,
+        value: u16,
+        maximum: u16,
+    },
+    #[error("pair {pair}: quote_ttl_ms must be between 1 and {maximum}, got {value}")]
+    InvalidPairTtl {
+        pair: String,
+        value: u64,
+        maximum: u128,
     },
     #[error(transparent)]
     Market(MarketError),
@@ -154,9 +169,44 @@ pub struct AssetPairConfig {
     /// comes from `exchangeInfo`, so either pair orientation works.
     #[serde(default)]
     pub binance_symbol: Option<Symbol>,
+    /// Half-width, in basis points, of the band around the Binance mid that
+    /// the pair's batch price may move in (bounded clearing price, ADR 0007).
+    /// `0`, the default, clears at the mid. At most 1%.
+    #[serde(default)]
+    pub band_bps: u16,
+    /// The pair's own quote freshness; without it `binance.quote_ttl_ms`.
+    /// The same 60 s cap applies.
+    #[serde(default)]
+    pub quote_ttl_ms: Option<u64>,
 }
 
 impl AssetPairConfig {
+    /// The pair's band and freshness, within their limits.
+    fn rules(&self) -> std::result::Result<PairRules, ConfigError> {
+        if self.band_bps > MAX_BAND_BPS {
+            return Err(ConfigError::BandTooWide {
+                pair: self.name.clone(),
+                value: self.band_bps,
+                maximum: MAX_BAND_BPS,
+            });
+        }
+        let quote_ttl = match self.quote_ttl_ms {
+            None => None,
+            Some(ms) if ms == 0 || Duration::from_millis(ms) > MAX_QUOTE_TTL => {
+                return Err(ConfigError::InvalidPairTtl {
+                    pair: self.name.clone(),
+                    value: ms,
+                    maximum: MAX_QUOTE_TTL.as_millis(),
+                });
+            }
+            Some(ms) => Some(Duration::from_millis(ms)),
+        };
+        Ok(PairRules {
+            band_bps: self.band_bps,
+            quote_ttl,
+        })
+    }
+
     /// The pair's faucets, `(asset_x, asset_y)`.
     fn faucets(&self) -> std::result::Result<(TokenId, TokenId), ConfigError> {
         let parse = |hex: &str, side: &'static str| {
@@ -547,6 +597,7 @@ impl SolverConfig {
         let mut assets = Vec::new();
         let mut clearing = Vec::new();
         for (pair, (x, y)) in self.pairs.iter().zip(self.faucet_pairs()?) {
+            let rules = pair.rules()?;
             let codes = [
                 (x, &pair.asset_x_binance_asset),
                 (y, &pair.asset_y_binance_asset),
@@ -582,6 +633,7 @@ impl SolverConfig {
                 base: x,
                 quote: y,
                 symbol: symbol.clone(),
+                rules,
             });
         }
         let quote = self.binance.valuation_quote_asset.clone();
@@ -668,6 +720,36 @@ mod tests {
         let saved = toml::to_string(&config).unwrap();
         assert!(saved.contains("retry_min_ms = 250"), "{saved}");
         assert!(saved.contains("connection_lifetime_secs = 7200"), "{saved}");
+    }
+
+    /// A pair's band and freshness are optional, read in their key units and
+    /// capped; without them the pair clears at the mid as before.
+    #[test]
+    fn pair_band_and_freshness_are_optional_and_capped() {
+        assert_eq!(example().pairs[0].rules().unwrap(), PairRules::default());
+        let text = EXAMPLE.replace(
+            r#"binance_symbol = "ETHUSDT""#,
+            "binance_symbol = \"ETHUSDT\"\nband_bps = 30\nquote_ttl_ms = 1500",
+        );
+        let config = parsed(&text);
+        config.validate().unwrap();
+        assert_eq!(
+            config.pairs[0].rules().unwrap(),
+            PairRules {
+                band_bps: 30,
+                quote_ttl: Some(Duration::from_millis(1500)),
+            }
+        );
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("band_bps = 30"), "{saved}");
+        accepted(|c| c.pairs[0].band_bps = MAX_BAND_BPS);
+        let wide = check(|c| c.pairs[0].band_bps = MAX_BAND_BPS + 1);
+        assert!(wide.contains("band_bps must be at most 100"), "{wide}");
+        accepted(|c| c.pairs[0].quote_ttl_ms = Some(60_000));
+        for bad in [0, 60_001] {
+            let error = check(|c| c.pairs[0].quote_ttl_ms = Some(bad));
+            assert!(error.contains("quote_ttl_ms must be between 1"), "{error}");
+        }
     }
 
     #[test]

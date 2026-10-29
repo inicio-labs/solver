@@ -18,7 +18,7 @@ mod ticker;
 pub(crate) use feed::spawn_price_feed_thread;
 pub use feed::{BinanceConfig, FeedMetrics};
 pub use market::{AssetCode, MarketError, Symbol};
-pub(crate) use market::{ClearingMarket, MarketPlan};
+pub(crate) use market::{ClearingMarket, MarketPlan, PairRules};
 pub use snapshot::PriceSnapshot;
 pub(crate) use snapshot::{PriceUnavailable, Valued};
 pub(crate) use ticker::parse_positive_decimal;

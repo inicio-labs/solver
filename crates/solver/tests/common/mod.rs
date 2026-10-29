@@ -431,6 +431,8 @@ pub fn pair_config(
         asset_y_faucet_id: y.to_hex(),
         asset_y_binance_asset: Some(asset(y_asset)),
         binance_symbol: Some(solver::price::Symbol::parse(symbol).expect("valid symbol")),
+        band_bps: 0,
+        quote_ttl_ms: None,
     }
 }
 
@@ -450,6 +452,8 @@ pub fn unpriced_pair_config(
             solver::price::AssetCode::parse(y_asset).expect("valid asset code"),
         ),
         binance_symbol: None,
+        band_bps: 0,
+        quote_ttl_ms: None,
     }
 }
 

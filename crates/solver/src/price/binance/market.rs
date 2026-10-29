@@ -10,6 +10,7 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::time::Duration;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -186,6 +187,18 @@ pub struct ClearingMarket {
     pub base: TokenId,
     pub quote: TokenId,
     pub symbol: Symbol,
+    pub rules: PairRules,
+}
+
+/// A clearing pair's own settings from its `[[pairs]]` block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PairRules {
+    /// Half-width of the band around the mid that the pair's batch price may
+    /// move in, in basis points (bounded clearing price, ADR 0007). `0`
+    /// clears at the mid.
+    pub band_bps: u16,
+    /// How long the pair's quote stays fresh; `None` uses the snapshot's TTL.
+    pub quote_ttl: Option<Duration>,
 }
 
 /// The markets the configuration asks for, before Binance has confirmed them.
@@ -369,6 +382,7 @@ impl MarketPlan {
                             orientation,
                             base_decimals,
                             quote_decimals,
+                            rules: market.rules,
                         },
                     );
                     if let Some(kind) = warning {
@@ -466,6 +480,7 @@ pub(crate) struct PairSource {
     pub(crate) orientation: Orientation,
     pub(crate) base_decimals: u8,
     pub(crate) quote_decimals: u8,
+    pub(crate) rules: PairRules,
 }
 
 impl PairSource {
@@ -544,6 +559,14 @@ impl Markets {
 
     pub(crate) fn valuation(&self, token: TokenId) -> Option<Valuation> {
         self.valuation.get(&token).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pair_rules(&mut self, base: TokenId, quote: TokenId, rules: PairRules) {
+        self.pairs
+            .get_mut(&(base, quote))
+            .expect("a confirmed clearing pair")
+            .rules = rules;
     }
 }
 
@@ -636,6 +659,7 @@ mod tests {
                 orientation: Orientation::Reverse,
                 base_decimals: 6,
                 quote_decimals: 18,
+                rules: PairRules::default(),
             })
         );
         assert_eq!(markets.pair(eth(), usdt()), None);

@@ -42,11 +42,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::clearing::OrderSide;
+use crate::clearing::{BatchPrice, OrderSide};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, SwapBookSnapshot};
 use crate::price::PricePrecision;
-use crate::price::{MarketPlan, PriceSnapshot, PriceUnavailable, Valued};
+use crate::price::{MarketPlan, OrderMarket, PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
     eval_can_fill, eval_off_market, expected_price, fill_price, judge, whole_price, DepthBook,
     DepthChange, FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, SettlementStats,
@@ -580,6 +580,21 @@ fn pair_sides(
     }
 }
 
+/// The expected batch price, or the mid if the walk fails (an overflow on
+/// extreme amounts): what the matcher clears at in that case too.
+fn walked_or_mid(
+    market: &OrderMarket,
+    fee_ppm: u32,
+    sells: &[BookLevel],
+    buys: &[BookLevel],
+    probe: Probe,
+) -> BatchPrice {
+    expected_price(market, fee_ppm, sells, buys, probe).unwrap_or_else(|error| {
+        tracing::debug!(%error, "bounded price failed; quoting at the mid");
+        market.price
+    })
+}
+
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
 ///
 /// The pair's expected batch price for this direction, under the same
@@ -599,10 +614,8 @@ async fn get_pair_price(
     let fee_ppm = state.verdict_terms.fee_ppm;
     let book = state.book_rx.borrow().clone();
     let (sells, buys) = pair_sides(&book, market.side, a, b);
-    let expected = expected_price(&market, fee_ppm, sells, buys, Probe::Reference)
-        .ok()
-        .and_then(|price| whole_price(&market, price))
-        .ok_or(ApiError::NoPrice)?;
+    let price = walked_or_mid(&market, fee_ppm, sells, buys, Probe::Reference);
+    let expected = whole_price(&market, price).ok_or(ApiError::NoPrice)?;
     let fill = fill_price(market.side, expected, fee_ppm).ok_or(ApiError::NoPrice)?;
     Ok(Json(PairPriceResponse {
         offered_faucet: a.to_hex(),
@@ -646,8 +659,7 @@ async fn get_swap_eta(
             // The batch price with this order in the book (ADR 0007); the
             // order is judged at it, as the matcher would clear it.
             let (sells, buys) = pair_sides(&book, market.side, a, b);
-            let price = expected_price(&market, terms.fee_ppm, sells, buys, Probe::Order(order))
-                .map_err(cannot_price)?;
+            let price = walked_or_mid(&market, terms.fee_ppm, sells, buys, Probe::Order(order));
             let verdict = judge(
                 market.side,
                 price,

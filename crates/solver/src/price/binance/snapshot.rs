@@ -364,6 +364,16 @@ impl PriceSnapshot {
         Self::build_for_tests(pairs, valuations, decimals, ttl, false)
     }
 
+    /// Like [`Self::for_tests`] with the tokens' `decimals`.
+    pub(crate) fn for_tests_with_decimals(
+        pairs: &[(TokenId, TokenId, &str, Instant)],
+        decimals: &[(TokenId, u8)],
+        ttl: Duration,
+    ) -> Self {
+        let decimals = decimals.iter().copied().collect();
+        Self::build_for_tests(pairs, &[], decimals, ttl, false)
+    }
+
     /// Like [`Self::for_tests`] with the tokens' `decimals`, but every pair's
     /// symbol is listed the other way round (Binance's base is the pair's
     /// quote), as `ETHUSDC` prices a USDC/ETH pair. `price` is still whole

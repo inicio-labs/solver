@@ -1278,3 +1278,69 @@ async fn swap_eta_judges_the_band_against_the_expected_price() {
     assert_eq!(v["expectedPrice"], "1.996703296703296703");
     assert_eq!(v["fillPrice"], "1.994706593406593406");
 }
+
+/// The docs' ETH/USDT example: 18 and 6 decimals, Binance listing the pair
+/// either way round. The expected price is exact, and an ask built from
+/// `fillPrice` with no slippage fills in full at it.
+#[tokio::test]
+async fn the_expected_price_uses_the_tokens_decimals() {
+    let pairs = [(faucet_a(), faucet_b(), "2500", received(true))];
+    let decimals = [(faucet_a(), 18), (faucet_b(), 6)];
+    let rules = PairRules {
+        band_bps: 30,
+        quote_ttl: None,
+        reference_amount: Some(Decimal::from(10)),
+    };
+    // A maker sells 5 ETH at 2,501.63 USDT each (+6.5 bps).
+    let ask = BookLevel {
+        rate: RateKey::new(2_501_630_000, 1_000_000_000_000_000_000),
+        volume: 5_000_000_000_000_000_000,
+    };
+    let book: SwapBookSnapshot = [((faucet_a(), faucet_b()), vec![ask])].into();
+    let registered: Vec<_> = registered()
+        .iter()
+        .map(|(id, dec)| (*id, *dec, None))
+        .collect();
+    for snapshot in [
+        PriceSnapshot::for_tests_with_decimals(&pairs, &decimals, TTL),
+        PriceSnapshot::for_tests_reversed(&pairs, &decimals, TTL),
+    ] {
+        let snapshot = snapshot.with_pair_rules(faucet_a(), faucet_b(), rules);
+        let h = serve(&registered, snapshot, book.clone(), running()).await;
+        // Buying ETH: 2,504.13 USDT each after the fee, 0.00039934 ETH per USDT.
+        let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+        assert_eq!(v["marketPrice"], "0.0004");
+        assert_eq!(v["expectedPrice"], "0.000399339630560874");
+        let fill: Decimal = v["fillPrice"].as_str().unwrap().parse().unwrap();
+        // 1,000 USDT asking exactly `fill` ETH per USDT.
+        let requested = (fill * Decimal::from(1_000_000_000_000_000_000_000u128)).floor();
+        let order = b_for_a(&format!(
+            "offered_amount=1000000000&requested_amount={requested}"
+        ));
+        let v = swap_get(&h, &order).await;
+        assert_eq!(v["priceBand"], "at_market");
+        assert_eq!(v["fillStatus"], "full");
+        assert_eq!(v["expectedPrice"], "0.000399339630560874");
+        // Selling ETH: no buyer inside the band, so the mid.
+        let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+        assert_eq!(v["expectedPrice"], "2500");
+        assert_eq!(v["fillPrice"], "2497.5");
+    }
+}
+
+/// A walk that fails (here a band of 100%, which config never allows)
+/// quotes the mid, as the matcher clears at the mid; it never takes the
+/// endpoints down or blames the order.
+#[tokio::test]
+async fn a_failed_walk_quotes_the_mid() {
+    let h = banded_server(10_000, makers_ask()).await;
+    let v: Value = h.server.get(&pair_url(faucet_b(), faucet_a())).await.json();
+    assert_eq!(v["expectedPrice"], "0.5");
+    let v = swap_get(
+        &h,
+        &b_for_a("offered_amount=1000000&requested_amount=495000"),
+    )
+    .await;
+    assert_eq!(v["expectedPrice"], "0.5");
+    assert_eq!(v["reason"], "liquidity");
+}

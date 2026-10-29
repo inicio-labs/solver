@@ -469,8 +469,9 @@ fn reference_leg(market: &OrderMarket, band: &Band) -> Result<Option<Leg<()>>, C
         OrderSide::SellBase => market.requested_decimals,
         OrderSide::BuyBase => market.offered_decimals,
     };
-    let units = Decimal::from(10u64.pow(u32::from(quote_decimals)))
-        .checked_mul(amount)
+    let units = 10u64
+        .checked_pow(u32::from(quote_decimals))
+        .and_then(|scale| Decimal::from(scale).checked_mul(amount))
         .and_then(|units| units.floor().to_u64())
         .ok_or(ClearingError::ArithmeticOverflow)?;
     if units == 0 {
@@ -547,7 +548,8 @@ impl Legs<()> for LevelLegs<'_> {
 
 /// `price`, in quote units per base unit of the pair, as whole requested
 /// tokens per whole offered token on `market`'s side, rounded toward zero at
-/// 18 places. The mid itself comes back exactly as `market.market`.
+/// 18 places, or at fewer when a large price leaves a `Decimal` no room for
+/// 18. The mid itself comes back exactly as `market.market`.
 pub(crate) fn whole_price(market: &OrderMarket, price: BatchPrice) -> Option<Decimal> {
     if price == market.price {
         return Some(market.market);
@@ -557,16 +559,16 @@ pub(crate) fn whole_price(market: &OrderMarket, price: BatchPrice) -> Option<Dec
         OrderSide::BuyBase => (price.base_units, price.quote_units),
     };
     let ten = |power: u8| U256::from(10u8).checked_pow(U256::from(power));
-    let scaled = requested
-        .checked_mul(ten(market.offered_decimals)?)?
-        .checked_mul(ten(18)?)?
-        / offered.checked_mul(ten(market.requested_decimals)?)?;
-    let mantissa = i128::try_from(scaled).ok()?;
-    Some(
-        Decimal::try_from_i128_with_scale(mantissa, 18)
-            .ok()?
-            .normalize(),
-    )
+    let numerator = requested.checked_mul(ten(market.offered_decimals)?)?;
+    let denominator = offered.checked_mul(ten(market.requested_decimals)?)?;
+    (0..=18u8).rev().find_map(|places| {
+        let mantissa = i128::try_from(numerator.checked_mul(ten(places)?)? / denominator).ok()?;
+        Some(
+            Decimal::try_from_i128_with_scale(mantissa, u32::from(places))
+                .ok()?
+                .normalize(),
+        )
+    })
 }
 
 /// The price an ask is built from, per whole offered token, in whole
@@ -732,6 +734,38 @@ mod tests {
     }
 
     // ── expected price ────────────────────────────────────────────────────
+    /// A token with more decimals than a `u64` power of ten holds is an
+    /// error the caller can fall back from, not a panic.
+    #[test]
+    fn a_reference_in_a_token_with_huge_decimals_is_an_error() {
+        let mut market = banded(OrderSide::BuyBase, 10);
+        market.offered_decimals = 20;
+        assert!(matches!(
+            expected_price(
+                &market,
+                0,
+                &[level(2_001, 1_000, 1_000)],
+                &[],
+                Probe::Reference
+            ),
+            Err(ClearingError::ArithmeticOverflow)
+        ));
+    }
+
+    /// A price too large for 18 places is given with fewer, not refused.
+    #[test]
+    fn a_huge_whole_price_keeps_fewer_places() {
+        let market = banded(OrderSide::SellBase, 10);
+        let huge =
+            BatchPrice::new(U256::from(10u8).pow(U256::from(20u8)), U256::from(3u8)).unwrap();
+        assert_eq!(
+            whole_price(&market, huge),
+            Some("33333333333333333333.333333333".parse().unwrap())
+        );
+        let normal = BatchPrice::from_ratio(2_001, 1_000).unwrap();
+        assert_eq!(whole_price(&market, normal), Some("2.001".parse().unwrap()));
+    }
+
     /// A bigger reference buy reaches deeper asks, so its price never falls;
     /// its own limit at the band's top never sets the price.
     #[test]

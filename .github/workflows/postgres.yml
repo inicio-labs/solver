@@ -50,7 +50,7 @@ jobs:
             crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs \
             crates/solver/src/matcher/clearing_book/bounded_price.rs \
             crates/solver/src/matcher/clearing_book/bounded_price/tests.rs \
-            crates/solver/src/obs.rs crates/solver/src/clearing/{math,mod,order,types}.rs \
+            crates/solver/src/obs.rs crates/solver/src/clearing/{bounded,math,mod,order,types}.rs \
             crates/solver/src/price/{mod,precision}.rs crates/solver/src/price/binance/*.rs \
             crates/solver/src/price/binance/feed/tests.rs crates/mock-binance/src/*.rs \
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs crates/solver/src/swap_eta.rs \

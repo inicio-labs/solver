@@ -96,7 +96,15 @@ impl Book {
 
     fn walk_with(&self, band_bps: u16, fee_ppm: u32, cap: usize) -> Option<BoundedPrice> {
         self.book
-            .bounded_price(base(), quote(), mid(), band_bps, fee_ppm, cap)
+            .bounded_price(base(), quote(), mid(), band_bps, fee_ppm, cap, true)
+            .unwrap()
+    }
+
+    /// The walk with self-trade prevention switched off, as admission is
+    /// when `engine.maker_self_trade_prevention = false`.
+    fn walk_without_stp(&self, band_bps: u16) -> Option<BoundedPrice> {
+        self.book
+            .bounded_price(base(), quote(), mid(), band_bps, 0, usize::MAX, false)
             .unwrap()
     }
 
@@ -155,7 +163,9 @@ fn a_book_that_does_not_cross_has_no_price() {
     let mut book = Book::new();
     book.maker("ask", 7, 1, SELL, 65, 5);
     book.maker("bid", 7, 2, BUY, -65, 5);
-    let walk = book.book.bounded_price(base(), quote(), mid(), 30, 0, 100);
+    let walk = book
+        .book
+        .bounded_price(base(), quote(), mid(), 30, 0, 100, true);
     assert!(walk.unwrap().is_none());
     assert!(Book::new().walk(30).is_none(), "an empty book has no price");
 }
@@ -224,6 +234,20 @@ fn a_makers_own_crossed_pair_cannot_pump_the_price() {
     let walk = book.walk(30).unwrap();
     assert_eq!(walk.price, at(80));
     assert_eq!(book.named(&walk.sit_outs), ["Y ask +25 #1", "Y bid +26 #2"]);
+}
+
+/// With self-trade prevention switched off, the walk benches nothing, as
+/// admission then skips ADR 0005: the same book prices at the crossed pair.
+#[test]
+fn without_self_trade_prevention_nothing_sits_out() {
+    let mut book = Book::new();
+    book.maker("Y ask +25 #1", 1, 1, SELL, 250, 1);
+    book.maker("Y bid +26 #2", 1, 2, BUY, 260, 1);
+    book.maker("Y ask +8 #3", 1, 3, SELL, 80, 3);
+    book.user("users", BUY, 400, 3);
+    let walk = book.walk_without_stp(30).unwrap();
+    assert!(walk.sit_outs.is_empty());
+    assert_eq!(walk.price, at(250));
 }
 
 /// Pragma's B1 → S1 → B2 → B3, every bid above the ask: B2 and B3 trade,
@@ -332,7 +356,7 @@ fn eighteen_and_six_decimals_pair_their_smallest_orders() {
     book.insert_or_skip(&fixture(false, 400_000_000, 1, 1, &mut rng));
     book.insert_or_skip(&fixture(true, 1, 400_000_000, 2, &mut rng));
     let walk = book
-        .bounded_price(base(), quote(), eth_usdt, 30, 0, 100)
+        .bounded_price(base(), quote(), eth_usdt, 30, 0, 100, true)
         .unwrap()
         .unwrap();
     assert_eq!(walk.price, eth_usdt);
@@ -347,7 +371,7 @@ fn a_band_wider_than_the_price_is_an_error_not_a_panic() {
     assert!(book.walk_with(9_999, 0, 100).is_some());
     assert!(matches!(
         book.book
-            .bounded_price(base(), quote(), mid(), 10_000, 0, 100),
+            .bounded_price(base(), quote(), mid(), 10_000, 0, 100, true),
         Err(ClearingError::InvalidConfig)
     ));
 }
@@ -359,7 +383,8 @@ fn an_overflow_is_an_error_not_a_panic() {
     book.user("buyer", BUY, 10, 1);
     let huge = BatchPrice::new(U256::from(1u8) << 250, U256::from(1u8)).unwrap();
     assert!(matches!(
-        book.book.bounded_price(base(), quote(), huge, 30, 0, 100),
+        book.book
+            .bounded_price(base(), quote(), huge, 30, 0, 100, true),
         Err(ClearingError::ArithmeticOverflow)
     ));
 }

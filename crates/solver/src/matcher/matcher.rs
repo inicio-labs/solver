@@ -379,6 +379,7 @@ fn clear_pair_bounded(
         band_bps,
         config.protocol_fee_ppm,
         config.max_orders_per_side,
+        config.self_trade_prevention,
     ) {
         Ok(Some(walk)) => walk,
         Ok(None) => {
@@ -999,7 +1000,7 @@ mod tests {
             fn walk(&self, band_bps: u16) -> Option<BoundedPrice> {
                 let mid = BatchPrice::from_ratio(2, 1).unwrap();
                 self.book
-                    .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100)
+                    .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100, true)
                     .unwrap()
             }
         }

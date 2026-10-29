@@ -53,6 +53,12 @@ asset_x_binance_asset = "USDT"
 asset_y_faucet_id = "0x<asset_y_faucet_id_hex>"
 asset_y_binance_asset = "ETH"
 binance_symbol = "ETHUSDT"
+# Bounded clearing price (ADR 0007): the batch price may move up to band_bps
+# either side of the Binance mid. 0 (the default) clears at the mid. A band
+# needs reference_amount, the size /v2/pair-price quotes at, in whole asset_y
+# tokens (here ETH: 0.004 is about $10).
+# band_bps = 30
+# reference_amount = "0.004"
 
 [engine]
 pulse_interval_ms = 5000

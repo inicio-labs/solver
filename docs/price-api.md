@@ -4,7 +4,8 @@ Read-only HTTP API for swap UIs:
 
 - `/v1/price`, `/v1/prices`: a token's **price in USDT** (the exact Binance
   Spot midpoint of its `<ASSET>USDT` market) plus its **on-chain decimals**.
-- `/v2/pair-price`: a pair's clearing price, to build an order's ask from.
+- `/v2/pair-price`: a pair's expected batch price, to build an order's ask
+  from.
 - `/v2/swap-eta`: whether the order a wallet is about to sign fills now,
   partly, or not, and why.
 - `/v1/swap-eta`: the original swap check, frozen for wallets built against
@@ -93,19 +94,22 @@ Only pairs configured as a Binance clearing market (for example `ETHUSDT`)
 can swap; both tokens having a `/v1/price` is not enough. `GET /v2/pairs`
 lists them: fetch it once for the token pickers.
 
-1. **Price.** `GET /v2/pair-price` gives `fillPrice`: the most the order can
-   ask per whole offered token and still fill now.
+1. **Price.** `GET /v2/pair-price` gives `fillPrice`, the price to build the
+   ask from: the expected batch price per whole offered token, less the fee.
 2. **Ask.** With the user's slippage as a fraction (`0.005` = 0.5%), in
    BigInt or a decimal library, never floats:
    `requested_amount = floor(offered_amount × fillPrice × (1 − slippage) × 10^requestedDecimals / 10^offeredDecimals)`
 3. **Verdict.** `GET /v2/swap-eta` with both amounts, **before the user
    signs**. Off market: go back to step 1 for a fresh price.
 
-**What the user receives.** A full fill pays the mid less the fee
-(`expectedRequestedAmount`), whatever the slippage. A partial fill pays the
-order's own rate, so there the user gets exactly what they asked. Slippage
-protects against the mid moving before the next batch; a lower ask also
-queues ahead of orders on the same side that ask more.
+**What the user receives.** A full fill pays the batch price less the fee
+(`expectedRequestedAmount`), whatever the slippage. On a pair without a
+price band the batch price is the Binance mid; on a pair with one it can be
+a quote in the book, inside the band ([Pairs with a price
+band](#pairs-with-a-price-band)). A partial fill pays the order's own rate,
+so there the user gets exactly what they asked. Slippage protects against
+the price moving before the next batch; a lower ask also queues ahead of
+orders on the same side that ask more.
 
 **Reading the verdict.** Take the first row that matches:
 
@@ -119,9 +123,36 @@ queues ahead of orders on the same side that ask more.
 | Can fill partly | `at_market` + `partial` | "Only `fillableOfferedAmount` fills now; the rest waits" |
 | Close: needs a small price move | `tolerated` + `full` or `partial` | "May take longer: fills when the price moves slightly" |
 
-Once the order is in the book, asking again counts it as volume ahead of
-itself; an order-status endpoint for the "not filling soon, cancel?" prompt
-is planned.
+Once the order is in the book, asking again counts it twice: as volume ahead
+of itself, and in the expected price. An order-status endpoint for the "not
+filling soon, cancel?" prompt is planned.
+
+### Pairs with a price band
+
+A pair can have a price band (`band_bps` in the solver's configuration). On
+such a pair every round still clears at one price for all its full fills,
+but that price is not always the Binance mid: it is the price inside
+`mid ± band` that trades the most volume, and among those the one closest to
+the mid. When more users buy than sell, a maker's ask above the mid can set
+it; when more sell than buy, a bid below. Users never pay outside the band.
+
+Both swap endpoints quote that price as `expectedPrice`, from the solver's
+own rule run on its book:
+
+- `/v2/pair-price` adds one order of the pair's reference size in the asked
+  direction, so the answer is the price a typical order gets now;
+- `/v2/swap-eta` adds the order being checked, so the answer is for its own
+  size and limit, and the verdict is judged at that price.
+
+On a pair without a band, `expectedPrice` equals `marketPrice` and every
+other field is as before.
+
+The expected price is an estimate for the next batch, on the book as it is
+now. Not modelled: a maker's own crossed orders, which the solver leaves out
+while pricing; all-or-nothing orders; the solver's fallback to the mid when
+nothing can trade at the band price; the per-side order cap; and the Binance
+mid moving before the batch. Show it as "≈", with `requestedAmount` as the
+guaranteed minimum, and ask again right before the user signs.
 
 ### `GET /v2/pairs` — what the solver swaps
 
@@ -171,20 +202,24 @@ contains it. Then `/v2/pair-price` gives the price in the chosen direction.
 ```json
 {
   "offeredFaucet": "0x…", "requestedFaucet": "0x…",
-  "marketPrice": "2500", "fillPrice": "2497.5", "feePpm": 1000,
-  "offeredDecimals": 18, "requestedDecimals": 6,
+  "marketPrice": "2500", "expectedPrice": "2500", "fillPrice": "2497.5",
+  "feePpm": 1000, "offeredDecimals": 18, "requestedDecimals": 6,
   "asOf": 1791470000
 }
 ```
 
 Prices are per offered token, so they depend on the direction: offering USDT
-for ETH on the same market gives `marketPrice` `"0.0004"` and `fillPrice`
-`"0.000399600399600399"` (ETH per USDT; invert them for display).
+for ETH on the same market gives `marketPrice` and `expectedPrice` `"0.0004"`
+and `fillPrice` `"0.000399600399600399"` (ETH per USDT; invert them for
+display). With a band and a maker selling ETH at 2501.63 USDT, the same
+request gives `expectedPrice` `"0.000399339630560874"`: 2501.63 USDT plus
+the fee per ETH.
 
 | Field | Meaning |
 |---|---|
 | `marketPrice` | the Binance mid, in whole requested tokens per whole offered token |
-| `fillPrice` | the most an ask can name per whole offered token and still fill now: selling the pair's base token, mid × (1 − fee); buying it, mid ÷ (1 + fee); rounded down at 18 decimals. A limit for the ask, not the payout |
+| `expectedPrice` | the batch price an order of the pair's reference size gets now, in whole requested tokens per whole offered token, rounded down at 18 decimals: `marketPrice` on a pair without a band ([Pairs with a price band](#pairs-with-a-price-band)) |
+| `fillPrice` | the price to build an ask from, per whole offered token: `expectedPrice` after the fee, selling the pair's base token × (1 − fee), buying it ÷ (1 + fee); rounded down at 18 decimals. An ask at it is eligible at the expected price; a full fill pays the batch price less the fee |
 | `feePpm` | the clearing fee in parts per million (`1000` = 0.1%; may be `0`) |
 | `offeredDecimals`, `requestedDecimals` | the tokens' on-chain decimals |
 | `asOf` | unix seconds the solver received the Binance quote |
@@ -216,7 +251,7 @@ by the solver's own rules, plus how long it takes.
   "maxOfferedAmount": "3200000000000000000",
   "expectedRequestedAmount": "2497500000",
   "feePpm": 1000, "feeAmount": "2500000",
-  "marketPrice": "2500", "fillPrice": "2497.5",
+  "marketPrice": "2500", "expectedPrice": "2500", "fillPrice": "2497.5",
   "settlementsRunning": true,
   "estimatedSeconds": 14, "median24hSeconds": 11
 }
@@ -232,19 +267,20 @@ whole offered token.
 | Field | Meaning |
 |---|---|
 | `offeredAmount`, `requestedAmount` | the order, as asked |
-| `priceBand` | `at_market`: fills at the current price · `tolerated`: fills once the price moves up to 0.5% (set per deployment) in the order's favour; its fill fields are judged at the price where it starts to fill · `off_market`: further than that |
+| `priceBand` | judged against `expectedPrice`. `at_market`: fills at it · `tolerated`: fills once the price moves up to 0.5% (set per deployment) in the order's favour; its fill fields are judged at the price where it starts to fill · `off_market`: further than that |
 | `fillStatus`, `reason` | `full`, `partial` or `none`; for `none`, why: `price`, `liquidity`, `no_market` or `no_price` |
 | `fillableOfferedAmount`, `fillableRequestedAmount` | how much of the order fills now, at the order's own rate |
 | `maxOfferedAmount` | the most of the offered token an order at this rate fills now, after the orders ahead of it; not capped by `offeredAmount` ("max you can swap now") |
-| `expectedRequestedAmount` | what a full fill pays at the current price: the mid less the fee, never less than `requestedAmount` |
+| `expectedRequestedAmount` | what a full fill pays: `expectedPrice` less the fee, never less than `requestedAmount` |
 | `feePpm`, `feeAmount` | the clearing fee, and what it takes from that full fill (requested token). It only comes out of the surplus over the ask, so it is smaller, down to `0`, for an order that is not at market |
-| `marketPrice`, `fillPrice` | as on `/v2/pair-price` |
+| `marketPrice` | as on `/v2/pair-price` |
+| `expectedPrice`, `fillPrice` | as on `/v2/pair-price`, for this order: the batch price with it in the book |
 | `settlementsRunning` | `false` while the solver cannot settle (missing fee funds, node or database down) or has just restarted: orders wait |
 | `estimatedSeconds` | next-batch ETA when settlements are running and the order is `at_market` and fills fully or partly; otherwise `null` |
 | `median24hSeconds` | the pair's median settlement time over the last 24 h |
 
 Without a price, `priceBand`, `maxOfferedAmount`, `expectedRequestedAmount`,
-`feeAmount`, `marketPrice` and `fillPrice` are `null`, and the answer is still
+`feeAmount`, `marketPrice`, `expectedPrice` and `fillPrice` are `null`, and the answer is still
 `200` with reason `no_market` or `no_price`. Off market, `maxOfferedAmount` is
 `null`. Optional fields are `null`, never omitted.
 
@@ -252,7 +288,8 @@ The verdict is advisory: nothing is reserved, so two wallets can be told
 `full` for the same liquidity. It counts the solver's own book only. Not
 modelled: external liquidity routing, the per-side order cap of one batch,
 and other orders' own minimum fills (an all-or-nothing order counts in full
-even when it could not fill against this one). Errors: see
+even when it could not fill against this one); on a pair with a band, also
+what [Pairs with a price band](#pairs-with-a-price-band) lists. Errors: see
 [Status codes](#status-codes).
 
 ### `GET /v1/swap-eta` — the original check (frozen)
@@ -272,7 +309,8 @@ required); it answers:
 
 It looks at the top of the book only and ignores the clearing fee, so it can
 differ from what the solver does; `/v2/swap-eta` follows the solver's own
-rule.
+rule. Its `marketPrice` and `offMarket` refer to the Binance mid: on a pair
+with a band the batch price can be up to the band away from it.
 
 ### Status codes
 

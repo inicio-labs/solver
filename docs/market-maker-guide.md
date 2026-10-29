@@ -1015,6 +1015,12 @@ A small newer order cancels larger older ones on the other side: the rule follow
 - Cancel an old quote before you send its replacement, or send the replacement on the same side.
 - Use private notes, or send `SubmitOrder` before you commit a public note. We match a public note as soon as we see it on chain ([7.1](#private-or-public-order-notes)); until your submit for it is stored, it has no maker ID and is not grouped with your other orders.
 
+### Pairs with a price band
+
+On a pair with a price band ([ADR 0007](adr/0007-bounded-clearing-price.md)), the round's price is not always the Binance mid. It is the price inside the band that trades the most volume, and among those the one closest to the mid. When users buy more than they sell, your ask can set the price; when they sell more, your bid can. Every fully filled order in the round trades at that one price.
+
+Your crossed orders are also checked before the price is chosen: the older of each of your bids and asks that clash is left out while pricing, so your own crossed pair can never set the price. Your normal two-sided quote is not affected. The rule above still decides, at the chosen price, which of your orders trade and which are cancelled.
+
 ---
 
 ## 13. Errors and what to do

@@ -6,9 +6,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::clearing_book::{ClearingBook, ClearingBootstrap};
+use super::clearing_book::{BoundedPrice, ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
-use crate::clearing::{ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
+use crate::clearing::{BatchPrice, ClearingConfig, ClearingOutcome, PairMatcher, SkipReason};
 use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::swap_eta::DepthChange;
 use crate::types::*;
@@ -17,6 +17,23 @@ static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
+static BOUNDED_OFF_MID: AtomicU64 = AtomicU64::new(0);
+static BOUNDED_FALLBACKS: [AtomicU64; MidFallback::COUNT] =
+    [const { AtomicU64::new(0) }; MidFallback::COUNT];
+static WALK_SIT_OUTS: AtomicU64 = AtomicU64::new(0);
+static WALK_BENCHED_FILLED: AtomicU64 = AtomicU64::new(0);
+
+/// Why a pair with a band cleared at the mid after all (ADR 0007).
+#[derive(Clone, Copy, Debug, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter)]
+#[strum(serialize_all = "snake_case")]
+enum MidFallback {
+    /// Nothing crossed inside the band once rule B had sat stale orders out.
+    WalkFoundNothing,
+    /// Admission and matching at the walk's price traded nothing.
+    NothingAtPrice,
+    /// The walk failed, e.g. an arithmetic overflow.
+    WalkError,
+}
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
@@ -35,6 +52,32 @@ pub(crate) fn price_skips() -> impl Iterator<Item = (&'static str, u64)> {
             PRICE_SKIPS[reason as usize].load(Ordering::Relaxed),
         )
     })
+}
+
+/// Pairs with a band that cleared at a price off the mid.
+pub(crate) fn bounded_off_mid() -> u64 {
+    BOUNDED_OFF_MID.load(Ordering::Relaxed)
+}
+
+/// Pairs with a band that cleared at the mid after all, per reason.
+pub(crate) fn bounded_fallbacks() -> impl Iterator<Item = (&'static str, u64)> {
+    MidFallback::iter().map(|reason| {
+        (
+            reason.into(),
+            BOUNDED_FALLBACKS[reason as usize].load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// Maker orders rule B sat out while pricing.
+pub(crate) fn walk_sit_outs() -> u64 {
+    WALK_SIT_OUTS.load(Ordering::Relaxed)
+}
+
+/// Orders the walk sat out that admission still let fill at the walk's
+/// price: the fingerprint of the dust-bid lever (issue #62).
+pub(crate) fn walk_benched_filled() -> u64 {
+    WALK_BENCHED_FILLED.load(Ordering::Relaxed)
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
@@ -171,55 +214,19 @@ pub(super) fn internal_clear(
             }
         };
         // The price is already in base units: the market plan knows both
-        // tokens' decimals.
-        let (batch, self_trade) = match book.build_pair_batch(base, quote, price, &runtime.config) {
-            Ok(built) => built,
-            Err(error) => {
-                tracing::error!(%base, %quote, %error, "clearing admission failed");
-                continue;
-            }
+        // tokens' decimals. A pair without a band clears at the mid.
+        let band_bps = prices
+            .markets()
+            .pair(base, quote)
+            .map_or(0, |pair| pair.rules.band_bps);
+        let execution = if band_bps == 0 {
+            clear_pair_at(book, base, quote, price, &runtime.config)
+        } else {
+            clear_pair_bounded(book, base, quote, price, band_bps, &runtime.config)
         };
-        let plan = match PairMatcher::new(&batch, &runtime.config).clear() {
-            Ok(ClearingOutcome::Accepted(plan)) => plan,
-            Ok(ClearingOutcome::Skipped(reason)) => {
-                match reason {
-                    SkipReason::ResourceLimit => {
-                        tracing::warn!(%base, %quote, "pair clearing resource limit exceeded");
-                    }
-                    SkipReason::Insolvent {
-                        base_shortfall,
-                        quote_shortfall,
-                        ..
-                    } => {
-                        tracing::warn!(%base, %quote, %base_shortfall, %quote_shortfall, "pair candidate was insolvent; nothing submitted");
-                    }
-                    other => tracing::debug!(%base, %quote, ?other, "pair did not clear"),
-                }
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(%base, %quote, %error, "pair clearing failed");
-                continue;
-            }
+        let Some(execution) = execution else {
+            continue;
         };
-        let mut execution = match plan.to_execution_batch(&batch) {
-            Ok(execution) => execution,
-            Err(error) => {
-                tracing::error!(%base, %quote, %error, "clearing execution batch construction failed");
-                continue;
-            }
-        };
-        book.attach_self_trade_cancels(self_trade, &mut execution);
-        tracing::info!(
-            %base,
-            %quote,
-            orders = execution.filled_notes.len(),
-            fee_base = %plan.accruals.realized_protocol_fee.base,
-            fee_quote = %plan.accruals.realized_protocol_fee.quote,
-            surplus_base = %plan.accruals.rounding_surplus.base,
-            surplus_quote = %plan.accruals.rounding_surplus.quote,
-            "clearing pair included in combined batch"
-        );
         combined.filled_notes.extend(execution.filled_notes);
         combined.group_ends.push(combined.filled_notes.len());
         included_pairs += 1;
@@ -257,6 +264,148 @@ pub(super) fn internal_clear(
         "combined clearing batch sent to executor"
     );
     Ok(())
+}
+
+/// One pair cleared at one price: its execution batch with the sit-outs to
+/// cancel attached, or `None` when nothing trades there. Every outcome but
+/// an accepted plan is logged here.
+fn clear_pair_at(
+    book: &ClearingBook,
+    base: TokenId,
+    quote: TokenId,
+    price: BatchPrice,
+    config: &ClearingConfig,
+) -> Option<ExecutionBatch> {
+    let (batch, self_trade) = match book.build_pair_batch(base, quote, price, config) {
+        Ok(built) => built,
+        Err(error) => {
+            tracing::error!(%base, %quote, %error, "clearing admission failed");
+            return None;
+        }
+    };
+    let plan = match PairMatcher::new(&batch, config).clear() {
+        Ok(ClearingOutcome::Accepted(plan)) => plan,
+        Ok(ClearingOutcome::Skipped(reason)) => {
+            match reason {
+                SkipReason::ResourceLimit => {
+                    tracing::warn!(%base, %quote, "pair clearing resource limit exceeded");
+                }
+                SkipReason::Insolvent {
+                    base_shortfall,
+                    quote_shortfall,
+                    ..
+                } => {
+                    tracing::warn!(%base, %quote, %base_shortfall, %quote_shortfall, "pair candidate was insolvent; nothing submitted");
+                }
+                other => tracing::debug!(%base, %quote, ?other, "pair did not clear"),
+            }
+            return None;
+        }
+        Err(error) => {
+            tracing::error!(%base, %quote, %error, "pair clearing failed");
+            return None;
+        }
+    };
+    let mut execution = match plan.to_execution_batch(&batch) {
+        Ok(execution) => execution,
+        Err(error) => {
+            tracing::error!(%base, %quote, %error, "clearing execution batch construction failed");
+            return None;
+        }
+    };
+    book.attach_self_trade_cancels(self_trade, &mut execution);
+    tracing::info!(
+        %base,
+        %quote,
+        orders = execution.filled_notes.len(),
+        fee_base = %plan.accruals.realized_protocol_fee.base,
+        fee_quote = %plan.accruals.realized_protocol_fee.quote,
+        surplus_base = %plan.accruals.rounding_surplus.base,
+        surplus_quote = %plan.accruals.rounding_surplus.quote,
+        "clearing pair included in combined batch"
+    );
+    Some(execution)
+}
+
+/// A pair with a band (ADR 0007): the walk's price when anything trades
+/// there, otherwise the mid, exactly as without a band.
+fn clear_pair_bounded(
+    book: &ClearingBook,
+    base: TokenId,
+    quote: TokenId,
+    mid: BatchPrice,
+    band_bps: u16,
+    config: &ClearingConfig,
+) -> Option<ExecutionBatch> {
+    let fallback = |reason: MidFallback| {
+        BOUNDED_FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
+        clear_pair_at(book, base, quote, mid, config)
+    };
+    let walk = match book.bounded_price(
+        base,
+        quote,
+        mid,
+        band_bps,
+        config.protocol_fee_ppm,
+        config.max_orders_per_side,
+    ) {
+        Ok(Some(walk)) => walk,
+        Ok(None) => {
+            tracing::debug!(%base, %quote, "nothing crossed inside the band; clearing at the mid");
+            return fallback(MidFallback::WalkFoundNothing);
+        }
+        Err(error) => {
+            tracing::warn!(%base, %quote, %error, "bounded price failed; clearing at the mid");
+            return fallback(MidFallback::WalkError);
+        }
+    };
+    WALK_SIT_OUTS.fetch_add(walk.sit_outs.len() as u64, Ordering::Relaxed);
+    if walk.price == mid {
+        return clear_pair_at(book, base, quote, mid, config);
+    }
+    let Some(execution) = clear_pair_at(book, base, quote, walk.price, config) else {
+        tracing::debug!(%base, %quote, price = ?walk.price, "nothing traded at the bounded price; clearing at the mid");
+        return fallback(MidFallback::NothingAtPrice);
+    };
+    BOUNDED_OFF_MID.fetch_add(1, Ordering::Relaxed);
+    let benched_filled = execution
+        .filled_notes
+        .iter()
+        .filter(|filled| walk.sit_outs.contains(&filled.note_id))
+        .count();
+    WALK_BENCHED_FILLED.fetch_add(benched_filled as u64, Ordering::Relaxed);
+    log_bounded_price(base, quote, mid, &walk, benched_filled);
+    Some(execution)
+}
+
+fn log_bounded_price(
+    base: TokenId,
+    quote: TokenId,
+    mid: BatchPrice,
+    walk: &BoundedPrice,
+    benched_filled: usize,
+) {
+    tracing::info!(
+        %base,
+        %quote,
+        bps_from_mid = bps_from(walk.price, mid),
+        price = ?walk.price,
+        mid = ?mid,
+        sell_limit = ?walk.sell_limit,
+        buy_limit = ?walk.buy_limit,
+        walk_volume = %walk.volume,
+        stop = ?walk.stop,
+        sit_outs = walk.sit_outs.len(),
+        price_setter = ?walk.price_setter,
+        benched_filled,
+        "pair cleared at its bounded price"
+    );
+}
+
+/// `price` against `mid` in basis points, for logs only.
+fn bps_from(price: BatchPrice, mid: BatchPrice) -> f64 {
+    let ratio = |p: BatchPrice| f64::from(p.quote_units) / f64::from(p.base_units);
+    (ratio(price) / ratio(mid) - 1.0) * 10_000.0
 }
 
 #[cfg(test)]
@@ -669,5 +818,219 @@ mod tests {
             exec_rx.try_recv().is_err(),
             "swapped decimals must not produce a batch"
         );
+    }
+
+    /// The bounded clearing price (ADR 0007) through `internal_clear`, on an
+    /// in-memory book: imiden/iusdt at 2 quote units per base unit.
+    mod bounded_price {
+        use super::*;
+        use crate::maker::{MakerId, MakerTag};
+        use crate::price::PairRules;
+        use miden_protocol::asset::{AssetAmount, FungibleAsset};
+        use miden_protocol::crypto::rand::{FeltRng, RandomCoin};
+        use miden_protocol::note::{Note, NoteId, NoteType};
+        use miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE;
+        use miden_protocol::Word;
+        use miden_standards::note::{PswapNote, PswapNoteStorage};
+
+        const BUY: bool = true;
+        const SELL: bool = false;
+
+        struct Book {
+            book: ClearingBook,
+            rng: RandomCoin,
+            priority: u64,
+        }
+
+        impl Book {
+            fn new() -> Self {
+                Self {
+                    book: ClearingBook::default(),
+                    rng: RandomCoin::new(Word::default()),
+                    priority: 0,
+                }
+            }
+
+            /// `lots` of 100,000 base units with a limit `tenths` of a basis
+            /// point from the mid; all-or-nothing when `whole`.
+            fn order(
+                &mut self,
+                buy: bool,
+                tenths: i64,
+                lots: u64,
+                whole: bool,
+                maker: Option<(MakerId, u64)>,
+            ) -> NoteId {
+                self.priority += 1;
+                let base_units = 100_000 * lots;
+                let quote_units = 2 * (100_000 + tenths) as u64 * lots;
+                let (offered, requested) = if buy {
+                    (
+                        FungibleAsset::new(iusdt(), quote_units).unwrap(),
+                        FungibleAsset::new(imiden(), base_units).unwrap(),
+                    )
+                } else {
+                    (
+                        FungibleAsset::new(imiden(), base_units).unwrap(),
+                        FungibleAsset::new(iusdt(), quote_units).unwrap(),
+                    )
+                };
+                let step = if whole {
+                    requested.amount()
+                } else {
+                    AssetAmount::new(1).unwrap()
+                };
+                let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+                    .try_into()
+                    .unwrap();
+                let note: Note = PswapNote::builder()
+                    .sender(creator)
+                    .storage(
+                        PswapNoteStorage::builder()
+                            .min_requested_asset(requested)
+                            .min_fill_step(step)
+                            .creator_account_id(creator)
+                            .build(),
+                    )
+                    .serial_number(self.rng.draw_word())
+                    .note_type(NoteType::Public)
+                    .offered_asset(offered)
+                    .build()
+                    .unwrap()
+                    .into();
+                let order = BookOrder {
+                    priority_seq: self.priority,
+                    arrival_unix: 1,
+                    note: Arc::new(note),
+                    maker: maker.map(|(maker_id, root_seq)| MakerTag {
+                        maker_id,
+                        root_seq,
+                        expires_at_unix_ms: None,
+                    }),
+                };
+                self.book.insert_or_skip(&order);
+                order.id()
+            }
+
+            /// One tick with the pair's band at `band_bps`, priced by a
+            /// Binance symbol listed either way round: the notes sent, sorted.
+            fn tick(&mut self, band_bps: u16, reversed: bool) -> Vec<NoteId> {
+                let ttl = Duration::from_secs(30);
+                let pairs = [(imiden(), iusdt(), "2", Instant::now())];
+                let snapshot = if reversed {
+                    PriceSnapshot::for_tests_reversed(&pairs, &[(imiden(), 0), (iusdt(), 0)], ttl)
+                } else {
+                    PriceSnapshot::for_tests(&pairs, &[], ttl)
+                };
+                let rules = PairRules {
+                    band_bps,
+                    quote_ttl: None,
+                };
+                let snapshot = snapshot.with_pair_rules(imiden(), iusdt(), rules);
+                let runtime = ClearingRuntime {
+                    bootstrap: oneshot::channel().1,
+                    prices: watch::channel(Arc::new(snapshot)).1,
+                    config: ClearingConfig::default(),
+                    maker_settlement_buffer_ms: 0,
+                    routing: None,
+                };
+                let (exec_tx, mut exec_rx) = mpsc::channel(1);
+                internal_clear(&mut self.book, &runtime, &exec_tx).unwrap();
+                let mut sent: Vec<_> = exec_rx
+                    .try_recv()
+                    .map(|batch| batch.filled_notes.iter().map(|f| f.note_id).collect())
+                    .unwrap_or_default();
+                sent.sort_unstable();
+                sent
+            }
+
+            fn walk(&self, band_bps: u16) -> Option<BoundedPrice> {
+                let mid = BatchPrice::from_ratio(2, 1).unwrap();
+                self.book
+                    .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100)
+                    .unwrap()
+            }
+        }
+
+        fn sorted(mut ids: Vec<NoteId>) -> Vec<NoteId> {
+            ids.sort_unstable();
+            ids
+        }
+
+        fn fallbacks(reason: &str) -> u64 {
+            bounded_fallbacks()
+                .find(|(name, _)| *name == reason)
+                .unwrap()
+                .1
+        }
+
+        /// Without a band the maker's ask above the mid is out of reach; with
+        /// one, the buyer takes it, whichever way Binance lists the symbol.
+        #[test]
+        fn a_band_lets_a_buyer_take_the_makers_ask() {
+            for reversed in [false, true] {
+                let mut book = Book::new();
+                let ask = book.order(SELL, 65, 2, false, Some((7, 2)));
+                book.order(BUY, -65, 2, false, Some((7, 1)));
+                let buyer = book.order(BUY, 400, 1, false, None);
+                assert!(
+                    book.tick(0, reversed).is_empty(),
+                    "band 0 clears at the mid"
+                );
+                let before = bounded_off_mid();
+                assert_eq!(book.tick(30, reversed), sorted(vec![ask, buyer]));
+                assert!(bounded_off_mid() > before);
+            }
+        }
+
+        /// Rule B sits the maker's stale ask out, so the walk finds nothing;
+        /// the mid still trades it, exactly as without a band.
+        #[test]
+        fn when_the_walk_finds_nothing_the_mid_still_trades() {
+            let mut book = Book::new();
+            let stale_ask = book.order(SELL, -300, 5, false, Some((7, 1)));
+            book.order(BUY, -190, 5, false, Some((7, 2)));
+            let buyer = book.order(BUY, 20, 5, false, None);
+            assert!(book.walk(30).is_none());
+            let before = fallbacks("walk_found_nothing");
+            assert_eq!(book.tick(30, false), sorted(vec![stale_ask, buyer]));
+            assert!(fallbacks("walk_found_nothing") > before);
+        }
+
+        /// The walk prices at an all-or-nothing ask that cannot fill, so
+        /// nothing trades there; the mid then trades what it can.
+        #[test]
+        fn when_nothing_trades_at_the_bounded_price_the_mid_does() {
+            let mut book = Book::new();
+            let seller = book.order(SELL, -10, 1, false, None);
+            let small_buyer = book.order(BUY, 5, 1, false, None);
+            book.order(SELL, 50, 10, true, None);
+            book.order(BUY, 400, 2, true, None);
+            let walk = book.walk(30).unwrap();
+            assert_eq!(
+                walk.price,
+                BatchPrice::from_ratio(200_100, 100_000).unwrap()
+            );
+            let before = fallbacks("nothing_at_price");
+            assert_eq!(book.tick(30, false), sorted(vec![seller, small_buyer]));
+            assert!(fallbacks("nothing_at_price") > before);
+        }
+
+        /// Known gap, issue #62: a dust bid benches the maker's own ask in
+        /// the walk, the price rises to the next maker's ask, and the benched
+        /// ask still fills first. The metric counts it.
+        #[test]
+        fn the_dust_bid_lever_shows_in_the_metric() {
+            let mut book = Book::new();
+            let x_ask = book.order(SELL, 50, 50, false, Some((1, 1)));
+            book.order(BUY, 55, 1, false, Some((1, 2)));
+            book.order(SELL, 80, 50, false, Some((2, 1)));
+            book.order(BUY, 500, 60, false, None);
+            let walk = book.walk(30).unwrap();
+            assert_eq!(walk.sit_outs, vec![x_ask]);
+            let before = walk_benched_filled();
+            assert!(book.tick(30, false).contains(&x_ask));
+            assert!(walk_benched_filled() > before);
+        }
     }
 }

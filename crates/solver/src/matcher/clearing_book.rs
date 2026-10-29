@@ -13,7 +13,7 @@ use crate::types::{BookOrder, BookUpdate, ExecutionBatch, TokenId};
 
 mod bounded_price;
 
-pub(super) use bounded_price::{BoundedPrice, WalkStop};
+pub(super) use bounded_price::BoundedPrice;
 
 /// Sent once, after ingestion reconciles persisted notes against the chain.
 pub struct ClearingBootstrap {

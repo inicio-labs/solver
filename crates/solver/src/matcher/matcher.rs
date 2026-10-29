@@ -978,6 +978,7 @@ mod tests {
                 let rules = PairRules {
                     band_bps,
                     quote_ttl: None,
+                    reference_amount: None,
                 };
                 let snapshot = snapshot.with_pair_rules(imiden(), iusdt(), rules);
                 let runtime = ClearingRuntime {

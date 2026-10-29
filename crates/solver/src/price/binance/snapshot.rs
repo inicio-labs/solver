@@ -129,6 +129,8 @@ pub(crate) struct OrderMarket {
     pub received_at: Instant,
     pub offered_decimals: u8,
     pub requested_decimals: u8,
+    /// The pair's own settings: its band and reference size.
+    pub rules: super::market::PairRules,
 }
 
 /// Latest merged quote per subscribed symbol, with the markets they price and
@@ -307,6 +309,7 @@ impl PriceSnapshot {
             received_at: latest.received_at,
             offered_decimals,
             requested_decimals,
+            rules: pair.rules,
         })
     }
 
@@ -607,6 +610,7 @@ mod tests {
         let rules = crate::price::PairRules {
             band_bps: 0,
             quote_ttl: Some(pair_ttl),
+            reference_amount: None,
         };
         let mut snapshot = book().with_pair_rules(usdt(), eth(), rules);
         let received = Instant::now();

@@ -2,6 +2,10 @@
 //! chain, the real solver, and the real price API over HTTP. Each checks what
 //! the chain pays every order, to the unit, and what the API quoted.
 //!
+//! Every order is a proven transaction, so a scenario takes ~30 s on a laptop
+//! and ~5 min on a CI runner; CI runs three. The whole file:
+//! `cargo test -p solver --test integration_bounded_price_scenarios -- --ignored`
+//!
 //! The pair is USDC/ETH with USDC as base, priced by Binance's ETHUSDC at 2,
 //! so the pair's mid is 0.5 ETH per USDC and a 30 bps band is
 //! [0.4985, 0.5015]. "Sellers" sell USDC for ETH, "buyers" offer ETH for
@@ -935,8 +939,17 @@ async fn a_random_book_keeps_every_invariant() -> Result<()> {
             }
             qa.start(qa.config(30, 0, false), orders.len() as i64)
                 .await?;
+            // Proving a settlement takes minutes on a slow machine: wait for
+            // the first as long as `settle` does, then for each next one
+            // twice as long as the first took. Stopping the solver mid-proof
+            // fails its shutdown.
+            let started = Instant::now();
+            let mut wait = Duration::from_secs(600);
             let mut rounds = 0;
-            while qa.submitted_within(Duration::from_secs(10)).await? {
+            while qa.submitted_within(wait).await? {
+                if rounds == 0 {
+                    wait = (started.elapsed() * 2).max(Duration::from_secs(10));
+                }
                 qa.commit().await?;
                 rounds += 1;
                 if rounds > 8 {

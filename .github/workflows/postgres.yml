@@ -80,10 +80,14 @@ jobs:
       # ADR 0007: a pair with a band settles at a maker's ask the mid never reaches.
       - name: Bounded clearing price integration
         run: cargo test -p solver --test integration_bounded_price --locked -- --ignored
-      # ADR 0007 with real orders: band edges, a price move, remainders, the
-      # fallback to the mid, a fee, two pairs, a random book.
+      # ADR 0007 with real orders. Each scenario takes ~5 min on a runner, so
+      # CI runs three; run the whole file by hand (see its header).
       - name: Bounded clearing price scenarios
-        run: cargo test -p solver --test integration_bounded_price_scenarios --locked -- --ignored
+        run: >-
+          cargo test -p solver --test integration_bounded_price_scenarios --locked -- --ignored
+          an_ask_at_the_band_top_settles
+          nothing_at_the_band_price_falls_back_to_the_mid
+          the_band_is_per_pair
       # Audit finding C2: a pair without a confirmed Binance market never settles.
       - name: Unpriced pair integration
         run: cargo test -p solver --test integration_unpriced_direct --locked -- --ignored

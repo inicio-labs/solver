@@ -56,7 +56,7 @@ jobs:
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs crates/solver/src/swap_eta.rs \
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \
             crates/solver/tests/common/mod.rs \
-            crates/solver/tests/integration_{already_consumed,bounded_price,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
+            crates/solver/tests/integration_{already_consumed,bounded_price,bounded_price_scenarios,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
             crates/e2e/src/{artifacts,provision,run}.rs src/main.rs crates/solver/build.rs
       - name: Compile workspace
         run: cargo check --workspace --locked
@@ -80,6 +80,10 @@ jobs:
       # ADR 0007: a pair with a band settles at a maker's ask the mid never reaches.
       - name: Bounded clearing price integration
         run: cargo test -p solver --test integration_bounded_price --locked -- --ignored
+      # ADR 0007 with real orders: band edges, a price move, remainders, the
+      # fallback to the mid, a fee, two pairs, a random book.
+      - name: Bounded clearing price scenarios
+        run: cargo test -p solver --test integration_bounded_price_scenarios --locked -- --ignored
       # Audit finding C2: a pair without a confirmed Binance market never settles.
       - name: Unpriced pair integration
         run: cargo test -p solver --test integration_unpriced_direct --locked -- --ignored

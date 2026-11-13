@@ -45,7 +45,7 @@ jobs:
             crates/solver/src/db/postgres_*.rs crates/solver/src/db/maker_db.rs \
             crates/solver/src/maker.rs crates/solver/src/types.rs \
             crates/solver/src/admin/admin.rs crates/solver/src/config.rs \
-            crates/solver/src/executor/executor.rs crates/solver/src/ingest/ingest.rs \
+            crates/solver/src/executor/{executor,metrics,mod}.rs crates/solver/src/ingest/ingest.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
             crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs \
             crates/solver/src/matcher/clearing_book/bounded_price.rs \
@@ -55,8 +55,8 @@ jobs:
             crates/solver/src/price/binance/feed/tests.rs crates/mock-binance/src/*.rs \
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs crates/solver/src/swap_eta.rs \
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \
-            crates/solver/tests/common/mod.rs \
-            crates/solver/tests/integration_{already_consumed,bounded_price,bounded_price_scenarios,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
+            crates/solver/tests/common/{mod,maker,node_like}.rs \
+            crates/solver/tests/integration_{already_consumed,bounded_price,bounded_price_scenarios,maker_gateway,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
             crates/e2e/src/{artifacts,provision,run}.rs src/main.rs crates/solver/build.rs
       - name: Compile workspace
         run: cargo check --workspace --locked
@@ -91,6 +91,10 @@ jobs:
       # Audit finding C2: a pair without a confirmed Binance market never settles.
       - name: Unpriced pair integration
         run: cargo test -p solver --test integration_unpriced_direct --locked -- --ignored
+      # A maker order through the gateway, on a mock node that refuses unknown
+      # notes like a real one: the baseline for orders live at accept.
+      - name: Maker gateway integration
+        run: cargo test -p solver --test integration_maker_gateway --locked -- --ignored
 
   production-binary:
     runs-on: ubuntu-latest

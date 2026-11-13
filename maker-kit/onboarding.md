@@ -102,6 +102,6 @@ To start with Claude Code: run `claude` in `maker-kit/` and ask, for example, *"
 
 ## 7. Before you trade
 
-Run the checklist in section 14 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
+Run the checklist in section 15 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
 
 Questions: your Inicio Labs contact.

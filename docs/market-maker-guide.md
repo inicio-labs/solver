@@ -23,9 +23,10 @@ Generate your client from the `gateway.proto` file delivered with this guide (pa
 10. [Settlement accounting](#10-settlement-accounting)
 11. [Order expiry](#11-order-expiry)
 12. [Self-trade prevention](#12-self-trade-prevention)
-13. [Errors and what to do](#13-errors-and-what-to-do)
-14. [Checklist before going live](#14-checklist-before-going-live)
-15. [Reference](#15-reference)
+13. [Orders live at accept](#13-orders-live-at-accept)
+14. [Errors and what to do](#14-errors-and-what-to-do)
+15. [Checklist before going live](#15-checklist-before-going-live)
+16. [Reference](#16-reference)
 
 ---
 
@@ -105,7 +106,7 @@ sequenceDiagram
 ```
 
 - Steps 1 and 3 can happen in either order. Your note may already be on chain when you submit it, or it may arrive later.
-- After step 2 the order is stored, but it isn't live and isn't filled.
+- After step 2 the order is stored, but it isn't live and isn't filled. On a solver with [live at accept](#13-orders-live-at-accept) on, a private order goes live right after step 2, and you send your transaction first.
 - Book a fill only at the last step, `SettlementResolved` with `committed = true`.
 - If only part of the order filled, the remainder trades on as the same order (the same lineage) and repeats steps 6 to 9.
 - You can cancel at any point with `CancelOrder` or `CancelAll`.
@@ -123,7 +124,7 @@ sequenceDiagram
 | Miden network and node endpoint | Create and commit your notes on the same chain as the solver. |
 | Supported token pairs, with each token's faucet ID and decimals | Amounts are integer token units. Orders for other pairs are rejected. |
 | Solver account ID | The account that consumes your notes. You need it to rebuild your output notes ([section 10](#10-settlement-accounting)). |
-| A test environment | Run the checklist in [section 14](#14-checklist-before-going-live) before trading. |
+| A test environment | Run the checklist in [section 15](#15-checklist-before-going-live) before trading. |
 
 ### Compatible Miden SDK versions
 
@@ -633,7 +634,7 @@ flowchart LR
     class e ev
 ```
 
-- **Sent:** once per order, when we verify your submitted note on chain and no cancel covers it.
+- **Sent:** once per order, when we verify your submitted note on chain and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, a private order's `LIVE` comes when we accept it, before the note is in a block.
 - **Carries:** `note_id`, `depth` (0), `state = LIVE`, and the order's `lineage_id` on the event.
 - **Not sent:** for remainders after a partial fill (`SettlementResolved` reports those), or for an order you cancelled before it went live.
 - **You do:** mark the order live. It can now be matched. Expiry or a later cancel can still stop it.
@@ -674,7 +675,7 @@ flowchart LR
     class e ev
 ```
 
-- **Sent:** once per order the solver stops. The only reason today is `self_trade_prevention` ([section 12](#12-self-trade-prevention)).
+- **Sent:** once per order the solver stops. The reason is `self_trade_prevention` ([section 12](#12-self-trade-prevention)), or `note_not_received` for an order that went live at accept whose note never arrived ([section 13](#13-orders-live-at-accept)).
 - **Carries:** `note_id`, `depth`, `state = CANCELLED`, `reason`, and the order's `lineage_id` on the event.
 - **Comes after:** the `SettlementPending` of your order that is trading instead.
 - **Not sent:** for an order you had already cancelled yourself.
@@ -1023,7 +1024,53 @@ Your crossed orders are also checked before the price is chosen: the older of ea
 
 ---
 
-## 13. Errors and what to do
+## 13. Orders live at accept
+
+On a solver running with live at accept (we tell you when it is on), a **private** order goes live as soon as we accept `SubmitOrder`, before its note is in a block. It can trade in the same block as your own transaction. Public orders are unchanged.
+
+### Send your transaction first
+
+Send the transaction that creates the note, wait until the node accepts it, then send `SubmitOrder`. The maker kit does this. If you submit first, our settlement spending your note is refused because the node doesn't know the note, and your order waits out of the book until the note lands. A transaction the node never accepts ends in a cancel (below).
+
+### What you see
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MM as Your system
+    participant S as Inicio solver
+    participant C as Miden node
+    MM->>C: your transaction (creates the note)
+    C-->>MM: accepted, waiting for a block
+    MM->>S: SubmitOrder
+    S-->>MM: reply: accepted
+    S-->>MM: event: OrderStatus LIVE (before any block)
+    S-->>MM: event: SettlementPending
+    S->>C: settlement spending your waiting note
+    C-->>S: both transactions in block N
+    S-->>MM: event: SettlementResolved (committed)
+```
+
+- `LIVE` comes right after the reply, not when the note lands. It is still sent once.
+- When your note lands, nothing more is sent.
+- **Don't hedge on `SettlementPending`.** If your transaction doesn't reach a block, our settlement can be dropped with it. Book only `SettlementResolved` with `committed = true`, as always.
+- A voided `SettlementResolved` can say `LIVE` while the node does not know your note yet: we keep the order out of the book until the note lands, then it trades again. `ListActiveMakerOrders` lists it the whole time.
+
+### Events that can follow LIVE
+
+| Event | Reason | What happened | You do |
+|---|---|---|---|
+| `OrderStatus CANCELLED` | `note_not_received` | We never saw your note: 60 seconds and 20 blocks after accept (both), it was not on chain. | Retire the order. If your transaction lands later, reclaim the note: we will not trade it. |
+| `OrderStatus REJECTED` | `committed note differs from the submitted note` | The note on chain is not the one you submitted. | Retire the order; check how you build and serialize it. |
+| `OrderStatus UNAVAILABLE` | `note spent outside this solver` | Your note was spent by something else, for example your own reclaim. | Retire the order. |
+
+### Re-quoting
+
+Cancels work as before. A replacement on the **same side** sent before your cancel of the old quote is applied can trade together with the old one, now that both are live at once. Send the cancel first and wait for its reply before the replacement, or size the two so that both filling is acceptable.
+
+---
+
+## 14. Errors and what to do
 
 | gRPC status | Typical cause | What to do |
 |---|---|---|
@@ -1040,7 +1087,7 @@ Requests larger than 64 KiB are rejected. A PSWAP note is a few kilobytes.
 
 ---
 
-## 14. Checklist before going live
+## 15. Checklist before going live
 
 Run each of these against our test environment:
 
@@ -1056,10 +1103,11 @@ Run each of these against our test environment:
 - [ ] Consume a payback note, and reclaim a cancelled order's note; check that your balances match your books.
 - [ ] Page through more than 500 active orders, including an empty last page and orders changing while you page.
 - [ ] Revoke a key. New calls fail and open streams close; your other key keeps working.
+- [ ] If live at accept is on: send your transaction then `SubmitOrder`, and confirm `LIVE` arrives before the block. Submit an order whose transaction you never send, and confirm `CANCELLED` `note_not_received` about a minute later.
 
 ---
 
-## 15. Reference
+## 16. Reference
 
 ### Identifiers
 

@@ -240,6 +240,7 @@ It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_
 - `solver_executor_settlement_conflicts_total{kind="unreadable"}` or `{kind="unknown_notes_unmatched"}` above 0: the node words its refusals differently; every unconfirmed order now waits. Re-check the text in `executor/refusal.rs` on every node upgrade.
 - `solver_maker_watcher_block_read_age_seconds` above 10 for long: every order takes the confirmed path (`solver_maker_accept_fallbacks_total{reason="watcher_stale"}`).
 - Several makers' unknown-note refusals at once: the node lost its mempool (a restart). Their orders wait, and return when their notes land or are capped.
+- `solver_maker_watcher_unobserved_notes` above 0 for long: notes the watcher can't read. Unconfirmed ones are still decided by the cap's lookup; activated ones go unwatched for spends until they read again.
 
 **Queries** join on root rows (`orders.note_id = maker_lineages.note_id`): unconfirmed orders are `maker_lineages` rows with `live_at_accept AND state = 'pending'`; `waiting` orders have `orders.status = 'waiting'`.
 

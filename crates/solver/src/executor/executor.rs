@@ -616,6 +616,17 @@ async fn release_rejected_settlement(
     Ok(true)
 }
 
+/// What the node said about a settlement that never commits, for a release
+/// by reconciliation: the answer to a refusal earlier in this run, else
+/// unclear. A drop, an expiry, or a refusal from before a restart can't tell
+/// whether the notes were known (ADR 0008, D3).
+fn release_answer(cause: ReleaseCause, refused: Option<&NodeAnswer>) -> NodeAnswer {
+    match (cause, refused) {
+        (ReleaseCause::Refused, Some(answer)) => answer.clone(),
+        _ => NodeAnswer::Unclear,
+    }
+}
+
 /// Building this composition failed; it would fail the same way again.
 fn build_failed(error: ExecutorError) -> BatchSubmission {
     tracing::error!(%error, "settlement transaction build failed");
@@ -1509,11 +1520,7 @@ impl Executor {
             // expiry or a refusal from before a restart can't tell whether
             // the notes were known.
             TxOutcome::NeverCommits(cause) => {
-                let answer = match cause {
-                    ReleaseCause::Refused => settlement.answer.clone(),
-                    ReleaseCause::Dropped | ReleaseCause::Expired => None,
-                }
-                .unwrap_or(NodeAnswer::Unclear);
+                let answer = release_answer(cause, settlement.answer.as_ref());
                 release_rejected_settlement(
                     &self.miden_adapter,
                     &self.pool,
@@ -2435,6 +2442,28 @@ mod recovery_tests {
             TxOutcome::NeverCommits(ReleaseCause::Expired),
             "never recorded: it may never have reached the node"
         );
+    }
+
+    #[test]
+    fn a_release_uses_only_this_runs_refusal_answer() {
+        let named = NodeAnswer::UnknownNotes(Default::default());
+        assert_eq!(release_answer(ReleaseCause::Refused, Some(&named)), named);
+        assert_eq!(
+            release_answer(ReleaseCause::Refused, Some(&NodeAnswer::NotSent)),
+            NodeAnswer::NotSent
+        );
+        // A refused attempt reloaded after a restart lost its answer.
+        assert_eq!(
+            release_answer(ReleaseCause::Refused, None),
+            NodeAnswer::Unclear
+        );
+        for cause in [ReleaseCause::Dropped, ReleaseCause::Expired] {
+            assert_eq!(release_answer(cause, None), NodeAnswer::Unclear);
+            assert_eq!(
+                release_answer(cause, Some(&NodeAnswer::AccountMismatch)),
+                NodeAnswer::Unclear
+            );
+        }
     }
 
     #[test]

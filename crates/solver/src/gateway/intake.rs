@@ -15,7 +15,7 @@ use miden_protocol::note::NoteType;
 use super::metrics as gateway_metrics;
 use crate::db::maker_db::{execute_command_with_tx, AcceptGate, CommandOutcome};
 use crate::db::{DbResult, IntakeSession};
-use crate::maker::{CommandHeader, CommandReply, EventWake, MakerCommand, MakerId};
+use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerId};
 
 type Reply = oneshot::Sender<Result<CommandReply, IntakeError>>;
 
@@ -97,6 +97,7 @@ pub async fn run_intake(
     max_submits: usize,
     cancel: CancellationToken,
 ) {
+    let wake = session.event_wake();
     loop {
         let first = tokio::select! {
             biased;
@@ -175,12 +176,13 @@ pub async fn run_intake(
                         return;
                     }
                 }
-                if went_live {
-                    // The core writer's append flag is not ours to take.
-                    EventWake::global().notify();
-                }
                 for (reply, (_, outcome)) in replies.into_iter().zip(outcomes) {
                     let _ = reply.send(Ok(outcome.reply));
+                }
+                // After the replies, so the maker hears Accepted before LIVE.
+                // The core writer's append flag is not ours to take.
+                if went_live {
+                    wake.notify();
                 }
             }
             Err(error) => {
@@ -200,6 +202,11 @@ pub async fn run_intake(
 /// a private submit in the round, the owner-epoch guard first (see
 /// [`AcceptGate::accept_block`]), then the order rows and maker rows the
 /// round may touch, in the reservation's lock order, then every command.
+///
+/// `commands` must hold the round's cancels before its submits, as
+/// [`run_intake`] orders them: the matcher applies a round's cancels before
+/// its new orders, so a submit cancelled in the same round would otherwise
+/// reach the book.
 pub(crate) fn intake_round_tx(
     conn: &mut PgConnection,
     commands: &[(CommandHeader, MakerCommand)],
@@ -209,11 +216,8 @@ pub(crate) fn intake_round_tx(
         matches!(command, MakerCommand::Submit { note, .. }
             if note.metadata().note_type() == NoteType::Private)
     });
-    match gate.as_mut() {
-        Some(gate) if private_submit => {
-            gate.accept_block(conn)?;
-        }
-        _ => gate = None,
+    if let Some(gate) = gate.as_mut().filter(|_| private_submit) {
+        gate.accept_block(conn)?;
     }
     crate::db::maker_db::prelock_submission_orders_tx(conn, commands)?;
     crate::db::maker_db::prelock_command_makers_tx(conn, commands)?;
@@ -439,10 +443,12 @@ pub(crate) mod tests {
     }
 
     /// Ingest advances `sync_state` and then appends maker events, which
-    /// lock maker rows. A live-at-accept round share-locks `sync_state` before
-    /// any maker row, so the two queue one behind the other. Taking it after
-    /// the maker lock deadlocks, and an intake round that fails stops the
-    /// solver.
+    /// lock maker rows. In one solver the two never overlap (both hold the
+    /// publication guard through their transaction), but during a takeover
+    /// the old process's intake runs beside the new owner's ingest. A
+    /// live-at-accept round share-locks `sync_state` before any maker row, so
+    /// the two queue one behind the other. Taking it after the maker lock
+    /// deadlocks, and an intake round that fails stops the solver.
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     fn a_live_at_accept_round_and_ingest_never_deadlock() -> anyhow::Result<()> {
@@ -509,20 +515,24 @@ pub(crate) mod tests {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
         let fresh = Arc::new(AtomicBool::new(true));
-        let session = db.pool.intake_session().with_live_at_accept({
-            let fresh = fresh.clone();
-            move || {
-                fresh
-                    .load(Ordering::Relaxed)
-                    .then(|| miden_protocol::block::BlockNumber::from(7))
-            }
-        });
+        let wake = crate::maker::EventWake::default();
+        let mut woken = wake.subscribe();
+        let session = db
+            .pool
+            .intake_session()
+            .with_event_wake(wake)
+            .with_live_at_accept({
+                let fresh = fresh.clone();
+                move || {
+                    fresh
+                        .load(Ordering::Relaxed)
+                        .then(|| miden_protocol::block::BlockNumber::from(7))
+                }
+            });
         let (intake, queues) = IntakeSender::new(4, 4);
         let (book_tx, mut book_rx) = mpsc::channel(4);
         let stop = CancellationToken::new();
         let writer = tokio::spawn(run_intake(session, queues, book_tx, 10, stop.clone()));
-        let mut woken = EventWake::global().subscribe();
-        woken.mark_unchanged();
 
         let order = pswap_note(1);
         assert_eq!(
@@ -543,7 +553,11 @@ pub(crate) mod tests {
             update.maker_updates.as_slice(),
             [MakerUpdate::OrdersAttributed { .. }]
         ));
-        assert!(woken.has_changed().unwrap(), "streams woken for LIVE");
+        // The wake follows the reply.
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken.changed())
+            .await
+            .expect("streams woken for LIVE")
+            .unwrap();
 
         fresh.store(false, Ordering::Relaxed);
         intake

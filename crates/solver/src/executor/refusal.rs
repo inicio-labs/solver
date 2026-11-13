@@ -109,7 +109,9 @@ mod tests {
         })
     }
 
-    /// The node's report of a state conflict: its top error, then the cause.
+    /// The node's report of a state conflict: its top error, then the cause,
+    /// as node 0.17.6 and 0.18.0 word them (`block-producer/src/errors.rs`),
+    /// written out here rather than taken from the parser's constants.
     fn report(cause: &str) -> String {
         format!("transaction conflicts with current mempool state\ncaused by: {cause}")
     }
@@ -118,7 +120,11 @@ mod tests {
     fn unknown_notes_name_the_missing_parents() {
         let (a, b, c) = (pswap_note(1), pswap_note(2), pswap_note(3));
         let parents = [a.clone(), b.clone(), c.clone()];
-        let text = report(&format!("{UNKNOWN_NOTES}: [{:?}, {:?}]", a.id(), c.id()));
+        let text = report(&format!(
+            "unauthenticated input notes are unknown: [{:?}, {:?}]",
+            a.id(),
+            c.id()
+        ));
         assert!(text.contains("NoteId("), "Debug form changed: {text}");
         let (answer, kind) = node_answer(&conflict(text), &parents);
         assert_eq!(
@@ -129,7 +135,10 @@ mod tests {
 
         // IDs printed another way match nothing.
         let (answer, kind) = node_answer(
-            &conflict(report(&format!("{UNKNOWN_NOTES}: [0x{}]", a.id().to_hex()))),
+            &conflict(report(&format!(
+                "unauthenticated input notes are unknown: [0x{}]",
+                a.id().to_hex()
+            ))),
             &parents,
         );
         assert_eq!(answer, NodeAnswer::UnknownNotes(Default::default()));

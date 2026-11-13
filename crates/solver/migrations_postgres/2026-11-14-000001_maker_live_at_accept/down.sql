@@ -6,6 +6,8 @@ DO $$ BEGIN
 END $$;
 DROP VIEW live_orders;
 DROP VIEW eligible_orders;
+DROP INDEX orders_waiting_idx;
+DROP INDEX maker_lineages_flagged_note_idx;
 CREATE VIEW live_orders AS
 SELECT o.note_id, o.raw_data, o.arrival_unix, o.status, o.priority_seq,
        o.lineage_id, o.depth, o.market, o.direction,

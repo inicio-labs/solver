@@ -360,7 +360,8 @@ clears crossing orders between the two tokens automatically.
   Maker gateway, published by the maker-note watcher after each successful round, so a scrape reads no database; absent when the gateway is disabled:
   - `solver_maker_watcher_synced_block` and `solver_maker_watcher_block_read_age_seconds`: the block the last successful round synced to, and how long ago that round started reading the chain (counted from the watcher's start until the first one succeeds).
   - `solver_maker_pending_lineages` and `solver_maker_oldest_pending_lineage_age_seconds`: submitted orders whose note the watcher has not resolved yet, and the age of the oldest by the database clock.
-  - `solver_maker_unconfirmed_orders`, `solver_maker_oldest_unconfirmed_order_age_seconds` and `solver_maker_waiting_orders`: of those, orders that went live at accept, the oldest one's age, and those waiting out of the book for their note.
+  - `solver_maker_unconfirmed_orders`, `solver_maker_oldest_unconfirmed_order_age_seconds` and `solver_maker_waiting_orders`: of those, orders that went live at accept and still trade, wait or settle, the oldest one's age, and those waiting out of the book for their note.
+  - `solver_maker_watcher_unobserved_notes`: notes the last round could not look up or import; they are retried every round.
 
   Live at accept, per maker (`{maker_id}`), counted after each commit: `solver_maker_live_at_accept_total`, `solver_maker_accept_fallbacks_total{reason}` (`watcher_stale`, `conflict`, `public`), `solver_maker_unknown_notes_named_total`, `solver_maker_sent_to_waiting_total`, `solver_maker_waiting_returned_total`, `solver_maker_cap_cancels_total` and `solver_maker_unconfirmed_activations_total{via}` (`watcher`, `lookup`, `settlement`). Alerts for these are in the [runbook](docs/postgres-runbook.md#maker-orders-live-at-accept).
 

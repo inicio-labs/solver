@@ -234,12 +234,22 @@ async fn a_solver_without_its_gateway_refuses_unconfirmed_orders() -> Result<()>
         rpc,
         ingest_store: temp.path().join("ingest.sqlite3"),
     });
-    let started = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        solver::start(factory, creator, config, CancellationToken::new()),
-    )
-    .await?;
-    let error = format!("{:#}", started.expect_err("start must refuse"));
+    // In a LocalSet, as in production, so a solver that does not refuse
+    // fails the assertion below rather than panicking on `spawn_local`.
+    let cancel = CancellationToken::new();
+    let local = tokio::task::LocalSet::new();
+    let started = local
+        .run_until(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            solver::start(factory, creator, config, cancel.clone()),
+        ))
+        .await;
+    cancel.cancel();
+    let error = match started {
+        Ok(Err(error)) => format!("{error:#}"),
+        Ok(Ok(())) => anyhow::bail!("start returned Ok with unconfirmed orders and no gateway"),
+        Err(_) => anyhow::bail!("start did not refuse within 30 s"),
+    };
     anyhow::ensure!(
         error.contains("cancel-unconfirmed") && error.contains("maker_gateway_enabled"),
         "unexpected start error: {error}"

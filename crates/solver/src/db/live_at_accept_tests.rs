@@ -423,7 +423,7 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
         maker_db::execute_command_with_tx(conn, &header, &submit, Some(&mut gate))
     });
     assert!(
-        matches!(refused, Err(DbError::OwnerEpochMoved { .. })),
+        matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
         "{refused:?}"
     );
     assert_eq!(status(conn, &second)?, None);
@@ -449,6 +449,10 @@ fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {
     }
     set_status(conn, &waiting, "waiting")?;
     set_status(conn, &cancelled, "waiting")?;
+    // The maker still sees a waiting order (D5).
+    let listed = maker_db::active_maker_orders_page_tx(conn, alpha, &[], 10, 0)?;
+    assert_eq!(listed.len(), 3);
+    assert!(listed.iter().any(|row| row.note_id == id(&waiting)));
     cancel(conn, alpha, 4, &cancelled)?;
     let submissions = [
         pending(conn, &waiting)?,
@@ -456,8 +460,11 @@ fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {
         pending(conn, &cancelled)?,
     ];
     let (update, returned) = conn.transaction::<_, DbError, _>(|conn| {
-        let (update, returned) = maker_db::activate_tx(conn, &submissions, 1)?;
-        Ok((live_book_update_tx(conn, update)?, returned))
+        let activated = maker_db::activate_tx(conn, &submissions, 1)?;
+        Ok((
+            live_book_update_tx(conn, activated.update)?,
+            activated.returned_makers,
+        ))
     })?;
     // Only the waiting root that is still live goes to the book; the one
     // already there is not sent again; the cancelled one is stored stopped.
@@ -553,10 +560,14 @@ fn a_release_follows_what_the_node_said() -> Result<()> {
         .iter()
         .all(|(_, status)| *status == proto::ResultingStatus::Live));
 
-    // Naming none of them: every unconfirmed parent waits.
+    // Naming only another parent: the node knew both maker notes.
     let (statuses, released, _) = released_with(|_, _, user| named(&[user]))?;
-    assert_eq!(statuses, ["waiting", "waiting", "active"]);
+    assert_eq!(statuses, ["active", "active", "active"]);
     assert!(released.named_makers.is_empty());
+    // Naming nothing we recognise: every unconfirmed parent waits.
+    let (statuses, released, _) = released_with(|_, _, _| named(&[]))?;
+    assert_eq!(statuses, ["waiting", "waiting", "active"]);
+    assert_eq!(released.waiting, 2);
 
     // Every note was known.
     let (statuses, _, _) = released_with(|_, _, _| NodeAnswer::AccountMismatch)?;
@@ -609,7 +620,7 @@ fn a_release_decides_by_the_rows_as_they_are_now() -> Result<()> {
     let (removed, closed) =
         conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &[stale]))?;
     assert!(removed.is_empty());
-    assert_eq!(closed, [alpha]);
+    assert!(closed.is_empty(), "closed silently, nothing stopped");
     assert_eq!(lineage(conn, &cancelled)?.0, "rejected");
     assert_eq!(statuses(conn, alpha)?.len(), before);
     Ok(())
@@ -773,7 +784,7 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
         conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &capped))?;
     let removed: HashSet<_> = removed.into_iter().collect();
     assert_eq!(removed, HashSet::from([active.id(), waiting.id()]));
-    assert_eq!(closed.len(), 4, "every lineage but the settling one");
+    assert_eq!(closed, [alpha, alpha], "the two orders it stopped");
     for order in [&active, &waiting] {
         assert_eq!(status(conn, order)?.as_deref(), Some("stopped"));
     }
@@ -783,7 +794,10 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
     assert_eq!(lineage(conn, &settling)?.0, "pending");
     assert_eq!(status(conn, &spent)?.as_deref(), Some("onchain_nullified"));
     let stops: i64 = maker_stops::table.count().get_result(conn)?;
-    assert_eq!(stops, 4, "the maker's own cancel plus the cap's three");
+    assert_eq!(
+        stops, 3,
+        "the maker's own cancel plus one per order stopped"
+    );
     // The maker hears CANCELLED only for the orders it saw live.
     let cancels: Vec<_> = statuses(conn, alpha)?[before..].to_vec();
     assert_eq!(
@@ -840,5 +854,108 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     assert_eq!(cancels, 2);
     assert!(postgres_migrations::cancel_unconfirmed(conn)?.is_empty());
     postgres_migrations::revert_last(conn)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn an_unconfirmed_order_still_in_the_book_is_retired_when_spent_or_different() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (reclaimed, differs, cancelled) = (note(1), note(2), note(3));
+    for (seq, order) in [(1, &reclaimed), (2, &differs), (3, &cancelled)] {
+        accept(conn, alpha, seq, order)?;
+    }
+    // The maker cancels the third, then its note turns out different.
+    cancel(conn, alpha, 4, &cancelled)?;
+    let rejections = [
+        (
+            pending(conn, &reclaimed)?,
+            proto::OrderState::Unavailable,
+            "note spent before it became live",
+        ),
+        (
+            pending(conn, &differs)?,
+            proto::OrderState::Rejected,
+            "committed note differs from the submitted note",
+        ),
+        (
+            pending(conn, &cancelled)?,
+            proto::OrderState::Rejected,
+            "committed note differs from the submitted note",
+        ),
+    ];
+    let removed: HashSet<_> = conn
+        .transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &rejections))?
+        .into_iter()
+        .collect();
+    assert_eq!(
+        removed,
+        HashSet::from([reclaimed.id(), differs.id(), cancelled.id()])
+    );
+    assert_eq!(
+        status(conn, &reclaimed)?.as_deref(),
+        Some("onchain_nullified")
+    );
+    assert_eq!(status(conn, &differs)?.as_deref(), Some("stopped"));
+    for order in [&reclaimed, &differs, &cancelled] {
+        assert_eq!(lineage(conn, order)?.0, "rejected");
+    }
+    // One event each for the two the maker saw live; none for the one it
+    // cancelled.
+    let terminal: Vec<_> = statuses(conn, alpha)?
+        .into_iter()
+        .filter(|(_, state, _)| !live(*state))
+        .map(|(note, state, _)| (note, state))
+        .collect();
+    assert_eq!(
+        terminal,
+        [
+            (id(&reclaimed), proto::OrderState::Unavailable),
+            (id(&differs), proto::OrderState::Rejected),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_hatch_tells_nothing_about_an_order_the_maker_cancelled() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let order = note(1);
+    accept(conn, alpha, 1, &order)?;
+    cancel(conn, alpha, 2, &order)?;
+    set_status(conn, &order, "waiting")?;
+    let before = epoch(conn)?;
+    assert_eq!(postgres_migrations::cancel_unconfirmed(conn)?, [(alpha, 1)]);
+    assert_eq!(status(conn, &order)?.as_deref(), Some("stopped"));
+    assert_eq!(statuses(conn, alpha)?.len(), 1, "LIVE only");
+    // An old intake can't put an order live after the hatch.
+    assert_eq!(epoch(conn)?, before + 1);
+    Ok(())
+}
+
+/// A round with only a public submit still reports why it took the
+/// confirmed path, without taking the owner-epoch lock.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_public_only_round_reports_its_fallback() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    // An epoch the gate would refuse: the round must never check it.
+    let gate = AcceptGate::new(epoch(conn)? + 100, || Some(BlockNumber::from(7)));
+    let commands = [(
+        CommandHeader::new(alpha, "r1".into(), 1).unwrap(),
+        MakerCommand::submit(note_of(1, NoteType::Public))?,
+    )];
+    let outcomes = conn.transaction::<_, DbError, _>(|conn| {
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(gate))
+    })?;
+    assert_eq!(outcomes[0].1.fallback, Some(AcceptFallback::Public));
+    assert!(outcomes[0].1.live.is_none());
     Ok(())
 }

@@ -12,6 +12,11 @@ ALTER TABLE maker_lineages
     ADD CONSTRAINT maker_lineages_live_at_accept_check
         CHECK (NOT live_at_accept OR accept_block IS NOT NULL);
 
+-- Settlement release and confirmation find flagged roots by note ID.
+CREATE INDEX maker_lineages_flagged_note_idx ON maker_lineages (note_id) WHERE live_at_accept;
+-- Orders out of the book until their note lands, for the maker's listing.
+CREATE INDEX orders_waiting_idx ON orders (note_id) WHERE status = 'waiting';
+
 -- Every order row the maker's cutoffs and stops admit, whatever its status.
 -- `live_orders` is the active part; a `waiting` maker order is eligible but
 -- not live.

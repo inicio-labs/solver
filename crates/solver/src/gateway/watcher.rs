@@ -41,6 +41,7 @@ static OLDEST_PENDING_MS: AtomicU64 = AtomicU64::new(0);
 static UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
 static OLDEST_UNCONFIRMED_MS: AtomicU64 = AtomicU64::new(0);
 static WAITING: AtomicU64 = AtomicU64::new(0);
+static UNOBSERVED: AtomicU64 = AtomicU64::new(0);
 
 /// What the maker-note watcher last saw, for `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +60,8 @@ pub(crate) struct WatcherGauges {
     pub oldest_unconfirmed_age_secs: f64,
     /// Of those, orders out of the book until their note lands.
     pub waiting: u64,
+    /// Watched notes the last round could not read.
+    pub unobserved: u64,
 }
 
 /// `None` when no watcher runs in this process (gateway disabled).
@@ -75,6 +78,7 @@ pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
         unconfirmed: UNCONFIRMED.load(Ordering::Relaxed),
         oldest_unconfirmed_age_secs: OLDEST_UNCONFIRMED_MS.load(Ordering::Relaxed) as f64 / 1000.0,
         waiting: WAITING.load(Ordering::Relaxed),
+        unobserved: UNOBSERVED.load(Ordering::Relaxed),
     })
 }
 
@@ -107,34 +111,47 @@ pub trait MakerTracker {
     /// One exact lookup of `note` and its nullifier on the node.
     async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation>;
 
-    /// The block the last `observe` synced to and when, in Unix
-    /// milliseconds, it started reading the chain.
-    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+    /// The block the last `observe` synced to, and when it started reading
+    /// the chain.
+    fn last_sync(&self) -> Option<SyncRead> {
         None
     }
+}
+
+/// A tracker's chain read: the block it synced to, and when it started
+/// reading, by the wall clock (for `/metrics`) and by a monotonic clock (for
+/// freshness, which a wall-clock step must not fake).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncRead {
+    pub block: BlockNumber,
+    pub read_unix_ms: u64,
+    pub read_at: std::time::Instant,
 }
 
 /// The watcher's latest synced block and when it was read from the chain,
 /// shared with intake: an order goes live at accept only while this is fresh
 /// (ADR 0008, D7).
 #[derive(Clone, Default)]
-pub struct SyncedHeight(Arc<Mutex<Option<(BlockNumber, u64)>>>);
+pub struct SyncedHeight(Arc<Mutex<Option<(BlockNumber, std::time::Instant)>>>);
 
 impl SyncedHeight {
     /// The longest a block read may be old for an order to go live at accept.
     pub const MAX_AGE: Duration = Duration::from_secs(10);
 
-    fn publish(&self, block: BlockNumber, read_unix_ms: u64) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((block, read_unix_ms));
+    fn publish(&self, read: SyncRead) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((read.block, read.read_at));
     }
 
     /// The block, if it was read from the chain less than `max_age` ago.
     pub fn fresh(&self, max_age: Duration) -> Option<BlockNumber> {
-        let (block, read_ms) = (*self.0.lock().unwrap_or_else(|e| e.into_inner()))?;
-        let age = now_millis().saturating_sub(read_ms);
-        (u128::from(age) < max_age.as_millis()).then_some(block)
+        let (block, read_at) = (*self.0.lock().unwrap_or_else(|e| e.into_inner()))?;
+        (read_at.elapsed() < max_age).then_some(block)
     }
 }
+
+/// At most this many cap lookups per round; the rest wait for the next one,
+/// so a backlog of missing notes cannot stall the round.
+const MAX_CAP_LOOKUPS: usize = 16;
 
 /// When the watcher cancels an order that went live at accept whose note
 /// never arrived (ADR 0008, D6): both must have passed since accept.
@@ -197,7 +214,7 @@ pub struct SdkTracker {
     // Recheck exact identity and historic spends when a note enters the watch
     // set, including after restart or a period excluded from scoped sync.
     tracked: HashSet<NoteId>,
-    last_sync: Option<(BlockNumber, u64)>,
+    last_sync: Option<SyncRead>,
 }
 
 impl SdkTracker {
@@ -252,17 +269,21 @@ impl SdkTracker {
             None,
             self.client.get_validator_config().await?,
         );
-        let started_ms = now_millis();
+        let (started_ms, started_at) = (now_millis(), std::time::Instant::now());
         let mut update = sync
             .fetch_state(self.client.get_sync_height().await?, input)
             .await?;
         sync.derive_state_updates(&mut update).await?;
         sync.fetch_nullifiers(&mut update).await?;
         self.client.apply_chain_updates(&sync, update).await?;
-        // For `/metrics` only: a failed read leaves the last value and never
-        // fails the round.
+        // The cap's blocks, intake's freshness and `/metrics` read this. A
+        // failed height read leaves the last value and never fails the round.
         if let Ok(synced) = self.client.get_sync_height().await {
-            self.last_sync = Some((synced, started_ms));
+            self.last_sync = Some(SyncRead {
+                block: synced,
+                read_unix_ms: started_ms,
+                read_at: started_at,
+            });
         }
         Ok(())
     }
@@ -277,8 +298,11 @@ impl SdkTracker {
         else {
             return Ok(NoteObservation::Pending);
         };
-        if found.id() != note.id() || found.metadata() != note.metadata() {
-            return Ok(NoteObservation::Mismatched);
+        // A note ID commits to the metadata, so the note under our ID is
+        // ours, however the node renders its metadata (a withheld
+        // attachment, for one).
+        if found.id() != note.id() {
+            return Ok(NoteObservation::Pending);
         }
         let spent = self
             .rpc
@@ -296,12 +320,18 @@ impl SdkTracker {
 
 #[async_trait(?Send)]
 impl MakerTracker for SdkTracker {
-    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+    fn last_sync(&self) -> Option<SyncRead> {
         self.last_sync
     }
 
     async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation> {
-        self.exact_lookup(note).await
+        let found = self.exact_lookup(note).await?;
+        if found != NoteObservation::Pending {
+            // Its record is still an expected note: import it again next
+            // round, so the store holds it committed and sees it spent.
+            self.tracked.remove(&note.id());
+        }
+        Ok(found)
     }
 
     async fn observe_from(
@@ -319,19 +349,25 @@ impl MakerTracker for SdkTracker {
         for commitment in &commitments {
             *count_by_commitment.entry(*commitment).or_insert(0_usize) += 1;
         }
-        let known: BTreeSet<_> = self
+        // Each stored record's ID by details commitment (none while expected).
+        let known: BTreeMap<_, _> = self
             .client
             .get_input_notes(NoteFilter::DetailsCommitments(commitments.clone()))
             .await?
             .iter()
-            .map(|record| record.details_commitment())
+            .map(|record| (record.details_commitment(), record.id()))
             .collect();
         let mut queued = BTreeSet::new();
         let new_notes: Vec<_> = notes
             .iter()
             .filter(|note| {
                 let commitment = note.details_commitment();
-                (!known.contains(&commitment) || !self.tracked.contains(&note.id()))
+                // A record of another note with the same details can't be
+                // replaced: the exact lookup below decides this one.
+                let held_by_other =
+                    matches!(known.get(&commitment), Some(Some(id)) if *id != note.id());
+                (!known.contains_key(&commitment) || !self.tracked.contains(&note.id()))
+                    && !held_by_other
                     && queued.insert(commitment)
             })
             .collect();
@@ -373,12 +409,9 @@ impl MakerTracker for SdkTracker {
                     if unreadable.contains(&note.id()) {
                         continue;
                     }
-                    imports.push(if let Some(found) = found.get(&note.id()) {
-                        if found.metadata() != note.metadata() {
-                            // The committed note is not the one submitted.
-                            observed.insert(note.id(), NoteObservation::Mismatched);
-                            continue;
-                        }
+                    // Found by our ID: it is our note (the ID commits to the
+                    // metadata), so it is imported with our own metadata.
+                    let file = if let Some(found) = found.get(&note.id()) {
                         NoteFile::Committed {
                             note: (*note).clone(),
                             proof: found.inclusion_proof().clone(),
@@ -396,10 +429,23 @@ impl MakerTracker for SdkTracker {
                             details: (*note).clone().into(),
                             sync_hint: NoteSyncHint::new(after, note.metadata().tag()),
                         }
-                    });
+                    };
+                    imports.push((note.id(), file));
                 }
-                if !imports.is_empty() {
-                    self.client.import_notes(&imports).await?;
+                if imports.is_empty() {
+                    continue;
+                }
+                let files: Vec<_> = imports.iter().map(|(_, file)| file.clone()).collect();
+                if let Err(error) = self.client.import_notes(&files).await {
+                    // One note's import can fail the batch: import each
+                    // alone, and skip the ones that still fail this round.
+                    tracing::warn!(%error, notes = imports.len(), "maker note import failed; importing notes one by one");
+                    for (id, file) in imports {
+                        if let Err(error) = self.client.import_notes(&[file]).await {
+                            tracing::warn!(note_id = %id, %error, "maker note import failed; skipped this round");
+                            unreadable.insert(id);
+                        }
+                    }
                 }
             }
         }
@@ -475,6 +521,10 @@ pub struct Watcher<T> {
     watched: HashMap<Vec<u8>, Note>,
     height: SyncedHeight,
     cap: UnconfirmedCap,
+    /// Where this round's cap lookups start among the pending submissions,
+    /// moved on every round so notes whose lookups keep failing can't hold
+    /// the per-round budget.
+    lookup_start: usize,
 }
 
 impl<T: MakerTracker> Watcher<T> {
@@ -486,6 +536,7 @@ impl<T: MakerTracker> Watcher<T> {
             watched: HashMap::new(),
             height: SyncedHeight::default(),
             cap: UnconfirmedCap::default(),
+            lookup_start: 0,
         }
     }
 
@@ -507,7 +558,12 @@ impl<T: MakerTracker> Watcher<T> {
     /// Its answer counts as this round's observation; if the note is still
     /// not on chain, the order is cancelled.
     pub async fn round(&mut self) -> Result<(), WatchError> {
-        let pending = self.pool.read(maker_db::pending_submissions_tx).await?;
+        let mut pending = self.pool.read(maker_db::pending_submissions_tx).await?;
+        if !pending.is_empty() {
+            let start = self.lookup_start % pending.len();
+            pending.rotate_left(start);
+            self.lookup_start = self.lookup_start.wrapping_add(MAX_CAP_LOOKUPS);
+        }
         let watched_ids = self.pool.read(maker_db::watched_maker_orders_tx).await?;
         let wanted: HashSet<_> = watched_ids.iter().cloned().collect();
         let new_ids: Vec<_> = watched_ids
@@ -542,23 +598,34 @@ impl<T: MakerTracker> Watcher<T> {
             .chain(self.watched.values())
             .filter(|note| !observations.contains_key(&note.id()))
             .count();
+        UNOBSERVED.store(unobserved as u64, Ordering::Relaxed);
         if unobserved > 0 {
             tracing::warn!(unobserved, "maker notes without an observation this round");
         }
-        let synced = self.tracker.last_sync().map(|(block, _)| block);
+        let read = self.tracker.last_sync();
+        // Publish the block now: the cap's lookups and the write below must
+        // not age it for intake.
+        if let Some(read) = read {
+            self.height.publish(read);
+        }
+        let synced = read.map(|read| read.block);
 
         let mut activations = Vec::new();
         let mut rejections = Vec::new();
         let mut capped = Vec::new();
         let mut looked_up = Vec::new();
+        let mut lookups = 0;
         for submission in pending {
-            // A note that could not be read this round gets no decision.
-            let Some(&observed) = observations.get(&submission.note.id()) else {
-                continue;
-            };
-            let observation = if observed == NoteObservation::Pending
+            let observed = observations.get(&submission.note.id()).copied();
+            // An unread note gets no decision, unless the cap is due: its
+            // exact lookup decides then, so it can't stay live forever.
+            let observation = if matches!(observed, None | Some(NoteObservation::Pending))
                 && self.cap.due(&submission, synced)
             {
+                if lookups == MAX_CAP_LOOKUPS {
+                    continue;
+                }
+                lookups += 1;
                 match self.tracker.lookup(&submission.note).await {
                     Ok(NoteObservation::Pending) => {
                         capped.push(submission);
@@ -573,8 +640,10 @@ impl<T: MakerTracker> Watcher<T> {
                         continue;
                     }
                 }
-            } else {
+            } else if let Some(observed) = observed {
                 observed
+            } else {
+                continue;
             };
             match observation {
                 NoteObservation::Committed => activations.push(submission),
@@ -628,20 +697,24 @@ impl<T: MakerTracker> Watcher<T> {
                     let rejected = maker_db::reject_tx(conn, &rejections)?;
                     let (stopped, cap_cancels) = maker_db::cap_unconfirmed_tx(conn, &capped)?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
-                    let (mut update, returned) =
-                        maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let activated = maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let mut update = activated.update;
                     update.removed.extend(removed);
                     update.removed.extend(rejected);
                     update.removed.extend(stopped);
                     *done_in.lock().unwrap_or_else(|e| e.into_inner()) = maker_db::WatcherWrites {
-                        returned,
+                        returned: activated.returned_makers,
                         cap_cancels,
+                        activated: activated.unconfirmed,
                     };
                     Ok(update)
                 })
                 .await?;
             let done = std::mem::take(&mut *done.lock().unwrap_or_else(|e| e.into_inner()));
-            for submission in activations.iter().filter(|s| s.unconfirmed()) {
+            for submission in activations
+                .iter()
+                .filter(|s| done.activated.contains(&s.lineage_id))
+            {
                 let via = if looked_up.contains(&submission.lineage_id) {
                     "lookup"
                 } else {
@@ -673,10 +746,9 @@ impl<T: MakerTracker> Watcher<T> {
     /// Publish what this successful round saw for `/metrics`. A failed count
     /// leaves the previous values; it never fails the round.
     async fn publish_gauges(&self) {
-        if let Some((block, read_ms)) = self.tracker.last_sync() {
-            SYNCED_BLOCK.store(u64::from(block.as_u32()), Ordering::Relaxed);
-            READ_UNIX_MS.store(read_ms, Ordering::Relaxed);
-            self.height.publish(block, read_ms);
+        if let Some(read) = self.tracker.last_sync() {
+            SYNCED_BLOCK.store(u64::from(read.block.as_u32()), Ordering::Relaxed);
+            READ_UNIX_MS.store(read.read_unix_ms, Ordering::Relaxed);
         }
         match self.pool.read(maker_db::pending_lineage_stats_tx).await {
             Ok(stats) => {
@@ -701,8 +773,10 @@ pub async fn run_watcher<T: MakerTracker>(
     interval: Duration,
     cancel: CancellationToken,
 ) {
-    // Until a round succeeds, the read age counts from now.
+    // Until a round succeeds, the read age counts from now, and no block is
+    // reported.
     READ_UNIX_MS.store(now_millis(), Ordering::Relaxed);
+    SYNCED_BLOCK.store(0, Ordering::Relaxed);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -751,8 +825,12 @@ mod tests {
         /// Notes a lagging round misses although they landed; the exact
         /// lookup still finds them.
         hidden: HashSet<NoteId>,
-        synced: Option<(u32, u64)>,
+        synced: Option<SyncRead>,
         lookups: usize,
+        /// The exact lookup fails, as on an RPC error.
+        lookup_fails: bool,
+        /// Notes whose exact lookup always fails.
+        failing_lookups: HashSet<NoteId>,
     }
 
     #[derive(Default, Clone)]
@@ -813,7 +891,11 @@ mod tests {
                     (note.id(), observation)
                 })
                 .collect();
-            state.synced = Some((state.tip, now_millis()));
+            state.synced = Some(SyncRead {
+                block: BlockNumber::from(state.tip),
+                read_unix_ms: now_millis(),
+                read_at: std::time::Instant::now(),
+            });
             Ok(observations)
         }
 
@@ -821,13 +903,14 @@ mod tests {
             let mut state = self.state();
             up(&state)?;
             state.lookups += 1;
+            if state.lookup_fails || state.failing_lookups.contains(&note.id()) {
+                return Err(ChainError::Test("lookup failed"));
+            }
             Ok(observed(&state, note))
         }
 
-        fn last_sync(&self) -> Option<(BlockNumber, u64)> {
-            self.state()
-                .synced
-                .map(|(tip, read_ms)| (BlockNumber::from(tip), read_ms))
+        fn last_sync(&self) -> Option<SyncRead> {
+            self.state().synced
         }
     }
 
@@ -887,9 +970,9 @@ mod tests {
             .unwrap();
         assert_eq!(first[&committed.id()], NoteObservation::Committed);
         // The sync it made is what `/metrics` reports.
-        let (block, read_ms) = tracker.last_sync().unwrap();
-        assert_eq!(block, tracker.client.get_sync_height().await.unwrap());
-        assert!(read_ms > 0);
+        let read = tracker.last_sync().unwrap();
+        assert_eq!(read.block, tracker.client.get_sync_height().await.unwrap());
+        assert!(read.read_unix_ms > 0);
 
         drop(tracker);
         let reopened = ClientBuilder::new()
@@ -1593,11 +1676,10 @@ mod tests {
         f.chain.commit(&good, 3);
         f.chain.state().unreadable.insert(bad.id());
         f.chain.state().tip = 100;
-        f.age(3600).await;
         f.watcher.round().await.unwrap();
 
         assert_eq!(f.status(&good).await, "active");
-        // Unread: no cap, no lookup.
+        // Unread, and the cap not due yet: no decision, no lookup.
         assert_eq!(f.status(&bad).await, "active");
         assert_eq!(f.chain.state().lookups, 0);
     }
@@ -1657,5 +1739,213 @@ mod tests {
             height.fresh(SyncedHeight::MAX_AGE),
             Some(BlockNumber::from(12))
         );
+    }
+
+    /// A spawn note committed by a maker wallet, and the wallet's executed
+    /// transaction that spends it, on a mock chain.
+    async fn spawned_note() -> (
+        Note,
+        miden_protocol::transaction::ExecutedTransaction,
+        Arc<MockRpcApi>,
+    ) {
+        use miden_protocol::transaction::RawOutputNote;
+        use miden_testing::Auth;
+        let mut builder = MockChain::builder();
+        let asset =
+            FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(), 100).unwrap();
+        let sender = builder
+            .add_existing_wallet_with_assets(Auth::IncrNonce, [asset.into()])
+            .unwrap();
+        let out = note_for_creator(720, NoteType::Public, sender.id());
+        let spawn = builder.add_spawn_note([&out]).unwrap();
+        let chain = builder.build().unwrap();
+        let spend = chain
+            .build_transaction(sender)
+            .authenticated_input_note(spawn.id())
+            .expected_output_note(RawOutputNote::Full(out))
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let rpc = Arc::new(MockRpcApi::new(chain));
+        rpc.prove_block();
+        (spawn, spend, rpc)
+    }
+
+    async fn tracker(rpc: &Arc<MockRpcApi>, dir: &tempfile::TempDir) -> SdkTracker {
+        let client = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(dir.path().join("maker.sqlite3"))
+            .build()
+            .await
+            .unwrap();
+        SdkTracker::new(client, rpc.clone())
+    }
+
+    /// The cap's lookup finds a note an earlier round missed (a lagging
+    /// node). The next round imports it again, so the store holds it
+    /// committed and later sees it spent.
+    #[tokio::test]
+    async fn sdk_tracker_resolves_a_note_its_cap_lookup_found() {
+        let (spawn, spend, rpc) = spawned_note().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(&rpc, &dir).await;
+        tracker.observe(&[]).await.unwrap();
+        let cursor = tracker.client.get_sync_height().await.unwrap();
+        // What a round leaves when the node answered "not found".
+        tracker
+            .client
+            .import_notes(&[NoteFile::ExpectedNote {
+                details: spawn.clone().into(),
+                sync_hint: NoteSyncHint::new(cursor.child(), spawn.metadata().tag()),
+            }])
+            .await
+            .unwrap();
+        tracker.tracked.insert(spawn.id());
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Pending);
+        assert_eq!(
+            tracker.lookup(&spawn).await.unwrap(),
+            NoteObservation::Committed
+        );
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Committed);
+        // The maker spends it: the next round sees it.
+        rpc.mock_chain
+            .write()
+            .add_pending_executed_transaction(&spend)
+            .unwrap();
+        rpc.prove_block();
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Consumed);
+    }
+
+    async fn seen(tracker: &mut SdkTracker, note: &Note) -> NoteObservation {
+        tracker.observe(std::slice::from_ref(note)).await.unwrap()[&note.id()]
+    }
+
+    /// A stored record of another note with the same details can't be
+    /// replaced by an import: the new note is decided by an exact lookup, and
+    /// the round goes on for every other note.
+    #[tokio::test]
+    async fn sdk_tracker_decides_a_note_sharing_details_with_a_record_by_lookup() {
+        use miden_protocol::transaction::RawOutputNote;
+        let old = note(730, NoteType::Public);
+        let new = note(730, NoteType::Private);
+        assert_eq!(old.details_commitment(), new.details_commitment());
+        assert_ne!(old.id(), new.id());
+        let good = note(731, NoteType::Private);
+        let mut builder = MockChain::builder();
+        for committed in [&old, &new, &good] {
+            builder.add_output_note(RawOutputNote::Full(committed.clone()));
+        }
+        let rpc = Arc::new(MockRpcApi::new(builder.build().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(&rpc, &dir).await;
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&old)).await.unwrap()[&old.id()],
+            NoteObservation::Committed
+        );
+        for _ in 0..2 {
+            let seen = tracker.observe(&[new.clone(), good.clone()]).await.unwrap();
+            assert_eq!(seen[&new.id()], NoteObservation::Committed);
+            assert_eq!(seen[&good.id()], NoteObservation::Committed);
+        }
+    }
+
+    /// A node error on the cap's lookup cancels nothing; the next round
+    /// tries again.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_failed_cap_lookup_cancels_nothing() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.chain.state().lookup_fails = true;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "active");
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only");
+
+        f.chain.state().lookup_fails = false;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "stopped");
+    }
+
+    /// An unconfirmed order whose note the tracker can never read is still
+    /// decided once the cap is due, by its exact lookup.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_decides_an_unreadable_note() {
+        let mut f = fixture().await;
+        let (missing, landed) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &missing, 0).await;
+        f.accept(2, &landed, 0).await;
+        f.chain.commit(&landed, 3);
+        for order in [&missing, &landed] {
+            f.chain.state().unreadable.insert(order.id());
+        }
+        f.chain.state().tip = 100;
+        // Not due yet: no decision for either.
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 0);
+        assert_eq!(
+            crate::gateway::watcher_gauges().map(|g| g.unobserved >= 2),
+            Some(true)
+        );
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 2);
+        assert_eq!(f.status(&missing).await, "stopped");
+        assert_eq!(f.status(&landed).await, "active");
+    }
+
+    /// The cap tells a maker nothing about an order it cancelled itself.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_sends_nothing_after_a_cancel_all() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.command(
+            "c2",
+            2,
+            MakerCommand::CancelAll {
+                scope: CutoffScope::all(),
+            },
+        )
+        .await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only, no CANCELLED");
+    }
+
+    /// Notes whose cap lookups keep failing can't take the whole per-round
+    /// lookup budget: the next round starts its lookups further on.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn failing_cap_lookups_do_not_hold_the_budget() {
+        let mut f = fixture().await;
+        let orders: Vec<_> = (1..=MAX_CAP_LOOKUPS as u32 + 1)
+            .map(|serial| note(serial, NoteType::Private))
+            .collect();
+        for (seq, order) in orders.iter().enumerate() {
+            f.accept(seq as u64 + 1, order, 0).await;
+        }
+        let (stuck, last) = orders.split_at(MAX_CAP_LOOKUPS);
+        f.chain
+            .state()
+            .failing_lookups
+            .extend(stuck.iter().map(Note::id));
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        for _ in 0..2 {
+            f.watcher.round().await.unwrap();
+        }
+        assert_eq!(f.status(&last[0]).await, "stopped");
+        for order in stuck {
+            assert_eq!(f.status(order).await, "active");
+        }
     }
 }

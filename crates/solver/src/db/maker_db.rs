@@ -262,9 +262,12 @@ impl AcceptGate {
     /// waits for this commit, and it fails if a new owner claimed it already.
     /// The freshness is read after that lock.
     ///
-    /// Call it before the round takes any other lock: ingest updates
-    /// `sync_state` before it locks maker rows, so taking this share lock
-    /// after a maker lock could deadlock with ingest.
+    /// Call it before the round takes any other lock. In one solver, intake
+    /// never overlaps ingest: both hold the publication guard through their
+    /// transaction. But during a takeover, the old process's intake runs
+    /// beside the new owner's ingest, which updates `sync_state` before it
+    /// locks maker rows; taking this share lock after a maker lock would
+    /// deadlock with it.
     pub fn accept_block(&mut self, conn: &mut PgConnection) -> DbResult<Option<BlockNumber>> {
         if let Some(checked) = self.checked {
             return Ok(checked);
@@ -275,7 +278,7 @@ impl AcceptGate {
             .select(sync_state::owner_epoch)
             .first(conn)?;
         if current != self.owner_epoch {
-            return Err(DbError::OwnerEpochMoved {
+            return Err(DbError::IntakeEpochMoved {
                 ours: self.owner_epoch,
                 current,
             });
@@ -721,7 +724,7 @@ impl PendingSubmission {
     }
 }
 
-/// Every pending submission, with the note its submit stored.
+/// Every pending submission, with the note its submit stored, oldest first.
 pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSubmission>> {
     maker_lineages::table
         .inner_join(
@@ -730,6 +733,9 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
                 .and(maker_commands::request_id.eq(maker_lineages::request_id))),
         )
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
+        .order(sql::<diesel::sql_types::Timestamptz>(
+            "maker_lineages.created_at ASC",
+        ))
         .select((
             maker_lineages::lineage_id,
             maker_lineages::maker_id,
@@ -890,15 +896,13 @@ fn order_status(note: &Note, state: proto::OrderState, reason: &str) -> proto::E
 /// Only rows this call stores, and roots that waited for their note (ADR
 /// 0008), go to the matcher: any other existing row is already there. An
 /// order that went live at accept was reported LIVE then.
-///
-/// Also returns the maker of each root that came back from `waiting`.
 pub fn activate_tx(
     conn: &mut PgConnection,
     submissions: &[PendingSubmission],
     arrival_unix: u64,
-) -> DbResult<(BookUpdate, Vec<MakerId>)> {
+) -> DbResult<Activated> {
     if submissions.is_empty() {
-        return Ok((BookUpdate::default(), Vec::new()));
+        return Ok(Activated::default());
     }
     let rows = submissions
         .iter()
@@ -949,14 +953,29 @@ pub fn activate_tx(
         .into_iter()
         .map(OrderRow::into_book_order)
         .collect::<DbResult<_>>()?;
-    Ok((
-        BookUpdate {
+    Ok(Activated {
+        update: BookUpdate {
             removed: Vec::new(),
             active,
             maker_updates: Vec::new(),
         },
         returned_makers,
-    ))
+        unconfirmed: submissions
+            .iter()
+            .filter(|s| s.unconfirmed() && activated.contains(&s.lineage_id))
+            .map(|s| s.lineage_id.clone())
+            .collect(),
+    })
+}
+
+/// What [`activate_tx`] did.
+#[derive(Debug, Default)]
+pub struct Activated {
+    pub update: BookUpdate,
+    /// The maker of each root that came back from `waiting`.
+    pub returned_makers: Vec<MakerId>,
+    /// Lineages that went live at accept that this call activated.
+    pub unconfirmed: HashSet<LineageId>,
 }
 
 /// What a watcher write did beyond its book update, for `/metrics`.
@@ -966,6 +985,8 @@ pub struct WatcherWrites {
     pub returned: Vec<MakerId>,
     /// The maker of each order the cap cancelled.
     pub cap_cancels: Vec<MakerId>,
+    /// Lineages that went live at accept that the write activated.
+    pub activated: HashSet<LineageId>,
 }
 
 /// Reject submissions the watcher found unusable, reporting each once, and
@@ -1038,6 +1059,8 @@ pub fn reject_tx(
 ///   order live;
 /// - a different note: the lineage is rejected with one REJECTED, and the row
 ///   is stopped.
+///
+/// The maker hears nothing for an order it cancelled itself.
 fn reject_unconfirmed_tx(
     conn: &mut PgConnection,
     rejections: &[&(PendingSubmission, proto::OrderState, &'static str)],
@@ -1100,10 +1123,11 @@ fn reject_unconfirmed_tx(
         if !rejected.contains(&submission.lineage_id) {
             continue;
         }
+        // Nothing for an order the maker cancelled itself.
+        if !shown.contains(submission.note.id().to_bytes().as_slice()) {
+            continue;
+        }
         let body = if *state == proto::OrderState::Unavailable {
-            if !shown.contains(submission.note.id().to_bytes().as_slice()) {
-                continue;
-            }
             order_status(
                 &submission.note,
                 proto::OrderState::Unavailable,
@@ -1162,8 +1186,14 @@ pub fn unconfirmed_count_tx(conn: &mut PgConnection) -> DbResult<i64> {
 /// and every `waiting` row, as the cap does. A maker that saw the order live
 /// hears CANCELLED `note_not_received`. A root a settlement still holds stays
 /// with that settlement: if it fails, the closed lineage keeps it out of the
-/// book. Returns how many orders it closed, per maker.
+/// book; if it commits, its remainder is reported CANCELLED, since the
+/// lineage is stopped. Returns how many orders it closed, per maker.
+///
+/// Its first statement claims a new owner epoch, so an intake session left
+/// over from a stopped solver can no longer put an order live afterwards.
 pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, usize)>> {
+    diesel::sql_query("UPDATE sync_state SET owner_epoch = owner_epoch + 1 WHERE id = 1")
+        .execute(conn)?;
     let pending: Vec<(Vec<u8>, i64, Vec<u8>)> = maker_lineages::table
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
         .filter(maker_lineages::live_at_accept.eq(true))
@@ -1260,7 +1290,7 @@ pub const NOTE_NOT_RECEIVED: &str = "note_not_received";
 /// round decides. Otherwise the lineage is closed whatever the root's status;
 /// an active or waiting root gets a stop row and is stopped, and the maker
 /// hears CANCELLED `note_not_received` if it saw the order live. Returns the
-/// orders to take out of the book, and the maker of each closed lineage.
+/// orders to take out of the book, and the maker of each order it stopped.
 pub fn cap_unconfirmed_tx(
     conn: &mut PgConnection,
     capped: &[PendingSubmission],
@@ -1289,15 +1319,6 @@ pub fn cap_unconfirmed_tx(
         .into_iter()
         .filter(|s| rejected.contains(&s.lineage_id))
         .collect();
-    for submission in &closed {
-        diesel::insert_into(maker_stops::table)
-            .values((
-                maker_stops::maker_id.eq(submission.maker_id),
-                maker_stops::lineage_id.eq(&submission.lineage_id),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?;
-    }
     let closed_ids: Vec<Vec<u8>> = closed
         .iter()
         .map(|s| s.note.id().to_bytes().to_vec())
@@ -1308,8 +1329,23 @@ pub fn cap_unconfirmed_tx(
         &[OrderStatus::Active, OrderStatus::Waiting],
         OrderStatus::Stopped,
     )?;
-    let makers = closed.iter().map(|s| s.maker_id).collect();
-    for submission in closed {
+    // A stop row, like `CancelOrder`'s, only for the orders it stops; a
+    // stopped or spent root's lineage is closed silently.
+    let stopped_now: Vec<&PendingSubmission> = closed
+        .into_iter()
+        .filter(|s| stopped.contains(&s.note.id().to_bytes().to_vec()))
+        .collect();
+    for submission in &stopped_now {
+        diesel::insert_into(maker_stops::table)
+            .values((
+                maker_stops::maker_id.eq(submission.maker_id),
+                maker_stops::lineage_id.eq(&submission.lineage_id),
+            ))
+            .on_conflict_do_nothing()
+            .execute(conn)?;
+    }
+    let makers = stopped_now.iter().map(|s| s.maker_id).collect();
+    for submission in stopped_now {
         if shown.contains(submission.note.id().to_bytes().as_slice()) {
             let body = order_status(
                 &submission.note,
@@ -1668,7 +1704,8 @@ pub struct PendingLineageStats {
     /// Seconds since the oldest was submitted, by the database clock.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
     pub oldest_age_secs: Option<f64>,
-    /// Of those, orders that went live at accept (ADR 0008).
+    /// Of those, orders that went live at accept (ADR 0008) and still
+    /// trade, wait or settle.
     #[diesel(sql_type = BigInt)]
     pub unconfirmed: i64,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
@@ -1686,8 +1723,10 @@ pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLine
     Ok(diesel::sql_query(
         "SELECT count(*) AS count,
                 EXTRACT(EPOCH FROM now() - min(m.created_at))::float8 AS oldest_age_secs,
-                count(*) FILTER (WHERE m.live_at_accept) AS unconfirmed,
-                EXTRACT(EPOCH FROM now() - min(m.created_at) FILTER (WHERE m.live_at_accept))::float8
+                count(*) FILTER (WHERE o.status IN ('active', 'waiting', 'settling'))
+                    AS unconfirmed,
+                EXTRACT(EPOCH FROM now() - min(m.created_at)
+                    FILTER (WHERE o.status IN ('active', 'waiting', 'settling')))::float8
                     AS oldest_unconfirmed_age_secs,
                 count(o.note_id) FILTER (WHERE o.status = 'waiting') AS waiting
          FROM maker_lineages m
@@ -1732,13 +1771,22 @@ pub fn active_maker_orders_page_tx(
     cutoff_unix_ms: i64,
 ) -> DbResult<Vec<ActiveMakerOrderRow>> {
     Ok(diesel::sql_query(
-        "SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth, m.expires_at_unix_ms
-         FROM eligible_orders l
-         JOIN maker_lineages m ON m.lineage_id = l.lineage_id
-         WHERE l.status IN ('active', 'waiting')
-           AND l.maker_id = $1 AND l.note_id > $2 AND l.depth IS NOT NULL
-           AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms > $4)
-         ORDER BY l.note_id
+        // Two parts, so each status keeps its partial index.
+        "SELECT * FROM (
+             SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth, m.expires_at_unix_ms
+             FROM live_orders l
+             JOIN maker_lineages m ON m.lineage_id = l.lineage_id
+             WHERE l.maker_id = $1 AND l.note_id > $2 AND l.depth IS NOT NULL
+               AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms > $4)
+             UNION ALL
+             SELECT l.note_id, l.lineage_id, l.root_seq, m.request_id, l.depth, m.expires_at_unix_ms
+             FROM eligible_orders l
+             JOIN maker_lineages m ON m.lineage_id = l.lineage_id
+             WHERE l.status = 'waiting'
+               AND l.maker_id = $1 AND l.note_id > $2 AND l.depth IS NOT NULL
+               AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms > $4)
+         ) listed
+         ORDER BY note_id
          LIMIT $3",
     )
     .bind::<BigInt, _>(maker_id)

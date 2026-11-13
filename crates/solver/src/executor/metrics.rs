@@ -283,6 +283,17 @@ mod tests {
         }
     }
 
+    /// Process-wide counters: only this test records a drop of a settlement
+    /// with an unconfirmed maker input.
+    #[test]
+    fn a_drop_is_labelled_by_whether_it_spent_an_unconfirmed_order() {
+        let count = |label| dropped().find(|(l, _)| *l == label).unwrap().1;
+        let before = count("true");
+        record_release(ReleaseCause::Dropped, 2, true);
+        record_release(ReleaseCause::Refused, 1, true);
+        assert_eq!(count("true"), before + 1);
+    }
+
     #[test]
     fn refusal_detail_carries_the_node_text() {
         let typed = refused(Some(AddTransactionError::StateConflict {

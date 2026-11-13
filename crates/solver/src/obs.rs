@@ -182,14 +182,16 @@ fn append_maker_metrics(body: &mut String, watcher: Option<WatcherGauges>) {
              solver_maker_oldest_pending_lineage_age_seconds {}\n\
              solver_maker_unconfirmed_orders {}\n\
              solver_maker_oldest_unconfirmed_order_age_seconds {}\n\
-             solver_maker_waiting_orders {}",
+             solver_maker_waiting_orders {}\n\
+             solver_maker_watcher_unobserved_notes {}",
             gauges.synced_block,
             gauges.read_age_secs,
             gauges.pending_lineages,
             gauges.oldest_pending_age_secs,
             gauges.unconfirmed,
             gauges.oldest_unconfirmed_age_secs,
-            gauges.waiting
+            gauges.waiting,
+            gauges.unobserved
         );
     }
 }
@@ -408,6 +410,7 @@ mod tests {
                 unconfirmed: 2,
                 oldest_unconfirmed_age_secs: 4.5,
                 waiting: 1,
+                unobserved: 0,
             }),
         );
         assert_eq!(
@@ -418,7 +421,8 @@ mod tests {
              solver_maker_oldest_pending_lineage_age_seconds 42.25\n\
              solver_maker_unconfirmed_orders 2\n\
              solver_maker_oldest_unconfirmed_order_age_seconds 4.5\n\
-             solver_maker_waiting_orders 1\n"
+             solver_maker_waiting_orders 1\n\
+             solver_maker_watcher_unobserved_notes 0\n"
         );
         // With the gateway disabled no watcher runs, and the lines are absent.
         let mut empty = String::new();

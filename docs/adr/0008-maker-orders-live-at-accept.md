@@ -33,12 +33,12 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 | D3 | When a settlement with unconfirmed parents never commits, what the node said decides where they go (table below). |
 | D4 | A `waiting` order comes back only when its note is in a block. |
 | D5 | The maker sees a `waiting` order as LIVE: in `ListActiveMakerOrders`, and as `LIVE` in a voided `SettlementResolved`. No proto change. A cancelled one becomes `stopped` and is reported CANCELLED. |
-| D6 | **The cap.** The watcher cancels an unconfirmed order only when all hold: (a) `maker_unconfirmed_cancel_after_secs` (default 60) since accept, by the database clock; (b) the watcher has synced to `accept_block + maker_unconfirmed_cancel_after_blocks` (default 20); (c) this round did not find the note; (d) one exact lookup of the note and its nullifier confirms it is not on chain. The lookup's answer counts as the round's observation: if it finds the note, the order is activated. |
+| D6 | **The cap.** The watcher cancels an unconfirmed order only when all hold: (a) `maker_unconfirmed_cancel_after_secs` (default 60) since accept, by the database clock; (b) the watcher has synced to `accept_block + maker_unconfirmed_cancel_after_blocks` (default 20); (c) this round did not find the note; (d) one exact lookup of the note and its nullifier confirms it is not on chain. The lookup's answer counts as the round's observation: if it finds the note, the order is activated. At most 16 lookups per round; the rest wait for the next. A failed lookup cancels nothing. The watcher imports an unconfirmed note's history from 10 blocks before `accept_block`, so a note a lagging node missed on its first lookup is still found. |
 | D7 | **Freshness.** `accept_block` is the watcher's latest synced block, written once at accept. An order goes live at accept only if that block was read from the chain less than 10 s ago. Intake reads it inside its transaction, after it share-locks the owner epoch. |
 | D8 | Settlement isolation (keeping a doubtful maker input out of other settlements) comes later, if the counters show it is needed. |
 | D9 | Accepted risks, below. |
 | D10 | Startup recovery keeps today's behaviour: a refused retry waits for the transaction's expiry. |
-| D11 | Two PRs: metrics and a mock-chain harness first, then this feature. |
+| D11 | Two PRs: metrics and a mock-chain harness first, then this feature. **Outstanding:** the plan's manual tests against a local node 0.18, and a refusal text captured from it as a fixture. The parser's markers are copied from the node's source (0.17.6 and 0.18.0); they are not yet pinned by a captured sample. |
 
 ### Accept
 
@@ -63,7 +63,8 @@ The confirmed path is today's: no row until the watcher sees the note. Accept fa
 | Cap | Lineage `rejected` whatever the root's status. An `active` or `waiting` root gets a stop row, is `stopped`, leaves the book, and the maker hears `CANCELLED` `note_not_received` if it saw the order live. A `stopped` or `onchain_nullified` root: closed silently. A `settling` root: skipped until its settlement resolves. |
 | Spent elsewhere | By the root's current status: `settling` waits; `executed` (our settlement) activates the lineage; any other status becomes `onchain_nullified`, the lineage `rejected`, with one `UNAVAILABLE` "note spent outside this solver" if the maker saw it live. |
 | A different note | `settling` waits for its settlement. Otherwise the lineage is `rejected` with one `REJECTED`, and the root is `stopped`. |
-| One bad note in a round | That note gets no observation and no cap; the round carries on. A batch lookup that fails is retried note by note; a committed note whose metadata differs is a mismatch. |
+| One bad note in a round | A note the tracker can't look up or import gets no observation this round; the others carry on. A failed batch lookup or import is retried note by note. A note whose details a stored record of another note already holds is decided by an exact lookup instead of an import. Once the cap is due, an unread unconfirmed order is decided by the cap's exact lookup. A failure of the chain sync itself still fails the round. `solver_maker_watcher_unobserved_notes` counts the notes a round left unread. |
+| A note found under our ID | It is ours: a note ID commits to the whole note, metadata included, so a node answer whose metadata looks different (a withheld attachment) is the same note. A note that really differs has another ID and is never found; the cap ends its order with `note_not_received`. The tracker therefore never reports a different note, and REJECTED is not sent. |
 | Lineage rejected | No longer watched. |
 | Maker cancels | Existing `CancelOrder` / `CancelAll`. A `waiting` root whose note lands later goes through `live_book_update_tx`, so it is stored `stopped`. |
 | Switch off | No new order goes live at accept; existing flagged lineages keep their rules. |
@@ -75,8 +76,8 @@ The executor keeps only the node's answer, in memory, until the release commits.
 
 | What the node said | Unconfirmed parents |
 |---|---|
-| Code 2 "unknown notes", naming at least one still-unconfirmed parent | Only those wait; the rest go back to the book. |
-| Code 2 "unknown notes", naming none of them (the text changed?) | All wait. |
+| Code 2 "unknown notes", naming at least one of the settlement's parents | Only the named unconfirmed parents wait; the rest go back to the book. The node names every unknown note in one refusal, so an unnamed one was known. |
+| Code 2 "unknown notes", naming nothing we recognise (the text changed?) | All wait. |
 | Code 2 "account commitment does not match" | Back to the book: the node checks the notes first. |
 | Code 2 mempool nullifiers or duplicate outputs; code 8; code 1; code 3; any other code; no details; unreadable text | All wait: the node stopped before the notes check, or we can't tell. |
 | Accepted, but it never landed; outcome unknown, then expired; a refused attempt reloaded after a restart | All wait. |
@@ -104,8 +105,8 @@ The node prints a state conflict as text. The executor matches `unauthenticated 
 
 ## Operations
 
-- **Metrics** (all in memory, no database read on scrape): `solver_executor_settlement_conflicts_total{kind}`, `solver_executor_settlements_dropped_total{unconfirmed_maker_input}`, per maker `solver_maker_live_at_accept_total`, `solver_maker_accept_fallbacks_total{reason}`, `solver_maker_unknown_notes_named_total`, `solver_maker_sent_to_waiting_total`, `solver_maker_waiting_returned_total`, `solver_maker_cap_cancels_total`, `solver_maker_unconfirmed_activations_total{via}`, and the gauges `solver_maker_unconfirmed_orders`, `solver_maker_waiting_orders`, `solver_maker_oldest_unconfirmed_order_age_seconds`. `solver_maker_watcher_block_read_age_seconds` is the D7 age.
-- **Escape hatch:** `solver-bin cancel-unconfirmed`, with the solver stopped, under the ownership lock: closes every unconfirmed lineage and stops its root and every `waiting` row, sending `CANCELLED` `note_not_received` to makers that saw them live.
+- **Metrics** (all in memory, no database read on scrape): `solver_executor_settlement_conflicts_total{kind}`, `solver_executor_settlements_dropped_total{unconfirmed_maker_input}`, per maker `solver_maker_live_at_accept_total`, `solver_maker_accept_fallbacks_total{reason}`, `solver_maker_unknown_notes_named_total`, `solver_maker_sent_to_waiting_total`, `solver_maker_waiting_returned_total`, `solver_maker_cap_cancels_total`, `solver_maker_unconfirmed_activations_total{via}`, and the gauges `solver_maker_unconfirmed_orders`, `solver_maker_waiting_orders`, `solver_maker_oldest_unconfirmed_order_age_seconds`, `solver_maker_watcher_unobserved_notes`. `solver_maker_watcher_block_read_age_seconds` approximates the D7 age by the wall clock; D7 itself measures it with a monotonic clock, so a clock step can't make an old block look fresh.
+- **Escape hatch:** `solver-bin cancel-unconfirmed`, with the solver stopped, under the ownership lock: first claims a new owner epoch (so an intake session left over from the stopped solver can't put another order live), then closes every unconfirmed lineage and stops its root and every `waiting` row, sending `CANCELLED` `note_not_received` to makers that saw them live. A root a settlement still holds stays with it: if that settlement fails, the order stays out of the book; if it commits, its remainder is reported `CANCELLED`.
 - **Rollback:** the migration's down refuses while `waiting` rows or unconfirmed lineages exist; run the hatch first.
 
 ## Consequences

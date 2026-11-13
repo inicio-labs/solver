@@ -71,7 +71,7 @@ jobs:
         run: cargo test -p solver --lib --locked -- --ignored --skip live_binance --test-threads=2
       - name: PostgreSQL startup and recovery integration
         run: |
-          cargo test -p solver --test integration_startup_failure --locked -- --ignored
+          cargo test -p solver --test integration_startup_failure --locked -- --ignored --test-threads=1
           cargo test -p solver --test integration_already_consumed --locked -- --ignored
           cargo test -p solver --test integration_post_commit_kill --locked -- --ignored
       - name: Full and partial settlement integration

@@ -561,7 +561,8 @@ fn insert_remainders(
 pub enum NodeAnswer {
     /// The node never received it: our own failure before submission.
     NotSent,
-    /// The node refused it for spending unknown notes, naming these.
+    /// The node refused it for spending unknown notes, naming these of its
+    /// parents (none when the text names nothing we recognise).
     UnknownNotes(HashSet<OrderId>),
     /// The node checked the notes and refused our account's state.
     AccountMismatch,
@@ -631,15 +632,6 @@ pub fn finish_discarded_settlement_tx(
         NodeAnswer::UnknownNotes(named) => Some(named),
         _ => None,
     };
-    // An answer naming none of the unconfirmed parents can't tell which are
-    // missing, so all of them wait.
-    let names_one = named.is_some_and(|named| {
-        inputs.iter().any(|(_, row)| {
-            row.status == OrderStatus::Settling.as_str()
-                && unconfirmed(&row.note_id)
-                && OrderId::read_from_bytes(&row.note_id).is_ok_and(|id| named.contains(&id))
-        })
-    });
 
     let mut active_ids = Vec::new();
     let mut consumed_ids = Vec::new();
@@ -676,9 +668,12 @@ pub fn finish_discarded_settlement_tx(
                 if named.is_some_and(|named| named.contains(&id)) {
                     released.named_makers.push(maker_id);
                 }
+                // The node names every unknown note in one refusal: an
+                // unnamed parent was known. Naming nothing of ours (its text
+                // changed?) tells nothing, so then every one waits.
                 let waits = match answer {
                     NodeAnswer::NotSent | NodeAnswer::AccountMismatch => false,
-                    NodeAnswer::UnknownNotes(named) => !names_one || named.contains(&id),
+                    NodeAnswer::UnknownNotes(named) => named.is_empty() || named.contains(&id),
                     NodeAnswer::Unclear => true,
                 };
                 if waits {

@@ -636,6 +636,8 @@ pub struct IntakeSession {
     /// live at accept (ADR 0008). `None` keeps every submit on the confirmed
     /// path.
     fresh_block: Option<FreshBlock>,
+    /// Woken after a round that put orders live at accept.
+    wake: crate::maker::EventWake,
     #[cfg(test)]
     drop_next_commit_reply: bool,
 }
@@ -678,6 +680,16 @@ impl IntakeSession {
     ) -> Self {
         self.fresh_block = Some(Arc::new(fresh_block));
         self
+    }
+
+    /// Wake `wake` instead of the process's event streams (tests).
+    pub fn with_event_wake(mut self, wake: crate::maker::EventWake) -> Self {
+        self.wake = wake;
+        self
+    }
+
+    pub(crate) fn event_wake(&self) -> crate::maker::EventWake {
+        self.wake.clone()
     }
 
     /// A gate for one intake round; `None` when live at accept is off.
@@ -888,6 +900,7 @@ impl PgPool {
             publish_order: self.publish_order.clone(),
             owner_epoch: self.writer_config.owner_epoch,
             fresh_block: None,
+            wake: crate::maker::EventWake::global().clone(),
             #[cfg(test)]
             drop_next_commit_reply: false,
         }

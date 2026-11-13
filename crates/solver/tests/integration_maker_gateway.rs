@@ -131,6 +131,9 @@ struct Scenario {
     solver: tokio::task::JoinHandle<Result<()>>,
     // Stops serving prices when dropped.
     _binance: common::BinanceStub,
+    /// `/metrics` when the scenario started. Counters are process-wide and
+    /// earlier scenarios in this process leave theirs behind.
+    baseline: String,
     _temps: [tempfile::TempDir; 2],
 }
 
@@ -252,6 +255,10 @@ impl Scenario {
             }
         };
         let events = gateway.events().await?;
+        // The watcher has read the chain once: an order can go live at
+        // accept from now on.
+        wait_for_metric(obs_port, "solver_maker_watcher_synced_block", |v| v > 0.0).await?;
+        let baseline = scrape(obs_port).await?;
         Ok(Self {
             pg,
             rpc,
@@ -266,6 +273,7 @@ impl Scenario {
             cancel,
             solver,
             _binance: binance,
+            baseline,
             _temps: [user_temp, solver_temp],
         })
     }
@@ -422,7 +430,8 @@ impl Scenario {
 
     /// Wait until the order row has `status`.
     async fn wait_for_status(&self, order: &Note, status: &str) -> Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        // Long enough for a full proof on a slow runner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(900);
         loop {
             if let Ok((current, _)) = self.state(order).await {
                 if current == status {
@@ -439,8 +448,23 @@ impl Scenario {
         }
     }
 
-    async fn metrics(&self) -> Result<String> {
-        scrape(self.obs_port).await
+    /// Wait until the change in the sum of `name`'s series whose labels
+    /// contain `labels`, since the scenario started, satisfies `want`.
+    /// Counters are recorded just after the commit and send they count.
+    async fn grew(&self, name: &str, labels: &str, want: impl Fn(f64) -> bool) -> Result<()> {
+        let start = total(&self.baseline, name, labels);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let delta = total(&scrape(self.obs_port).await?, name, labels) - start;
+            if want(delta) {
+                return Ok(());
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "{name}{{{labels}}} changed by {delta} since the scenario started"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -513,14 +537,14 @@ async fn a_maker_order_goes_live_after_its_note_lands_and_trades() -> Result<()>
                     ensure!(lineage == "activated", "lineage is {lineage}");
 
                     // Nothing was refused or dropped on the way.
-                    let metrics = s.metrics().await?;
-                    for line in metrics.lines() {
-                        if line.starts_with("solver_executor_settlement_refusals_total")
-                            || line.starts_with("solver_executor_settlements_dropped_total")
-                        {
-                            ensure!(line.ends_with(" 0"), "unexpected {line}");
-                        }
-                    }
+                    s.grew("solver_executor_settlement_refusals_total", "", |d| {
+                        d == 0.0
+                    })
+                    .await?;
+                    s.grew("solver_executor_settlements_dropped_total", "", |d| {
+                        d == 0.0
+                    })
+                    .await?;
                     Ok(())
                 })
             },
@@ -556,17 +580,19 @@ async fn a_live_at_accept_order_trades_in_the_block_that_creates_it() -> Result<
                     "maker order is {status}, not executed"
                 );
                 ensure!(lineage == "activated", "lineage is {lineage}");
-                let metrics = s.metrics().await?;
-                ensure!(total(&metrics, "solver_maker_live_at_accept_total", "") == 1.0);
-                ensure!(
-                    total(
-                        &metrics,
-                        "solver_maker_unconfirmed_activations_total",
-                        "via=\"settlement\""
-                    ) == 1.0,
-                    "not activated by our settlement:\n{metrics}"
-                );
-                ensure!(total(&metrics, "solver_executor_settlement_refusals_total", "") == 0.0);
+                s.grew("solver_maker_live_at_accept_total", "", |d| d == 1.0)
+                    .await?;
+                s.grew(
+                    "solver_maker_unconfirmed_activations_total",
+                    "via=\"settlement\"",
+                    |d| d == 1.0,
+                )
+                .await
+                .context("not activated by our settlement")?;
+                s.grew("solver_executor_settlement_refusals_total", "", |d| {
+                    d == 0.0
+                })
+                .await?;
                 Ok(())
             })
         }))
@@ -589,17 +615,16 @@ async fn an_order_whose_note_is_unknown_waits_then_trades() -> Result<()> {
                 s.submit(&order).await?;
                 s.wait_for_live(&order, Duration::from_secs(10)).await?;
                 s.wait_for_status(&order, "waiting").await?;
-                let metrics = s.metrics().await?;
-                ensure!(
-                    total(
-                        &metrics,
-                        "solver_executor_settlement_conflicts_total",
-                        "kind=\"unknown_notes\""
-                    ) >= 1.0,
-                    "no unknown-notes refusal:\n{metrics}"
-                );
-                ensure!(total(&metrics, "solver_maker_sent_to_waiting_total", "") >= 1.0);
-                ensure!(total(&metrics, "solver_maker_unknown_notes_named_total", "") >= 1.0);
+                s.grew(
+                    "solver_executor_settlement_conflicts_total",
+                    "kind=\"unknown_notes\"",
+                    |d| d >= 1.0,
+                )
+                .await?;
+                s.grew("solver_maker_sent_to_waiting_total", "", |d| d >= 1.0)
+                    .await?;
+                s.grew("solver_maker_unknown_notes_named_total", "", |d| d >= 1.0)
+                    .await?;
                 wait_for_metric(s.obs_port, "solver_maker_waiting_orders", |v| v == 1.0).await?;
                 // The voided settlement still shows the order live.
                 wait_for_event(&mut s.events, Duration::from_secs(10), |kind| {
@@ -627,8 +652,8 @@ async fn an_order_whose_note_is_unknown_waits_then_trades() -> Result<()> {
                     status == "executed",
                     "maker order is {status}, not executed"
                 );
-                let metrics = s.metrics().await?;
-                ensure!(total(&metrics, "solver_maker_waiting_returned_total", "") == 1.0);
+                s.grew("solver_maker_waiting_returned_total", "", |d| d == 1.0)
+                    .await?;
                 Ok(())
             })
         }))
@@ -671,8 +696,8 @@ async fn an_order_whose_note_never_arrives_is_capped() -> Result<()> {
                         (status.as_str(), lineage.as_str()) == ("stopped", "rejected"),
                         "after the cap: {status}, {lineage}"
                     );
-                    let metrics = s.metrics().await?;
-                    ensure!(total(&metrics, "solver_maker_cap_cancels_total", "") == 1.0);
+                    s.grew("solver_maker_cap_cancels_total", "", |d| d == 1.0)
+                        .await?;
                     Ok(())
                 })
             },

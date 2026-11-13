@@ -43,9 +43,10 @@ jobs:
         run: |
           rustfmt --check --edition 2021 --config skip_children=true \
             crates/solver/src/db/postgres_*.rs crates/solver/src/db/maker_db.rs \
+            crates/solver/src/db/{mod,live_at_accept_tests}.rs \
             crates/solver/src/maker.rs crates/solver/src/types.rs \
             crates/solver/src/admin/admin.rs crates/solver/src/config.rs \
-            crates/solver/src/executor/{executor,metrics,mod}.rs crates/solver/src/ingest/ingest.rs \
+            crates/solver/src/executor/{executor,metrics,mod,refusal}.rs crates/solver/src/ingest/ingest.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
             crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs \
             crates/solver/src/matcher/clearing_book/bounded_price.rs \
@@ -94,7 +95,7 @@ jobs:
       # A maker order through the gateway, on a mock node that refuses unknown
       # notes like a real one: the baseline for orders live at accept.
       - name: Maker gateway integration
-        run: cargo test -p solver --test integration_maker_gateway --locked -- --ignored
+        run: cargo test -p solver --test integration_maker_gateway --locked -- --ignored --test-threads=1
 
   production-binary:
     runs-on: ubuntu-latest

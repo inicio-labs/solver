@@ -109,6 +109,16 @@ pub fn revert_last(conn: &mut PgConnection) -> DbResult<String> {
     })
 }
 
+/// The live-at-accept escape hatch (ADR 0008): with the solver stopped, close
+/// every order that went live at accept and still lacks its note. Refuses
+/// while a solver owns the database.
+pub fn cancel_unconfirmed(conn: &mut PgConnection) -> DbResult<Vec<(i64, usize)>> {
+    verify(conn)?;
+    super::postgres_pool::with_ownership_lock(conn, |conn| {
+        conn.transaction(super::maker_db::cancel_unconfirmed_tx)
+    })
+}
+
 /// Check, without DDL, that the applied migration history equals the set
 /// compiled into this binary. Each migration creates its own tables, so an
 /// exact history match also means the schema this binary expects is present.

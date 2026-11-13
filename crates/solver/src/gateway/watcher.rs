@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,6 +38,9 @@ static SYNCED_BLOCK: AtomicU64 = AtomicU64::new(0);
 static READ_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static PENDING_LINEAGES: AtomicU64 = AtomicU64::new(0);
 static OLDEST_PENDING_MS: AtomicU64 = AtomicU64::new(0);
+static UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
+static OLDEST_UNCONFIRMED_MS: AtomicU64 = AtomicU64::new(0);
+static WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// What the maker-note watcher last saw, for `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +54,11 @@ pub(crate) struct WatcherGauges {
     pub pending_lineages: u64,
     /// Age of the oldest of them, by the database clock.
     pub oldest_pending_age_secs: f64,
+    /// Of those, orders that went live at accept (ADR 0008).
+    pub unconfirmed: u64,
+    pub oldest_unconfirmed_age_secs: f64,
+    /// Of those, orders out of the book until their note lands.
+    pub waiting: u64,
 }
 
 /// `None` when no watcher runs in this process (gateway disabled).
@@ -64,6 +72,9 @@ pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
         read_age_secs: now_millis().saturating_sub(read_ms) as f64 / 1000.0,
         pending_lineages: PENDING_LINEAGES.load(Ordering::Relaxed),
         oldest_pending_age_secs: OLDEST_PENDING_MS.load(Ordering::Relaxed) as f64 / 1000.0,
+        unconfirmed: UNCONFIRMED.load(Ordering::Relaxed),
+        oldest_unconfirmed_age_secs: OLDEST_UNCONFIRMED_MS.load(Ordering::Relaxed) as f64 / 1000.0,
+        waiting: WAITING.load(Ordering::Relaxed),
     })
 }
 
@@ -78,14 +89,86 @@ pub enum NoteObservation {
 /// Check a set of exact notes without deciding whether their orders may trade.
 #[async_trait(?Send)]
 pub trait MakerTracker {
-    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
+    /// Observe `notes`. A note new to the tracker that is in `import_from`
+    /// has its history searched from that block: an order that went live at
+    /// accept (ADR 0008), whose note may have landed while a lagging node
+    /// still answered that it didn't. A note the tracker could not read this
+    /// round is left out of the result.
+    async fn observe_from(
+        &mut self,
+        notes: &[Note],
+        import_from: &HashMap<NoteId, BlockNumber>,
+    ) -> ChainResult<HashMap<NoteId, NoteObservation>>;
+
+    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+        self.observe_from(notes, &HashMap::new()).await
+    }
+
+    /// One exact lookup of `note` and its nullifier on the node.
+    async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation>;
 
     /// The block the last `observe` synced to and when, in Unix
-    /// milliseconds, it started reading the chain. For `/metrics` only.
+    /// milliseconds, it started reading the chain.
     fn last_sync(&self) -> Option<(BlockNumber, u64)> {
         None
     }
 }
+
+/// The watcher's latest synced block and when it was read from the chain,
+/// shared with intake: an order goes live at accept only while this is fresh
+/// (ADR 0008, D7).
+#[derive(Clone, Default)]
+pub struct SyncedHeight(Arc<Mutex<Option<(BlockNumber, u64)>>>);
+
+impl SyncedHeight {
+    /// The longest a block read may be old for an order to go live at accept.
+    pub const MAX_AGE: Duration = Duration::from_secs(10);
+
+    fn publish(&self, block: BlockNumber, read_unix_ms: u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((block, read_unix_ms));
+    }
+
+    /// The block, if it was read from the chain less than `max_age` ago.
+    pub fn fresh(&self, max_age: Duration) -> Option<BlockNumber> {
+        let (block, read_ms) = (*self.0.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let age = now_millis().saturating_sub(read_ms);
+        (u128::from(age) < max_age.as_millis()).then_some(block)
+    }
+}
+
+/// When the watcher cancels an order that went live at accept whose note
+/// never arrived (ADR 0008, D6): both must have passed since accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnconfirmedCap {
+    pub secs: u64,
+    pub blocks: u32,
+}
+
+impl Default for UnconfirmedCap {
+    fn default() -> Self {
+        Self {
+            secs: 60,
+            blocks: 20,
+        }
+    }
+}
+
+impl UnconfirmedCap {
+    /// Whether the time and block parts of the cap have passed for
+    /// `submission`, with the watcher synced to `synced`.
+    fn due(&self, submission: &maker_db::PendingSubmission, synced: Option<BlockNumber>) -> bool {
+        let (Some(accept_block), Some(synced)) = (submission.accept_block, synced) else {
+            return false;
+        };
+        submission.age_secs >= self.secs as f64
+            && u64::from(synced.as_u32())
+                >= u64::from(accept_block.as_u32()) + u64::from(self.blocks)
+    }
+}
+
+/// Blocks before an order's accept block from which its note's history is
+/// searched, in case the watcher's block lagged the maker's transaction.
+const IMPORT_MARGIN_BLOCKS: u32 = 10;
 
 /// Only exact notes supplied by PostgreSQL may enter the maker client store.
 struct MakerNoteScreen(HashSet<NoteId>);
@@ -217,7 +300,15 @@ impl MakerTracker for SdkTracker {
         self.last_sync
     }
 
-    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+    async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation> {
+        self.exact_lookup(note).await
+    }
+
+    async fn observe_from(
+        &mut self,
+        notes: &[Note],
+        import_from: &HashMap<NoteId, BlockNumber>,
+    ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
         self.client.ensure_genesis_in_place().await?;
         self.client.ensure_rpc_limits_in_place().await?;
         // Capture before lookup: a note committed during import must still be
@@ -244,44 +335,79 @@ impl MakerTracker for SdkTracker {
                     && queued.insert(commitment)
             })
             .collect();
+        // Decided per note: one note's failure never fails the round.
+        let mut observed = HashMap::with_capacity(notes.len());
+        let mut unreadable = HashSet::new();
         if !new_notes.is_empty() {
             let limit = self.rpc.get_rpc_limits().await?.note_ids_limit.max(1) as usize;
             for batch in new_notes.chunks(limit) {
                 let ids: Vec<_> = batch.iter().map(|note| note.id()).collect();
-                let found: HashMap<_, _> = self
-                    .rpc
-                    .get_notes_by_id(&ids)
-                    .await?
-                    .into_iter()
-                    .map(|note| (note.id(), note))
-                    .collect();
+                let found = match self.rpc.get_notes_by_id(&ids).await {
+                    Ok(found) => found,
+                    // One note that fails to decode fails the whole batch:
+                    // look each one up alone.
+                    Err(error) if ids.len() > 1 => {
+                        tracing::warn!(%error, notes = ids.len(), "maker note batch lookup failed; looking notes up one by one");
+                        let mut found = Vec::with_capacity(ids.len());
+                        for id in &ids {
+                            match self.rpc.get_notes_by_id(&[*id]).await {
+                                Ok(note) => found.extend(note),
+                                Err(error) => {
+                                    tracing::warn!(note_id = %id, %error, "maker note lookup failed; skipped this round");
+                                    unreadable.insert(*id);
+                                }
+                            }
+                        }
+                        found
+                    }
+                    Err(error) => {
+                        tracing::warn!(note_id = %ids[0], %error, "maker note lookup failed; skipped this round");
+                        unreadable.insert(ids[0]);
+                        Vec::new()
+                    }
+                };
+                let found: HashMap<_, _> =
+                    found.into_iter().map(|note| (note.id(), note)).collect();
                 let mut imports = Vec::with_capacity(batch.len());
                 for note in batch {
+                    if unreadable.contains(&note.id()) {
+                        continue;
+                    }
                     imports.push(if let Some(found) = found.get(&note.id()) {
                         if found.metadata() != note.metadata() {
-                            return Err(ClientError::NoteImportError(
-                                "committed maker note metadata differs from submission".into(),
-                            )
-                            .into());
+                            // The committed note is not the one submitted.
+                            observed.insert(note.id(), NoteObservation::Mismatched);
+                            continue;
                         }
                         NoteFile::Committed {
                             note: (*note).clone(),
                             proof: found.inclusion_proof().clone(),
                         }
                     } else {
+                        // Forward sync starts at the captured cursor and
+                        // covers commitments racing this lookup. A note that
+                        // went live at accept is searched from its accept
+                        // block too.
+                        let after = import_from.get(&note.id()).map_or(cursor.child(), |block| {
+                            BlockNumber::from(block.as_u32().saturating_sub(IMPORT_MARGIN_BLOCKS))
+                                .min(cursor.child())
+                        });
                         NoteFile::ExpectedNote {
                             details: (*note).clone().into(),
-                            // Skip historical import; forward sync starts at the
-                            // captured cursor and covers commitments racing lookup.
-                            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
+                            sync_hint: NoteSyncHint::new(after, note.metadata().tag()),
                         }
                     });
                 }
-                self.client.import_notes(&imports).await?;
+                if !imports.is_empty() {
+                    self.client.import_notes(&imports).await?;
+                }
             }
         }
+        let skip =
+            |note: &&Note| !unreadable.contains(&note.id()) && !observed.contains_key(&note.id());
 
-        self.sync_maker_notes(notes).await?;
+        let synced: Vec<Note> = notes.iter().filter(skip).cloned().collect();
+        self.sync_maker_notes(&synced).await?;
         let records: BTreeMap<_, _> = self
             .client
             .get_input_notes(NoteFilter::DetailsCommitments(commitments))
@@ -289,35 +415,45 @@ impl MakerTracker for SdkTracker {
             .into_iter()
             .map(|record| (record.details_commitment(), record))
             .collect();
-        let mut observed = HashMap::with_capacity(notes.len());
-        for note in notes {
+        for note in &synced {
             // The SDK stores only one expected record per details commitment.
             // If two submitted IDs share it, use exact SDK RPC lookup for both
             // rather than treating either record as the other's commitment.
-            if count_by_commitment[&note.details_commitment()] > 1 {
-                observed.insert(note.id(), self.exact_lookup(note).await?);
-                continue;
-            }
-            let record = records
-                .get(&note.details_commitment())
-                .ok_or(ChainError::MissingSyncedNote(note.id()))?;
-            let state =
-                if record.id() == Some(note.id()) && record.metadata() == Some(note.metadata()) {
-                    if record.is_consumed() {
-                        NoteObservation::Consumed
-                    } else if record.is_committed() {
-                        NoteObservation::Committed
-                    } else {
-                        NoteObservation::Pending
+            let state = if count_by_commitment[&note.details_commitment()] > 1 {
+                self.exact_lookup(note).await
+            } else {
+                match records.get(&note.details_commitment()) {
+                    None => Err(ChainError::MissingSyncedNote(note.id())),
+                    Some(record)
+                        if record.id() == Some(note.id())
+                            && record.metadata() == Some(note.metadata()) =>
+                    {
+                        Ok(if record.is_consumed() {
+                            NoteObservation::Consumed
+                        } else if record.is_committed() {
+                            NoteObservation::Committed
+                        } else {
+                            NoteObservation::Pending
+                        })
                     }
-                } else if record.id().is_some() {
-                    self.exact_lookup(note).await?
-                } else {
-                    NoteObservation::Pending
-                };
-            observed.insert(note.id(), state);
+                    Some(record) if record.id().is_some() => self.exact_lookup(note).await,
+                    Some(_) => Ok(NoteObservation::Pending),
+                }
+            };
+            match state {
+                Ok(state) => {
+                    observed.insert(note.id(), state);
+                }
+                Err(error) => {
+                    tracing::warn!(note_id = %note.id(), %error, "maker note not observed this round");
+                }
+            }
         }
-        self.tracked = notes.iter().map(Note::id).collect();
+        self.tracked = notes
+            .iter()
+            .map(Note::id)
+            .filter(|id| !unreadable.contains(id))
+            .collect();
         Ok(observed)
     }
 }
@@ -328,8 +464,6 @@ pub enum WatchError {
     Chain(#[from] ChainError),
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
-    #[error("tracker omitted note {0}")]
-    MissingObservation(NoteId),
 }
 
 pub struct Watcher<T> {
@@ -339,6 +473,8 @@ pub struct Watcher<T> {
     // PostgreSQL supplies the authoritative set; this cache avoids decoding
     // every unchanged live note on every round. It is rebuilt after restart.
     watched: HashMap<Vec<u8>, Note>,
+    height: SyncedHeight,
+    cap: UnconfirmedCap,
 }
 
 impl<T: MakerTracker> Watcher<T> {
@@ -348,11 +484,28 @@ impl<T: MakerTracker> Watcher<T> {
             tracker,
             book_tx,
             watched: HashMap::new(),
+            height: SyncedHeight::default(),
+            cap: UnconfirmedCap::default(),
         }
+    }
+
+    pub fn with_cap(mut self, cap: UnconfirmedCap) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Where this watcher publishes its latest synced block, for intake.
+    pub fn synced_height(&self) -> SyncedHeight {
+        self.height.clone()
     }
 
     /// Reconcile pending submissions and previously live maker orders against
     /// the SDK, then commit every resulting order and event change together.
+    ///
+    /// An order that went live at accept (ADR 0008) whose note is still not
+    /// found once the cap's time and blocks have passed gets one exact lookup.
+    /// Its answer counts as this round's observation; if the note is still
+    /// not on chain, the order is cancelled.
     pub async fn round(&mut self) -> Result<(), WatchError> {
         let pending = self.pool.read(maker_db::pending_submissions_tx).await?;
         let watched_ids = self.pool.read(maker_db::watched_maker_orders_tx).await?;
@@ -375,24 +528,55 @@ impl<T: MakerTracker> Watcher<T> {
             .map(|submission| (submission.note.id(), submission.note.clone()))
             .chain(self.watched.values().map(|note| (note.id(), note.clone())))
             .collect();
+        let import_from: HashMap<NoteId, BlockNumber> = pending
+            .iter()
+            .filter_map(|s| Some((s.note.id(), s.accept_block?)))
+            .collect();
         let observations = self
             .tracker
-            .observe(&notes.into_values().collect::<Vec<_>>())
+            .observe_from(&notes.into_values().collect::<Vec<_>>(), &import_from)
             .await?;
-        for note in pending
+        let unobserved = pending
             .iter()
             .map(|submission| &submission.note)
             .chain(self.watched.values())
-        {
-            if !observations.contains_key(&note.id()) {
-                return Err(WatchError::MissingObservation(note.id()));
-            }
+            .filter(|note| !observations.contains_key(&note.id()))
+            .count();
+        if unobserved > 0 {
+            tracing::warn!(unobserved, "maker notes without an observation this round");
         }
+        let synced = self.tracker.last_sync().map(|(block, _)| block);
 
         let mut activations = Vec::new();
         let mut rejections = Vec::new();
+        let mut capped = Vec::new();
+        let mut looked_up = Vec::new();
         for submission in pending {
-            match observations[&submission.note.id()] {
+            // A note that could not be read this round gets no decision.
+            let Some(&observed) = observations.get(&submission.note.id()) else {
+                continue;
+            };
+            let observation = if observed == NoteObservation::Pending
+                && self.cap.due(&submission, synced)
+            {
+                match self.tracker.lookup(&submission.note).await {
+                    Ok(NoteObservation::Pending) => {
+                        capped.push(submission);
+                        continue;
+                    }
+                    Ok(found) => {
+                        looked_up.push(submission.lineage_id.clone());
+                        found
+                    }
+                    Err(error) => {
+                        tracing::warn!(note_id = %submission.note.id(), %error, "cap lookup failed; next round");
+                        continue;
+                    }
+                }
+            } else {
+                observed
+            };
+            match observation {
                 NoteObservation::Committed => activations.push(submission),
                 NoteObservation::Consumed => rejections.push((
                     submission,
@@ -414,26 +598,67 @@ impl<T: MakerTracker> Watcher<T> {
             .map(|(id, _)| id.clone())
             .collect();
 
-        if !activations.is_empty() || !rejections.is_empty() || !spent_ids.is_empty() {
+        if !activations.is_empty()
+            || !rejections.is_empty()
+            || !capped.is_empty()
+            || !spent_ids.is_empty()
+        {
             let removed = spent_ids
                 .iter()
                 .map(|id| Ok(OrderId::read_from_bytes(id)?))
                 .collect::<Result<Vec<_>, crate::db::DbError>>()?;
-            let writes = (activations.clone(), rejections.clone(), spent_ids.clone());
+            let writes = (
+                activations.clone(),
+                rejections.clone(),
+                capped.clone(),
+                spent_ids.clone(),
+            );
+            let done = Arc::new(Mutex::new(maker_db::WatcherWrites::default()));
+            let done_in = done.clone();
             self.pool
                 .write_book(&self.book_tx, move |conn| {
-                    let (activations, rejections, spent_ids) = writes;
-                    maker_db::prelock_watcher_tx(conn, &activations, &rejections, &spent_ids)?;
-                    maker_db::reject_tx(conn, &rejections)?;
+                    let (activations, rejections, capped, spent_ids) = writes;
+                    maker_db::prelock_watcher_tx(
+                        conn,
+                        &activations,
+                        &rejections,
+                        &capped,
+                        &spent_ids,
+                    )?;
+                    let rejected = maker_db::reject_tx(conn, &rejections)?;
+                    let (stopped, cap_cancels) = maker_db::cap_unconfirmed_tx(conn, &capped)?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
-                    let mut update = maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let (mut update, returned) =
+                        maker_db::activate_tx(conn, &activations, now_unix())?;
                     update.removed.extend(removed);
+                    update.removed.extend(rejected);
+                    update.removed.extend(stopped);
+                    *done_in.lock().unwrap_or_else(|e| e.into_inner()) = maker_db::WatcherWrites {
+                        returned,
+                        cap_cancels,
+                    };
                     Ok(update)
                 })
                 .await?;
+            let done = std::mem::take(&mut *done.lock().unwrap_or_else(|e| e.into_inner()));
+            for submission in activations.iter().filter(|s| s.unconfirmed()) {
+                let via = if looked_up.contains(&submission.lineage_id) {
+                    "lookup"
+                } else {
+                    "watcher"
+                };
+                super::metrics::count_activation(submission.maker_id, via);
+            }
+            for maker_id in done.returned {
+                super::metrics::count(super::metrics::WAITING_RETURNED, maker_id);
+            }
+            for maker_id in &done.cap_cancels {
+                super::metrics::count(super::metrics::CAP_CANCELS, *maker_id);
+            }
             tracing::info!(
                 activated = activations.len(),
                 rejected = rejections.len(),
+                capped = done.cap_cancels.len(),
                 spent = spent_ids.len(),
                 "maker notes verified"
             );
@@ -451,12 +676,20 @@ impl<T: MakerTracker> Watcher<T> {
         if let Some((block, read_ms)) = self.tracker.last_sync() {
             SYNCED_BLOCK.store(u64::from(block.as_u32()), Ordering::Relaxed);
             READ_UNIX_MS.store(read_ms, Ordering::Relaxed);
+            self.height.publish(block, read_ms);
         }
         match self.pool.read(maker_db::pending_lineage_stats_tx).await {
             Ok(stats) => {
                 PENDING_LINEAGES.store(u64::try_from(stats.count).unwrap_or(0), Ordering::Relaxed);
-                let oldest_ms = stats.oldest_age_secs.unwrap_or(0.0).max(0.0) * 1000.0;
-                OLDEST_PENDING_MS.store(oldest_ms as u64, Ordering::Relaxed);
+                let millis = |secs: Option<f64>| (secs.unwrap_or(0.0).max(0.0) * 1000.0) as u64;
+                OLDEST_PENDING_MS.store(millis(stats.oldest_age_secs), Ordering::Relaxed);
+                UNCONFIRMED.store(
+                    u64::try_from(stats.unconfirmed).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                OLDEST_UNCONFIRMED_MS
+                    .store(millis(stats.oldest_unconfirmed_age_secs), Ordering::Relaxed);
+                WAITING.store(u64::try_from(stats.waiting).unwrap_or(0), Ordering::Relaxed);
             }
             Err(error) => tracing::debug!(%error, "pending lineage count failed"),
         }
@@ -513,6 +746,13 @@ mod tests {
         notes: HashMap<NoteId, (u32, NoteMetadata)>,
         spent: HashMap<Nullifier, u32>,
         down: bool,
+        /// Notes the tracker cannot read: no observation, no lookup answer.
+        unreadable: HashSet<NoteId>,
+        /// Notes a lagging round misses although they landed; the exact
+        /// lookup still finds them.
+        hidden: HashSet<NoteId>,
+        synced: Option<(u32, u64)>,
+        lookups: usize,
     }
 
     #[derive(Default, Clone)]
@@ -543,30 +783,51 @@ mod tests {
         Ok(())
     }
 
+    fn observed(state: &ChainState, note: &Note) -> NoteObservation {
+        match state.notes.get(&note.id()) {
+            None => NoteObservation::Pending,
+            Some((_, metadata)) if metadata != note.metadata() => NoteObservation::Mismatched,
+            Some(_) if state.spent.contains_key(&note.nullifier()) => NoteObservation::Consumed,
+            Some(_) => NoteObservation::Committed,
+        }
+    }
+
     #[async_trait(?Send)]
     impl MakerTracker for FakeChain {
-        async fn observe(
+        async fn observe_from(
             &mut self,
             notes: &[Note],
+            _import_from: &HashMap<NoteId, BlockNumber>,
         ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
-            let state = self.state();
+            let mut state = self.state();
             up(&state)?;
-            Ok(notes
+            let observations = notes
                 .iter()
+                .filter(|note| !state.unreadable.contains(&note.id()))
                 .map(|note| {
-                    let observation = match state.notes.get(&note.id()) {
-                        None => NoteObservation::Pending,
-                        Some((_, metadata)) if metadata != note.metadata() => {
-                            NoteObservation::Mismatched
-                        }
-                        Some(_) if state.spent.contains_key(&note.nullifier()) => {
-                            NoteObservation::Consumed
-                        }
-                        Some(_) => NoteObservation::Committed,
+                    let observation = if state.hidden.contains(&note.id()) {
+                        NoteObservation::Pending
+                    } else {
+                        observed(&state, note)
                     };
                     (note.id(), observation)
                 })
-                .collect())
+                .collect();
+            state.synced = Some((state.tip, now_millis()));
+            Ok(observations)
+        }
+
+        async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation> {
+            let mut state = self.state();
+            up(&state)?;
+            state.lookups += 1;
+            Ok(observed(&state, note))
+        }
+
+        fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+            self.state()
+                .synced
+                .map(|(tip, read_ms)| (BlockNumber::from(tip), read_ms))
         }
     }
 
@@ -1022,13 +1283,20 @@ mod tests {
         f.chain.commit(&order, 2);
         f.watcher.round().await.unwrap();
 
-        let update = f.book.try_recv().unwrap();
-        assert_eq!(update.active[0].id(), order.id());
-        assert!(
-            update.active[0].maker.is_some(),
-            "now tagged as a maker order"
+        // Ingest put the order in the book, and the submit's attribution
+        // tagged it there, so activation sends nothing again.
+        assert!(f.book.try_recv().is_err());
+        assert_eq!(
+            f.statuses().await,
+            [(id(&order), proto::OrderState::Live, String::new())]
         );
-        assert_eq!(f.statuses().await.len(), 1);
+        assert_eq!(f.status(&order).await, "active");
+        let tagged =
+            f.db.pool
+                .read(postgres_db::load_live_orders_tx)
+                .await
+                .unwrap();
+        assert!(tagged[0].maker.is_some(), "now a maker order");
     }
 
     /// A public maker note can trade before the watcher activates its claim:
@@ -1179,5 +1447,215 @@ mod tests {
         f.chain.state().down = false;
         f.watcher.round().await.unwrap();
         assert_eq!(f.book.try_recv().unwrap().active[0].id(), order.id());
+    }
+
+    impl Fixture {
+        /// Submit with live at accept on, the watcher's block at `block`.
+        async fn accept(&self, seq: u64, note: &Note, block: u32) {
+            let header = CommandHeader::new(self.maker_id, format!("a{seq}"), seq).unwrap();
+            let command = MakerCommand::submit(note.clone()).unwrap();
+            let outcome = self
+                .db
+                .pool
+                .write(move |conn| {
+                    use crate::db::postgres_schema::sync_state;
+                    use diesel::prelude::*;
+                    let epoch: i64 = sync_state::table
+                        .find(1_i16)
+                        .select(sync_state::owner_epoch)
+                        .first(conn)?;
+                    let mut gate =
+                        maker_db::AcceptGate::new(epoch, move || Some(BlockNumber::from(block)));
+                    maker_db::execute_command_with_tx(conn, &header, &command, Some(&mut gate))
+                })
+                .await
+                .unwrap();
+            assert!(outcome.live.is_some(), "live at accept");
+        }
+
+        /// Make every pending submission `secs` older.
+        async fn age(&self, secs: u32) {
+            self.db
+                .pool
+                .write(move |conn| {
+                    use diesel::connection::SimpleConnection;
+                    conn.batch_execute(&format!(
+                        "UPDATE maker_lineages SET created_at = created_at - interval '{secs} seconds'"
+                    ))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn set_status(&self, note: &Note, status: &'static str) {
+            let id = note.id().to_bytes().to_vec();
+            self.db
+                .pool
+                .write(move |conn| {
+                    use crate::db::postgres_schema::orders;
+                    use diesel::prelude::*;
+                    diesel::update(orders::table.find(id))
+                        .set(orders::status.eq(status))
+                        .execute(conn)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The cap needs its time AND its blocks since accept, then a lookup that
+    /// still misses the note.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_waits_for_time_and_blocks_then_cancels() {
+        let mut f = fixture().await;
+        f.watcher = Watcher::new(
+            f.db.pool.clone(),
+            f.chain.clone(),
+            f.watcher.book_tx.clone(),
+        )
+        .with_cap(UnconfirmedCap {
+            secs: 60,
+            blocks: 20,
+        });
+        let order = note(1, NoteType::Private);
+        f.chain.state().tip = 10;
+        f.accept(1, &order, 10).await;
+
+        // Blocks passed, time not.
+        f.chain.state().tip = 40;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "active");
+        // Time passed, blocks not.
+        f.chain.state().tip = 29;
+        f.age(61).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "active");
+        assert_eq!(f.chain.state().lookups, 0);
+        // Both: one lookup, still missing, so the order is cancelled.
+        f.chain.state().tip = 30;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "stopped");
+        let update = f.book.try_recv().unwrap();
+        assert_eq!(update.removed, [order.id()]);
+        assert_eq!(
+            f.statuses().await,
+            [
+                (id(&order), proto::OrderState::Live, String::new()),
+                (
+                    id(&order),
+                    proto::OrderState::Cancelled,
+                    maker_db::NOTE_NOT_RECEIVED.to_owned()
+                ),
+            ]
+        );
+        // Closed: neither pending nor watched any more.
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.statuses().await.len(), 2);
+    }
+
+    /// A round that missed a landed note (a lagging node) does not cap it:
+    /// the exact lookup finds it and counts as the round's observation.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_lookup_finds_a_note_the_round_missed() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.set_status(&order, "waiting").await;
+        f.chain.commit(&order, 5);
+        f.chain.state().hidden.insert(order.id());
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "active");
+        let update = f.book.try_recv().unwrap();
+        assert_eq!(update.active[0].id(), order.id(), "back from waiting");
+        assert!(update.active[0].maker.is_some());
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only at accept");
+    }
+
+    /// One note the tracker cannot read gets no decision; the others do.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn one_unreadable_note_does_not_stop_the_round() {
+        let mut f = fixture().await;
+        let (bad, good) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &bad, 0).await;
+        f.accept(2, &good, 0).await;
+        f.set_status(&good, "waiting").await;
+        f.chain.commit(&good, 3);
+        f.chain.state().unreadable.insert(bad.id());
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+
+        assert_eq!(f.status(&good).await, "active");
+        // Unread: no cap, no lookup.
+        assert_eq!(f.status(&bad).await, "active");
+        assert_eq!(f.chain.state().lookups, 0);
+    }
+
+    /// A waiting order comes back once its note lands; an active one is
+    /// activated in place and not sent again.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn landed_notes_activate_unconfirmed_orders_quietly() {
+        let mut f = fixture().await;
+        let (waiting, active) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &waiting, 0).await;
+        f.accept(2, &active, 0).await;
+        f.set_status(&waiting, "waiting").await;
+        f.chain.commit(&waiting, 2);
+        f.chain.commit(&active, 2);
+        f.watcher.round().await.unwrap();
+
+        let update = f.book.try_recv().unwrap();
+        let sent: Vec<_> = update.active.iter().map(|order| order.id()).collect();
+        assert_eq!(sent, [waiting.id()]);
+        assert_eq!(f.status(&waiting).await, "active");
+        assert_eq!(f.statuses().await.len(), 2, "LIVE only at accept");
+        // Activated: now watched like any live maker order.
+        f.chain.spend(&active, 3);
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&active).await, "onchain_nullified");
+        assert_eq!(
+            f.statuses().await.last().unwrap(),
+            &(
+                id(&active),
+                proto::OrderState::Unavailable,
+                "note spent outside this solver".to_owned()
+            )
+        );
+    }
+
+    /// The watcher publishes its block for intake, fresh only while recent.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_synced_height_is_fresh_only_after_a_recent_round() {
+        let mut f = fixture().await;
+        let height = f.watcher.synced_height();
+        assert_eq!(height.fresh(SyncedHeight::MAX_AGE), None);
+        f.chain.state().tip = 12;
+        f.watcher.round().await.unwrap();
+        assert_eq!(
+            height.fresh(SyncedHeight::MAX_AGE),
+            Some(BlockNumber::from(12))
+        );
+        assert_eq!(height.fresh(Duration::ZERO), None);
+        // A failed round publishes nothing new.
+        f.chain.state().down = true;
+        f.chain.state().tip = 13;
+        assert!(f.watcher.round().await.is_err());
+        assert_eq!(
+            height.fresh(SyncedHeight::MAX_AGE),
+            Some(BlockNumber::from(12))
+        );
     }
 }

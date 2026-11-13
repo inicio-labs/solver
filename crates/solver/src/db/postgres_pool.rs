@@ -631,9 +631,16 @@ pub struct IntakeSession {
     fatal_db: CancellationToken,
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
+    owner_epoch: i64,
+    /// The watcher's latest block while it is fresh, when private submits go
+    /// live at accept (ADR 0008). `None` keeps every submit on the confirmed
+    /// path.
+    fresh_block: Option<FreshBlock>,
     #[cfg(test)]
     drop_next_commit_reply: bool,
 }
+
+type FreshBlock = Arc<dyn Fn() -> Option<miden_protocol::block::BlockNumber> + Send + Sync>;
 
 pub(crate) struct PublicationGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -661,6 +668,25 @@ impl IntakeSession {
     #[cfg(test)]
     pub(crate) fn simulate_lost_commit_reply(&mut self) {
         self.drop_next_commit_reply = true;
+    }
+
+    /// Let private submits go live at accept (ADR 0008) while `fresh_block`
+    /// returns the watcher's latest block.
+    pub fn with_live_at_accept(
+        mut self,
+        fresh_block: impl Fn() -> Option<miden_protocol::block::BlockNumber> + Send + Sync + 'static,
+    ) -> Self {
+        self.fresh_block = Some(Arc::new(fresh_block));
+        self
+    }
+
+    /// A gate for one intake round; `None` when live at accept is off.
+    pub(crate) fn accept_gate(&self) -> Option<super::maker_db::AcceptGate> {
+        let fresh_block = self.fresh_block.clone()?;
+        Some(super::maker_db::AcceptGate::new(
+            self.owner_epoch,
+            move || fresh_block(),
+        ))
     }
 
     /// Serialize the intake commit and publication with all book writers.
@@ -860,6 +886,8 @@ impl PgPool {
             fatal_db: self.fatal_db.clone(),
             deadline: self.operation_deadline,
             publish_order: self.publish_order.clone(),
+            owner_epoch: self.writer_config.owner_epoch,
+            fresh_block: None,
             #[cfg(test)]
             drop_next_commit_reply: false,
         }

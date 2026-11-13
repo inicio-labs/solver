@@ -6,7 +6,8 @@
 mod config;
 mod error;
 mod events;
-mod intake;
+pub(crate) mod intake;
+pub(crate) mod metrics;
 mod service;
 mod watcher;
 
@@ -16,7 +17,10 @@ pub use error::IntakeError;
 pub use events::append_event_tx;
 pub use intake::{run_intake, IntakeReceiver, IntakeSender};
 pub use service::{spawn_gateway_thread, MakerGatewayService};
-pub use watcher::{run_watcher, MakerTracker, NoteObservation, SdkTracker, WatchError, Watcher};
+pub use watcher::{
+    run_watcher, MakerTracker, NoteObservation, SdkTracker, SyncedHeight, UnconfirmedCap,
+    WatchError, Watcher,
+};
 pub(crate) use watcher::{watcher_gauges, WatcherGauges};
 
 /// Generated from `proto/maker/v1/gateway.proto`.

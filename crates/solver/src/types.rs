@@ -94,6 +94,10 @@ pub enum OrderStatus {
     /// anyway (insertion, release) finds it below a cutoff. Liveness is read
     /// through `live_orders`, never from this column alone.
     Stopped,
+    /// A maker order that went live at accept and whose settlement the node
+    /// refused because its note is unknown: out of the book until the note
+    /// is in a block (ADR 0008).
+    Waiting,
 }
 
 impl OrderStatus {

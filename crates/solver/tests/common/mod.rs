@@ -411,6 +411,9 @@ pub fn engine_config() -> solver::config::EngineConfig {
         maker_watch_interval_ms: 1_000,
         maker_settlement_buffer_ms: 30_000,
         maker_self_trade_prevention: true,
+        maker_live_at_accept: false,
+        maker_unconfirmed_cancel_after_secs: 60,
+        maker_unconfirmed_cancel_after_blocks: 20,
     }
 }
 

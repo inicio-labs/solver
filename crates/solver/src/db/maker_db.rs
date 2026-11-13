@@ -1037,6 +1037,28 @@ pub fn report_settlement_tx(
     Ok(())
 }
 
+/// Submitted orders whose note the watcher has not resolved yet.
+#[derive(QueryableByName, Debug, Clone, Copy, PartialEq)]
+pub struct PendingLineageStats {
+    #[diesel(sql_type = BigInt)]
+    pub count: i64,
+    /// Seconds since the oldest was submitted, by the database clock.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    pub oldest_age_secs: Option<f64>,
+}
+
+/// Count pending lineages through the partial index on pending rows. The age
+/// is computed by PostgreSQL, so it does not depend on the host clock.
+pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLineageStats> {
+    Ok(diesel::sql_query(
+        "SELECT count(*) AS count,
+                EXTRACT(EPOCH FROM now() - min(created_at))::float8 AS oldest_age_secs
+         FROM maker_lineages
+         WHERE state = 'pending'",
+    )
+    .get_result(conn)?)
+}
+
 /// One maker-owned order admitted by the database's liveness rule.
 #[derive(QueryableByName, Debug, Clone, PartialEq, Eq)]
 pub struct ActiveMakerOrderRow {
@@ -1244,6 +1266,42 @@ mod tests {
             .iter()
             .map(|note| ids.contains(&note.id().to_bytes().to_vec()))
             .collect())
+    }
+
+    /// Only pending lineages count, and the age is the oldest pending one's,
+    /// by the database clock.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn pending_lineage_stats_count_pending_rows_and_age_the_oldest() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let empty = pending_lineage_stats_tx(conn)?;
+        assert_eq!((empty.count, empty.oldest_age_secs), (0, None));
+
+        let maker_id = maker(conn, "alpha")?;
+        for (seq, serial) in [(1, 1), (2, 2), (3, 3)] {
+            run(
+                conn,
+                maker_id,
+                &format!("r{seq}"),
+                seq,
+                submit(&note(serial)),
+            )?;
+        }
+        // An activated lineage is older still, but no longer pending.
+        conn.batch_execute(&format!(
+            "UPDATE maker_lineages SET state = 'activated', created_at = now() - interval '2 days'
+               WHERE note_id = '\\x{}'::bytea;
+             UPDATE maker_lineages SET created_at = now() - interval '1 hour'
+               WHERE note_id = '\\x{}'::bytea;",
+            hex::encode(note(1).id().to_bytes()),
+            hex::encode(note(2).id().to_bytes()),
+        ))?;
+        let stats = pending_lineage_stats_tx(conn)?;
+        assert_eq!(stats.count, 2);
+        let age = stats.oldest_age_secs.unwrap();
+        assert!((3600.0..3660.0).contains(&age), "oldest pending age {age}");
+        Ok(())
     }
 
     #[test]

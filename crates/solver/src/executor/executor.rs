@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::error::{BatchError, ExecResult, ExecutorError};
+use super::metrics::{self, RefusalAttempt, ReleaseCause};
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow, SettlementStatus};
 use crate::db::{self, DbPool};
@@ -472,12 +474,35 @@ enum TxOutcome {
     /// The node committed our transaction in `block`.
     Committed { block: BlockNumber },
     /// It can never commit: rejected by the node, or its whole validity
-    /// window has passed without it appearing.
-    NeverCommits,
+    /// window has passed without it appearing. The cause feeds `/metrics`.
+    NeverCommits(ReleaseCause),
     /// Not decidable yet (still valid, not seen, or an RPC failed).
     /// `resubmittable`: the executor client has no record of submitting it,
     /// so the executor may have stopped before the node received it.
     Unknown { resubmittable: bool },
+}
+
+/// What the executor client's own record of our transaction decides, before
+/// asking the node: a commit, a definite discard, or `None` to ask the node.
+fn recorded_outcome(status: Option<&TransactionStatus>) -> Option<TxOutcome> {
+    match status {
+        Some(TransactionStatus::Committed { block_number, .. }) => Some(TxOutcome::Committed {
+            block: *block_number,
+        }),
+        // A definite discard means this transaction can never commit. The
+        // client records a submission only after the node accepted it.
+        Some(TransactionStatus::Discarded(reason))
+            if !matches!(
+                reason,
+                DiscardCause::Stale | DiscardCause::DiscardedInitialState
+            ) =>
+        {
+            Some(TxOutcome::NeverCommits(ReleaseCause::Dropped))
+        }
+        // Pending, an ambiguous discard, or no local record (the executor may
+        // have stopped between submission and recording): ask the node.
+        _ => None,
+    }
 }
 
 /// The node's answer for our transaction, searched up to `synced`. A
@@ -492,7 +517,12 @@ fn node_outcome(
     if let Some(block) = committed {
         TxOutcome::Committed { block }
     } else if synced > expiration {
-        TxOutcome::NeverCommits
+        // A local record exists only once the node accepted the submission.
+        TxOutcome::NeverCommits(if resubmittable {
+            ReleaseCause::Expired
+        } else {
+            ReleaseCause::Dropped
+        })
     } else {
         TxOutcome::Unknown { resubmittable }
     }
@@ -503,6 +533,7 @@ async fn release_rejected_settlement(
     pool: &DbPool,
     settlement: &PendingSettlement,
     book_tx: &mpsc::Sender<BookUpdate>,
+    cause: ReleaseCause,
 ) -> ExecResult<bool> {
     let consumed = match adapter
         .lock()
@@ -518,14 +549,27 @@ async fn release_rejected_settlement(
     };
     let attempt_id = settlement.id_bytes().to_vec();
     let cancelled = settlement.cancelled.clone();
+    // What this release did, for `/metrics`: an attempt already resolved
+    // elsewhere yields an empty update and is not counted.
+    let found = Arc::new(AtomicBool::new(false));
+    let returned = Arc::new(AtomicUsize::new(0));
+    let (found_in, returned_in) = (found.clone(), returned.clone());
     pool.write_book(book_tx, move |conn| {
         let mut update =
             db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed)?;
+        found_in.store(
+            !(update.active.is_empty() && update.removed.is_empty()),
+            AtomicOrdering::Relaxed,
+        );
+        returned_in.store(update.active.len(), AtomicOrdering::Relaxed);
         // Its sit-outs stay cancelled.
         update.removed.extend(cancelled);
         Ok(update)
     })
     .await?;
+    if found.load(AtomicOrdering::Relaxed) {
+        metrics::record_release(cause, returned.load(AtomicOrdering::Relaxed));
+    }
     Ok(true)
 }
 
@@ -1132,12 +1176,19 @@ impl Executor {
             tracing::warn!(error = %write, "rejected settlement status write failed; continuing");
         }
         settlement.mark_rejected();
-        tracing::error!(%error, "settlement transaction rejected; releasing its inputs by nullifier");
+        let code = metrics::refusal_code(&error);
+        metrics::record_refusal(code, RefusalAttempt::First);
+        tracing::error!(
+            error = %metrics::refusal_detail(&error),
+            code = <&str>::from(code),
+            "settlement transaction rejected; releasing its inputs by nullifier"
+        );
         match release_rejected_settlement(
             &self.miden_adapter,
             &self.pool,
             &settlement,
             &self.book_tx,
+            ReleaseCause::Refused,
         )
         .await
         {
@@ -1256,6 +1307,10 @@ impl Executor {
                     tracing::warn!(attempt, error = %e, "submission outcome unknown; retrying same transaction");
                 }
                 Err(e) if unknown_seen => {
+                    metrics::record_refusal(
+                        metrics::refusal_code(&e),
+                        RefusalAttempt::Resubmission,
+                    );
                     tracing::warn!(tx_id = %result.id(), error = %e, "earlier submission may have landed; inputs remain reserved");
                     return Ok(BatchSubmission::Uncertain(pending));
                 }
@@ -1338,7 +1393,7 @@ impl Executor {
         let tx_id = settlement.id();
         if settlement.attempt.settlement_status()? == SettlementStatus::Rejected {
             // Rejected by the node at submission: it never entered the chain.
-            return Ok(TxOutcome::NeverCommits);
+            return Ok(TxOutcome::NeverCommits(ReleaseCause::Refused));
         }
         let record = match self
             .client
@@ -1357,25 +1412,12 @@ impl Executor {
             Err(error) => return Err(error.into()),
         };
         let resubmittable = record.is_none();
-        match record.map(|record| record.status) {
-            Some(TransactionStatus::Committed { block_number, .. }) => {
-                return Ok(TxOutcome::Committed {
-                    block: block_number,
-                })
-            }
-            // A definite discard means the node never accepted this transaction.
-            Some(TransactionStatus::Discarded(reason))
-                if !matches!(
-                    reason,
-                    DiscardCause::Stale | DiscardCause::DiscardedInitialState
-                ) =>
-            {
+        let status = record.map(|record| record.status);
+        if let Some(outcome) = recorded_outcome(status.as_ref()) {
+            if let Some(TransactionStatus::Discarded(reason)) = &status {
                 tracing::warn!(%tx_id, %reason, "settlement transaction discarded");
-                return Ok(TxOutcome::NeverCommits);
             }
-            // Pending, an ambiguous discard, or no local record (the executor may
-            // have stopped between submission and recording): ask the node.
-            _ => {}
+            return Ok(outcome);
         }
 
         let result =
@@ -1413,12 +1455,13 @@ impl Executor {
             }
             // Inputs return by nullifier: a parent someone else consumed is
             // retired, every other parent goes back to the matcher.
-            TxOutcome::NeverCommits => {
+            TxOutcome::NeverCommits(cause) => {
                 release_rejected_settlement(
                     &self.miden_adapter,
                     &self.pool,
                     settlement,
                     &self.book_tx,
+                    cause,
                 )
                 .await
             }
@@ -1525,12 +1568,20 @@ impl Executor {
             Err(ClientError::SubmissionOutcomeUnknown { .. }) => {
                 tracing::warn!(tx_id = %result.id(), "recovered submission still has no definite outcome");
             }
-            Err(ClientError::RpcError(error)) => {
+            Err(error @ ClientError::RpcError(_)) => {
                 // This retry was rejected, but the original submission may have
                 // been sent before a crash. Keep it reserved until its recorded
                 // transaction expires; rejection of the retry cannot disprove the
                 // original copy.
-                tracing::warn!(tx_id = %result.id(), %error, "recovery retry rejected; waiting for expiry");
+                metrics::record_refusal(
+                    metrics::refusal_code(&error),
+                    RefusalAttempt::Resubmission,
+                );
+                tracing::warn!(
+                    tx_id = %result.id(),
+                    error = %metrics::refusal_detail(&error),
+                    "recovery retry rejected; waiting for expiry"
+                );
             }
             Err(error) => {
                 let attempt_id = attempt.tx_id.clone();
@@ -2183,9 +2234,30 @@ mod recovery_tests {
             };
             let adapter = chain(&settlement.parent_notes, consumed, fail_lookup);
             let (book_tx, mut book_rx) = mpsc::channel(1);
-            let resolved =
-                release_rejected_settlement(&adapter, &pool, &settlement, &book_tx).await?;
+            let counted = || {
+                let bounced = metrics::bounced()
+                    .find(|(cause, _)| *cause == "dropped")
+                    .map_or(0, |(_, count)| count);
+                (metrics::dropped(), bounced)
+            };
+            let before = counted();
+            let resolved = release_rejected_settlement(
+                &adapter,
+                &pool,
+                &settlement,
+                &book_tx,
+                ReleaseCause::Dropped,
+            )
+            .await?;
             assert_eq!(resolved, !fail_lookup);
+            // A drop counts once its release commits, with the inputs it
+            // returned; a failed lookup counts nothing.
+            let expected = if fail_lookup {
+                before
+            } else {
+                (before.0 + 1, before.1 + u64::from(!consumed))
+            };
+            assert_eq!(counted(), expected);
 
             let parent_bytes = parent_id.to_bytes().to_vec();
             let (status, unresolved) = pool
@@ -2207,6 +2279,17 @@ mod recovery_tests {
                 assert_eq!(update.active.len(), usize::from(!consumed));
                 assert_eq!(update.removed.len(), usize::from(consumed) + 1);
                 assert_eq!(update.removed.last(), Some(&sit_out));
+                // Releasing an attempt that is already resolved counts nothing.
+                let again = release_rejected_settlement(
+                    &adapter,
+                    &pool,
+                    &settlement,
+                    &book_tx,
+                    ReleaseCause::Dropped,
+                )
+                .await?;
+                assert!(again);
+                assert_eq!(counted(), expected);
             }
         }
         Ok(())
@@ -2273,8 +2356,51 @@ mod recovery_tests {
         );
         assert_eq!(
             node_outcome(None, BlockNumber::from(101_u32), expiration, false),
-            TxOutcome::NeverCommits
+            TxOutcome::NeverCommits(ReleaseCause::Dropped),
+            "recorded locally: the node had accepted it"
         );
+        assert_eq!(
+            node_outcome(None, BlockNumber::from(101_u32), expiration, true),
+            TxOutcome::NeverCommits(ReleaseCause::Expired),
+            "never recorded: it may never have reached the node"
+        );
+    }
+
+    #[test]
+    fn the_local_record_decides_commits_and_definite_discards() {
+        let committed = TransactionStatus::Committed {
+            block_number: BlockNumber::from(7_u32),
+            commit_timestamp: 0,
+        };
+        assert_eq!(
+            recorded_outcome(Some(&committed)),
+            Some(TxOutcome::Committed {
+                block: BlockNumber::from(7_u32)
+            })
+        );
+        for cause in [
+            DiscardCause::Expired,
+            DiscardCause::InputConsumed,
+            DiscardCause::Superseded,
+        ] {
+            assert_eq!(
+                recorded_outcome(Some(&TransactionStatus::Discarded(cause))),
+                Some(TxOutcome::NeverCommits(ReleaseCause::Dropped)),
+                "{cause}: recorded, so the node had accepted it"
+            );
+        }
+        for status in [
+            TransactionStatus::Discarded(DiscardCause::Stale),
+            TransactionStatus::Discarded(DiscardCause::DiscardedInitialState),
+            TransactionStatus::Pending,
+        ] {
+            assert_eq!(
+                recorded_outcome(Some(&status)),
+                None,
+                "{status:?}: ask the node"
+            );
+        }
+        assert_eq!(recorded_outcome(None), None, "no record: ask the node");
     }
 
     #[tokio::test]

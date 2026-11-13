@@ -7,6 +7,7 @@
 //! on every round, so a restart or failed write does not lose a transition.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,43 @@ use super::proto::OrderState;
 use crate::db::maker_db;
 use crate::db::{postgres_db, DbPool};
 use crate::ingest::{ChainError, ChainResult};
-use crate::types::{now_unix, BookUpdate, OrderId};
+use crate::types::{now_millis, now_unix, BookUpdate, OrderId};
+
+// Published after each successful round, for `/metrics`. `READ_UNIX_MS` is
+// set when the watcher starts, so a watcher that never completes a round
+// still reports a growing age.
+static SYNCED_BLOCK: AtomicU64 = AtomicU64::new(0);
+static READ_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+static PENDING_LINEAGES: AtomicU64 = AtomicU64::new(0);
+static OLDEST_PENDING_MS: AtomicU64 = AtomicU64::new(0);
+
+/// What the maker-note watcher last saw, for `/metrics`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WatcherGauges {
+    /// The block the last successful round synced to; 0 before the first.
+    pub synced_block: u64,
+    /// Seconds since that round started reading the chain, or since the
+    /// watcher started.
+    pub read_age_secs: f64,
+    /// Submitted orders whose note is not resolved yet.
+    pub pending_lineages: u64,
+    /// Age of the oldest of them, by the database clock.
+    pub oldest_pending_age_secs: f64,
+}
+
+/// `None` when no watcher runs in this process (gateway disabled).
+pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
+    let read_ms = READ_UNIX_MS.load(Ordering::Relaxed);
+    if read_ms == 0 {
+        return None;
+    }
+    Some(WatcherGauges {
+        synced_block: SYNCED_BLOCK.load(Ordering::Relaxed),
+        read_age_secs: now_millis().saturating_sub(read_ms) as f64 / 1000.0,
+        pending_lineages: PENDING_LINEAGES.load(Ordering::Relaxed),
+        oldest_pending_age_secs: OLDEST_PENDING_MS.load(Ordering::Relaxed) as f64 / 1000.0,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteObservation {
@@ -42,6 +79,12 @@ pub enum NoteObservation {
 #[async_trait(?Send)]
 pub trait MakerTracker {
     async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
+
+    /// The block the last `observe` synced to and when, in Unix
+    /// milliseconds, it started reading the chain. For `/metrics` only.
+    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+        None
+    }
 }
 
 /// Only exact notes supplied by PostgreSQL may enter the maker client store.
@@ -71,6 +114,7 @@ pub struct SdkTracker {
     // Recheck exact identity and historic spends when a note enters the watch
     // set, including after restart or a period excluded from scoped sync.
     tracked: HashSet<NoteId>,
+    last_sync: Option<(BlockNumber, u64)>,
 }
 
 impl SdkTracker {
@@ -79,6 +123,7 @@ impl SdkTracker {
             client,
             rpc,
             tracked: HashSet::new(),
+            last_sync: None,
         }
     }
 
@@ -124,12 +169,18 @@ impl SdkTracker {
             None,
             self.client.get_validator_config().await?,
         );
+        let started_ms = now_millis();
         let mut update = sync
             .fetch_state(self.client.get_sync_height().await?, input)
             .await?;
         sync.derive_state_updates(&mut update).await?;
         sync.fetch_nullifiers(&mut update).await?;
         self.client.apply_chain_updates(&sync, update).await?;
+        // For `/metrics` only: a failed read leaves the last value and never
+        // fails the round.
+        if let Ok(synced) = self.client.get_sync_height().await {
+            self.last_sync = Some((synced, started_ms));
+        }
         Ok(())
     }
 
@@ -162,6 +213,10 @@ impl SdkTracker {
 
 #[async_trait(?Send)]
 impl MakerTracker for SdkTracker {
+    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+        self.last_sync
+    }
+
     async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
         self.client.ensure_genesis_in_place().await?;
         self.client.ensure_rpc_limits_in_place().await?;
@@ -386,7 +441,25 @@ impl<T: MakerTracker> Watcher<T> {
         for id in spent_ids {
             self.watched.remove(&id);
         }
+        self.publish_gauges().await;
         Ok(())
+    }
+
+    /// Publish what this successful round saw for `/metrics`. A failed count
+    /// leaves the previous values; it never fails the round.
+    async fn publish_gauges(&self) {
+        if let Some((block, read_ms)) = self.tracker.last_sync() {
+            SYNCED_BLOCK.store(u64::from(block.as_u32()), Ordering::Relaxed);
+            READ_UNIX_MS.store(read_ms, Ordering::Relaxed);
+        }
+        match self.pool.read(maker_db::pending_lineage_stats_tx).await {
+            Ok(stats) => {
+                PENDING_LINEAGES.store(u64::try_from(stats.count).unwrap_or(0), Ordering::Relaxed);
+                let oldest_ms = stats.oldest_age_secs.unwrap_or(0.0).max(0.0) * 1000.0;
+                OLDEST_PENDING_MS.store(oldest_ms as u64, Ordering::Relaxed);
+            }
+            Err(error) => tracing::debug!(%error, "pending lineage count failed"),
+        }
     }
 }
 
@@ -395,6 +468,8 @@ pub async fn run_watcher<T: MakerTracker>(
     interval: Duration,
     cancel: CancellationToken,
 ) {
+    // Until a round succeeds, the read age counts from now.
+    READ_UNIX_MS.store(now_millis(), Ordering::Relaxed);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -543,12 +618,17 @@ mod tests {
             .await
             .unwrap();
         let mut tracker = SdkTracker::new(client, rpc.clone());
+        assert_eq!(tracker.last_sync(), None);
 
         let first = tracker
             .observe(std::slice::from_ref(&committed))
             .await
             .unwrap();
         assert_eq!(first[&committed.id()], NoteObservation::Committed);
+        // The sync it made is what `/metrics` reports.
+        let (block, read_ms) = tracker.last_sync().unwrap();
+        assert_eq!(block, tracker.client.get_sync_height().await.unwrap());
+        assert!(read_ms > 0);
 
         drop(tracker);
         let reopened = ClientBuilder::new()

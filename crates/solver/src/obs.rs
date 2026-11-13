@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::db::postgres_pool::{LatencySnapshot, LATENCY_BUCKET_US};
 use crate::db::DbPool;
+use crate::gateway::WatcherGauges;
 use crate::price::{FeedMetrics, PriceSnapshot};
 use crate::types::{now_unix, BookUpdate, ExecutionBatch};
 
@@ -138,6 +139,48 @@ fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceS
     );
 }
 
+/// How often the node refuses or drops our settlements, and how many inputs
+/// failed settlements release. `unconfirmed_maker_input` is always "false"
+/// until maker orders can go live before their note is confirmed.
+fn append_settlement_metrics(body: &mut String) {
+    for (code, attempt, count) in crate::executor::metrics::refusals() {
+        let _ = writeln!(
+            body,
+            "solver_executor_settlement_refusals_total{{code=\"{code}\",attempt=\"{attempt}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_executor_settlements_dropped_total{{unconfirmed_maker_input=\"false\"}} {}",
+        crate::executor::metrics::dropped()
+    );
+    for (reason, count) in crate::executor::metrics::bounced() {
+        let _ = writeln!(
+            body,
+            "solver_executor_inputs_bounced_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
+}
+
+/// What the maker-note watcher last saw. It publishes these after each
+/// successful round, so a scrape reads no database. Absent when the maker
+/// gateway is disabled.
+fn append_maker_metrics(body: &mut String, watcher: Option<WatcherGauges>) {
+    if let Some(gauges) = watcher {
+        let _ = writeln!(
+            body,
+            "solver_maker_watcher_synced_block {}\n\
+             solver_maker_watcher_block_read_age_seconds {}\n\
+             solver_maker_pending_lineages {}\n\
+             solver_maker_oldest_pending_lineage_age_seconds {}",
+            gauges.synced_block,
+            gauges.read_age_secs,
+            gauges.pending_lineages,
+            gauges.oldest_pending_age_secs
+        );
+    }
+}
+
 async fn metrics(
     State(state): State<ObsState>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
@@ -188,6 +231,8 @@ async fn metrics(
     }
     let snapshot = state.prices.borrow().clone();
     append_price_metrics(&mut body, &state.feed_metrics, &snapshot);
+    append_settlement_metrics(&mut body);
+    append_maker_metrics(&mut body, crate::gateway::watcher_gauges());
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
@@ -276,6 +321,89 @@ mod tests {
             .find_map(|line| line.strip_prefix(prefix.as_str()))
             .unwrap();
         assert!(age.parse::<f64>().unwrap() >= 5.0);
+    }
+
+    /// Every label is rendered, at zero too, so alerts can rely on the series.
+    #[test]
+    fn settlement_metrics_render_every_label() {
+        let mut body = String::new();
+        append_settlement_metrics(&mut body);
+        for code in [
+            "expired",
+            "state_conflict",
+            "capacity",
+            "fee",
+            "auth_failed",
+            "other_code",
+            "no_details",
+            "local",
+        ] {
+            for attempt in ["first", "resubmission"] {
+                let line = format!(
+                    "solver_executor_settlement_refusals_total{{code=\"{code}\",attempt=\"{attempt}\"}} "
+                );
+                assert!(body.contains(&line), "{line} missing from {body}");
+            }
+        }
+        assert!(body.contains(
+            "solver_executor_settlements_dropped_total{unconfirmed_maker_input=\"false\"} "
+        ));
+        for reason in ["refused", "dropped", "expired"] {
+            let line = format!("solver_executor_inputs_bounced_total{{reason=\"{reason}\"}} ");
+            assert!(body.contains(&line), "{line} missing from {body}");
+        }
+    }
+
+    /// The rendered numbers are the counters' values. The counters are
+    /// process-wide, so compare against the value before recording.
+    #[test]
+    fn settlement_metrics_render_the_counted_values() {
+        use crate::executor::metrics::{
+            record_refusal, record_release, RefusalAttempt, RefusalCode, ReleaseCause,
+        };
+        fn value(body: &str, prefix: &str) -> u64 {
+            body.lines()
+                .find_map(|line| line.strip_prefix(prefix)?.trim().parse().ok())
+                .unwrap()
+        }
+        let refused =
+            "solver_executor_settlement_refusals_total{code=\"capacity\",attempt=\"resubmission\"}";
+        // The executor's PostgreSQL test counts drops; this one uses causes
+        // nothing else records, so the two cannot race.
+        let bounced = "solver_executor_inputs_bounced_total{reason=\"expired\"}";
+        let mut before = String::new();
+        append_settlement_metrics(&mut before);
+        record_refusal(RefusalCode::Capacity, RefusalAttempt::Resubmission);
+        record_release(ReleaseCause::Expired, 3);
+        let mut after = String::new();
+        append_settlement_metrics(&mut after);
+        assert_eq!(value(&after, refused), value(&before, refused) + 1);
+        assert_eq!(value(&after, bounced), value(&before, bounced) + 3);
+    }
+
+    #[test]
+    fn maker_metrics_report_what_the_watcher_published() {
+        let mut body = String::new();
+        append_maker_metrics(
+            &mut body,
+            Some(WatcherGauges {
+                synced_block: 120,
+                read_age_secs: 1.5,
+                pending_lineages: 3,
+                oldest_pending_age_secs: 42.25,
+            }),
+        );
+        assert_eq!(
+            body,
+            "solver_maker_watcher_synced_block 120\n\
+             solver_maker_watcher_block_read_age_seconds 1.5\n\
+             solver_maker_pending_lineages 3\n\
+             solver_maker_oldest_pending_lineage_age_seconds 42.25\n"
+        );
+        // With the gateway disabled no watcher runs, and the lines are absent.
+        let mut empty = String::new();
+        append_maker_metrics(&mut empty, None);
+        assert_eq!(empty, "");
     }
 
     fn test_state(db: &TestDb) -> ObsState {
@@ -371,6 +499,7 @@ mod tests {
         assert!(body.contains("solver_db_read_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(body.contains("solver_matcher_book_channel_remaining 3"));
         assert!(body.contains("solver_matcher_executor_channel_remaining 2"));
+        assert!(body.contains("solver_executor_settlements_dropped_total"));
         db.pool.fatal_token().cancel();
         let failed = server.get("/metrics").await;
         assert!(failed

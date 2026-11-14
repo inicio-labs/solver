@@ -579,11 +579,9 @@ pub struct DiscardedSettlement {
     pub found: bool,
     /// Parents that went live at accept and still lack their note.
     pub unconfirmed: usize,
-    /// Of those, the ones now waiting for their note.
-    pub waiting: usize,
     /// The maker of each unconfirmed parent the node named as unknown.
     pub named_makers: Vec<crate::maker::MakerId>,
-    /// The maker of each parent now waiting.
+    /// The maker of each unconfirmed parent now waiting for its note.
     pub waiting_makers: Vec<crate::maker::MakerId>,
 }
 
@@ -628,10 +626,6 @@ pub fn finish_discarded_settlement_tx(
         .collect();
     let state_of = |id: &[u8]| flagged.get(id).map(|(state, _)| state.as_str());
     let unconfirmed = |id: &[u8]| state_of(id) == Some(maker_db::LineageState::Pending.as_str());
-    let named: Option<&HashSet<OrderId>> = match answer {
-        NodeAnswer::UnknownNotes(named) => Some(named),
-        _ => None,
-    };
 
     let mut active_ids = Vec::new();
     let mut consumed_ids = Vec::new();
@@ -664,16 +658,16 @@ pub fn finish_discarded_settlement_tx(
             }
             _ if unconfirmed(&note_id) => {
                 released.unconfirmed += 1;
-                let maker_id = flagged[&note_id].1;
-                if named.is_some_and(|named| named.contains(&id)) {
-                    released.named_makers.push(maker_id);
-                }
                 // The node names every unknown note in one refusal: an
                 // unnamed parent was known. Naming nothing of ours (its text
                 // changed?) tells nothing, so then every one waits.
                 let waits = match answer {
                     NodeAnswer::NotSent | NodeAnswer::AccountMismatch => false,
-                    NodeAnswer::UnknownNotes(named) => named.is_empty() || named.contains(&id),
+                    NodeAnswer::UnknownNotes(named) if named.contains(&id) => {
+                        released.named_makers.push(flagged[&note_id].1);
+                        true
+                    }
+                    NodeAnswer::UnknownNotes(named) => named.is_empty(),
                     NodeAnswer::Unclear => true,
                 };
                 if waits {
@@ -702,7 +696,6 @@ pub fn finish_discarded_settlement_tx(
         .into_iter()
         .partition(|id| eligible.contains(id));
     stopped_ids.extend(cancelled);
-    released.waiting = waiting_ids.len();
     released.waiting_makers = waiting_ids.iter().map(|id| flagged[id].1).collect();
     for (ids, status) in [
         (&active_ids, OrderStatus::Active),
@@ -726,7 +719,7 @@ pub fn finish_discarded_settlement_tx(
         tx_id = %hex::encode(tx_id),
         reactivated = active_ids.len(),
         consumed = consumed_ids.len(),
-        waiting = released.waiting,
+        waiting = waiting_ids.len(),
         stopped = stopped_ids.len(),
         status = "discarded",
         "persisted discarded settlement"
@@ -734,14 +727,8 @@ pub fn finish_discarded_settlement_tx(
     Ok(released)
 }
 
-/// Called only by the executor, after the node confirmed our transaction ID:
-/// retire the parents, add any remainder not yet ingested with the parent's
-/// FIFO slot, and delete the attempt. A missing attempt was already resolved,
-/// so this is a no-op.
-///
-/// `consumed_children` are remainders whose nullifiers the executor already
-/// found on chain: they keep the parent's FIFO slot but are stored
-/// OnchainNullified and never activated.
+/// [`confirm_settlement_with_tx`], for tests that need only the book update.
+#[cfg(test)]
 pub fn confirm_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
@@ -770,8 +757,16 @@ pub struct ConfirmedSettlement {
     pub activated_makers: Vec<crate::maker::MakerId>,
 }
 
-/// [`confirm_settlement_tx`], also returning the makers whose unconfirmed
-/// orders it activated.
+/// Called only by the executor, after the node confirmed our transaction ID:
+/// retire the parents, add any remainder not yet ingested with the parent's
+/// FIFO slot, and delete the attempt. A missing attempt was already resolved,
+/// so this is a no-op.
+///
+/// `consumed_children` are remainders whose nullifiers the executor already
+/// found on chain: they keep the parent's FIFO slot but are stored
+/// OnchainNullified and never activated.
+///
+/// Also returns the makers whose unconfirmed orders it activated (ADR 0008).
 pub fn confirm_settlement_with_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],

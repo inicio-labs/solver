@@ -162,22 +162,13 @@ pub fn lock_makers_ordered_tx(conn: &mut PgConnection, maker_ids: &[MakerId]) ->
 pub fn prelock_watcher_tx(
     conn: &mut PgConnection,
     activations: &[PendingSubmission],
-    rejections: &[(PendingSubmission, proto::OrderState, &'static str)],
+    rejections: &[PendingSubmission],
     capped: &[PendingSubmission],
     spent_ids: &[Vec<u8>],
 ) -> DbResult<()> {
+    let submissions = || activations.iter().chain(rejections).chain(capped);
     let mut note_ids = spent_ids.to_vec();
-    note_ids.extend(
-        activations
-            .iter()
-            .chain(capped)
-            .map(|s| s.note.id().to_bytes().to_vec()),
-    );
-    note_ids.extend(
-        rejections
-            .iter()
-            .map(|(s, ..)| s.note.id().to_bytes().to_vec()),
-    );
+    note_ids.extend(submissions().map(|s| s.note.id().to_bytes().to_vec()));
     note_ids.sort();
     note_ids.dedup();
     if !note_ids.is_empty() {
@@ -188,12 +179,7 @@ pub fn prelock_watcher_tx(
             .select(orders::note_id)
             .load::<Vec<u8>>(conn)?;
     }
-    let mut makers: Vec<_> = activations
-        .iter()
-        .chain(capped)
-        .map(|s| s.maker_id)
-        .collect();
-    makers.extend(rejections.iter().map(|(s, ..)| s.maker_id));
+    let mut makers: Vec<_> = submissions().map(|s| s.maker_id).collect();
     if !spent_ids.is_empty() {
         makers.extend(
             eligible_orders::table
@@ -207,16 +193,15 @@ pub fn prelock_watcher_tx(
     lock_makers_ordered_tx(conn, &makers)
 }
 
-/// Write one maker command, returning its reply and the update the matcher must
-/// learn once the transaction commits. An exact retry or a conflict changes
-/// nothing and has no update: a change lost to a crash is restored by the
-/// matcher's startup hydration. Every order takes the confirmed path.
+/// [`execute_command_with_tx`] on the confirmed path, for tests that need
+/// only the reply and the matcher's update.
+#[cfg(test)]
 pub fn execute_command_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     command: &MakerCommand,
 ) -> DbResult<(CommandReply, Option<MakerUpdate>)> {
-    let outcome = execute_command_with_tx(conn, header, command, None)?;
+    let outcome = execute_command_with_tx(conn, header, command, AcceptMode::Off)?;
     Ok((outcome.reply, outcome.update))
 }
 
@@ -235,11 +220,23 @@ pub enum AcceptFallback {
     Public,
 }
 
-/// Intake's live-at-accept gate for one round (ADR 0008).
+/// Whether a private submit goes live at accept in one intake round (ADR
+/// 0008), decided once for the round by [`AcceptGate::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptMode {
+    /// Live at accept is off: every order takes the confirmed path.
+    Off,
+    /// On, but the round has no fresh watcher block: the confirmed path,
+    /// counted as a fallback.
+    Stale,
+    /// On: an order accepted in this round is measured from this block.
+    Fresh(BlockNumber),
+}
+
+/// Intake's live-at-accept gate (ADR 0008).
 pub struct AcceptGate {
     owner_epoch: i64,
-    fresh_block: Box<dyn Fn() -> Option<BlockNumber> + Send>,
-    checked: Option<Option<BlockNumber>>,
+    fresh_block: Box<dyn Fn() -> Option<BlockNumber> + Send + Sync>,
 }
 
 impl AcceptGate {
@@ -247,31 +244,27 @@ impl AcceptGate {
     /// the chain recently enough, else `None`.
     pub fn new(
         owner_epoch: i64,
-        fresh_block: impl Fn() -> Option<BlockNumber> + Send + 'static,
+        fresh_block: impl Fn() -> Option<BlockNumber> + Send + Sync + 'static,
     ) -> Self {
         Self {
             owner_epoch,
             fresh_block: Box::new(fresh_block),
-            checked: None,
         }
     }
 
-    /// The block an order accepted in this round is measured from, or `None`
-    /// when the watcher is not fresh. The first call in a round guards a
-    /// writer takeover: it share-locks the owner epoch, so a new owner's claim
-    /// waits for this commit, and it fails if a new owner claimed it already.
-    /// The freshness is read after that lock.
+    /// Decide the mode for a round that holds a private submit. It guards a
+    /// writer takeover: it share-locks the owner epoch, so a new owner's
+    /// claim waits for this commit, and it fails if a new owner claimed it
+    /// already. The freshness is read after that lock.
     ///
-    /// Call it before the round takes any other lock. In one solver, intake
-    /// never overlaps ingest: both hold the publication guard through their
+    /// This must be the round's first statement. In one solver, intake never
+    /// overlaps ingest: both hold the publication guard through their
     /// transaction. But during a takeover, the old process's intake runs
     /// beside the new owner's ingest, which updates `sync_state` before it
     /// locks maker rows; taking this share lock after a maker lock would
-    /// deadlock with it.
-    pub fn accept_block(&mut self, conn: &mut PgConnection) -> DbResult<Option<BlockNumber>> {
-        if let Some(checked) = self.checked {
-            return Ok(checked);
-        }
+    /// deadlock with it. Commands take the resolved mode, never the gate, so
+    /// no later statement can take the lock.
+    pub fn resolve(&self, conn: &mut PgConnection) -> DbResult<AcceptMode> {
         let current: i64 = sync_state::table
             .find(1_i16)
             .for_share()
@@ -283,9 +276,7 @@ impl AcceptGate {
                 current,
             });
         }
-        let block = (self.fresh_block)();
-        self.checked = Some(block);
-        Ok(block)
+        Ok((self.fresh_block)().map_or(AcceptMode::Stale, AcceptMode::Fresh))
     }
 }
 
@@ -301,14 +292,19 @@ pub struct CommandOutcome {
     pub fallback: Option<AcceptFallback>,
 }
 
-/// [`execute_command_tx`], with live at accept when `gate` is given (ADR
-/// 0008): a newly claimed private note goes live in this transaction if the
-/// watcher is fresh and the order is not cancelled already.
+/// Write one maker command, returning its reply and the update the matcher
+/// must learn once the transaction commits. An exact retry or a conflict
+/// changes nothing and has no update: a change lost to a crash is restored
+/// by the matcher's startup hydration.
+///
+/// Unless `accept` is off, a newly claimed private note goes live in this
+/// transaction (ADR 0008) if the round's watcher block is fresh and the
+/// order is not cancelled already; otherwise it takes the confirmed path.
 pub fn execute_command_with_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     command: &MakerCommand,
-    gate: Option<&mut AcceptGate>,
+    accept: AcceptMode,
 ) -> DbResult<CommandOutcome> {
     let replayed = |reply| CommandOutcome {
         reply,
@@ -384,9 +380,9 @@ pub fn execute_command_with_tx(
                     .into_iter()
                     .map(|bytes| Ok(crate::types::OrderId::read_from_bytes(&bytes)?))
                     .collect::<DbResult<Vec<_>>>()?;
-                if let Some(gate) = gate {
+                if accept != AcceptMode::Off {
                     (live, fallback) =
-                        go_live_at_accept_tx(conn, gate, maker_id, &keys.lineage_id, note)?;
+                        go_live_at_accept_tx(conn, accept, maker_id, &keys.lineage_id, note)?;
                 }
                 let update = MakerUpdate::OrdersAttributed {
                     order_ids,
@@ -462,7 +458,7 @@ pub fn execute_command_with_tx(
 /// confirmed path, as does a note that already has a row.
 fn go_live_at_accept_tx(
     conn: &mut PgConnection,
-    gate: &mut AcceptGate,
+    accept: AcceptMode,
     maker_id: MakerId,
     lineage_id: &LineageId,
     note: &Note,
@@ -470,7 +466,7 @@ fn go_live_at_accept_tx(
     if note.metadata().note_type() != NoteType::Private {
         return Ok((None, Some(AcceptFallback::Public)));
     }
-    let Some(accept_block) = gate.accept_block(conn)? else {
+    let AcceptMode::Fresh(accept_block) = accept else {
         return Ok((None, Some(AcceptFallback::WatcherStale)));
     };
     let row = NewOrderRow::parsed(note, now_unix())?;
@@ -794,25 +790,25 @@ fn settle_lineages(
     if lineages.is_empty() {
         return Ok(HashSet::new());
     }
-    let pending = maker_lineages::table
-        .filter(maker_lineages::lineage_id.eq_any(lineages))
-        .filter(maker_lineages::state.eq(LineageState::Pending.as_str()));
-    let changed = if state == LineageState::Activated {
-        diesel::update(pending)
-            .set((
-                maker_lineages::state.eq(state.as_str()),
-                maker_lineages::activated_at.eq(sql::<
-                    diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-                >("now()")),
-            ))
-            .returning(maker_lineages::lineage_id)
-            .get_results::<Vec<u8>>(conn)?
+    // Only an activation is stamped; the column is null until then.
+    let activated_at = if state == LineageState::Activated {
+        "now()"
     } else {
-        diesel::update(pending)
-            .set(maker_lineages::state.eq(state.as_str()))
-            .returning(maker_lineages::lineage_id)
-            .get_results::<Vec<u8>>(conn)?
+        "NULL"
     };
+    let changed = diesel::update(
+        maker_lineages::table
+            .filter(maker_lineages::lineage_id.eq_any(lineages))
+            .filter(maker_lineages::state.eq(LineageState::Pending.as_str())),
+    )
+    .set((
+        maker_lineages::state.eq(state.as_str()),
+        maker_lineages::activated_at.eq(sql::<
+            diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        >(activated_at)),
+    ))
+    .returning(maker_lineages::lineage_id)
+    .get_results::<Vec<u8>>(conn)?;
     Ok(changed.into_iter().collect())
 }
 
@@ -989,8 +985,9 @@ pub struct WatcherWrites {
     pub activated: HashSet<LineageId>,
 }
 
-/// Reject submissions the watcher found unusable, reporting each once, and
-/// return the orders to take out of the book.
+/// Close submissions whose note the watcher found spent before they were
+/// confirmed, reporting each once, and return the orders to take out of the
+/// book.
 ///
 /// A public note can trade before its claim is activated. When the note the
 /// watcher found spent was consumed by our own settlement, the settlement
@@ -998,47 +995,40 @@ pub struct WatcherWrites {
 /// event; while that settlement is still in flight, the claim waits for the
 /// next round. The caller holds the order rows (`prelock_watcher_tx`).
 /// Orders that went live at accept follow [`reject_unconfirmed_tx`].
-pub fn reject_tx(
-    conn: &mut PgConnection,
-    rejections: &[(PendingSubmission, proto::OrderState, &'static str)],
-) -> DbResult<Vec<OrderId>> {
-    let (unconfirmed, rejections): (Vec<_>, Vec<_>) = rejections
+pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResult<Vec<OrderId>> {
+    let (unconfirmed, spent): (Vec<_>, Vec<_>) = spent
         .iter()
-        .partition(|(submission, ..)| submission.unconfirmed());
+        .partition(|submission| submission.unconfirmed());
     let removed = reject_unconfirmed_tx(conn, &unconfirmed)?;
-    let spent: Vec<Vec<u8>> = rejections
+    let ids: Vec<Vec<u8>> = spent
         .iter()
-        .filter(|(_, state, _)| *state == proto::OrderState::Unavailable)
-        .map(|(s, ..)| s.note.id().to_bytes().to_vec())
+        .map(|s| s.note.id().to_bytes().to_vec())
         .collect();
-    let ours: HashMap<Vec<u8>, String> = orders::table
-        .filter(orders::note_id.eq_any(&spent))
-        .filter(orders::status.eq_any([
-            OrderStatus::Settling.as_str(),
-            OrderStatus::Executed.as_str(),
-        ]))
-        .select((orders::note_id, orders::status))
-        .load(conn)?
-        .into_iter()
-        .collect();
+    let statuses = order_statuses(conn, &ids)?;
     let mut traded = Vec::new();
     let mut unusable = Vec::new();
-    for &rejection in &rejections {
-        let note_id = rejection.0.note.id().to_bytes().to_vec();
-        match ours.get(&note_id).map(String::as_str) {
+    for submission in spent {
+        let note_id = submission.note.id().to_bytes().to_vec();
+        match statuses.get(&note_id).map(String::as_str) {
             // Our settlement is still in flight: decide once it resolves.
             Some(status) if status == OrderStatus::Settling.as_str() => {}
-            Some(_) => traded.push(&rejection.0.lineage_id),
-            None => unusable.push(rejection),
+            Some(status) if status == OrderStatus::Executed.as_str() => {
+                traded.push(&submission.lineage_id);
+            }
+            _ => unusable.push(submission),
         }
     }
     settle_lineages(conn, &traded, LineageState::Activated)?;
 
-    let lineages: Vec<_> = unusable.iter().map(|(s, ..)| &s.lineage_id).collect();
+    let lineages: Vec<_> = unusable.iter().map(|s| &s.lineage_id).collect();
     let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
-    for (submission, state, reason) in unusable {
+    for submission in unusable {
         if rejected.contains(&submission.lineage_id) {
-            let body = order_status(&submission.note, *state, reason);
+            let body = order_status(
+                &submission.note,
+                proto::OrderState::Unavailable,
+                "note spent before it became live",
+            );
             gateway::append_event_tx(
                 conn,
                 submission.maker_id,
@@ -1053,59 +1043,46 @@ pub fn reject_tx(
 /// [`reject_tx`] for orders that went live at accept (ADR 0008), decided by
 /// the root's current status:
 /// - `settling`: wait for that settlement to resolve;
-/// - spent, `executed`: our settlement spent it, so the lineage is activated;
-/// - spent, any other status: the row is retired `onchain_nullified`, the
-///   lineage rejected, and the maker hears one UNAVAILABLE if it saw the
-///   order live;
-/// - a different note: the lineage is rejected with one REJECTED, and the row
-///   is stopped.
+/// - any other: the row is retired `onchain_nullified`, the lineage rejected,
+///   and the maker hears one UNAVAILABLE if it saw the order live.
 ///
-/// The maker hears nothing for an order it cancelled itself.
+/// A root our own settlement spent is not here: its confirmation activates
+/// the lineage in the transaction that writes `executed`. The maker hears
+/// nothing for an order it cancelled itself.
 fn reject_unconfirmed_tx(
     conn: &mut PgConnection,
-    rejections: &[&(PendingSubmission, proto::OrderState, &'static str)],
+    spent: &[&PendingSubmission],
 ) -> DbResult<Vec<OrderId>> {
-    if rejections.is_empty() {
+    if spent.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<Vec<u8>> = rejections
+    let ids: Vec<Vec<u8>> = spent
         .iter()
-        .map(|(s, ..)| s.note.id().to_bytes().to_vec())
+        .map(|s| s.note.id().to_bytes().to_vec())
         .collect();
     let statuses = order_statuses(conn, &ids)?;
     let shown = shown_live_ids(conn, &ids)?;
-    let mut traded = Vec::new();
-    let mut closing = Vec::new();
-    for &rejection in rejections {
-        let (submission, state, _) = rejection;
-        let id = submission.note.id().to_bytes().to_vec();
-        match statuses.get(&id).map(String::as_str) {
-            Some(status) if status == OrderStatus::Settling.as_str() => {}
-            Some(status)
-                if status == OrderStatus::Executed.as_str()
-                    && *state == proto::OrderState::Unavailable =>
-            {
-                traded.push(&submission.lineage_id);
-            }
-            _ => closing.push(rejection),
-        }
-    }
-    settle_lineages(conn, &traded, LineageState::Activated)?;
-    let lineages: Vec<_> = closing.iter().map(|(s, ..)| &s.lineage_id).collect();
+    let closing: Vec<_> = spent
+        .iter()
+        .filter(|s| {
+            statuses
+                .get(s.note.id().to_bytes().as_slice())
+                .is_none_or(|status| status != OrderStatus::Settling.as_str())
+        })
+        .collect();
+    let lineages: Vec<_> = closing.iter().map(|s| &s.lineage_id).collect();
     let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
-    let closed = |spent: bool| -> Vec<Vec<u8>> {
-        closing
-            .iter()
-            .filter(|(s, state, _)| {
-                rejected.contains(&s.lineage_id)
-                    && (*state == proto::OrderState::Unavailable) == spent
-            })
-            .map(|(s, ..)| s.note.id().to_bytes().to_vec())
-            .collect()
-    };
-    let mut removed = move_orders(
+    let closed: Vec<_> = closing
+        .into_iter()
+        .filter(|s| rejected.contains(&s.lineage_id))
+        .collect();
+    let closed_ids: Vec<Vec<u8>> = closed
+        .iter()
+        .map(|s| s.note.id().to_bytes().to_vec())
+        .collect();
+    let removed = move_orders(
         conn,
-        &closed(true),
+        &closed_ids,
         &[
             OrderStatus::Active,
             OrderStatus::Waiting,
@@ -1113,29 +1090,16 @@ fn reject_unconfirmed_tx(
         ],
         OrderStatus::OnchainNullified,
     )?;
-    removed.extend(move_orders(
-        conn,
-        &closed(false),
-        &[OrderStatus::Active, OrderStatus::Waiting],
-        OrderStatus::Stopped,
-    )?);
-    for (submission, state, reason) in closing {
-        if !rejected.contains(&submission.lineage_id) {
-            continue;
-        }
+    for submission in closed {
         // Nothing for an order the maker cancelled itself.
         if !shown.contains(submission.note.id().to_bytes().as_slice()) {
             continue;
         }
-        let body = if *state == proto::OrderState::Unavailable {
-            order_status(
-                &submission.note,
-                proto::OrderState::Unavailable,
-                "note spent outside this solver",
-            )
-        } else {
-            order_status(&submission.note, *state, reason)
-        };
+        let body = order_status(
+            &submission.note,
+            proto::OrderState::Unavailable,
+            "note spent outside this solver",
+        );
         gateway::append_event_tx(
             conn,
             submission.maker_id,
@@ -1156,20 +1120,19 @@ pub fn activate_spent_roots_tx(
     if note_ids.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(diesel::update(
-        maker_lineages::table
-            .filter(maker_lineages::note_id.eq_any(note_ids))
-            .filter(maker_lineages::live_at_accept.eq(true))
-            .filter(maker_lineages::state.eq(LineageState::Pending.as_str())),
-    )
-    .set((
-        maker_lineages::state.eq(LineageState::Activated.as_str()),
-        maker_lineages::activated_at.eq(sql::<
-            diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-        >("now()")),
-    ))
-    .returning(maker_lineages::maker_id)
-    .get_results(conn)?)
+    let roots: Vec<(LineageId, MakerId)> = maker_lineages::table
+        .filter(maker_lineages::note_id.eq_any(note_ids))
+        .filter(maker_lineages::live_at_accept.eq(true))
+        .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
+        .select((maker_lineages::lineage_id, maker_lineages::maker_id))
+        .load(conn)?;
+    let lineages: Vec<_> = roots.iter().map(|(lineage_id, _)| lineage_id).collect();
+    let activated = settle_lineages(conn, &lineages, LineageState::Activated)?;
+    Ok(roots
+        .iter()
+        .filter(|(lineage_id, _)| activated.contains(lineage_id))
+        .map(|(_, maker_id)| *maker_id)
+        .collect())
 }
 
 /// Orders that went live at accept whose note is still not seen (ADR 0008).

@@ -273,14 +273,16 @@ mod tests {
         }
     }
 
-    /// Process-wide counters: only this test records a drop of a settlement
-    /// with an unconfirmed maker input.
+    /// The counters are process-wide. Only this test records a drop of a
+    /// settlement with an unconfirmed maker input, and it returns no inputs,
+    /// so it moves nothing the executor's release test compares (the
+    /// `false` label and the inputs returned by drops).
     #[test]
     fn a_drop_is_labelled_by_whether_it_spent_an_unconfirmed_order() {
         let count = |label| dropped().find(|(l, _)| *l == label).unwrap().1;
         let before = count("true");
-        record_release(ReleaseCause::Dropped, 2, true);
-        record_release(ReleaseCause::Refused, 1, true);
+        record_release(ReleaseCause::Dropped, 0, true);
+        record_release(ReleaseCause::Refused, 0, true);
         assert_eq!(count("true"), before + 1);
     }
 

@@ -129,6 +129,26 @@ pub fn verify(conn: &mut PgConnection) -> DbResult<()> {
     }
 }
 
+/// Views a solver session reads directly, so its own role needs `SELECT` on
+/// each. A view reached only through another view is checked against that
+/// view's owner instead.
+const DIRECTLY_READ_VIEWS: [&str; 2] = ["live_orders", "eligible_orders"];
+
+/// Check that this session's role can read the views the solver reads
+/// directly. A migration that adds one needs a grant of its own unless the
+/// deployment's default grants cover it. Without this check a missing grant
+/// passes startup, since hydration reads `live_orders` and reaches
+/// `eligible_orders` as that view's owner, and then fails the first ingest
+/// or settlement write with "permission denied".
+pub fn verify_access(conn: &mut PgConnection) -> DbResult<()> {
+    for relation in DIRECTLY_READ_VIEWS {
+        diesel::sql_query(format!("SELECT 1 FROM {relation} LIMIT 0"))
+            .execute(conn)
+            .map_err(|source| DbError::Unreadable { relation, source })?;
+    }
+    Ok(())
+}
+
 pub fn connect(database_url: &str) -> DbResult<PgConnection> {
     Ok(PgConnection::establish(database_url)?)
 }
@@ -156,6 +176,50 @@ mod tests {
             result.is_err(),
             "statement unexpectedly succeeded: {statement}"
         );
+        Ok(())
+    }
+
+    /// A runtime role that was granted the old view but not the new one
+    /// passes the history check and can still read the book (`live_orders`
+    /// reaches `eligible_orders` as its owner). The access check names the
+    /// view it cannot read.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_role_that_cannot_read_a_view_is_refused_by_name() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        let role = format!("{schema}_r");
+        // Rolled back at the end, so the role never outlives the test.
+        conn.batch_execute(&format!(
+            "BEGIN; CREATE ROLE {role} NOLOGIN;
+             GRANT USAGE ON SCHEMA {schema} TO {role};
+             GRANT SELECT ON {schema}.__diesel_schema_migrations, {schema}.live_orders TO {role}"
+        ))?;
+        let as_role = |conn: &mut PgConnection| -> Result<DbResult<()>> {
+            conn.batch_execute(&format!("SAVEPOINT as_role; SET LOCAL ROLE {role}"))?;
+            let checked = verify(conn).and_then(|()| {
+                diesel::sql_query("SELECT 1 FROM live_orders LIMIT 0").execute(conn)?;
+                verify_access(conn)
+            });
+            conn.batch_execute("ROLLBACK TO SAVEPOINT as_role; RELEASE SAVEPOINT as_role")?;
+            Ok(checked)
+        };
+        let refused = as_role(conn)?.expect_err("eligible_orders is not granted");
+        assert!(
+            matches!(
+                refused,
+                DbError::Unreadable {
+                    relation: "eligible_orders",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        conn.batch_execute(&format!(
+            "GRANT SELECT ON {schema}.eligible_orders TO {role}"
+        ))?;
+        as_role(conn)??;
+        conn.batch_execute("ROLLBACK")?;
         Ok(())
     }
 

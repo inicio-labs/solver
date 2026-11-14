@@ -175,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 env::var("SOLVER_DATABASE_URL").context("set SOLVER_DATABASE_URL for check-db")?;
             let mut conn = solver::db::postgres_migrations::connect(&url)?;
             solver::db::postgres_migrations::verify(&mut conn)?;
+            solver::db::postgres_migrations::verify_access(&mut conn)?;
             println!("PostgreSQL schema matches this solver binary");
             return Ok(());
         }

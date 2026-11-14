@@ -203,8 +203,9 @@ enum OrderState {
   // Verified on chain, or accepted with live at accept on, and eligible for
   // matching.
   ORDER_STATE_LIVE = 1;
-  // Its note on chain differs from the submitted note. A note ID commits to
-  // the whole note, so the current solver does not send it.
+  // Never sent; kept so existing clients keep working. A note ID commits to
+  // the whole note, so a note that differs from the submitted one has
+  // another ID and is never found under it.
   ORDER_STATE_REJECTED = 2;
   // Its note was verified spent elsewhere.
   ORDER_STATE_UNAVAILABLE = 3;

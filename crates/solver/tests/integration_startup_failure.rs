@@ -181,18 +181,13 @@ async fn a_solver_without_its_gateway_refuses_unconfirmed_orders() -> Result<()>
     let url = pg.url.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         use diesel::prelude::*;
-        use solver::db::postgres_schema::sync_state;
         let mut conn = solver::db::postgres_migrations::connect(&url)?;
         let maker = maker_db::create_maker_tx(&mut conn, "mm1")?.expect("new maker");
-        let epoch: i64 = sync_state::table
-            .find(1_i16)
-            .select(sync_state::owner_epoch)
-            .first(&mut conn)?;
-        let mut gate = maker_db::AcceptGate::new(epoch, || Some(BlockNumber::from(3)));
+        let accept = maker_db::AcceptMode::Fresh(BlockNumber::from(3));
         let header = CommandHeader::new(maker, "s1".into(), 1)?;
         let submit = MakerCommand::submit(note)?;
         let outcome = conn.transaction::<_, solver::db::DbError, _>(|conn| {
-            maker_db::execute_command_with_tx(conn, &header, &submit, Some(&mut gate))
+            maker_db::execute_command_with_tx(conn, &header, &submit, accept)
         })?;
         anyhow::ensure!(outcome.live.is_some(), "the order went live at accept");
         Ok(())

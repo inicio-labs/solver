@@ -571,21 +571,18 @@ async fn release_rejected_settlement(
                 unconfirmed,
                 named_makers,
                 waiting_makers,
-                ..
             } = db::postgres_db::finish_discarded_settlement_tx(
                 conn,
                 &attempt_id,
                 &consumed,
                 &answer,
             )?;
-            let released = found.then(|| {
-                (
-                    update.active.len(),
-                    unconfirmed,
-                    named_makers,
-                    waiting_makers,
-                )
-            });
+            let released = found.then_some((
+                update.active.len(),
+                unconfirmed,
+                named_makers,
+                waiting_makers,
+            ));
             // Its sit-outs stay cancelled.
             update.removed.extend(cancelled);
             Ok((update, released))
@@ -1573,10 +1570,9 @@ impl Executor {
         let consumer = self.solver_id;
         let fills = settlement.fills.clone();
         let cancelled = settlement.cancelled.clone();
-        let activated = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let activated_in = activated.clone();
-        self.pool
-            .write_book(&self.book_tx, move |conn| {
+        let activated = self
+            .pool
+            .write_book_with(&self.book_tx, move |conn| {
                 let confirmed = db::postgres_db::confirm_settlement_with_tx(
                     conn,
                     &attempt_id,
@@ -1585,14 +1581,12 @@ impl Executor {
                     consumer,
                     Some(&fills),
                 )?;
-                *activated_in.lock().unwrap_or_else(|e| e.into_inner()) =
-                    confirmed.activated_makers;
                 let mut update = confirmed.update;
                 update.removed.extend(cancelled);
-                Ok(update)
+                Ok((update, confirmed.activated_makers))
             })
             .await?;
-        for maker_id in std::mem::take(&mut *activated.lock().unwrap_or_else(|e| e.into_inner())) {
+        for maker_id in activated {
             gateway_metrics::count_activation(maker_id, "settlement");
         }
         Ok(true)
@@ -2308,7 +2302,11 @@ mod recovery_tests {
                 let bounced = metrics::bounced()
                     .find(|(cause, _)| *cause == "dropped")
                     .map_or(0, |(_, count)| count);
-                let dropped: u64 = metrics::dropped().map(|(_, count)| count).sum();
+                // Only the `false` label: a metrics unit test records a
+                // drop with an unconfirmed input in the same process.
+                let dropped = metrics::dropped()
+                    .find(|(unconfirmed, _)| *unconfirmed == "false")
+                    .map_or(0, |(_, count)| count);
                 (dropped, bounced)
             };
             let before = counted();

@@ -50,7 +50,7 @@ The feed carries three kinds of event. [Section 8](#8-events-what-you-receive-an
 
 | Event | Meaning |
 |---|---|
-| `OrderStatus` | Your submitted order went `LIVE`, was `REJECTED`, became `UNAVAILABLE` because its note was spent outside the solver, or was `CANCELLED` by [self-trade prevention](#12-self-trade-prevention) or because its note never arrived ([live at accept](#13-orders-live-at-accept)). |
+| `OrderStatus` | Your submitted order went `LIVE`, became `UNAVAILABLE` because its note was spent outside the solver, or was `CANCELLED` by [self-trade prevention](#12-self-trade-prevention) or because its note never arrived ([live at accept](#13-orders-live-at-accept)). |
 | `SettlementPending` | We reserved your order for a settlement transaction. Nothing is filled yet. |
 | `SettlementResolved` | That transaction committed on chain (a fill) or was voided (no fill). |
 
@@ -592,7 +592,7 @@ stateDiagram-v2
     state "Spent elsewhere" as SpentElsewhere
     [*] --> Accepted: SubmitOrder reply (no event)
     Accepted --> Live: OrderStatus LIVE
-    Accepted --> NeverLive: OrderStatus REJECTED or UNAVAILABLE
+    Accepted --> NeverLive: OrderStatus UNAVAILABLE
     Accepted --> Cancelled: you cancel (no event)
     Live --> Reserved: SettlementPending
     Live --> SpentElsewhere: OrderStatus UNAVAILABLE
@@ -607,7 +607,7 @@ stateDiagram-v2
 | Arrow | What happened |
 |---|---|
 | Accepted → Live | We found your exact note committed and unspent on chain, and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, a private order goes live when we accept it. |
-| Accepted → Never went live | The note on chain differs from what you sent (`REJECTED`), or it was spent before it went live (`UNAVAILABLE`). |
+| Accepted → Never went live | The note was spent before it went live (`UNAVAILABLE`). |
 | Live → Reserved | We matched your order and reserved it for a settlement transaction. |
 | Live → Spent elsewhere | The note was spent outside the solver, for example you reclaimed it, or someone else consumed a public note. |
 | Reserved → Filled | The transaction committed and nothing is left. |
@@ -641,15 +641,9 @@ flowchart LR
 
 #### `OrderStatus` · `REJECTED`
 
-```mermaid
-flowchart LR
-    t["The note on chain under that ID<br/>differs from the note you submitted"] --> e(["OrderStatus REJECTED"])
-    classDef ev fill:#fde2e1,stroke:#b3402e,color:#5c1a10
-    class e ev
-```
-
-- **Sent:** once, when a note under your note's ID turns out to differ from what you submitted. Reason: `committed note differs from the submitted note`. A note ID commits to the whole note, so a note that differs has another ID and is never found: the current solver does not send this event. Handle it as final if it arrives.
-- **You do:** treat it as no order. Nothing was filled. Check how you serialize the note.
+- **Never sent.** The state stays in the API so existing clients keep working.
+- **Why:** a note ID commits to the whole note. A note that differs from what you submitted has another ID, so we never find it under yours. Such an order ends like one whose note never arrived: it stays accepted and never goes live, or, with [live at accept](#13-orders-live-at-accept), it is `CANCELLED` with `note_not_received`.
+- **You do:** nothing new. If your client already handles it, keep treating it as final with nothing filled.
 
 #### `OrderStatus` · `UNAVAILABLE`
 

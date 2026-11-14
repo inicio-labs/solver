@@ -88,6 +88,15 @@ pub enum DbError {
     },
     #[error("PostgreSQL migration failed: {0}")]
     Migration(String),
+    #[error(
+        "this PostgreSQL role cannot read `{relation}`: grant it SELECT on that relation \
+         (docs/postgres-runbook.md, production setup, step 2)"
+    )]
+    Unreadable {
+        relation: &'static str,
+        #[source]
+        source: diesel::result::Error,
+    },
 
     // ---- stored and incoming data ----
     #[error("PostgreSQL sync cursor row is missing")]

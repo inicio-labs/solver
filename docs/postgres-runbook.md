@@ -30,7 +30,8 @@ active-active mode in V1.
    future migrations as well.
 3. Set `SOLVER_MIGRATION_DATABASE_URL` to the migration-role URL and run
    `solver-bin migrate-db` once. Set `SOLVER_DATABASE_URL` to the writer URL
-   and run `solver-bin check-db` (it checks the writer connection only). Set
+   and run `solver-bin check-db` (it checks the writer connection only: the
+   migration history, and `SELECT` on the views the solver reads directly). Set
    `SOLVER_READ_DATABASE_URL` to the reader URL for the runtime; startup
    verifies that both URLs resolve the same database and schema. Use `sslmode=verify-full`, a trusted root CA,
    `connect_timeout=5`, and libpq TCP keepalives in remote URLs, for example
@@ -69,7 +70,14 @@ every schema change is a stop-then-start deploy:
 
 1. Stop the solver.
 2. With the **new** binary: `solver-bin migrate-db` (migration role).
-3. Start the new binary.
+3. If the migration adds a table or view and your default grants don't cover
+   new relations, grant it to the writer and reader roles now. The
+   live-at-accept migration adds the view `eligible_orders`; both roles need
+   `SELECT` on it.
+4. `solver-bin check-db` with the writer URL. It checks the migration history
+   and that the role can read the views the solver reads directly.
+5. Start the new binary. Startup runs the same checks for the writer and the
+   reader, and stops with the name of a view a role cannot read.
 
 To roll back after step 2, revert the migration with the new binary before
 starting the old one: `solver-bin revert-db` (migration role, same

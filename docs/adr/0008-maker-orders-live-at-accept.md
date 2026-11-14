@@ -61,10 +61,9 @@ The confirmed path is today's: no row until the watcher sees the note. Accept fa
 | Our settlement lands | `confirm_settlement_tx` activates the parents' pending flagged lineages. When the settlement lands in the block that creates the note, the note is erased and the watcher never sees it; this is the only way the lineage learns it was real. |
 | Release of a failed settlement | D3. |
 | Cap | Lineage `rejected` whatever the root's status. An `active` or `waiting` root gets a stop row, is `stopped`, leaves the book, and the maker hears `CANCELLED` `note_not_received` if it saw the order live. A `stopped` or `onchain_nullified` root: closed silently. A `settling` root: skipped until its settlement resolves. |
-| Spent elsewhere | By the root's current status: `settling` waits; `executed` (our settlement) activates the lineage; any other status becomes `onchain_nullified`, the lineage `rejected`, with one `UNAVAILABLE` "note spent outside this solver" if the maker saw it live. |
-| A different note | `settling` waits for its settlement. Otherwise the lineage is `rejected` with one `REJECTED`, and the root is `stopped`. |
-| One bad note in a round | A note the tracker can't look up or import gets no observation this round; the others carry on. A failed batch lookup or import is retried note by note. A note whose details a stored record of another note already holds is decided by an exact lookup instead of an import. Once the cap is due, an unread unconfirmed order is decided by the cap's exact lookup. A failure of the chain sync itself still fails the round. `solver_maker_watcher_unobserved_notes` counts the notes a round left unread. |
-| A note found under our ID | It is ours: a note ID commits to the whole note, metadata included, so a node answer whose metadata looks different (a withheld attachment) is the same note. A note that really differs has another ID and is never found; the cap ends its order with `note_not_received`. The tracker therefore never reports a different note, and REJECTED is not sent. |
+| Spent elsewhere | By the root's current status: `settling` waits; any other status becomes `onchain_nullified`, the lineage `rejected`, with one `UNAVAILABLE` "note spent outside this solver" if the maker saw it live. A root our own settlement spent is never here: its confirmation activates the lineage in the transaction that writes `executed`. |
+| One bad note in a round | A note the tracker can't look up or import gets no observation this round; the others carry on. A batch lookup whose answer does not decode, or a failed batch import, is retried note by note. A lookup the node did not answer (it is down, or refuses the call) fails the round after that one call, as before. A note whose details a stored record of another note already holds is decided by an exact lookup instead of an import. Once the cap is due, an unread unconfirmed order is decided by the cap's exact lookup. A failure of the chain sync itself still fails the round. `solver_maker_watcher_unobserved_notes` counts the notes a round left unread. |
+| A note found under our ID | It is ours: a note ID commits to the whole note, metadata included, so a node answer whose metadata looks different (a withheld attachment) is the same note. A note that really differs has another ID and is never found; the cap ends its order with `note_not_received`. The tracker therefore has no "different note" observation, and REJECTED is never sent. |
 | Lineage rejected | No longer watched. |
 | Maker cancels | Existing `CancelOrder` / `CancelAll`. A `waiting` root whose note lands later goes through `live_book_update_tx`, so it is stored `stopped`. |
 | Switch off | No new order goes live at accept; existing flagged lineages keep their rules. |
@@ -113,6 +112,6 @@ The node prints a state conflict as text. The executor matches `unauthenticated 
 ## Consequences
 
 - Makers' orders trade about 3 to 4 seconds sooner.
-- A maker can see `REJECTED`, `UNAVAILABLE` or `CANCELLED` `note_not_received` after `LIVE`.
+- A maker can see `UNAVAILABLE` or `CANCELLED` `note_not_received` after `LIVE`.
 - Activation no longer re-sends rows that already exist, with the switch on or off.
 - The watcher no longer fails a whole round for one unreadable or mismatched note.

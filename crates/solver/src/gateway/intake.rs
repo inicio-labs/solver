@@ -13,7 +13,7 @@ use diesel::pg::PgConnection;
 use miden_protocol::note::NoteType;
 
 use super::metrics as gateway_metrics;
-use crate::db::maker_db::{execute_command_with_tx, AcceptGate, CommandOutcome};
+use crate::db::maker_db::{execute_command_with_tx, AcceptGate, AcceptMode, CommandOutcome};
 use crate::db::{DbResult, IntakeSession};
 use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerId};
 
@@ -138,7 +138,7 @@ pub async fn run_intake(
         let gate = session.accept_gate();
         let mut publication = session.publication_guard().await;
         let outcome = session
-            .transaction(move |conn| intake_round_tx(conn, &commands, gate))
+            .transaction(move |conn| intake_round_tx(conn, &commands, gate.as_deref()))
             .await;
         match outcome {
             Ok(mut outcomes) => {
@@ -200,8 +200,8 @@ pub async fn run_intake(
 
 /// One intake round's writes, in its transaction: with live at accept on and
 /// a private submit in the round, the owner-epoch guard first (see
-/// [`AcceptGate::accept_block`]), then the order rows and maker rows the
-/// round may touch, in the reservation's lock order, then every command.
+/// [`AcceptGate::resolve`]), then the order rows and maker rows the round
+/// may touch, in the reservation's lock order, then every command.
 ///
 /// `commands` must hold the round's cancels before its submits, as
 /// [`run_intake`] orders them: the matcher applies a round's cancels before
@@ -210,21 +210,26 @@ pub async fn run_intake(
 pub(crate) fn intake_round_tx(
     conn: &mut PgConnection,
     commands: &[(CommandHeader, MakerCommand)],
-    mut gate: Option<AcceptGate>,
+    gate: Option<&AcceptGate>,
 ) -> DbResult<Vec<(MakerId, CommandOutcome)>> {
     let private_submit = commands.iter().any(|(_, command)| {
         matches!(command, MakerCommand::Submit { note, .. }
             if note.metadata().note_type() == NoteType::Private)
     });
-    if let Some(gate) = gate.as_mut().filter(|_| private_submit) {
-        gate.accept_block(conn)?;
-    }
+    let accept = match gate {
+        None => AcceptMode::Off,
+        // The round's first statement, before any other lock.
+        Some(gate) if private_submit => gate.resolve(conn)?,
+        // Nothing here can go live at accept, so no block is read and no
+        // lock taken; a public submit still reports its fallback.
+        Some(_) => AcceptMode::Stale,
+    };
     crate::db::maker_db::prelock_submission_orders_tx(conn, commands)?;
     crate::db::maker_db::prelock_command_makers_tx(conn, commands)?;
     commands
         .iter()
         .map(|(header, command)| {
-            let outcome = execute_command_with_tx(conn, header, command, gate.as_mut())?;
+            let outcome = execute_command_with_tx(conn, header, command, accept)?;
             Ok((header.maker_id, outcome))
         })
         .collect()
@@ -491,7 +496,7 @@ pub(crate) mod tests {
                     AcceptGate::new(epoch, || Some(miden_protocol::block::BlockNumber::from(7)));
                 barrier.wait();
                 let outcomes = conn.transaction::<_, crate::db::DbError, _>(|conn| {
-                    intake_round_tx(conn, &commands, Some(gate))
+                    intake_round_tx(conn, &commands, Some(&gate))
                 })?;
                 Ok(outcomes[0].1.live.is_some())
             }

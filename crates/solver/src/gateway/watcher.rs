@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{NoteFile, NoteSyncHint};
 use miden_client::rpc::domain::note::CommittedNote;
-use miden_client::rpc::NodeRpcClient;
+use miden_client::rpc::{NodeRpcClient, RpcError};
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::sync::{NoteUpdateAction, OnNoteReceived, StateSync, StateSyncInput};
 use miden_client::{Client, ClientError};
@@ -25,7 +25,6 @@ use miden_protocol::note::{Note, NoteId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::proto::OrderState;
 use crate::db::maker_db;
 use crate::db::{postgres_db, DbPool};
 use crate::ingest::{ChainError, ChainResult};
@@ -38,10 +37,11 @@ static SYNCED_BLOCK: AtomicU64 = AtomicU64::new(0);
 static READ_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static PENDING_LINEAGES: AtomicU64 = AtomicU64::new(0);
 // When the oldest pending lineage was submitted (0: none), not its age: the
-// age is computed at scrape, so it keeps growing while rounds fail.
+// age is computed at scrape, so it keeps growing while rounds fail. The same
+// for the oldest unconfirmed order.
 static OLDEST_PENDING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
-static OLDEST_UNCONFIRMED_MS: AtomicU64 = AtomicU64::new(0);
+static OLDEST_UNCONFIRMED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static WAITING: AtomicU64 = AtomicU64::new(0);
 static UNOBSERVED: AtomicU64 = AtomicU64::new(0);
 
@@ -98,7 +98,10 @@ pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
         pending_lineages: PENDING_LINEAGES.load(Ordering::Relaxed),
         oldest_pending_age_secs: age_secs(OLDEST_PENDING_SINCE_MS.load(Ordering::Relaxed), now_ms),
         unconfirmed: UNCONFIRMED.load(Ordering::Relaxed),
-        oldest_unconfirmed_age_secs: OLDEST_UNCONFIRMED_MS.load(Ordering::Relaxed) as f64 / 1000.0,
+        oldest_unconfirmed_age_secs: age_secs(
+            OLDEST_UNCONFIRMED_SINCE_MS.load(Ordering::Relaxed),
+            now_ms,
+        ),
         waiting: WAITING.load(Ordering::Relaxed),
         unobserved: UNOBSERVED.load(Ordering::Relaxed),
     })
@@ -109,7 +112,6 @@ pub enum NoteObservation {
     Pending,
     Committed,
     Consumed,
-    Mismatched,
 }
 
 /// Check a set of exact notes without deciding whether their orders may trade.
@@ -208,6 +210,19 @@ impl UnconfirmedCap {
 /// Blocks before an order's accept block from which its note's history is
 /// searched, in case the watcher's block lagged the maker's transaction.
 const IMPORT_MARGIN_BLOCKS: u32 = 10;
+
+/// Whether the node answered a lookup with something that did not decode.
+/// One note's content can do that to a whole batch, so its notes are then
+/// looked up one by one. Any other failure (the node is down, or refuses the
+/// call) would fail each of those lookups the same way.
+fn is_decode_error(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::DeserializationError(_)
+            | RpcError::ExpectedDataMissing(_)
+            | RpcError::InvalidResponse(_)
+    )
+}
 
 /// Only exact notes supplied by PostgreSQL may enter the maker client store.
 struct MakerNoteScreen(HashSet<NoteId>);
@@ -402,6 +417,9 @@ impl MakerTracker for SdkTracker {
                 let ids: Vec<_> = batch.iter().map(|note| note.id()).collect();
                 let found = match self.rpc.get_notes_by_id(&ids).await {
                     Ok(found) => found,
+                    // The node did not answer: every lookup would fail the
+                    // same way, so the round fails after this one call.
+                    Err(error) if !is_decode_error(&error) => return Err(error.into()),
                     // One note that fails to decode fails the whole batch:
                     // look each one up alone.
                     Err(error) if ids.len() > 1 => {
@@ -410,6 +428,7 @@ impl MakerTracker for SdkTracker {
                         for id in &ids {
                             match self.rpc.get_notes_by_id(&[*id]).await {
                                 Ok(note) => found.extend(note),
+                                Err(error) if !is_decode_error(&error) => return Err(error.into()),
                                 Err(error) => {
                                     tracing::warn!(note_id = %id, error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
                                     unreadable.insert(*id);
@@ -471,10 +490,11 @@ impl MakerTracker for SdkTracker {
                 }
             }
         }
-        let skip =
-            |note: &&Note| !unreadable.contains(&note.id()) && !observed.contains_key(&note.id());
-
-        let synced: Vec<Note> = notes.iter().filter(skip).cloned().collect();
+        let synced: Vec<Note> = notes
+            .iter()
+            .filter(|note| !unreadable.contains(&note.id()))
+            .cloned()
+            .collect();
         self.sync_maker_notes(&synced).await?;
         let records: BTreeMap<_, _> = self
             .client
@@ -679,16 +699,8 @@ impl<T: MakerTracker> Watcher<T> {
             };
             match observation {
                 NoteObservation::Committed => activations.push(submission),
-                NoteObservation::Consumed => rejections.push((
-                    submission,
-                    OrderState::Unavailable,
-                    "note spent before it became live",
-                )),
-                NoteObservation::Mismatched => rejections.push((
-                    submission,
-                    OrderState::Rejected,
-                    "committed note differs from the submitted note",
-                )),
+                // Spent before it was confirmed.
+                NoteObservation::Consumed => rejections.push(submission),
                 NoteObservation::Pending => {}
             }
         }
@@ -714,10 +726,9 @@ impl<T: MakerTracker> Watcher<T> {
                 capped.clone(),
                 spent_ids.clone(),
             );
-            let done = Arc::new(Mutex::new(maker_db::WatcherWrites::default()));
-            let done_in = done.clone();
-            self.pool
-                .write_book(&self.book_tx, move |conn| {
+            let done = self
+                .pool
+                .write_book_with(&self.book_tx, move |conn| {
                     let (activations, rejections, capped, spent_ids) = writes;
                     maker_db::prelock_watcher_tx(
                         conn,
@@ -734,15 +745,14 @@ impl<T: MakerTracker> Watcher<T> {
                     update.removed.extend(removed);
                     update.removed.extend(rejected);
                     update.removed.extend(stopped);
-                    *done_in.lock().unwrap_or_else(|e| e.into_inner()) = maker_db::WatcherWrites {
+                    let done = maker_db::WatcherWrites {
                         returned: activated.returned_makers,
                         cap_cancels,
                         activated: activated.unconfirmed,
                     };
-                    Ok(update)
+                    Ok((update, done))
                 })
                 .await?;
-            let done = std::mem::take(&mut *done.lock().unwrap_or_else(|e| e.into_inner()));
             for submission in activations
                 .iter()
                 .filter(|s| done.activated.contains(&s.lineage_id))
@@ -785,17 +795,17 @@ impl<T: MakerTracker> Watcher<T> {
         match self.pool.read(maker_db::pending_lineage_stats_tx).await {
             Ok(stats) => {
                 PENDING_LINEAGES.store(u64::try_from(stats.count).unwrap_or(0), Ordering::Relaxed);
-                let millis = |secs: Option<f64>| (secs.unwrap_or(0.0).max(0.0) * 1000.0) as u64;
-                OLDEST_PENDING_SINCE_MS.store(
-                    since_ms(stats.oldest_age_secs, now_millis()),
-                    Ordering::Relaxed,
-                );
+                let now_ms = now_millis();
+                OLDEST_PENDING_SINCE_MS
+                    .store(since_ms(stats.oldest_age_secs, now_ms), Ordering::Relaxed);
                 UNCONFIRMED.store(
                     u64::try_from(stats.unconfirmed).unwrap_or(0),
                     Ordering::Relaxed,
                 );
-                OLDEST_UNCONFIRMED_MS
-                    .store(millis(stats.oldest_unconfirmed_age_secs), Ordering::Relaxed);
+                OLDEST_UNCONFIRMED_SINCE_MS.store(
+                    since_ms(stats.oldest_unconfirmed_age_secs, now_ms),
+                    Ordering::Relaxed,
+                );
                 WAITING.store(u64::try_from(stats.waiting).unwrap_or(0), Ordering::Relaxed);
             }
             Err(error) => tracing::debug!(%error, "pending lineage count failed"),
@@ -838,7 +848,7 @@ mod tests {
     use miden_client::testing::mock::MockRpcApi;
     use miden_client_sqlite_store::ClientBuilderSqliteExt;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
-    use miden_protocol::note::{Note, NoteMetadata, NoteType, Nullifier};
+    use miden_protocol::note::{Note, NoteType, Nullifier};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
@@ -848,6 +858,37 @@ mod tests {
     use miden_testing::MockChain;
     use prost::Message;
     use std::sync::Mutex;
+
+    /// Only an answer that did not decode sends a batch to one-by-one
+    /// lookups; a node that is down fails the round after one call.
+    #[test]
+    fn only_a_decode_failure_falls_back_to_single_lookups() {
+        use miden_client::rpc::{GrpcError, RpcEndpoint};
+        for error in [
+            RpcError::DeserializationError("bad note".into()),
+            RpcError::ExpectedDataMissing("metadata".into()),
+            RpcError::InvalidResponse("two notes for one ID".into()),
+        ] {
+            assert!(is_decode_error(&error), "{error}");
+        }
+        for error in [
+            RpcError::ConnectionError("connection refused".into()),
+            RpcError::RequestError {
+                endpoint: RpcEndpoint::GetNotesById,
+                error_kind: GrpcError::Unavailable,
+                endpoint_error: None,
+                source: None,
+            },
+            RpcError::RequestError {
+                endpoint: RpcEndpoint::GetNotesById,
+                error_kind: GrpcError::DeadlineExceeded,
+                endpoint_error: None,
+                source: None,
+            },
+        ] {
+            assert!(!is_decode_error(&error), "{error}");
+        }
+    }
 
     /// The oldest-pending gauge keeps ageing between rounds: it is stored as
     /// a time, and the age is taken when it is read.
@@ -867,7 +908,8 @@ mod tests {
     #[derive(Default)]
     struct ChainState {
         tip: u32,
-        notes: HashMap<NoteId, (u32, NoteMetadata)>,
+        /// The block each landed note is in.
+        notes: HashMap<NoteId, u32>,
         spent: HashMap<Nullifier, u32>,
         down: bool,
         /// Notes the tracker cannot read: no observation, no lookup answer.
@@ -894,7 +936,7 @@ mod tests {
         fn commit(&self, note: &Note, block: u32) {
             let mut state = self.state();
             state.tip = state.tip.max(block);
-            state.notes.insert(note.id(), (block, *note.metadata()));
+            state.notes.insert(note.id(), block);
         }
 
         fn spend(&self, note: &Note, block: u32) {
@@ -914,7 +956,6 @@ mod tests {
     fn observed(state: &ChainState, note: &Note) -> NoteObservation {
         match state.notes.get(&note.id()) {
             None => NoteObservation::Pending,
-            Some((_, metadata)) if metadata != note.metadata() => NoteObservation::Mismatched,
             Some(_) if state.spent.contains_key(&note.nullifier()) => NoteObservation::Consumed,
             Some(_) => NoteObservation::Committed,
         }
@@ -1337,38 +1378,23 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn a_differing_or_spent_note_is_rejected_with_its_reason() {
+    async fn a_note_spent_before_it_was_confirmed_is_unavailable() {
         let mut f = fixture().await;
-        let (differs, spent) = (note(1, NoteType::Private), note(2, NoteType::Private));
-        f.submit(1, &differs).await;
+        let spent = note(2, NoteType::Private);
         f.submit(2, &spent).await;
-        // The chain holds a note with this ID but other metadata.
-        let other = note(1, NoteType::Public);
-        f.chain
-            .state()
-            .notes
-            .insert(differs.id(), (4, *other.metadata()));
         f.chain.commit(&spent, 4);
         f.chain.spend(&spent, 5);
         f.watcher.round().await.unwrap();
 
         assert!(f.book.try_recv().is_err(), "nothing goes live");
-        let mut statuses = f.statuses().await;
-        statuses.sort();
-        let mut expected = vec![
-            (
-                id(&differs),
-                proto::OrderState::Rejected,
-                "committed note differs from the submitted note".to_string(),
-            ),
-            (
+        assert_eq!(
+            f.statuses().await,
+            [(
                 id(&spent),
                 proto::OrderState::Unavailable,
                 "note spent before it became live".to_string(),
-            ),
-        ];
-        expected.sort();
-        assert_eq!(statuses, expected);
+            )]
+        );
         let pending =
             f.db.pool
                 .read(maker_db::pending_submissions_tx)
@@ -1591,15 +1617,8 @@ mod tests {
                 .db
                 .pool
                 .write(move |conn| {
-                    use crate::db::postgres_schema::sync_state;
-                    use diesel::prelude::*;
-                    let epoch: i64 = sync_state::table
-                        .find(1_i16)
-                        .select(sync_state::owner_epoch)
-                        .first(conn)?;
-                    let mut gate =
-                        maker_db::AcceptGate::new(epoch, move || Some(BlockNumber::from(block)));
-                    maker_db::execute_command_with_tx(conn, &header, &command, Some(&mut gate))
+                    let accept = maker_db::AcceptMode::Fresh(BlockNumber::from(block));
+                    maker_db::execute_command_with_tx(conn, &header, &command, accept)
                 })
                 .await
                 .unwrap();

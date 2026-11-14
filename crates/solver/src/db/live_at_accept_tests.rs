@@ -1,6 +1,6 @@
 //! PostgreSQL tests for maker orders that go live at accept (ADR 0008):
 //! accept, activation, confirmation, release by the node's answer (D3), the
-//! spent and mismatched rules, the cap, and the escape hatch.
+//! spent rule, the cap, and the escape hatch.
 
 use std::collections::HashSet;
 
@@ -20,7 +20,9 @@ use miden_protocol::Word;
 use miden_standards::note::{PswapNote, PswapNoteStorage};
 use prost::Message as _;
 
-use super::maker_db::{self, AcceptFallback, AcceptGate, CommandOutcome, PendingSubmission};
+use super::maker_db::{
+    self, AcceptFallback, AcceptGate, AcceptMode, CommandOutcome, PendingSubmission,
+};
 use super::postgres_db::{
     self, confirm_settlement_with_tx, finish_discarded_settlement_tx, live_book_update_tx,
     prepare_settlement_tx, test_consumer, NodeAnswer,
@@ -86,10 +88,12 @@ fn accept_with(
     command: &MakerCommand,
     block: Option<u32>,
 ) -> Result<CommandOutcome> {
-    let mut gate = AcceptGate::new(epoch(conn)?, move || block.map(BlockNumber::from));
+    let accept = block.map_or(AcceptMode::Stale, |block| {
+        AcceptMode::Fresh(BlockNumber::from(block))
+    });
     let header = CommandHeader::new(maker_id, format!("r{seq}"), seq).unwrap();
     Ok(conn.transaction::<_, DbError, _>(|conn| {
-        maker_db::execute_command_with_tx(conn, &header, command, Some(&mut gate))
+        maker_db::execute_command_with_tx(conn, &header, command, accept)
     })?)
 }
 
@@ -397,16 +401,17 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     // While an intake round holds the epoch, a new owner's claim waits.
     let mut intake = postgres_migrations::connect(&url)?;
     intake.batch_execute("BEGIN")?;
-    let mut gate = AcceptGate::new(ours, || Some(BlockNumber::from(7)));
-    let header = CommandHeader::new(alpha, "r1".into(), 1).unwrap();
+    let gate = AcceptGate::new(ours, || Some(BlockNumber::from(7)));
+    let round = |seq: u64, order: &Note| -> Result<_> {
+        Ok([(
+            CommandHeader::new(alpha, format!("r{seq}"), seq).unwrap(),
+            MakerCommand::submit(order.clone())?,
+        )])
+    };
     let first = note(1);
-    let outcome = maker_db::execute_command_with_tx(
-        &mut intake,
-        &header,
-        &MakerCommand::submit(first.clone())?,
-        Some(&mut gate),
-    )?;
-    assert!(outcome.live.is_some());
+    let outcomes =
+        crate::gateway::intake::intake_round_tx(&mut intake, &round(1, &first)?, Some(&gate))?;
+    assert!(outcomes[0].1.live.is_some());
     conn.batch_execute("SET lock_timeout = '200ms'")?;
     let claim = conn.batch_execute("UPDATE sync_state SET owner_epoch = owner_epoch + 1");
     assert!(claim.is_err(), "the claim must wait for the intake round");
@@ -416,11 +421,9 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     // Once a new owner claimed it, the old intake refuses and writes nothing.
     conn.batch_execute("UPDATE sync_state SET owner_epoch = owner_epoch + 1")?;
     let second = note(2);
-    let mut gate = AcceptGate::new(ours, || Some(BlockNumber::from(7)));
-    let header = CommandHeader::new(alpha, "r2".into(), 2).unwrap();
-    let submit = MakerCommand::submit(second.clone())?;
+    let commands = round(2, &second)?;
     let refused = conn.transaction::<_, DbError, _>(|conn| {
-        maker_db::execute_command_with_tx(conn, &header, &submit, Some(&mut gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
     });
     assert!(
         matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
@@ -548,7 +551,7 @@ fn a_release_follows_what_the_node_said() -> Result<()> {
     // Naming one unconfirmed parent: only it waits.
     let (statuses, released, reported) = released_with(|a, _, _| named(&[a]))?;
     assert_eq!(statuses, ["waiting", "active", "active"]);
-    assert_eq!((released.unconfirmed, released.waiting), (2, 1));
+    assert_eq!(released.unconfirmed, 2);
     assert_eq!(
         (released.named_makers.len(), released.waiting_makers.len()),
         (1, 1)
@@ -567,7 +570,7 @@ fn a_release_follows_what_the_node_said() -> Result<()> {
     // Naming nothing we recognise: every unconfirmed parent waits.
     let (statuses, released, _) = released_with(|_, _, _| named(&[]))?;
     assert_eq!(statuses, ["waiting", "waiting", "active"]);
-    assert_eq!(released.waiting, 2);
+    assert_eq!(released.waiting_makers.len(), 2);
 
     // Every note was known.
     let (statuses, _, _) = released_with(|_, _, _| NodeAnswer::AccountMismatch)?;
@@ -604,7 +607,8 @@ fn a_release_decides_by_the_rows_as_they_are_now() -> Result<()> {
     // CANCELLED.
     assert_eq!(status(conn, &found)?.as_deref(), Some("active"));
     assert_eq!(status(conn, &cancelled)?.as_deref(), Some("stopped"));
-    assert_eq!((released.unconfirmed, released.waiting), (1, 0));
+    assert_eq!(released.unconfirmed, 1);
+    assert!(released.waiting_makers.is_empty());
     let reported: HashSet<_> = resolutions(conn, alpha)?.into_iter().collect();
     assert_eq!(
         reported,
@@ -632,25 +636,13 @@ fn a_spent_unconfirmed_order_is_decided_by_its_status() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
-    let (waiting, ours, settling) = (note(1), note(2), note(3));
-    for (seq, order) in [(1, &waiting), (2, &ours), (3, &settling)] {
+    let (waiting, settling) = (note(1), note(3));
+    for (seq, order) in [(1, &waiting), (3, &settling)] {
         accept(conn, alpha, seq, order)?;
     }
     set_status(conn, &waiting, "waiting")?;
-    set_status(conn, &ours, "executed")?;
     reserve(conn, 9, &[&settling])?;
-    let spent = |s: PendingSubmission| {
-        (
-            s,
-            proto::OrderState::Unavailable,
-            "note spent before it became live",
-        )
-    };
-    let rejections = [
-        spent(pending(conn, &waiting)?),
-        spent(pending(conn, &ours)?),
-        spent(pending(conn, &settling)?),
-    ];
+    let rejections = [pending(conn, &waiting)?, pending(conn, &settling)?];
     let removed =
         conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &rejections))?;
     assert_eq!(removed, [waiting.id()]);
@@ -659,8 +651,6 @@ fn a_spent_unconfirmed_order_is_decided_by_its_status() -> Result<()> {
         Some("onchain_nullified")
     );
     assert_eq!(lineage(conn, &waiting)?.0, "rejected");
-    // Our own settlement spent it: activated, never rejected.
-    assert_eq!(lineage(conn, &ours)?.0, "activated");
     // Still in flight: decided once it resolves.
     assert_eq!(status(conn, &settling)?.as_deref(), Some("settling"));
     assert_eq!(lineage(conn, &settling)?.0, "pending");
@@ -678,7 +668,7 @@ fn a_spent_unconfirmed_order_is_decided_by_its_status() -> Result<()> {
     );
     // Once only.
     conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &rejections[..1]))?;
-    assert_eq!(statuses(conn, alpha)?.len(), reports.len() + 3);
+    assert_eq!(statuses(conn, alpha)?.len(), reports.len() + 2);
     Ok(())
 }
 
@@ -696,11 +686,7 @@ fn a_spend_seen_elsewhere_first_is_reported_once() -> Result<()> {
         postgres_db::mark_orders_onchain_nullified_tx(conn, &[id(&order)])
     })?;
     assert_eq!(status(conn, &order)?.as_deref(), Some("onchain_nullified"));
-    let rejection = (
-        pending(conn, &order)?,
-        proto::OrderState::Unavailable,
-        "spent",
-    );
+    let rejection = pending(conn, &order)?;
     conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &[rejection]))?;
     assert_eq!(lineage(conn, &order)?.0, "rejected");
     let unavailable = statuses(conn, alpha)?
@@ -713,41 +699,34 @@ fn a_spend_seen_elsewhere_first_is_reported_once() -> Result<()> {
 
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn a_different_note_waits_for_its_settlement_then_is_rejected_once() -> Result<()> {
+fn a_spent_note_waits_for_its_settlement_then_is_reported_once() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
     let order = note(1);
     accept(conn, alpha, 1, &order)?;
     reserve(conn, 9, &[&order])?;
-    let differs = |s| {
-        (
-            s,
-            proto::OrderState::Rejected,
-            "committed note differs from the submitted note",
-        )
-    };
-    let first = differs(pending(conn, &order)?);
+    let first = pending(conn, &order)?;
     conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &[first]))?;
     assert_eq!(lineage(conn, &order)?.0, "pending");
     release(conn, 9, NodeAnswer::Unclear)?;
     assert_eq!(status(conn, &order)?.as_deref(), Some("waiting"));
-    let second = differs(pending(conn, &order)?);
+    let second = pending(conn, &order)?;
     let removed = conn.transaction::<_, DbError, _>(|conn| {
         maker_db::reject_tx(conn, std::slice::from_ref(&second))
     })?;
     assert_eq!(removed, [order.id()]);
-    assert_eq!(status(conn, &order)?.as_deref(), Some("stopped"));
+    assert_eq!(status(conn, &order)?.as_deref(), Some("onchain_nullified"));
     assert_eq!(lineage(conn, &order)?.0, "rejected");
-    let rejected = |conn: &mut PgConnection| -> Result<usize> {
+    let unavailable = |conn: &mut PgConnection| -> Result<usize> {
         Ok(statuses(conn, alpha)?
             .into_iter()
-            .filter(|(_, state, _)| *state == proto::OrderState::Rejected)
+            .filter(|(_, state, _)| *state == proto::OrderState::Unavailable)
             .count())
     };
-    assert_eq!(rejected(conn)?, 1);
+    assert_eq!(unavailable(conn)?, 1);
     conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &[second]))?;
-    assert_eq!(rejected(conn)?, 1);
+    assert_eq!(unavailable(conn)?, 1);
     Ok(())
 }
 
@@ -859,63 +838,34 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
 
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn an_unconfirmed_order_still_in_the_book_is_retired_when_spent_or_different() -> Result<()> {
+fn an_unconfirmed_order_still_in_the_book_is_retired_when_spent() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
-    let (reclaimed, differs, cancelled) = (note(1), note(2), note(3));
-    for (seq, order) in [(1, &reclaimed), (2, &differs), (3, &cancelled)] {
+    let (reclaimed, cancelled) = (note(1), note(3));
+    for (seq, order) in [(1, &reclaimed), (3, &cancelled)] {
         accept(conn, alpha, seq, order)?;
     }
-    // The maker cancels the third, then its note turns out different.
+    // The maker cancels the second, then its note turns out spent too.
     cancel(conn, alpha, 4, &cancelled)?;
-    let rejections = [
-        (
-            pending(conn, &reclaimed)?,
-            proto::OrderState::Unavailable,
-            "note spent before it became live",
-        ),
-        (
-            pending(conn, &differs)?,
-            proto::OrderState::Rejected,
-            "committed note differs from the submitted note",
-        ),
-        (
-            pending(conn, &cancelled)?,
-            proto::OrderState::Rejected,
-            "committed note differs from the submitted note",
-        ),
-    ];
+    let rejections = [pending(conn, &reclaimed)?, pending(conn, &cancelled)?];
     let removed: HashSet<_> = conn
         .transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &rejections))?
         .into_iter()
         .collect();
-    assert_eq!(
-        removed,
-        HashSet::from([reclaimed.id(), differs.id(), cancelled.id()])
-    );
-    assert_eq!(
-        status(conn, &reclaimed)?.as_deref(),
-        Some("onchain_nullified")
-    );
-    assert_eq!(status(conn, &differs)?.as_deref(), Some("stopped"));
-    for order in [&reclaimed, &differs, &cancelled] {
+    assert_eq!(removed, HashSet::from([reclaimed.id(), cancelled.id()]));
+    for order in [&reclaimed, &cancelled] {
+        assert_eq!(status(conn, order)?.as_deref(), Some("onchain_nullified"));
         assert_eq!(lineage(conn, order)?.0, "rejected");
     }
-    // One event each for the two the maker saw live; none for the one it
+    // One event for the order the maker saw live; none for the one it
     // cancelled.
     let terminal: Vec<_> = statuses(conn, alpha)?
         .into_iter()
         .filter(|(_, state, _)| !live(*state))
         .map(|(note, state, _)| (note, state))
         .collect();
-    assert_eq!(
-        terminal,
-        [
-            (id(&reclaimed), proto::OrderState::Unavailable),
-            (id(&differs), proto::OrderState::Rejected),
-        ]
-    );
+    assert_eq!(terminal, [(id(&reclaimed), proto::OrderState::Unavailable)]);
     Ok(())
 }
 
@@ -953,7 +903,7 @@ fn a_public_only_round_reports_its_fallback() -> Result<()> {
         MakerCommand::submit(note_of(1, NoteType::Public))?,
     )];
     let outcomes = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
     })?;
     assert_eq!(outcomes[0].1.fallback, Some(AcceptFallback::Public));
     assert!(outcomes[0].1.live.is_none());

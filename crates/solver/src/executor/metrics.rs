@@ -113,17 +113,7 @@ pub(crate) fn refusal_code(error: &ClientError) -> RefusalCode {
 /// status, and carries the node's message when it is typed, otherwise its
 /// source (the gRPC status) does.
 pub(crate) fn refusal_detail(error: &ClientError) -> String {
-    match error {
-        ClientError::RpcError(rpc) => match rpc {
-            RpcError::RequestError {
-                endpoint_error: None,
-                source: Some(source),
-                ..
-            } => format!("{rpc}: {source}"),
-            _ => rpc.to_string(),
-        },
-        other => other.to_string(),
-    }
+    crate::ingest::client_error_detail(error)
 }
 
 pub(crate) fn record_refusal(code: RefusalCode, attempt: RefusalAttempt) {

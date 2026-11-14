@@ -383,13 +383,13 @@ impl MakerTracker for SdkTracker {
                     // One note that fails to decode fails the whole batch:
                     // look each one up alone.
                     Err(error) if ids.len() > 1 => {
-                        tracing::warn!(%error, notes = ids.len(), "maker note batch lookup failed; looking notes up one by one");
+                        tracing::warn!(error = %ChainError::from(error).detail(), notes = ids.len(), "maker note batch lookup failed; looking notes up one by one");
                         let mut found = Vec::with_capacity(ids.len());
                         for id in &ids {
                             match self.rpc.get_notes_by_id(&[*id]).await {
                                 Ok(note) => found.extend(note),
                                 Err(error) => {
-                                    tracing::warn!(note_id = %id, %error, "maker note lookup failed; skipped this round");
+                                    tracing::warn!(note_id = %id, error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
                                     unreadable.insert(*id);
                                 }
                             }
@@ -397,7 +397,7 @@ impl MakerTracker for SdkTracker {
                         found
                     }
                     Err(error) => {
-                        tracing::warn!(note_id = %ids[0], %error, "maker note lookup failed; skipped this round");
+                        tracing::warn!(note_id = %ids[0], error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
                         unreadable.insert(ids[0]);
                         Vec::new()
                     }
@@ -439,10 +439,10 @@ impl MakerTracker for SdkTracker {
                 if let Err(error) = self.client.import_notes(&files).await {
                     // One note's import can fail the batch: import each
                     // alone, and skip the ones that still fail this round.
-                    tracing::warn!(%error, notes = imports.len(), "maker note import failed; importing notes one by one");
+                    tracing::warn!(error = %crate::ingest::client_error_detail(&error), notes = imports.len(), "maker note import failed; importing notes one by one");
                     for (id, file) in imports {
                         if let Err(error) = self.client.import_notes(&[file]).await {
-                            tracing::warn!(note_id = %id, %error, "maker note import failed; skipped this round");
+                            tracing::warn!(note_id = %id, error = %crate::ingest::client_error_detail(&error), "maker note import failed; skipped this round");
                             unreadable.insert(id);
                         }
                     }
@@ -491,7 +491,7 @@ impl MakerTracker for SdkTracker {
                     observed.insert(note.id(), state);
                 }
                 Err(error) => {
-                    tracing::warn!(note_id = %note.id(), %error, "maker note not observed this round");
+                    tracing::warn!(note_id = %note.id(), error = %error.detail(), "maker note not observed this round");
                 }
             }
         }
@@ -510,6 +510,16 @@ pub enum WatchError {
     Chain(#[from] ChainError),
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
+}
+
+impl WatchError {
+    /// For logs: a chain error's inner RPC error and the node's message.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Chain(error) => error.detail(),
+            Self::Db(error) => error.to_string(),
+        }
+    }
 }
 
 pub struct Watcher<T> {
@@ -636,7 +646,7 @@ impl<T: MakerTracker> Watcher<T> {
                         found
                     }
                     Err(error) => {
-                        tracing::warn!(note_id = %submission.note.id(), %error, "cap lookup failed; next round");
+                        tracing::warn!(note_id = %submission.note.id(), error = %error.detail(), "cap lookup failed; next round");
                         continue;
                     }
                 }
@@ -784,7 +794,7 @@ pub async fn run_watcher<T: MakerTracker>(
             _ = cancel.cancelled() => return,
             _ = tick.tick() => {
                 if let Err(error) = watcher.round().await {
-                    tracing::warn!(%error, "maker-note watcher round failed; retrying");
+                    tracing::warn!(error = %error.detail(), "maker-note watcher round failed; retrying");
                 }
             }
         }

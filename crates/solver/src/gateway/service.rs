@@ -559,6 +559,10 @@ async fn supervise_gateway<S, E>(
         }
         worker = workers.join_next() => {
             match worker {
+                // A shutdown stops the workers too: no error then.
+                Some(Ok(name)) if cancel.is_cancelled() => {
+                    tracing::debug!(name, "maker gateway worker stopped");
+                }
                 Some(Ok(name)) => tracing::error!(name, "maker gateway worker exited early"),
                 Some(Err(error)) => tracing::error!(%error, "maker gateway worker panicked"),
                 None => tracing::error!("maker gateway workers vanished"),

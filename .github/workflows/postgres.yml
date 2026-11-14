@@ -46,7 +46,7 @@ jobs:
             crates/solver/src/db/{mod,live_at_accept_tests}.rs \
             crates/solver/src/maker.rs crates/solver/src/types.rs \
             crates/solver/src/admin/admin.rs crates/solver/src/config.rs \
-            crates/solver/src/executor/{executor,metrics,mod,refusal}.rs crates/solver/src/ingest/ingest.rs \
+            crates/solver/src/executor/{executor,metrics,mod,refusal}.rs crates/solver/src/ingest/{ingest,error,mod}.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
             crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs \
             crates/solver/src/matcher/clearing_book/bounded_price.rs \

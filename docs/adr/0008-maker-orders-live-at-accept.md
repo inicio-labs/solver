@@ -102,6 +102,7 @@ The node prints a state conflict as text. The executor matches `unauthenticated 
 11. A note erased by the maker's own reclaim in the same block ends as `note_not_received`.
 12. A crash before a refusal is recorded makes recovery retry until expiry (about 60 s, one or two proofs).
 13. An order released into `waiting` after its cap time has passed can be cancelled in the next round, even if a re-sent maker transaction is about to land.
+14. **A note erased in the same block, plus a wrong local "discarded" record.** If the executor's client ever recorded a settlement that landed as discarded, the release would normally still see its parents spent on chain and retire them. A maker note created and spent in one block leaves no nullifier, so that check can't catch it: the order would go to `waiting` and the maker would be told it was never filled. miden-client 0.17.5 can't produce such a record: each sync marks our included transactions committed before any discard rule runs, and the node reports a transaction whatever happened to its notes. No guard is built; revisit if the client's sync changes.
 
 ## Operations
 

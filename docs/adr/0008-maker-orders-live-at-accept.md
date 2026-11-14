@@ -38,7 +38,7 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 | D8 | Settlement isolation (keeping a doubtful maker input out of other settlements) comes later, if the counters show it is needed. |
 | D9 | Accepted risks, below. |
 | D10 | Startup recovery keeps today's behaviour: a refused retry waits for the transaction's expiry. |
-| D11 | Two PRs: metrics and a mock-chain harness first, then this feature. **Outstanding:** the plan's manual tests against a local node 0.18, and a refusal text captured from it as a fixture. The parser's markers are copied from the node's source (0.17.6 and 0.18.0); they are not yet pinned by a captured sample. |
+| D11 | Two PRs: metrics and a mock-chain harness first, then this feature. Checked against a local node 0.18.0 (`tests/local_node_018.rs`, manual): a note created by a transaction still in the mempool can be spent, and both land in one block with the note erased; a spend of a note nobody created is refused naming it (`[NoteId(Word([…]))]`), and the text is pinned in `tests/fixtures/node-0.18-refusals.json`; a node restart loses a waiting transaction, the next spend of its note is refused as unknown, and the maker's client learns it only on expiry; a second spend of a note a waiting transaction already spends is refused by nullifier (hex) before the notes are checked (#69); a USDCx transfer expires 20 blocks after its reference block. Not covered: a note with a withheld attachment. |
 
 ### Accept
 

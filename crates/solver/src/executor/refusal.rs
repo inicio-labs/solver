@@ -215,4 +215,38 @@ mod tests {
             (NodeAnswer::NotSent, None)
         );
     }
+
+    /// Refusals a local node 0.18.0 sent the client the solver uses, captured
+    /// by `tests/local_node_018.rs`. Re-capture after every node upgrade.
+    #[test]
+    fn refusals_captured_from_node_0_18_parse() {
+        use miden_protocol::utils::serde::Deserializable;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/node-0.18-refusals.json"))
+                .unwrap();
+        let note = |key: &str, field: &str| {
+            let bytes = hex::decode(fixture[key][field].as_str().unwrap()).unwrap();
+            Note::read_from_bytes(&bytes).unwrap()
+        };
+        let message = |key: &str| fixture[key]["message"].as_str().unwrap().to_owned();
+        let other = pswap_note(1);
+
+        let unknown = note("unknown_notes", "unknown_note");
+        let (answer, kind) = node_answer(
+            &conflict(message("unknown_notes")),
+            &[other.clone(), unknown.clone()],
+        );
+        assert_eq!(
+            answer,
+            NodeAnswer::UnknownNotes([unknown.id()].into_iter().collect())
+        );
+        assert_eq!(kind, Some(ConflictKind::UnknownNotes));
+
+        // A note a waiting transaction already spends is refused by nullifier
+        // (issue #69): every unconfirmed parent waits.
+        let spent = note("mempool_nullifiers", "spent_note");
+        let (answer, kind) = node_answer(&conflict(message("mempool_nullifiers")), &[spent, other]);
+        assert_eq!(answer, NodeAnswer::Unclear);
+        assert_eq!(kind, Some(ConflictKind::MempoolNullifiers));
+    }
 }

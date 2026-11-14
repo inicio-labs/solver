@@ -237,7 +237,7 @@ It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_
 - `solver_maker_unknown_notes_named_total` rising for one maker: its transactions reach the node after its `SubmitOrder`, or not at all.
 - `solver_maker_cap_cancels_total` rising: notes that never arrive.
 - `solver_executor_settlements_dropped_total{unconfirmed_maker_input="true"}` above 0: a maker transaction dropped from the mempool took our settlement with it.
-- `solver_executor_settlement_conflicts_total{kind="unreadable"}` or `{kind="unknown_notes_unmatched"}` above 0: the node words its refusals differently; every unconfirmed order now waits. Re-check the text in `executor/refusal.rs` on every node upgrade.
+- `solver_executor_settlement_conflicts_total{kind="unreadable"}` or `{kind="unknown_notes_unmatched"}` above 0: the node words its refusals differently; every unconfirmed order now waits. On every node upgrade, re-capture the text: start the node's local network and run `SOLVER_LOCAL_NODE_WRITE_FIXTURE=1 cargo test -p solver --test local_node_018 -- --ignored --test-threads=1`, which rewrites `tests/fixtures/node-0.18-refusals.json` for the parser's unit test.
 - `solver_maker_watcher_block_read_age_seconds` above 10 for long: every order takes the confirmed path (`solver_maker_accept_fallbacks_total{reason="watcher_stale"}`).
 - Several makers' unknown-note refusals at once: the node lost its mempool (a restart). Their orders wait, and return when their notes land or are capped.
 - `solver_maker_watcher_unobserved_notes` above 0 for long: notes the watcher can't read. Unconfirmed ones are still decided by the cap's lookup; activated ones go unwatched for spends until they read again.

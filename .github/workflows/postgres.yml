@@ -56,7 +56,7 @@ jobs:
             crates/solver/src/price/binance/feed/tests.rs crates/mock-binance/src/*.rs \
             crates/solver/src/pipeline.rs crates/solver/src/price_api.rs crates/solver/src/swap_eta.rs \
             crates/solver/src/price_api/tests.rs crates/solver/src/start.rs \
-            crates/solver/tests/common/{mod,maker,node_like}.rs \
+            crates/solver/tests/common/{mod,maker,node_like}.rs crates/solver/tests/local_node_018.rs \
             crates/solver/tests/integration_{already_consumed,bounded_price,bounded_price_scenarios,maker_gateway,partial_fill,post_commit_kill,startup_failure,three_user_direct,unpriced_direct}.rs \
             crates/e2e/src/{artifacts,provision,run}.rs src/main.rs crates/solver/build.rs
       - name: Compile workspace

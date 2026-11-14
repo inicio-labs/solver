@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -549,26 +548,21 @@ async fn release_rejected_settlement(
     };
     let attempt_id = settlement.id_bytes().to_vec();
     let cancelled = settlement.cancelled.clone();
-    // What this release did, for `/metrics`: an attempt already resolved
-    // elsewhere yields an empty update and is not counted.
-    let found = Arc::new(AtomicBool::new(false));
-    let returned = Arc::new(AtomicUsize::new(0));
-    let (found_in, returned_in) = (found.clone(), returned.clone());
-    pool.write_book(book_tx, move |conn| {
-        let mut update =
-            db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed)?;
-        found_in.store(
-            !(update.active.is_empty() && update.removed.is_empty()),
-            AtomicOrdering::Relaxed,
-        );
-        returned_in.store(update.active.len(), AtomicOrdering::Relaxed);
-        // Its sit-outs stay cancelled.
-        update.removed.extend(cancelled);
-        Ok(update)
-    })
-    .await?;
-    if found.load(AtomicOrdering::Relaxed) {
-        metrics::record_release(cause, returned.load(AtomicOrdering::Relaxed));
+    // Counted for `/metrics` only when this call released the attempt: one
+    // already resolved elsewhere is not a release.
+    let returned = pool
+        .write_book_with(book_tx, move |conn| {
+            let released =
+                db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed)?;
+            let returned = released.found.then_some(released.update.active.len());
+            let mut update = released.update;
+            // Its sit-outs stay cancelled.
+            update.removed.extend(cancelled);
+            Ok((update, returned))
+        })
+        .await?;
+    if let Some(returned) = returned {
+        metrics::record_release(cause, returned);
     }
     Ok(true)
 }

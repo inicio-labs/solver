@@ -313,20 +313,17 @@ async fn a_maker_order_goes_live_after_its_note_lands_and_trades() -> Result<()>
                 let mut resolved = false;
                 for _ in 0..10 {
                     rpc.prove_block();
-                    match wait_for_event(&mut events, Duration::from_secs(3), |kind| {
-                        matches!(
-                            kind,
-                            proto::event_body::Kind::SettlementResolved(resolved) if resolved.committed
-                        )
-                    })
-                    .await
-                    {
-                        Ok(_) => {
-                            resolved = true;
-                            break;
-                        }
-                        Err(error) if error.to_string().starts_with("event not seen within") => {}
-                        Err(error) => return Err(error),
+                    let committed = events
+                        .next_match(Duration::from_secs(3), |kind| {
+                            matches!(
+                                kind,
+                                proto::event_body::Kind::SettlementResolved(resolved) if resolved.committed
+                            )
+                        })
+                        .await?;
+                    if committed.is_some() {
+                        resolved = true;
+                        break;
                     }
                 }
                 ensure!(resolved, "the maker's settlement never resolved as committed");

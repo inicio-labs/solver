@@ -1,6 +1,7 @@
 //! Maker gateway helpers: register a maker, send commands to the gateway over
 //! gRPC with its API key, and read its event feed.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -105,60 +106,85 @@ impl MakerClient {
     }
 
     /// The maker's event feed from the first event.
-    pub async fn events(&mut self) -> Result<Streaming<proto::StreamMessage>> {
+    pub async fn events(&mut self) -> Result<EventFeed> {
         let request = self.request(proto::StreamEventsRequest { after_seq: 0 });
-        Ok(self.client.stream_events(request).await?.into_inner())
+        Ok(EventFeed {
+            stream: self.client.stream_events(request).await?.into_inner(),
+            unread: VecDeque::new(),
+        })
+    }
+}
+
+/// A maker's event feed. An event read while waiting for another one stays
+/// here until a later wait matches it or passes it.
+pub struct EventFeed {
+    stream: Streaming<proto::StreamMessage>,
+    unread: VecDeque<proto::MakerEvent>,
+}
+
+impl EventFeed {
+    /// Read until an event matches `want`, and return it with every event
+    /// before it, in order. `None` when none matched within `max_wait`: the
+    /// events read meanwhile are kept for the next wait.
+    pub async fn next_match<F>(
+        &mut self,
+        max_wait: Duration,
+        mut want: F,
+    ) -> Result<Option<Vec<proto::MakerEvent>>>
+    where
+        F: FnMut(&proto::event_body::Kind) -> bool,
+    {
+        let deadline = Instant::now() + max_wait;
+        let mut checked = 0;
+        loop {
+            while let Some(event) = self.unread.get(checked) {
+                checked += 1;
+                let kind = event.body.as_ref().and_then(|body| body.kind.as_ref());
+                if kind.is_some_and(&mut want) {
+                    return Ok(Some(self.unread.drain(..checked).collect()));
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            let Ok(message) = tokio::time::timeout(left, self.stream.message()).await else {
+                return Ok(None);
+            };
+            let message =
+                message?.ok_or_else(|| anyhow!("event stream ended; saw {:?}", self.unread))?;
+            if let Some(proto::stream_message::Message::Event(event)) = message.message {
+                self.unread.push_back(event);
+            }
+        }
     }
 }
 
 /// Read the feed until an event matches `want`, or fail after `max_wait`.
 /// Every event seen on the way is returned too, in order, for assertions.
 pub async fn wait_for_event<F>(
-    stream: &mut Streaming<proto::StreamMessage>,
+    feed: &mut EventFeed,
     max_wait: Duration,
-    mut want: F,
+    want: F,
 ) -> Result<Vec<proto::MakerEvent>>
 where
     F: FnMut(&proto::event_body::Kind) -> bool,
 {
-    let deadline = Instant::now() + max_wait;
-    let mut seen = Vec::new();
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            bail!("event not seen within {max_wait:?}; saw {seen:?}");
-        }
-        let message = tokio::time::timeout(left, stream.message())
-            .await
-            .map_err(|_| anyhow!("event not seen within {max_wait:?}; saw {seen:?}"))??
-            .ok_or_else(|| anyhow!("event stream ended; saw {seen:?}"))?;
-        if let Some(proto::stream_message::Message::Event(event)) = message.message {
-            let matched = event
-                .body
-                .as_ref()
-                .and_then(|body| body.kind.as_ref())
-                .is_some_and(&mut want);
-            seen.push(event);
-            if matched {
-                return Ok(seen);
-            }
-        }
+    match feed.next_match(max_wait, want).await? {
+        Some(seen) => Ok(seen),
+        None => bail!("event not seen within {max_wait:?}; saw {:?}", feed.unread),
     }
 }
 
-/// Fail if an event matching `unwanted` arrives within `window`.
-pub async fn expect_no_event<F>(
-    stream: &mut Streaming<proto::StreamMessage>,
-    window: Duration,
-    unwanted: F,
-) -> Result<()>
+/// Fail if an event matching `unwanted` is in the feed or arrives within
+/// `window`. Other events stay in the feed.
+pub async fn expect_no_event<F>(feed: &mut EventFeed, window: Duration, unwanted: F) -> Result<()>
 where
     F: FnMut(&proto::event_body::Kind) -> bool,
 {
-    match wait_for_event(stream, window, unwanted).await {
-        Ok(seen) => bail!("unexpected event: {:?}", seen.last()),
-        Err(error) if error.to_string().starts_with("event not seen within") => Ok(()),
-        Err(error) => Err(error),
+    match feed.next_match(window, unwanted).await? {
+        Some(seen) => bail!("unexpected event: {:?}", seen.last()),
+        None => Ok(()),
     }
 }
 

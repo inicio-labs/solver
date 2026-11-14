@@ -35,7 +35,7 @@ use miden_protocol::batch::{ProposedBatch, ProvenBatch};
 use miden_protocol::block::{BlockHeader, BlockNumber, SignedBlock};
 use miden_protocol::crypto::merkle::mmr::MmrProof;
 use miden_protocol::note::{NoteId, NoteScript, NoteTag, Nullifier};
-use miden_protocol::transaction::ProvenTransaction;
+use miden_protocol::transaction::{ProvenTransaction, TransactionId};
 use miden_protocol::vm::ExecutionProof;
 use miden_protocol::Word;
 
@@ -85,39 +85,68 @@ pub fn committed_spend_error(nullifiers: &[Nullifier]) -> RpcError {
     }
 }
 
-/// What the wrapper's "mempool" holds between blocks.
+/// The notes a transaction creates and spends.
+struct Effects {
+    outputs: Vec<NoteId>,
+    nullifiers: Vec<Nullifier>,
+}
+
+/// What the wrapper knows about transactions submitted through it.
 #[derive(Default)]
-struct Pending {
-    /// Notes created by transactions not yet in a block.
-    outputs: BTreeSet<NoteId>,
-    /// Notes those transactions spend.
-    nullifiers: BTreeSet<Nullifier>,
+struct State {
+    /// Accepted and not yet seen in a block: the wrapper's "mempool".
+    waiting: BTreeMap<TransactionId, Effects>,
+    /// Every transaction seen in a block, and how many blocks were read for
+    /// it.
+    included: BTreeSet<TransactionId>,
+    scanned: usize,
+    /// Notes spent by this wrapper's transactions that are now in a block.
+    spent: BTreeSet<Nullifier>,
 }
 
 pub struct NodeLikeRpc {
     inner: Arc<MockRpcApi>,
-    pending: Mutex<Pending>,
-    /// Notes spent by transactions submitted through this wrapper that are
-    /// now in a block.
-    spent: Mutex<BTreeSet<Nullifier>>,
+    state: Mutex<State>,
 }
 
 impl NodeLikeRpc {
     pub fn new(inner: Arc<MockRpcApi>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            pending: Mutex::new(Pending::default()),
-            spent: Mutex::new(BTreeSet::new()),
+            state: Mutex::new(State::default()),
         })
     }
 
-    /// Commit every queued transaction in one block. The mock takes all of
-    /// them, so the mempool is empty afterwards; a note created and spent in
-    /// that block was erased and is unknown again.
+    /// Commit every queued transaction in one block. A note created and
+    /// spent in that block was erased and is unknown again.
     pub fn prove_block(&self) {
         self.inner.prove_block();
-        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
-        self.spent.lock().unwrap().extend(pending.nullifiers);
+        self.settle();
+    }
+
+    /// Move the transactions the chain now holds out of the mempool. This is
+    /// decided by the blocks' own transaction IDs, not by when it runs: the
+    /// solver submits from another thread, so a submission can reach the mock
+    /// after it has drained its queue for a block and before this call. It
+    /// stays in the mempool until a block really holds it.
+    fn settle(&self) {
+        let mut state = self.state.lock().unwrap();
+        let included: Vec<TransactionId> = {
+            let chain = self.inner.mock_chain.read();
+            let blocks = chain.proven_blocks();
+            let new = &blocks[state.scanned.min(blocks.len())..];
+            state.scanned = blocks.len();
+            new.iter()
+                .flat_map(|block| block.body().transactions().as_slice())
+                .map(|transaction| transaction.id())
+                .collect()
+        };
+        for id in included {
+            if let Some(effects) = state.waiting.remove(&id) {
+                state.spent.extend(effects.nullifiers);
+            }
+            state.included.insert(id);
+        }
     }
 }
 
@@ -128,62 +157,84 @@ impl NodeRpcClient for NodeLikeRpc {
         proven_transaction: &ProvenTransaction,
         sealed_transaction_inputs: SealedTransactionInputs,
     ) -> Result<BlockNumber, RpcError> {
+        // A block proven behind this wrapper's back still counts.
+        self.settle();
         // The node checks spent notes, on chain then in its mempool, before
         // unknown notes.
         let inputs = proven_transaction.input_notes();
-        let committed: Vec<Nullifier> = {
-            let spent = self.spent.lock().unwrap();
-            inputs
-                .iter()
-                .map(|note| note.nullifier())
-                .filter(|nullifier| spent.contains(nullifier))
-                .collect()
-        };
-        if !committed.is_empty() {
-            return Err(committed_spend_error(&committed));
-        }
-        let spent: Vec<Nullifier> = {
-            let pending = self.pending.lock().unwrap();
-            inputs
-                .iter()
-                .map(|note| note.nullifier())
-                .filter(|nullifier| pending.nullifiers.contains(nullifier))
-                .collect()
-        };
-        if !spent.is_empty() {
-            return Err(spent_notes_error(&spent));
-        }
+        let nullifiers: Vec<Nullifier> = inputs.iter().map(|note| note.nullifier()).collect();
         // Only unauthenticated inputs carry a header.
-        let unknown: Vec<NoteId> = inputs
+        let unauthenticated: Vec<NoteId> = inputs
             .iter()
             .filter_map(|note| note.header().map(|header| header.id()))
-            .filter(|id| {
-                !self
-                    .inner
-                    .mock_chain
-                    .read()
-                    .committed_notes()
-                    .contains_key(id)
-                    && !self.pending.lock().unwrap().outputs.contains(id)
-            })
             .collect();
-        if !unknown.is_empty() {
-            return Err(unknown_notes_error(&unknown));
+        let off_chain: Vec<NoteId> = {
+            let chain = self.inner.mock_chain.read();
+            unauthenticated
+                .into_iter()
+                .filter(|id| !chain.committed_notes().contains_key(id))
+                .collect()
+        };
+        {
+            let state = self.state.lock().unwrap();
+            let committed: Vec<Nullifier> = nullifiers
+                .iter()
+                .copied()
+                .filter(|nullifier| state.spent.contains(nullifier))
+                .collect();
+            if !committed.is_empty() {
+                return Err(committed_spend_error(&committed));
+            }
+            let waiting = |nullifier: &Nullifier| {
+                state
+                    .waiting
+                    .values()
+                    .any(|effects| effects.nullifiers.contains(nullifier))
+            };
+            let spent: Vec<Nullifier> = nullifiers
+                .iter()
+                .copied()
+                .filter(|nullifier| waiting(nullifier))
+                .collect();
+            if !spent.is_empty() {
+                return Err(spent_notes_error(&spent));
+            }
+            let unknown: Vec<NoteId> = off_chain
+                .into_iter()
+                .filter(|id| {
+                    !state
+                        .waiting
+                        .values()
+                        .any(|effects| effects.outputs.contains(id))
+                })
+                .collect();
+            if !unknown.is_empty() {
+                return Err(unknown_notes_error(&unknown));
+            }
         }
         let accepted = self
             .inner
             .submit_proven_transaction(proven_transaction, sealed_transaction_inputs)
             .await?;
-        let mut pending = self.pending.lock().unwrap();
-        pending.outputs.extend(
-            proven_transaction
+        let id = proven_transaction.id();
+        let mut state = self.state.lock().unwrap();
+        if state.included.contains(&id) {
+            // A block took it before this line ran.
+            state.spent.extend(nullifiers);
+        } else {
+            let outputs = proven_transaction
                 .output_notes()
                 .iter()
-                .map(|note| note.id()),
-        );
-        pending
-            .nullifiers
-            .extend(inputs.iter().map(|note| note.nullifier()));
+                .map(|note| note.id())
+                .collect();
+            state.waiting.insert(
+                id,
+                Effects {
+                    outputs,
+                    nullifiers,
+                },
+            );
+        }
         Ok(accepted)
     }
 

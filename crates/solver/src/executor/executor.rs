@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -562,42 +561,38 @@ async fn release_rejected_settlement(
     };
     let attempt_id = settlement.id_bytes().to_vec();
     let cancelled = settlement.cancelled.clone();
-    // What this release did, for `/metrics`: an attempt already resolved
-    // elsewhere is not counted.
-    let found = Arc::new(AtomicBool::new(false));
-    let returned = Arc::new(AtomicUsize::new(0));
-    let unconfirmed = Arc::new(AtomicUsize::new(0));
-    let makers = Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
-    let counts = (
-        found.clone(),
-        returned.clone(),
-        unconfirmed.clone(),
-        makers.clone(),
-    );
-    pool.write_book(book_tx, move |conn| {
-        let released =
-            db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed, &answer)?;
-        let (found, returned, unconfirmed, makers) = counts;
-        found.store(released.found, AtomicOrdering::Relaxed);
-        returned.store(released.update.active.len(), AtomicOrdering::Relaxed);
-        unconfirmed.store(released.unconfirmed, AtomicOrdering::Relaxed);
-        *makers.lock().unwrap_or_else(|e| e.into_inner()) =
-            (released.named_makers, released.waiting_makers);
-        let mut update = released.update;
-        // Its sit-outs stay cancelled.
-        update.removed.extend(cancelled);
-        Ok(update)
-    })
-    .await?;
-    if found.load(AtomicOrdering::Relaxed) {
-        let unconfirmed = unconfirmed.load(AtomicOrdering::Relaxed);
-        metrics::record_release(
-            cause,
-            returned.load(AtomicOrdering::Relaxed),
-            unconfirmed > 0,
-        );
-        let (named, waiting) =
-            std::mem::take(&mut *makers.lock().unwrap_or_else(|e| e.into_inner()));
+    // Counted for `/metrics` only when this call released the attempt: one
+    // already resolved elsewhere is not a release.
+    let released = pool
+        .write_book_with(book_tx, move |conn| {
+            let db::postgres_db::DiscardedSettlement {
+                mut update,
+                found,
+                unconfirmed,
+                named_makers,
+                waiting_makers,
+                ..
+            } = db::postgres_db::finish_discarded_settlement_tx(
+                conn,
+                &attempt_id,
+                &consumed,
+                &answer,
+            )?;
+            let released = found.then(|| {
+                (
+                    update.active.len(),
+                    unconfirmed,
+                    named_makers,
+                    waiting_makers,
+                )
+            });
+            // Its sit-outs stay cancelled.
+            update.removed.extend(cancelled);
+            Ok((update, released))
+        })
+        .await?;
+    if let Some((returned, unconfirmed, named, waiting)) = released {
+        metrics::record_release(cause, returned, unconfirmed > 0);
         for maker_id in named {
             gateway_metrics::count(gateway_metrics::UNKNOWN_NOTES_NAMED, maker_id);
         }

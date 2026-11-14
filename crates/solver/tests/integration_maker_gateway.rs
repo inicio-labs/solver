@@ -126,7 +126,7 @@ struct Scenario {
     maker: AccountId,
     obs_port: u16,
     gateway: MakerClient,
-    events: tonic::Streaming<proto::StreamMessage>,
+    events: common::maker::EventFeed,
     cancel: CancellationToken,
     solver: tokio::task::JoinHandle<Result<()>>,
     // Stops serving prices when dropped.
@@ -390,17 +390,17 @@ impl Scenario {
     async fn prove_until_committed(&mut self) -> Result<()> {
         for _ in 0..10 {
             self.rpc.prove_block();
-            match wait_for_event(&mut self.events, Duration::from_secs(3), |kind| {
-                matches!(
-                    kind,
-                    proto::event_body::Kind::SettlementResolved(resolved) if resolved.committed
-                )
-            })
-            .await
-            {
-                Ok(_) => return Ok(()),
-                Err(error) if error.to_string().starts_with("event not seen within") => {}
-                Err(error) => return Err(error),
+            let committed = self
+                .events
+                .next_match(Duration::from_secs(3), |kind| {
+                    matches!(
+                        kind,
+                        proto::event_body::Kind::SettlementResolved(resolved) if resolved.committed
+                    )
+                })
+                .await?;
+            if committed.is_some() {
+                return Ok(());
             }
         }
         Err(anyhow!(

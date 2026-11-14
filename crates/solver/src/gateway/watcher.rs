@@ -37,11 +37,31 @@ use crate::types::{now_millis, now_unix, BookUpdate, OrderId};
 static SYNCED_BLOCK: AtomicU64 = AtomicU64::new(0);
 static READ_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static PENDING_LINEAGES: AtomicU64 = AtomicU64::new(0);
-static OLDEST_PENDING_MS: AtomicU64 = AtomicU64::new(0);
+// When the oldest pending lineage was submitted (0: none), not its age: the
+// age is computed at scrape, so it keeps growing while rounds fail.
+static OLDEST_PENDING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
 static OLDEST_UNCONFIRMED_MS: AtomicU64 = AtomicU64::new(0);
 static WAITING: AtomicU64 = AtomicU64::new(0);
 static UNOBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The host-clock time of something `age_secs` old by the database clock; 0
+/// for `None`.
+fn since_ms(age_secs: Option<f64>, now_ms: u64) -> u64 {
+    age_secs.map_or(0, |secs| {
+        now_ms
+            .saturating_sub((secs.max(0.0) * 1000.0) as u64)
+            .max(1)
+    })
+}
+
+/// Seconds from `since_ms` to `now_ms`; 0 when there is nothing to age.
+fn age_secs(since_ms: u64, now_ms: u64) -> f64 {
+    if since_ms == 0 {
+        return 0.0;
+    }
+    now_ms.saturating_sub(since_ms) as f64 / 1000.0
+}
 
 /// What the maker-note watcher last saw, for `/metrics`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,7 +73,8 @@ pub(crate) struct WatcherGauges {
     pub read_age_secs: f64,
     /// Submitted orders whose note is not resolved yet.
     pub pending_lineages: u64,
-    /// Age of the oldest of them, by the database clock.
+    /// Age of the oldest of them: its age by the database clock at the last
+    /// successful round, plus the time since.
     pub oldest_pending_age_secs: f64,
     /// Of those, orders that went live at accept (ADR 0008).
     pub unconfirmed: u64,
@@ -70,11 +91,12 @@ pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
     if read_ms == 0 {
         return None;
     }
+    let now_ms = now_millis();
     Some(WatcherGauges {
         synced_block: SYNCED_BLOCK.load(Ordering::Relaxed),
-        read_age_secs: now_millis().saturating_sub(read_ms) as f64 / 1000.0,
+        read_age_secs: age_secs(read_ms, now_ms),
         pending_lineages: PENDING_LINEAGES.load(Ordering::Relaxed),
-        oldest_pending_age_secs: OLDEST_PENDING_MS.load(Ordering::Relaxed) as f64 / 1000.0,
+        oldest_pending_age_secs: age_secs(OLDEST_PENDING_SINCE_MS.load(Ordering::Relaxed), now_ms),
         unconfirmed: UNCONFIRMED.load(Ordering::Relaxed),
         oldest_unconfirmed_age_secs: OLDEST_UNCONFIRMED_MS.load(Ordering::Relaxed) as f64 / 1000.0,
         waiting: WAITING.load(Ordering::Relaxed),
@@ -764,7 +786,10 @@ impl<T: MakerTracker> Watcher<T> {
             Ok(stats) => {
                 PENDING_LINEAGES.store(u64::try_from(stats.count).unwrap_or(0), Ordering::Relaxed);
                 let millis = |secs: Option<f64>| (secs.unwrap_or(0.0).max(0.0) * 1000.0) as u64;
-                OLDEST_PENDING_MS.store(millis(stats.oldest_age_secs), Ordering::Relaxed);
+                OLDEST_PENDING_SINCE_MS.store(
+                    since_ms(stats.oldest_age_secs, now_millis()),
+                    Ordering::Relaxed,
+                );
                 UNCONFIRMED.store(
                     u64::try_from(stats.unconfirmed).unwrap_or(0),
                     Ordering::Relaxed,
@@ -823,6 +848,21 @@ mod tests {
     use miden_testing::MockChain;
     use prost::Message;
     use std::sync::Mutex;
+
+    /// The oldest-pending gauge keeps ageing between rounds: it is stored as
+    /// a time, and the age is taken when it is read.
+    #[test]
+    fn an_age_gauge_grows_between_rounds() {
+        let stored = since_ms(Some(12.5), 100_000);
+        assert_eq!(stored, 87_500);
+        assert_eq!(age_secs(stored, 100_000), 12.5);
+        // No round since: thirty seconds later it reads thirty seconds older.
+        assert_eq!(age_secs(stored, 130_000), 42.5);
+        // Nothing pending reads 0, however much time passes.
+        assert_eq!(age_secs(since_ms(None, 100_000), 130_000), 0.0);
+        // An age longer than the clock still counts as something pending.
+        assert_eq!(since_ms(Some(500.0), 100_000), 1);
+    }
 
     #[derive(Default)]
     struct ChainState {

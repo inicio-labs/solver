@@ -440,6 +440,68 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     Ok(())
 }
 
+/// Going live at accept is one transaction with the rest of the round. Its
+/// last write, the LIVE event, is made to fail: the command, the lineage
+/// claim, the order row and the flag written before it are all rolled back,
+/// so the same command then goes live as if it were new.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
+    use super::postgres_schema::maker_commands;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let gate = AcceptGate::new(epoch(conn)?, || Some(BlockNumber::from(7)));
+    let order = note(1);
+    let round = [(
+        CommandHeader::new(alpha, "r1".into(), 1).unwrap(),
+        MakerCommand::submit(order.clone())?,
+    )];
+    let go_live = |conn: &mut PgConnection| {
+        conn.transaction::<_, DbError, _>(|conn| {
+            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate))
+        })
+    };
+    conn.batch_execute(
+        "CREATE FUNCTION fail_event() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN RAISE EXCEPTION 'injected: event insert failed'; END $$;
+         CREATE TRIGGER fail_event BEFORE INSERT ON maker_events
+             FOR EACH ROW EXECUTE FUNCTION fail_event();",
+    )?;
+    let failed = go_live(conn);
+    assert!(
+        format!("{failed:?}").contains("injected"),
+        "the LIVE event must be the write that failed: {failed:?}"
+    );
+    assert_eq!(status(conn, &order)?, None, "no order row");
+    let lineages: i64 = maker_lineages::table
+        .filter(maker_lineages::note_id.eq(id(&order)))
+        .count()
+        .get_result(conn)?;
+    assert_eq!(lineages, 0, "no lineage claim or flag");
+    let commands: i64 = maker_commands::table
+        .filter(maker_commands::maker_id.eq(alpha))
+        .count()
+        .get_result(conn)?;
+    assert_eq!(commands, 0, "the command was not recorded");
+    assert!(statuses(conn, alpha)?.is_empty());
+
+    // The maker's retry of the same command is not a replay: it goes live.
+    conn.batch_execute("DROP TRIGGER fail_event ON maker_events")?;
+    let outcomes = go_live(conn)?;
+    assert!(outcomes[0].1.live.is_some());
+    assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
+    assert_eq!(
+        lineage(conn, &order)?,
+        ("pending".into(), true, Some(7), false)
+    );
+    assert_eq!(
+        statuses(conn, alpha)?,
+        [(id(&order), proto::OrderState::Live, String::new())]
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {

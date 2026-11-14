@@ -8,7 +8,9 @@ package solver.maker.v1;
 
 service MakerGateway {
   // Durably accept a PSWAP note, private or public. Accepted does not mean
-  // Live: the note becomes Live once it is verified on chain.
+  // Live: the note becomes Live once it is verified on chain. On a solver
+  // with live at accept on, a private note goes Live when it is accepted,
+  // before it is in a block: send the transaction that creates it first.
   rpc SubmitOrder(SubmitOrderRequest) returns (CommandReply);
   // Stop every order of this maker in the scope whose submit sequence is
   // below this command's sequence, including submits that arrive later.
@@ -27,8 +29,9 @@ service MakerGateway {
   // Report how far you have processed the feed; returns the server time and
   // your latest event sequence, so you can see your lag.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
-  // Page through this maker's orders currently eligible for matching in the
-  // database. An order selected for building/proving can still appear here
+  // Page through this maker's live orders in the database: those eligible
+  // for matching, and those that went live at accept and wait for their note
+  // to land. An order selected for building/proving can still appear here
   // until its settlement reservation commits.
   rpc ListActiveMakerOrders(ListActiveMakerOrdersRequest) returns (ListActiveMakerOrdersReply);
 }
@@ -197,13 +200,17 @@ message EventBody {
 
 enum OrderState {
   ORDER_STATE_UNSPECIFIED = 0;
-  // Verified on chain and eligible for matching.
+  // Verified on chain, or accepted with live at accept on, and eligible for
+  // matching.
   ORDER_STATE_LIVE = 1;
-  // Rejected after an earlier Accepted reply.
+  // Its note on chain differs from the submitted note. A note ID commits to
+  // the whole note, so the current solver does not send it.
   ORDER_STATE_REJECTED = 2;
   // Its note was verified spent elsewhere.
   ORDER_STATE_UNAVAILABLE = 3;
-  // Stopped by the solver; `reason` says why.
+  // Stopped by the solver; `reason` says why: `self_trade_prevention`, or
+  // `note_not_received` for an order that went live at accept whose note
+  // never reached a block.
   ORDER_STATE_CANCELLED = 4;
 }
 

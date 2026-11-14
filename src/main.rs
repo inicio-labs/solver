@@ -96,6 +96,10 @@ fn cli() -> clap::Command {
             clap::Command::new("check-db")
                 .about("Check PostgreSQL schema compatibility using SOLVER_DATABASE_URL"),
         )
+        .subcommand(clap::Command::new("cancel-unconfirmed").about(
+            "With the solver stopped, cancel every maker order that went live at accept and \
+             still lacks its note (ADR 0008), using SOLVER_DATABASE_URL",
+        ))
 }
 
 async fn run(matches: clap::ArgMatches) -> Result<()> {
@@ -172,6 +176,20 @@ fn main() -> anyhow::Result<()> {
             let mut conn = solver::db::postgres_migrations::connect(&url)?;
             solver::db::postgres_migrations::verify(&mut conn)?;
             println!("PostgreSQL schema matches this solver binary");
+            return Ok(());
+        }
+        Some("cancel-unconfirmed") => {
+            let url = env::var("SOLVER_DATABASE_URL")
+                .context("set SOLVER_DATABASE_URL for cancel-unconfirmed")?;
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            let cancelled = solver::db::postgres_migrations::cancel_unconfirmed(&mut conn)
+                .context("cancel unconfirmed maker orders (is the solver stopped?)")?;
+            if cancelled.is_empty() {
+                println!("No unconfirmed maker orders");
+            }
+            for (maker_id, orders) in cancelled {
+                println!("maker {maker_id}: {orders} order(s) cancelled (note_not_received)");
+            }
             return Ok(());
         }
         _ => {}

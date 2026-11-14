@@ -217,6 +217,35 @@ speed does not degrade with history; storage and backup size do (roughly
 design, because startup recovery uses stored note IDs to recognise notes it
 has already ingested.
 
+## Maker orders live at accept
+
+`engine.maker_live_at_accept` (off by default, [ADR 0008](adr/0008-maker-orders-live-at-accept.md)) lets a private maker order trade before its note is in a block. It needs the maker gateway and a watch interval of at most 2 s.
+
+**Switching.** Changing it needs a restart. Turning it off stops new orders going live at accept; orders that already did keep their rules (the watcher still activates or caps them).
+
+**Rollback.** The migration's `down.sql` refuses while any maker order went live at accept and still lacks its note, or any order is `waiting`. Stop the solver, run the escape hatch, then `revert-db`.
+
+**Escape hatch.** With the solver stopped (it takes the ownership lock and refuses otherwise):
+
+```bash
+SOLVER_DATABASE_URL=… solver-bin cancel-unconfirmed
+```
+
+It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints the count per maker. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist.
+
+**Alerts:**
+- `solver_maker_unknown_notes_named_total` rising for one maker: its transactions reach the node after its `SubmitOrder`, or not at all.
+- `solver_maker_cap_cancels_total` rising: notes that never arrive.
+- `solver_executor_settlements_dropped_total{unconfirmed_maker_input="true"}` above 0: a maker transaction dropped from the mempool took our settlement with it.
+- `solver_executor_settlement_conflicts_total{kind="unreadable"}` or `{kind="unknown_notes_unmatched"}` above 0: the node words its refusals differently; every unconfirmed order now waits. On every node upgrade, re-capture the text: start the node's local network and run `SOLVER_LOCAL_NODE_WRITE_FIXTURE=1 cargo test -p solver --test local_node_018 -- --ignored --test-threads=1`, which rewrites `tests/fixtures/node-0.18-refusals.json` for the parser's unit test.
+- `solver_maker_watcher_block_read_age_seconds` above 10 for long: every order takes the confirmed path (`solver_maker_accept_fallbacks_total{reason="watcher_stale"}`).
+- Several makers' unknown-note refusals at once: the node lost its mempool (a restart). Their orders wait, and return when their notes land or are capped.
+- `solver_maker_watcher_unobserved_notes` above 0 for long: notes the watcher can't read. Unconfirmed ones are still decided by the cap's lookup; activated ones go unwatched for spends until they read again.
+
+**Queries** join on root rows (`orders.note_id = maker_lineages.note_id`): unconfirmed orders are `maker_lineages` rows with `live_at_accept AND state = 'pending'`; `waiting` orders have `orders.status = 'waiting'`.
+
+**After an asynchronous failover**, restart the solver as after any failover: the watcher re-reads every pending lineage, and the cap counts from the database clock.
+
 ## Backup and restore
 
 Back up PostgreSQL and both Miden SQLite client stores together with a recorded

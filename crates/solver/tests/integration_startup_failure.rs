@@ -137,3 +137,122 @@ async fn startup_failure_surfaces_clean_error_no_hang() -> Result<()> {
         })
         .await
 }
+
+/// Orders that went live at accept need the gateway's watcher. With the
+/// gateway off and such an order unresolved, `start()` refuses at once and
+/// names the escape hatch (ADR 0008).
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn a_solver_without_its_gateway_refuses_unconfirmed_orders() -> Result<()> {
+    use miden_protocol::asset::{AssetAmount, FungibleAsset};
+    use miden_protocol::block::BlockNumber;
+    use miden_protocol::note::{Note, NoteType};
+    use miden_protocol::testing::account_id::{
+        ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+        ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+    };
+    use miden_protocol::Word;
+    use miden_standards::note::{PswapNote, PswapNoteStorage};
+    use solver::db::maker_db;
+    use solver::maker::{CommandHeader, MakerCommand};
+
+    let pg = PgSchema::new().await?;
+    let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE.try_into()?;
+    let note: Note = PswapNote::builder()
+        .sender(creator)
+        .storage(
+            PswapNoteStorage::builder()
+                .min_requested_asset(FungibleAsset::new(
+                    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into()?,
+                    100,
+                )?)
+                .min_fill_step(AssetAmount::new(1)?)
+                .creator_account_id(creator)
+                .build(),
+        )
+        .serial_number(Word::from([1u32, 0, 0, 0]))
+        .note_type(NoteType::Private)
+        .offered_asset(FungibleAsset::new(
+            ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into()?,
+            50,
+        )?)
+        .build()?
+        .into();
+    let url = pg.url.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use diesel::prelude::*;
+        use solver::db::postgres_schema::sync_state;
+        let mut conn = solver::db::postgres_migrations::connect(&url)?;
+        let maker = maker_db::create_maker_tx(&mut conn, "mm1")?.expect("new maker");
+        let epoch: i64 = sync_state::table
+            .find(1_i16)
+            .select(sync_state::owner_epoch)
+            .first(&mut conn)?;
+        let mut gate = maker_db::AcceptGate::new(epoch, || Some(BlockNumber::from(3)));
+        let header = CommandHeader::new(maker, "s1".into(), 1)?;
+        let submit = MakerCommand::submit(note)?;
+        let outcome = conn.transaction::<_, solver::db::DbError, _>(|conn| {
+            maker_db::execute_command_with_tx(conn, &header, &submit, Some(&mut gate))
+        })?;
+        anyhow::ensure!(outcome.live.is_some(), "the order went live at accept");
+        Ok(())
+    })
+    .await??;
+
+    let rpc = Arc::new(MockRpcApi::new(MockChain::new()));
+    let (temp, keystore, _) = temp_paths()?;
+    let binance = common::BinanceStub::start(&[]);
+    let mut engine = common::engine_config();
+    engine.maker_gateway_enabled = false;
+    let config = SolverConfig {
+        rpc: RpcConfig {
+            endpoint: "http://unused".into(),
+            timeout_ms: 1_000,
+            prover_endpoint: None,
+            prover_timeout_ms: 45_000,
+        },
+        solver: SolverAccountConfig {
+            account_id: creator.to_hex(),
+            keystore_path: keystore.to_string_lossy().into_owned(),
+            executor_store_path: temp
+                .path()
+                .join("executor.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            ingest_store_path: temp
+                .path()
+                .join("ingest.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            read_pool_size: 2,
+        },
+        pairs: vec![],
+        engine,
+        binance: binance.config(),
+    };
+    let factory: Arc<dyn solver::ClientFactory> = Arc::new(FailingExecutorFactory {
+        rpc,
+        ingest_store: temp.path().join("ingest.sqlite3"),
+    });
+    // In a LocalSet, as in production, so a solver that does not refuse
+    // fails the assertion below rather than panicking on `spawn_local`.
+    let cancel = CancellationToken::new();
+    let local = tokio::task::LocalSet::new();
+    let started = local
+        .run_until(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            solver::start(factory, creator, config, cancel.clone()),
+        ))
+        .await;
+    cancel.cancel();
+    let error = match started {
+        Ok(Err(error)) => format!("{error:#}"),
+        Ok(Ok(())) => anyhow::bail!("start returned Ok with unconfirmed orders and no gateway"),
+        Err(_) => anyhow::bail!("start did not refuse within 30 s"),
+    };
+    anyhow::ensure!(
+        error.contains("cancel-unconfirmed") && error.contains("maker_gateway_enabled"),
+        "unexpected start error: {error}"
+    );
+    Ok(())
+}

@@ -32,7 +32,7 @@ use super::events::{feed, unix_ms, Subscriber};
 use super::intake::{run_intake, IntakeSender};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
-use super::watcher::{run_watcher, SdkTracker, Watcher};
+use super::watcher::{run_watcher, SdkTracker, SyncedHeight, Watcher};
 use crate::db::{maker_db, DbPool};
 use crate::maker::EventWake;
 use crate::maker::{
@@ -490,32 +490,30 @@ pub fn spawn_gateway_thread(
                     }
                 };
                 let (intake, queues) = IntakeSender::new(cfg.cancel_queue, cfg.submit_queue);
+                let watcher = Watcher::new(
+                    pool.clone(),
+                    SdkTracker::new(maker_client, rpc),
+                    book_tx.clone(),
+                )
+                .with_cap(cfg.unconfirmed_cap);
+                let mut session = pool.intake_session();
+                if cfg.live_at_accept {
+                    let height = watcher.synced_height();
+                    session =
+                        session.with_live_at_accept(move || height.fresh(SyncedHeight::MAX_AGE));
+                }
                 let mut workers = JoinSet::new();
-                let intake_pool = pool.clone();
                 let intake_book = book_tx.clone();
                 let intake_cancel = cancel.clone();
                 let round_submits = cfg.round_submits;
                 workers.spawn(async move {
-                    run_intake(
-                        intake_pool.intake_session(),
-                        queues,
-                        intake_book,
-                        round_submits,
-                        intake_cancel,
-                    )
-                    .await;
+                    run_intake(session, queues, intake_book, round_submits, intake_cancel).await;
                     "intake"
                 });
-                let watcher_pool = pool.clone();
                 let watcher_cancel = cancel.clone();
                 let watch_interval = cfg.watch_interval;
                 workers.spawn_local(async move {
-                    run_watcher(
-                        Watcher::new(watcher_pool, SdkTracker::new(maker_client, rpc), book_tx),
-                        watch_interval,
-                        watcher_cancel,
-                    )
-                    .await;
+                    run_watcher(watcher, watch_interval, watcher_cancel).await;
                     "watcher"
                 });
                 let _ = ready_tx.send(Ok(()));
@@ -561,6 +559,10 @@ async fn supervise_gateway<S, E>(
         }
         worker = workers.join_next() => {
             match worker {
+                // A shutdown stops the workers too: no error then.
+                Some(Ok(name)) if cancel.is_cancelled() => {
+                    tracing::debug!(name, "maker gateway worker stopped");
+                }
                 Some(Ok(name)) => tracing::error!(name, "maker gateway worker exited early"),
                 Some(Err(error)) => tracing::error!(%error, "maker gateway worker panicked"),
                 None => tracing::error!("maker gateway workers vanished"),
@@ -1043,6 +1045,8 @@ mod tests {
             cancel_queue: 4,
             stream: TEST_STREAM,
             settlement_buffer: Duration::ZERO,
+            live_at_accept: false,
+            unconfirmed_cap: Default::default(),
         };
         // No node answers here: watcher rounds fail and are retried.
         let rpc = || -> Arc<dyn NodeRpcClient> {

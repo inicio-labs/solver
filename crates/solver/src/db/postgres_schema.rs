@@ -88,6 +88,9 @@ diesel::table! {
         market -> Nullable<Binary>,
         direction -> Nullable<Binary>,
         expires_at_unix_ms -> Nullable<BigInt>,
+        live_at_accept -> Bool,
+        accept_block -> Nullable<BigInt>,
+        activated_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -137,6 +140,23 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    eligible_orders (note_id) {
+        note_id -> Binary,
+        raw_data -> Binary,
+        arrival_unix -> BigInt,
+        status -> Text,
+        priority_seq -> BigInt,
+        lineage_id -> Nullable<Binary>,
+        depth -> Nullable<BigInt>,
+        market -> Nullable<Binary>,
+        direction -> Nullable<Binary>,
+        maker_id -> Nullable<BigInt>,
+        root_seq -> Nullable<BigInt>,
+        expires_at_unix_ms -> Nullable<BigInt>,
+    }
+}
+
 diesel::joinable!(settlement_inputs -> orders (parent_note_id));
 diesel::joinable!(api_keys -> makers (maker_id));
 diesel::joinable!(settlement_inputs -> settlement_attempts (tx_id));
@@ -155,4 +175,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     maker_stops,
     maker_events,
     live_orders,
+    eligible_orders,
 );

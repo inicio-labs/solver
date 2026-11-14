@@ -60,6 +60,11 @@ pub enum DbError {
          (owner epoch {ours} -> {current})"
     )]
     OwnerEpochMoved { ours: i64, current: i64 },
+    #[error(
+        "another solver, or the cancel-unconfirmed escape hatch, took over the database \
+         (owner epoch {ours} -> {current}); maker intake stopped"
+    )]
+    IntakeEpochMoved { ours: i64, current: i64 },
     #[error("cannot determine whether transaction {xid} committed (status {status:?})")]
     CommitOutcomeUnknown { xid: String, status: Option<String> },
     #[error("PostgreSQL writer session was lost before commit; reconnected, nothing was written")]
@@ -131,6 +136,7 @@ impl DbError {
                 | Self::OwnershipLost
                 | Self::LockTakenAfterDisconnect
                 | Self::OwnerEpochMoved { .. }
+                | Self::IntakeEpochMoved { .. }
                 | Self::CommitOutcomeUnknown { .. }
                 | Self::WriterPanicked(_)
                 | Self::WriteDeadline(_)

@@ -40,8 +40,9 @@ use miden_protocol::vm::ExecutionProof;
 use miden_protocol::Word;
 
 /// A code-2 refusal in the shape miden-client 0.17.5 reports for a node's
-/// mempool conflicts. The text is built to match the node's (`{:?}` of the
-/// IDs); it is not a captured sample.
+/// mempool conflicts. The text matches what a local node 0.18.0 sent
+/// (`tests/fixtures/node-0.18-refusals.json`): `{:?}` of the note IDs, hex
+/// nullifiers.
 fn state_conflict(cause: String) -> RpcError {
     RpcError::RequestError {
         endpoint: RpcEndpoint::SubmitProvenTx,

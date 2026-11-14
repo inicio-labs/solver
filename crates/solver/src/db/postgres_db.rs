@@ -18,8 +18,8 @@ use super::postgres_models::{
     RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
-    live_orders, maker_lineages, makers, orders, registered_tokens, settlement_attempts,
-    settlement_inputs, sync_state,
+    eligible_orders, live_orders, maker_lineages, makers, orders, registered_tokens,
+    settlement_attempts, settlement_inputs, sync_state,
 };
 use crate::maker::MakerTag;
 use crate::types::{BookOrder, BookUpdate, Order, OrderId, OrderStatus, SettlementError, TokenId};
@@ -221,6 +221,7 @@ pub fn mark_orders_onchain_nullified_tx(
                 OrderStatus::Active.as_str(),
                 OrderStatus::Settling.as_str(),
                 OrderStatus::Stopped.as_str(),
+                OrderStatus::Waiting.as_str(),
             ]),
         ))
         .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
@@ -554,17 +555,55 @@ fn insert_remainders(
         .collect())
 }
 
+/// What the node said about a settlement that never commits. It decides
+/// where the settlement's unconfirmed maker parents go (ADR 0008, D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeAnswer {
+    /// The node never received it: our own failure before submission.
+    NotSent,
+    /// The node refused it for spending unknown notes, naming these of its
+    /// parents (none when the text names nothing we recognise).
+    UnknownNotes(HashSet<OrderId>),
+    /// The node checked the notes and refused our account's state.
+    AccountMismatch,
+    /// Any other refusal, a drop, an expiry, or an answer lost to a restart:
+    /// the notes may be missing.
+    Unclear,
+}
+
+/// What a release did with the settlement's parents.
+#[derive(Debug, Default)]
+pub struct DiscardedSettlement {
+    pub update: BookUpdate,
+    /// Whether the attempt was still unresolved, so this call released it.
+    pub found: bool,
+    /// Parents that went live at accept and still lack their note.
+    pub unconfirmed: usize,
+    /// Of those, the ones now waiting for their note.
+    pub waiting: usize,
+    /// The maker of each unconfirmed parent the node named as unknown.
+    pub named_makers: Vec<crate::maker::MakerId>,
+    /// The maker of each parent now waiting.
+    pub waiting_makers: Vec<crate::maker::MakerId>,
+}
+
 /// Release a settlement whose transaction never commits, once the parents'
 /// on-chain nullifiers are known. Consumed parents retire, the rest return to
 /// the book, and the attempt is deleted. A missing attempt was already
 /// resolved, so this is a no-op.
+///
+/// A parent that went live at accept and whose note is not seen yet waits
+/// out of the book for its note, unless `answer` shows the node had it (ADR
+/// 0008, D3). This is decided against the rows as they are now, so a note
+/// the watcher found meanwhile is back in the book.
 pub fn finish_discarded_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed: &HashSet<OrderId>,
-) -> DbResult<BookUpdate> {
+    answer: &NodeAnswer,
+) -> DbResult<DiscardedSettlement> {
     if !lock_attempt(conn, tx_id)? {
-        return Ok(BookUpdate::default());
+        return Ok(DiscardedSettlement::default());
     }
     let inputs: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
@@ -573,10 +612,35 @@ pub fn finish_discarded_settlement_tx(
         .for_update()
         .select((SettlementInputRow::as_select(), OrderRow::as_select()))
         .load(conn)?;
+    let parent_ids: Vec<Vec<u8>> = inputs.iter().map(|(_, row)| row.note_id.clone()).collect();
+    // Roots that went live at accept: their lineage's state and maker.
+    let flagged: HashMap<Vec<u8>, (String, i64)> = maker_lineages::table
+        .filter(maker_lineages::note_id.eq_any(&parent_ids))
+        .filter(maker_lineages::live_at_accept.eq(true))
+        .select((
+            maker_lineages::note_id,
+            maker_lineages::state,
+            maker_lineages::maker_id,
+        ))
+        .load::<(Vec<u8>, String, i64)>(conn)?
+        .into_iter()
+        .map(|(note_id, state, maker_id)| (note_id, (state, maker_id)))
+        .collect();
+    let state_of = |id: &[u8]| flagged.get(id).map(|(state, _)| state.as_str());
+    let unconfirmed = |id: &[u8]| state_of(id) == Some(maker_db::LineageState::Pending.as_str());
+    let named: Option<&HashSet<OrderId>> = match answer {
+        NodeAnswer::UnknownNotes(named) => Some(named),
+        _ => None,
+    };
 
     let mut active_ids = Vec::new();
     let mut consumed_ids = Vec::new();
-    let mut update = BookUpdate::default();
+    let mut waiting_ids = Vec::new();
+    let mut stopped_ids = Vec::new();
+    let mut released = DiscardedSettlement {
+        found: true,
+        ..DiscardedSettlement::default()
+    };
     for (_, row) in &inputs {
         // Only a reserved parent is ours to release.
         if row.status != OrderStatus::Settling.as_str() {
@@ -585,17 +649,66 @@ pub fn finish_discarded_settlement_tx(
         }
         let parent = row.clone().into_book_order()?;
         let id = parent.id();
+        let note_id = id.to_bytes().to_vec();
         if consumed.contains(&id) {
-            consumed_ids.push(id.to_bytes().to_vec());
-            update.removed.push(id);
-        } else {
-            active_ids.push(id.to_bytes().to_vec());
-            update.active.push(parent);
+            consumed_ids.push(note_id);
+            released.update.removed.push(id);
+            continue;
         }
+        match state_of(&note_id) {
+            // Closed while reserved: it never returns.
+            Some(state) if state == maker_db::LineageState::Rejected.as_str() => {
+                stopped_ids.push(note_id);
+                released.update.removed.push(id);
+                continue;
+            }
+            _ if unconfirmed(&note_id) => {
+                released.unconfirmed += 1;
+                let maker_id = flagged[&note_id].1;
+                if named.is_some_and(|named| named.contains(&id)) {
+                    released.named_makers.push(maker_id);
+                }
+                // The node names every unknown note in one refusal: an
+                // unnamed parent was known. Naming nothing of ours (its text
+                // changed?) tells nothing, so then every one waits.
+                let waits = match answer {
+                    NodeAnswer::NotSent | NodeAnswer::AccountMismatch => false,
+                    NodeAnswer::UnknownNotes(named) => named.is_empty() || named.contains(&id),
+                    NodeAnswer::Unclear => true,
+                };
+                if waits {
+                    waiting_ids.push(note_id);
+                    released.update.removed.push(id);
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        active_ids.push(note_id);
+        released.update.active.push(parent);
     }
+    // A waiting parent the maker has cancelled is stopped at once.
+    let eligible: HashSet<Vec<u8>> = if waiting_ids.is_empty() {
+        HashSet::new()
+    } else {
+        eligible_orders::table
+            .filter(eligible_orders::note_id.eq_any(&waiting_ids))
+            .select(eligible_orders::note_id)
+            .load::<Vec<u8>>(conn)?
+            .into_iter()
+            .collect()
+    };
+    let (waiting_ids, cancelled): (Vec<_>, Vec<_>) = waiting_ids
+        .into_iter()
+        .partition(|id| eligible.contains(id));
+    stopped_ids.extend(cancelled);
+    released.waiting = waiting_ids.len();
+    released.waiting_makers = waiting_ids.iter().map(|id| flagged[id].1).collect();
     for (ids, status) in [
         (&active_ids, OrderStatus::Active),
         (&consumed_ids, OrderStatus::OnchainNullified),
+        (&waiting_ids, OrderStatus::Waiting),
+        (&stopped_ids, OrderStatus::Stopped),
     ] {
         if !ids.is_empty() {
             diesel::update(orders::table.filter(orders::note_id.eq_any(ids)))
@@ -613,10 +726,12 @@ pub fn finish_discarded_settlement_tx(
         tx_id = %hex::encode(tx_id),
         reactivated = active_ids.len(),
         consumed = consumed_ids.len(),
+        waiting = released.waiting,
+        stopped = stopped_ids.len(),
         status = "discarded",
         "persisted discarded settlement"
     );
-    Ok(update)
+    Ok(released)
 }
 
 /// Called only by the executor, after the node confirmed our transaction ID:
@@ -635,8 +750,38 @@ pub fn confirm_settlement_tx(
     consumer: AccountId,
     cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<BookUpdate> {
+    Ok(confirm_settlement_with_tx(
+        conn,
+        tx_id,
+        consumed_children,
+        commit_block,
+        consumer,
+        cached_fills,
+    )?
+    .update)
+}
+
+/// What a confirmation did.
+#[derive(Debug, Default)]
+pub struct ConfirmedSettlement {
+    pub update: BookUpdate,
+    /// The maker of each parent that went live at accept whose lineage this
+    /// confirmation activated.
+    pub activated_makers: Vec<crate::maker::MakerId>,
+}
+
+/// [`confirm_settlement_tx`], also returning the makers whose unconfirmed
+/// orders it activated.
+pub fn confirm_settlement_with_tx(
+    conn: &mut PgConnection,
+    tx_id: &[u8],
+    consumed_children: &HashSet<OrderId>,
+    commit_block: BlockNumber,
+    consumer: AccountId,
+    cached_fills: Option<&maker_db::SettlementFills>,
+) -> DbResult<ConfirmedSettlement> {
     if !lock_attempt(conn, tx_id)? {
-        return Ok(BookUpdate::default());
+        return Ok(ConfirmedSettlement::default());
     }
     let rows: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
@@ -703,6 +848,11 @@ pub fn confirm_settlement_tx(
     };
     let report_inputs: Vec<_> = rows.iter().map(|(input, parent)| (input, parent)).collect();
     maker_db::report_settlement_tx(conn, tx_id, &report_inputs, committed, cached_fills)?;
+    // A parent that went live at accept is on chain now: our transaction
+    // spent its note, perhaps in the block that created it, which erases the
+    // note before the watcher can see it (ADR 0008). After the maker locks
+    // taken by the report.
+    let activated = maker_db::activate_spent_roots_tx(conn, &parent_ids)?;
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     let active: Vec<BookOrder> = children
         .into_iter()
@@ -715,13 +865,17 @@ pub fn confirm_settlement_tx(
         tx_id = %hex::encode(tx_id),
         parents = parent_ids.len(),
         remainders = active.len(),
+        activated = activated.len(),
         status = "confirmed",
         "persisted settlement confirmation"
     );
-    Ok(BookUpdate {
-        removed,
-        active,
-        maker_updates: Vec::new(),
+    Ok(ConfirmedSettlement {
+        update: BookUpdate {
+            removed,
+            active,
+            maker_updates: Vec::new(),
+        },
+        activated_makers: activated,
     })
 }
 
@@ -1185,8 +1339,9 @@ mod tests {
             conn.batch_execute(&format!("SET search_path TO {schema}"))?;
             barrier.wait();
             conn.transaction::<_, DbError, _>(|conn| {
-                finish_discarded_settlement_tx(conn, &[41], &HashSet::new())
+                finish_discarded_settlement_tx(conn, &[41], &HashSet::new(), &NodeAnswer::Unclear)
             })
+            .map(|released| released.update)
             .map_err(Into::into)
         });
         let confirmed = confirmer.join().expect("confirmation worker panicked")?;

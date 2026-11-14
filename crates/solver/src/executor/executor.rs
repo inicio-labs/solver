@@ -26,9 +26,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::{BatchError, ExecResult, ExecutorError};
 use super::metrics::{self, RefusalAttempt, ReleaseCause};
+use super::refusal;
 use crate::client_factory::ClientFactory;
+use crate::db::postgres_db::NodeAnswer;
 use crate::db::postgres_models::{SettlementAttemptRow, SettlementInputRow, SettlementStatus};
 use crate::db::{self, DbPool};
+use crate::gateway::metrics as gateway_metrics;
 use crate::ingest::{ChainError, MidenClient, MidenClientAdapter};
 use crate::swap_eta::SettlementStats;
 use crate::types::{BookOrder, BookUpdate, ExecutionBatch, SettlementError, TokenId};
@@ -137,6 +140,10 @@ struct PendingSettlement {
     /// until the confirmation or discard removes them. Not stored: after a
     /// restart the matcher loads only live orders.
     cancelled: Vec<NoteId>,
+    /// What the node said when it refused this submission, kept until the
+    /// release commits (ADR 0008). Not stored: after a restart a refused
+    /// attempt is released as `NodeAnswer::Unclear`.
+    answer: Option<NodeAnswer>,
     retry_at: Option<tokio::time::Instant>,
 }
 
@@ -173,6 +180,7 @@ impl PendingSettlement {
                 .filter_map(|input| input.remainder.clone())
                 .collect(),
             cancelled,
+            answer: None,
             retry_at: None,
         })
     }
@@ -206,6 +214,7 @@ impl PendingSettlement {
                     fills: Arc::new(recovered.fills),
                     child_notes,
                     cancelled: Vec::new(),
+                    answer: None,
                     retry_at: None,
                 },
             );
@@ -528,12 +537,16 @@ fn node_outcome(
     }
 }
 
+/// Release a settlement that never commits. `answer` is what the node said
+/// about it, which decides whether its unconfirmed maker orders return to the
+/// book or wait for their note (ADR 0008).
 async fn release_rejected_settlement(
     adapter: &Arc<Mutex<dyn MidenClient>>,
     pool: &DbPool,
     settlement: &PendingSettlement,
     book_tx: &mpsc::Sender<BookUpdate>,
     cause: ReleaseCause,
+    answer: NodeAnswer,
 ) -> ExecResult<bool> {
     let consumed = match adapter
         .lock()
@@ -550,27 +563,68 @@ async fn release_rejected_settlement(
     let attempt_id = settlement.id_bytes().to_vec();
     let cancelled = settlement.cancelled.clone();
     // What this release did, for `/metrics`: an attempt already resolved
-    // elsewhere yields an empty update and is not counted.
+    // elsewhere is not counted.
     let found = Arc::new(AtomicBool::new(false));
     let returned = Arc::new(AtomicUsize::new(0));
-    let (found_in, returned_in) = (found.clone(), returned.clone());
+    let unconfirmed = Arc::new(AtomicUsize::new(0));
+    let makers = Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
+    let counts = (
+        found.clone(),
+        returned.clone(),
+        unconfirmed.clone(),
+        makers.clone(),
+    );
     pool.write_book(book_tx, move |conn| {
-        let mut update =
-            db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed)?;
-        found_in.store(
-            !(update.active.is_empty() && update.removed.is_empty()),
-            AtomicOrdering::Relaxed,
-        );
-        returned_in.store(update.active.len(), AtomicOrdering::Relaxed);
+        let released =
+            db::postgres_db::finish_discarded_settlement_tx(conn, &attempt_id, &consumed, &answer)?;
+        let (found, returned, unconfirmed, makers) = counts;
+        found.store(released.found, AtomicOrdering::Relaxed);
+        returned.store(released.update.active.len(), AtomicOrdering::Relaxed);
+        unconfirmed.store(released.unconfirmed, AtomicOrdering::Relaxed);
+        *makers.lock().unwrap_or_else(|e| e.into_inner()) =
+            (released.named_makers, released.waiting_makers);
+        let mut update = released.update;
         // Its sit-outs stay cancelled.
         update.removed.extend(cancelled);
         Ok(update)
     })
     .await?;
     if found.load(AtomicOrdering::Relaxed) {
-        metrics::record_release(cause, returned.load(AtomicOrdering::Relaxed));
+        let unconfirmed = unconfirmed.load(AtomicOrdering::Relaxed);
+        metrics::record_release(
+            cause,
+            returned.load(AtomicOrdering::Relaxed),
+            unconfirmed > 0,
+        );
+        let (named, waiting) =
+            std::mem::take(&mut *makers.lock().unwrap_or_else(|e| e.into_inner()));
+        for maker_id in named {
+            gateway_metrics::count(gateway_metrics::UNKNOWN_NOTES_NAMED, maker_id);
+        }
+        for &maker_id in &waiting {
+            gateway_metrics::count(gateway_metrics::SENT_TO_WAITING, maker_id);
+        }
+        if !waiting.is_empty() {
+            tracing::info!(
+                tx_id = %settlement.id(),
+                waiting = waiting.len(),
+                unconfirmed,
+                "maker orders wait for their notes"
+            );
+        }
     }
     Ok(true)
+}
+
+/// What the node said about a settlement that never commits, for a release
+/// by reconciliation: the answer to a refusal earlier in this run, else
+/// unclear. A drop, an expiry, or a refusal from before a restart can't tell
+/// whether the notes were known (ADR 0008, D3).
+fn release_answer(cause: ReleaseCause, refused: Option<&NodeAnswer>) -> NodeAnswer {
+    match (cause, refused) {
+        (ReleaseCause::Refused, Some(answer)) => answer.clone(),
+        _ => NodeAnswer::Unclear,
+    }
 }
 
 /// Building this composition failed; it would fail the same way again.
@@ -1178,17 +1232,24 @@ impl Executor {
         settlement.mark_rejected();
         let code = metrics::refusal_code(&error);
         metrics::record_refusal(code, RefusalAttempt::First);
+        let (answer, conflict) = refusal::node_answer(&error, &settlement.parent_notes);
+        if let Some(kind) = conflict {
+            metrics::record_conflict(kind);
+        }
         tracing::error!(
             error = %metrics::refusal_detail(&error),
             code = <&str>::from(code),
+            conflict = conflict.map(<&str>::from),
             "settlement transaction rejected; releasing its inputs by nullifier"
         );
+        settlement.answer = Some(answer.clone());
         match release_rejected_settlement(
             &self.miden_adapter,
             &self.pool,
             &settlement,
             &self.book_tx,
             ReleaseCause::Refused,
+            answer,
         )
         .await
         {
@@ -1455,13 +1516,18 @@ impl Executor {
             }
             // Inputs return by nullifier: a parent someone else consumed is
             // retired, every other parent goes back to the matcher.
+            // A refusal answered earlier in this run decides; a drop, an
+            // expiry or a refusal from before a restart can't tell whether
+            // the notes were known.
             TxOutcome::NeverCommits(cause) => {
+                let answer = release_answer(cause, settlement.answer.as_ref());
                 release_rejected_settlement(
                     &self.miden_adapter,
                     &self.pool,
                     settlement,
                     &self.book_tx,
                     cause,
+                    answer,
                 )
                 .await
             }
@@ -1512,9 +1578,11 @@ impl Executor {
         let consumer = self.solver_id;
         let fills = settlement.fills.clone();
         let cancelled = settlement.cancelled.clone();
+        let activated = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let activated_in = activated.clone();
         self.pool
             .write_book(&self.book_tx, move |conn| {
-                let mut update = db::postgres_db::confirm_settlement_tx(
+                let confirmed = db::postgres_db::confirm_settlement_with_tx(
                     conn,
                     &attempt_id,
                     &consumed_children,
@@ -1522,10 +1590,16 @@ impl Executor {
                     consumer,
                     Some(&fills),
                 )?;
+                *activated_in.lock().unwrap_or_else(|e| e.into_inner()) =
+                    confirmed.activated_makers;
+                let mut update = confirmed.update;
                 update.removed.extend(cancelled);
                 Ok(update)
             })
             .await?;
+        for maker_id in std::mem::take(&mut *activated.lock().unwrap_or_else(|e| e.into_inner())) {
+            gateway_metrics::count_activation(maker_id, "settlement");
+        }
         Ok(true)
     }
 
@@ -2230,6 +2304,7 @@ mod recovery_tests {
                 fills: Arc::default(),
                 child_notes: Vec::new(),
                 cancelled: vec![sit_out],
+                answer: None,
                 retry_at: None,
             };
             let adapter = chain(&settlement.parent_notes, consumed, fail_lookup);
@@ -2238,7 +2313,8 @@ mod recovery_tests {
                 let bounced = metrics::bounced()
                     .find(|(cause, _)| *cause == "dropped")
                     .map_or(0, |(_, count)| count);
-                (metrics::dropped(), bounced)
+                let dropped: u64 = metrics::dropped().map(|(_, count)| count).sum();
+                (dropped, bounced)
             };
             let before = counted();
             let resolved = release_rejected_settlement(
@@ -2247,6 +2323,7 @@ mod recovery_tests {
                 &settlement,
                 &book_tx,
                 ReleaseCause::Dropped,
+                NodeAnswer::Unclear,
             )
             .await?;
             assert_eq!(resolved, !fail_lookup);
@@ -2286,6 +2363,7 @@ mod recovery_tests {
                     &settlement,
                     &book_tx,
                     ReleaseCause::Dropped,
+                    NodeAnswer::Unclear,
                 )
                 .await?;
                 assert!(again);
@@ -2364,6 +2442,28 @@ mod recovery_tests {
             TxOutcome::NeverCommits(ReleaseCause::Expired),
             "never recorded: it may never have reached the node"
         );
+    }
+
+    #[test]
+    fn a_release_uses_only_this_runs_refusal_answer() {
+        let named = NodeAnswer::UnknownNotes(Default::default());
+        assert_eq!(release_answer(ReleaseCause::Refused, Some(&named)), named);
+        assert_eq!(
+            release_answer(ReleaseCause::Refused, Some(&NodeAnswer::NotSent)),
+            NodeAnswer::NotSent
+        );
+        // A refused attempt reloaded after a restart lost its answer.
+        assert_eq!(
+            release_answer(ReleaseCause::Refused, None),
+            NodeAnswer::Unclear
+        );
+        for cause in [ReleaseCause::Dropped, ReleaseCause::Expired] {
+            assert_eq!(release_answer(cause, None), NodeAnswer::Unclear);
+            assert_eq!(
+                release_answer(cause, Some(&NodeAnswer::AccountMismatch)),
+                NodeAnswer::Unclear
+            );
+        }
     }
 
     #[test]

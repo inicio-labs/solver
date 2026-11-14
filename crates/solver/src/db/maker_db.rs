@@ -720,7 +720,8 @@ pub fn reject_tx(
 /// about to be retired because their notes were spent elsewhere. Called by
 /// every path that retires consumed orders, before it updates them. Orders
 /// already reserved by our own settlement are not live, so they are not
-/// reported.
+/// reported. Events are appended in note order, so the caller must already
+/// hold the order rows and their makers (`prelock_watcher_tx`, ADR 0006).
 pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<()> {
     /// Note ID, maker, lineage and depth of a live maker order.
     type Spent = (Vec<u8>, i64, Option<Vec<u8>>, Option<i64>);
@@ -1129,8 +1130,9 @@ mod tests {
     use super::*;
     use crate::db::postgres_db::{
         backfill_order_keys_tx, confirm_settlement_tx, finish_discarded_settlement_tx,
-        insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
-        reserve_settlement_tx, test_consumer,
+        insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx,
+        mark_orders_onchain_nullified_tx, prepare_settlement_tx, reserve_settlement_tx,
+        test_consumer,
     };
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
@@ -1878,6 +1880,99 @@ mod tests {
             Ok(())
         })?;
         reserving.join().expect("reservation panicked")?;
+        Ok(())
+    }
+
+    /// Retiring spent maker orders locks their makers in maker-ID order before
+    /// it reports them (ADR 0006). Beta's note sorts first, so reporting in
+    /// note order alone would hold beta while waiting for alpha. A trigger
+    /// pauses the retirement after its first event while an intake round
+    /// locks alpha, then beta: without the prelock the two deadlock and
+    /// PostgreSQL aborts the round.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn retiring_spent_maker_orders_does_not_deadlock_an_intake_round() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker(&mut fixture.conn, "alpha")?;
+        let beta = maker(&mut fixture.conn, "beta")?;
+        assert!(alpha < beta);
+        let mut notes = [note(61), note(62)];
+        notes.sort_by_key(|quote| quote.id().to_bytes());
+        let [beta_quote, alpha_quote] = notes;
+        // Stored in note order too, so any scan meets beta's order first.
+        run(&mut fixture.conn, beta, "s1", 1, submit(&beta_quote))?;
+        run(&mut fixture.conn, alpha, "s1", 1, submit(&alpha_quote))?;
+        ingest(&mut fixture.conn, &[&beta_quote, &alpha_quote])?;
+        assert_eq!(
+            live(&mut fixture.conn, &[&beta_quote, &alpha_quote])?,
+            [true, true]
+        );
+        fixture.conn.batch_execute(
+            "CREATE FUNCTION pause_after_first_event() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN
+                     IF current_setting('solver_test.pause', true) = 'on' THEN
+                         PERFORM set_config('solver_test.pause', 'off', true);
+                         PERFORM pg_sleep(0.5);
+                     END IF;
+                     RETURN NULL;
+                 END $$;
+             CREATE TRIGGER pause_after_first_event AFTER INSERT ON maker_events
+                 FOR EACH ROW EXECUTE FUNCTION pause_after_first_event()",
+        )?;
+
+        let spent = vec![
+            alpha_quote.id().to_bytes().to_vec(),
+            beta_quote.id().to_bytes().to_vec(),
+        ];
+        let mut retirer = connect(&fixture)?;
+        let pid = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "pg_backend_pid()",
+        ))
+        .get_result::<i32>(&mut retirer)?;
+        let retiring = std::thread::spawn(move || {
+            retirer.transaction::<_, DbError, _>(|conn| {
+                conn.batch_execute("SET LOCAL solver_test.pause = 'on'")?;
+                mark_orders_onchain_nullified_tx(conn, &spent)
+            })
+        });
+        let started = Instant::now();
+        let paused = diesel::dsl::sql::<diesel::sql_types::Bool>(&format!(
+            "EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {pid} AND wait_event = 'PgSleep')"
+        ));
+        while !diesel::select(paused.clone()).get_result::<bool>(&mut fixture.conn)? {
+            assert!(started.elapsed() < Duration::from_secs(5), "never paused");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // An intake round exactly as `gateway::intake` writes it.
+        let commands = vec![
+            (header(beta, "c2", 2), cancel_all(CutoffScope::all())),
+            (header(alpha, "c2", 2), cancel_all(CutoffScope::all())),
+        ];
+        let mut intake = connect(&fixture)?;
+        let round = intake.transaction::<_, DbError, _>(|conn| {
+            prelock_submission_orders_tx(conn, &commands)?;
+            prelock_command_makers_tx(conn, &commands)?;
+            commands
+                .iter()
+                .map(|(header, command)| execute_command_tx(conn, header, command))
+                .collect::<DbResult<Vec<_>>>()
+        });
+        let retired = retiring.join().expect("retirement panicked");
+        let replies: Vec<_> = round?.into_iter().map(|(reply, _)| reply).collect();
+        assert_eq!(retired?, 2);
+        let applied = CommandReply::Committed(CommandResult::Applied {
+            cutoff: 2,
+            settling: 0,
+        });
+        assert_eq!(replies, [applied.clone(), applied]);
+        for maker_id in [alpha, beta] {
+            let events = settlement_events(&mut fixture.conn, maker_id)?;
+            assert!(
+                matches!(&events[..], [proto::event_body::Kind::OrderStatus(status)]
+                    if status.state == i32::from(proto::OrderState::Unavailable)),
+                "maker {maker_id}: {events:?}"
+            );
+        }
         Ok(())
     }
 

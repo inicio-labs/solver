@@ -214,6 +214,9 @@ pub fn mark_orders_onchain_nullified_tx(
     let mut sorted = note_ids.to_vec();
     sorted.sort();
     sorted.dedup();
+    // ADR 0006: lock the order rows, then their makers in maker-ID order,
+    // before `report_spent_tx` appends events maker by maker in note order.
+    super::maker_db::prelock_watcher_tx(conn, &[], &[], &sorted)?;
     super::maker_db::report_spent_tx(conn, &sorted)?;
     Ok(
         diesel::update(orders::table.filter(orders::note_id.eq_any(sorted)).filter(

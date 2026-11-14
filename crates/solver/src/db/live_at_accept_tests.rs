@@ -473,7 +473,8 @@ fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {
     // already there is not sent again; the cancelled one is stored stopped.
     let sent: Vec<_> = update.active.iter().map(|order| order.id()).collect();
     assert_eq!(sent, [waiting.id()]);
-    assert_eq!(returned, [alpha, alpha]);
+    // Counted as returned only if it reached the book.
+    assert_eq!(returned, [alpha]);
     assert_eq!(status(conn, &waiting)?.as_deref(), Some("active"));
     assert_eq!(status(conn, &live_one)?.as_deref(), Some("active"));
     assert_eq!(status(conn, &cancelled)?.as_deref(), Some("stopped"));
@@ -736,46 +737,60 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
-    let (active, waiting, settling, cancelled, spent) =
-        (note(1), note(2), note(3), note(4), note(5));
+    let (active, waiting, settling, cancelled, spent, cancelled_active) =
+        (note(1), note(2), note(3), note(4), note(5), note(6));
     for (seq, order) in [
         (1, &active),
         (2, &waiting),
         (3, &settling),
         (4, &cancelled),
         (5, &spent),
+        (6, &cancelled_active),
     ] {
         accept(conn, alpha, seq, order)?;
     }
     set_status(conn, &waiting, "waiting")?;
     reserve(conn, 9, &[&settling])?;
     // The maker cancelled it; the book write stored it stopped.
-    cancel(conn, alpha, 6, &cancelled)?;
+    cancel(conn, alpha, 7, &cancelled)?;
     set_status(conn, &cancelled, "stopped")?;
     set_status(conn, &spent, "onchain_nullified")?;
-    let capped: Vec<_> = [&active, &waiting, &settling, &cancelled, &spent]
-        .into_iter()
-        .map(|order| pending(conn, order))
-        .collect::<Result<_>>()?;
+    // Cancelled too, but no book write has touched its row: still active.
+    cancel(conn, alpha, 8, &cancelled_active)?;
+    let capped: Vec<_> = [
+        &active,
+        &waiting,
+        &settling,
+        &cancelled,
+        &spent,
+        &cancelled_active,
+    ]
+    .into_iter()
+    .map(|order| pending(conn, order))
+    .collect::<Result<_>>()?;
     let before = statuses(conn, alpha)?.len();
 
     let (removed, closed) =
         conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &capped))?;
     let removed: HashSet<_> = removed.into_iter().collect();
-    assert_eq!(removed, HashSet::from([active.id(), waiting.id()]));
-    assert_eq!(closed, [alpha, alpha], "the two orders it stopped");
-    for order in [&active, &waiting] {
+    assert_eq!(
+        removed,
+        HashSet::from([active.id(), waiting.id(), cancelled_active.id()])
+    );
+    // Counted for the two the maker saw live, not the one it had cancelled.
+    assert_eq!(closed, [alpha, alpha], "the two orders it cancelled");
+    for order in [&active, &waiting, &cancelled_active] {
         assert_eq!(status(conn, order)?.as_deref(), Some("stopped"));
     }
-    for order in [&active, &waiting, &cancelled, &spent] {
+    for order in [&active, &waiting, &cancelled, &spent, &cancelled_active] {
         assert_eq!(lineage(conn, order)?.0, "rejected");
     }
     assert_eq!(lineage(conn, &settling)?.0, "pending");
     assert_eq!(status(conn, &spent)?.as_deref(), Some("onchain_nullified"));
     let stops: i64 = maker_stops::table.count().get_result(conn)?;
     assert_eq!(
-        stops, 3,
-        "the maker's own cancel plus one per order stopped"
+        stops, 4,
+        "the maker's two cancels plus one per order the cap cancelled"
     );
     // The maker hears CANCELLED only for the orders it saw live.
     let cancels: Vec<_> = statuses(conn, alpha)?[before..].to_vec();
@@ -834,6 +849,58 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     assert!(postgres_migrations::cancel_unconfirmed(conn)?.is_empty());
     postgres_migrations::revert_last(conn)?;
     Ok(())
+}
+
+/// The escape hatch closes a lineage whose root a settlement holds; the
+/// settlement then commits. Its remainder is a real note, so it is watched
+/// (and retired once spent), though the lineage is closed.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_remainder_of_a_closed_lineage_is_still_watched() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let order = note(1);
+    accept(conn, alpha, 1, &order)?;
+    reserve(conn, 9, &[&order])?;
+    // The confirmation deletes the settlement's inputs.
+    let remainder = settlement_child(conn, &order)?;
+    // Nothing stopped: a settlement holds the root.
+    assert!(postgres_migrations::cancel_unconfirmed(conn)?.is_empty());
+    assert_eq!(lineage(conn, &order)?.0, "rejected");
+    conn.transaction::<_, DbError, _>(|conn| {
+        let confirmed = confirm_settlement_with_tx(
+            conn,
+            &[9; 32],
+            &HashSet::new(),
+            BlockNumber::from(8),
+            test_consumer(),
+            None,
+        )?;
+        live_book_update_tx(conn, confirmed.update)?;
+        Ok(())
+    })?;
+    assert_eq!(status(conn, &order)?.as_deref(), Some("executed"));
+    let stored: String = orders::table
+        .find(&remainder)
+        .select(orders::status)
+        .first(conn)?;
+    assert_eq!(
+        stored, "stopped",
+        "the closed lineage keeps it out of the book"
+    );
+    assert_eq!(maker_db::watched_maker_orders_tx(conn)?, [remainder]);
+    Ok(())
+}
+
+/// The remainder note ID the settlement holding `parent` creates.
+fn settlement_child(conn: &mut PgConnection, parent: &Note) -> Result<Vec<u8>, DbError> {
+    use super::postgres_schema::settlement_inputs;
+    settlement_inputs::table
+        .filter(settlement_inputs::parent_note_id.eq(id(parent)))
+        .select(settlement_inputs::child_note_id.assume_not_null())
+        .first(conn)
+        .map_err(Into::into)
 }
 
 #[test]

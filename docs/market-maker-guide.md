@@ -1046,7 +1046,7 @@ sequenceDiagram
     S-->>MM: event: SettlementResolved (committed)
 ```
 
-- `LIVE` follows the reply at once, not when the note lands. It is still sent once.
+- `LIVE` follows the reply at once, not when the note lands. It is still sent once. The reply and the event stream are separate calls, so `LIVE` can reach you just before the reply.
 - When your note lands, nothing more is sent.
 - **Don't hedge on `SettlementPending`.** If your transaction doesn't reach a block, our settlement can be dropped with it. Book only `SettlementResolved` with `committed = true`, as always.
 - A voided `SettlementResolved` can say `LIVE` while the node does not know your note yet: we keep the order out of the book until the note lands, then it trades again. `ListActiveMakerOrders` lists it the whole time.

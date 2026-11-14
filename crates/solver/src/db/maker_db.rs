@@ -711,6 +711,9 @@ pub struct PendingSubmission {
     pub accept_block: Option<BlockNumber>,
     /// Seconds since the submit was accepted, by the database clock.
     pub age_secs: f64,
+    /// A settlement holds the root row: that settlement decides it, not the
+    /// cap.
+    pub root_settling: bool,
 }
 
 impl PendingSubmission {
@@ -728,6 +731,7 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
                 .eq(maker_lineages::maker_id)
                 .and(maker_commands::request_id.eq(maker_lineages::request_id))),
         )
+        .left_join(orders::table.on(orders::note_id.eq(maker_lineages::note_id)))
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
         .order(sql::<diesel::sql_types::Timestamptz>(
             "maker_lineages.created_at ASC",
@@ -741,11 +745,20 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
             sql::<diesel::sql_types::Double>(
                 "EXTRACT(EPOCH FROM now() - maker_lineages.created_at)::float8",
             ),
+            orders::status.nullable(),
         ))
-        .load::<(Vec<u8>, i64, Vec<u8>, bool, Option<i64>, f64)>(conn)?
+        .load::<(
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            bool,
+            Option<i64>,
+            f64,
+            Option<String>,
+        )>(conn)?
         .into_iter()
         .map(
-            |(lineage_id, maker_id, payload, live_at_accept, accept_block, age_secs)| {
+            |(lineage_id, maker_id, payload, live_at_accept, accept_block, age_secs, status)| {
                 let accept_block = match (live_at_accept, accept_block) {
                     (true, Some(block)) => Some(BlockNumber::from(u32::try_from(block)?)),
                     (true, None) => {
@@ -759,6 +772,7 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
                     note: Note::read_from_bytes(&payload)?,
                     accept_block,
                     age_secs,
+                    root_settling: status.as_deref() == Some(OrderStatus::Settling.as_str()),
                 })
             },
         )
@@ -828,7 +842,8 @@ fn order_statuses(
         .collect())
 }
 
-/// The rows among `note_ids` the maker sees as live, cancels included.
+/// The rows among `note_ids` the maker sees as live: active or waiting, and
+/// not covered by one of its cancels.
 fn shown_live_ids(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResult<HashSet<Vec<u8>>> {
     if note_ids.is_empty() {
         return Ok(HashSet::new());
@@ -914,18 +929,21 @@ pub fn activate_tx(
     let activated = settle_lineages(conn, &lineages, LineageState::Activated)?;
     let ids: Vec<Vec<u8>> = rows.iter().map(|row| row.note_id.clone()).collect();
     let returned = move_orders(conn, &ids, &[OrderStatus::Waiting], OrderStatus::Active)?;
-    let returned_makers = submissions
-        .iter()
-        .filter(|s| returned.contains(&s.note.id().to_bytes().to_vec()))
-        .map(|s| s.maker_id)
-        .collect();
-    sent.extend(returned);
     let live: HashSet<Vec<u8>> = live_orders::table
         .filter(live_orders::note_id.eq_any(&ids))
         .select(live_orders::note_id)
         .load::<Vec<u8>>(conn)?
         .into_iter()
         .collect();
+    // Back in the book: a root the maker cancelled while it waited is stored
+    // stopped by `write_book` and never reaches it.
+    let returned_makers = submissions
+        .iter()
+        .map(|s| (s, s.note.id().to_bytes().to_vec()))
+        .filter(|(_, id)| returned.contains(id) && live.contains(id))
+        .map(|(s, _)| s.maker_id)
+        .collect();
+    sent.extend(returned);
     for submission in submissions {
         let id = submission.note.id().to_bytes().to_vec();
         if activated.contains(&submission.lineage_id)
@@ -1253,7 +1271,9 @@ pub const NOTE_NOT_RECEIVED: &str = "note_not_received";
 /// round decides. Otherwise the lineage is closed whatever the root's status;
 /// an active or waiting root gets a stop row and is stopped, and the maker
 /// hears CANCELLED `note_not_received` if it saw the order live. Returns the
-/// orders to take out of the book, and the maker of each order it stopped.
+/// orders to take out of the book, and the maker of each order it cancelled:
+/// one its maker saw live. An order the maker had cancelled is only tidied
+/// up.
 pub fn cap_unconfirmed_tx(
     conn: &mut PgConnection,
     capped: &[PendingSubmission],
@@ -1307,7 +1327,7 @@ pub fn cap_unconfirmed_tx(
             .on_conflict_do_nothing()
             .execute(conn)?;
     }
-    let makers = stopped_now.iter().map(|s| s.maker_id).collect();
+    let mut makers = Vec::new();
     for submission in stopped_now {
         if shown.contains(submission.note.id().to_bytes().as_slice()) {
             let body = order_status(
@@ -1321,6 +1341,7 @@ pub fn cap_unconfirmed_tx(
                 Some(&submission.lineage_id),
                 &body,
             )?;
+            makers.push(submission.maker_id);
         }
     }
     Ok((order_ids(&stopped)?, makers))
@@ -1416,8 +1437,10 @@ pub(super) fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>
 /// Maker orders that may still be spent elsewhere: Active or Stopped rows
 /// of a claimed lineage. Settling ones are resolved by the executor. A lineage
 /// that went live at accept (ADR 0008) is left out while pending, since the
-/// pending round decides its root by the row's status, and once rejected,
-/// since its root is closed.
+/// pending round decides its root by the row's status. Once it is rejected,
+/// its root is left out (its note may never have landed), but a remainder is
+/// watched: our committed settlement created that note, for example after
+/// the escape hatch closed a lineage whose root a settlement held.
 pub fn watched_maker_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<Vec<u8>>> {
     Ok(orders::table
         .inner_join(
@@ -1429,7 +1452,8 @@ pub fn watched_maker_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<Vec<u8>>
         .filter(
             maker_lineages::live_at_accept
                 .eq(false)
-                .or(maker_lineages::state.eq(LineageState::Activated.as_str())),
+                .or(maker_lineages::state.eq(LineageState::Activated.as_str()))
+                .or(orders::depth.gt(0_i64)),
         )
         .select(orders::note_id)
         .load(conn)?)

@@ -659,8 +659,12 @@ pub fn finish_discarded_settlement_tx(
             _ if unconfirmed(&note_id) => {
                 released.unconfirmed += 1;
                 // The node names every unknown note in one refusal: an
-                // unnamed parent was known. Naming nothing of ours (its text
-                // changed?) tells nothing, so then every one waits.
+                // unnamed parent was known. (Node 0.18 collects every
+                // unauthenticated input that is neither in the store nor
+                // created in its mempool before it refuses:
+                // block-producer/src/mempool/graph/state.rs, validate_append.)
+                // Naming nothing of ours (its text changed?) tells nothing,
+                // so then every one waits.
                 let waits = match answer {
                     NodeAnswer::NotSent | NodeAnswer::AccountMismatch => false,
                     NodeAnswer::UnknownNotes(named) if named.contains(&id) => {

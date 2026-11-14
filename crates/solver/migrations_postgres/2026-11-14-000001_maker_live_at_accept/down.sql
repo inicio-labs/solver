@@ -4,11 +4,9 @@ DO $$ BEGIN
  RAISE EXCEPTION 'maker orders that went live at accept are unresolved; stop the solver and run the escape hatch first';
  END IF;
 END $$;
-DROP VIEW live_orders;
-DROP VIEW eligible_orders;
-DROP INDEX orders_waiting_idx;
-DROP INDEX maker_lineages_flagged_note_idx;
-CREATE VIEW live_orders AS
+-- Replace, never drop, `live_orders`: dropping it would lose its grants,
+-- and the previous binary reads it at startup.
+CREATE OR REPLACE VIEW live_orders AS
 SELECT o.note_id, o.raw_data, o.arrival_unix, o.status, o.priority_seq,
        o.lineage_id, o.depth, o.market, o.direction,
        m.maker_id, m.root_seq, m.expires_at_unix_ms
@@ -24,6 +22,9 @@ WHERE o.status = 'active'
   AND NOT EXISTS (
       SELECT 1 FROM maker_stops s
       WHERE s.maker_id = m.maker_id AND s.lineage_id = o.lineage_id);
+DROP VIEW eligible_orders;
+DROP INDEX orders_waiting_idx;
+DROP INDEX maker_lineages_flagged_note_idx;
 
 ALTER TABLE maker_lineages
     DROP CONSTRAINT maker_lineages_live_at_accept_check,

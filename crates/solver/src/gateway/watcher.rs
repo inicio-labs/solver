@@ -671,7 +671,10 @@ impl<T: MakerTracker> Watcher<T> {
             let observed = observations.get(&submission.note.id()).copied();
             // An unread note gets no decision, unless the cap is due: its
             // exact lookup decides then, so it can't stay live forever.
+            // A root a settlement holds is decided by that settlement; a
+            // lookup now would only use the round's budget.
             let observation = if matches!(observed, None | Some(NoteObservation::Pending))
+                && !submission.root_settling
                 && self.cap.due(&submission, synced)
             {
                 if lookups == MAX_CAP_LOOKUPS {
@@ -1708,6 +1711,28 @@ mod tests {
         f.watcher.round().await.unwrap();
         assert_eq!(f.chain.state().lookups, 1);
         assert_eq!(f.statuses().await.len(), 2);
+    }
+
+    /// A due root that a settlement holds takes no cap lookup: the
+    /// settlement decides it. Once it is back, the cap looks it up.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_settling_root_takes_no_cap_lookup() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.set_status(&order, "settling").await;
+        f.watcher.round().await.unwrap();
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 0);
+        assert_eq!(f.status(&order).await, "settling");
+
+        f.set_status(&order, "active").await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "stopped");
     }
 
     /// A round that missed a landed note (a lagging node) does not cap it:

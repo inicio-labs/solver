@@ -179,8 +179,11 @@ pub async fn run_intake(
                 for (reply, (_, outcome)) in replies.into_iter().zip(outcomes) {
                     let _ = reply.send(Ok(outcome.reply));
                 }
-                // After the replies, so the maker hears Accepted before LIVE.
-                // The core writer's append flag is not ours to take.
+                // After the replies, so the maker usually hears Accepted
+                // first. Not always: LIVE is committed already, and a stream
+                // that wakes for another reason (a keep-alive, another event)
+                // reads it; the reply and the stream are separate calls. The
+                // core writer's append flag is not ours to take.
                 if went_live {
                     wake.notify();
                 }

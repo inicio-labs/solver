@@ -179,6 +179,35 @@ mod tests {
         Ok(())
     }
 
+    /// Reverting the live-at-accept migration keeps the grants on
+    /// `live_orders`: the previous binary reads it at startup.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_revert_keeps_the_grants_on_live_orders() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        conn.batch_execute(&format!("GRANT SELECT ON {schema}.live_orders TO PUBLIC"))?;
+        #[derive(QueryableByName)]
+        struct Acl {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            acl: Option<String>,
+        }
+        let public_reads = |conn: &mut PgConnection| -> Result<bool> {
+            let acl = diesel::sql_query(format!(
+                "SELECT relacl::text AS acl FROM pg_class WHERE oid = '{schema}.live_orders'::regclass"
+            ))
+            .get_result::<Acl>(conn)?
+            .acl
+            .unwrap_or_default();
+            // PUBLIC's entry has an empty grantee: "=r/owner".
+            Ok(acl.contains("\"=r/") || acl.contains(",=r/") || acl.contains("{=r/"))
+        };
+        assert!(public_reads(conn)?);
+        assert_eq!(revert_last(conn)?, "20261114000001");
+        assert!(public_reads(conn)?, "the revert dropped the grant");
+        Ok(())
+    }
+
     /// A runtime role that was granted the old view but not the new one
     /// passes the history check and can still read the book (`live_orders`
     /// reaches `eligible_orders` as its owner). The access check names the

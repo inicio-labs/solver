@@ -38,10 +38,12 @@ use common::{
 
 const SCHEME: AuthSchemeId = AuthSchemeId::Falcon512Poseidon2;
 
-/// A transaction spending a note nobody created is refused at submission,
-/// with the node's error, instead of failing later in `prove_block`.
+/// The mock refuses at submission, with the node's error and in the node's
+/// order, instead of failing later in `prove_block`: a note nobody created, a
+/// note a waiting transaction already spends, a note spent in a block, and a
+/// note created and spent in one block (erased, so unknown again).
 #[tokio::test]
-async fn the_mock_node_refuses_unknown_notes_like_a_real_node() -> Result<()> {
+async fn the_mock_node_refuses_like_a_real_node() -> Result<()> {
     let rpc = NodeLikeRpc::new(Arc::new(MockRpcApi::new(MockChain::new())));
     let (_temp, keystore, store) = temp_paths()?;
     let mut client = TestClient::new(build_test_client(rpc.clone(), keystore, store).await?);
@@ -57,6 +59,9 @@ async fn the_mock_node_refuses_unknown_notes_like_a_real_node() -> Result<()> {
         .insert_account(AccountSetup::wallet(mode).auth_scheme(SCHEME))
         .await?;
     let (bob, _) = client
+        .insert_account(AccountSetup::wallet(mode).auth_scheme(SCHEME))
+        .await?;
+    let (carol, _) = client
         .insert_account(AccountSetup::wallet(mode).auth_scheme(SCHEME))
         .await?;
     rpc.prove_block();
@@ -100,18 +105,110 @@ async fn the_mock_node_refuses_unknown_notes_like_a_real_node() -> Result<()> {
     );
 
     // Once Alice sends it, Bob's spend is accepted while it still waits
-    // for a block, and both land together.
+    // for a block. The same spend again is refused by nullifier.
     Box::pin(client.submit_new_transaction(alice.id(), payment))
         .await
         .map_err(|e| anyhow!("send payment: {e}"))?;
     let consume = TransactionRequestBuilder::new()
-        .build_consume_notes(vec![unsent])
+        .build_consume_notes(vec![unsent.clone()])
         .map_err(|e| anyhow!("build consume: {e}"))?;
-    Box::pin(client.submit_new_transaction(bob.id(), consume))
+    let (spend, inputs) = prove(&mut client, bob.id(), consume).await?;
+    client
+        .submit_proven_transaction(spend.clone(), &inputs)
         .await
         .map_err(|e| anyhow!("consume a note waiting in the mempool: {e}"))?;
+    let nullifier = format!("{:?}", unsent.nullifier());
+    let text = refusal(&mut client, &spend, &inputs).await?;
+    ensure!(
+        text.contains("transaction conflicts with current mempool state")
+            && text.contains("nullifiers already exist")
+            && text.contains(&nullifier),
+        "a second spend of a waiting spend: {text}"
+    );
+
+    // Both land in one block, which erases the note: the block records no
+    // nullifier for it, so the spend is refused as unknown, not as spent.
     rpc.prove_block();
+    let text = refusal(&mut client, &spend, &inputs).await?;
+    ensure!(
+        text.contains("unauthenticated input notes are unknown")
+            && text.contains(&format!("{:?}", unsent.id())),
+        "a spend of an erased note: {text}"
+    );
+
+    // A note in a block and spent in a later one is refused as spent (code 8).
+    client.sync_state().await?;
+    let payment = TransactionRequestBuilder::new()
+        .build_pay_to_id(
+            PaymentNoteDescription::new(
+                vec![FungibleAsset::new(faucet.id(), 5)?.into()],
+                alice.id(),
+                carol.id(),
+            ),
+            NoteType::Private,
+            client.rng(),
+        )
+        .map_err(|e| anyhow!("build payment: {e}"))?;
+    let sent = payment
+        .expected_output_own_notes()
+        .into_iter()
+        .next()
+        .context("the payment creates no note")?;
+    Box::pin(client.submit_new_transaction(alice.id(), payment))
+        .await
+        .map_err(|e| anyhow!("send payment: {e}"))?;
+    rpc.prove_block();
+    let consume = TransactionRequestBuilder::new()
+        .build_consume_notes(vec![sent.clone()])
+        .map_err(|e| anyhow!("build consume: {e}"))?;
+    let (spend, inputs) = prove(&mut client, carol.id(), consume).await?;
+    client
+        .submit_proven_transaction(spend.clone(), &inputs)
+        .await
+        .map_err(|e| anyhow!("consume a note in a block: {e}"))?;
+    rpc.prove_block();
+    let text = refusal(&mut client, &spend, &inputs).await?;
+    ensure!(
+        text.contains("failed to authenticate transaction")
+            && text.contains("nullifiers already exist")
+            && text.contains(&format!("{:?}", sent.nullifier())),
+        "a spend of a note spent in a block: {text}"
+    );
     Ok(())
+}
+
+/// Executes and proves a transaction without submitting it, so a test can
+/// submit the same proof more than once.
+async fn prove(
+    client: &mut TestClient,
+    account: miden_protocol::account::AccountId,
+    request: miden_client::transaction::TransactionRequest,
+) -> Result<(
+    miden_protocol::transaction::ProvenTransaction,
+    miden_client::transaction::TransactionResult,
+)> {
+    let result = Box::pin(client.execute_transaction(account, request))
+        .await
+        .map_err(|e| anyhow!("execute: {e}"))?;
+    let proven = client
+        .prove_transaction(&result)
+        .await
+        .map_err(|e| anyhow!("prove: {e}"))?;
+    Ok((proven, result))
+}
+
+/// Submits a proof the mock must refuse, and returns the refusal's text.
+async fn refusal(
+    client: &mut TestClient,
+    spend: &miden_protocol::transaction::ProvenTransaction,
+    inputs: &miden_client::transaction::TransactionResult,
+) -> Result<String> {
+    let refused = client
+        .submit_proven_transaction(spend.clone(), inputs)
+        .await
+        .err()
+        .context("the mock accepted a spend a node refuses")?;
+    Ok(format!("{refused:?}"))
 }
 
 /// Today's path end to end: the maker sends its transaction, then

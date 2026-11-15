@@ -88,7 +88,6 @@ diesel::table! {
         market -> Nullable<Binary>,
         direction -> Nullable<Binary>,
         expires_at_unix_ms -> Nullable<BigInt>,
-        live_at_accept -> Bool,
         accept_block -> Nullable<BigInt>,
     }
 }

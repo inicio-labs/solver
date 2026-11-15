@@ -239,7 +239,7 @@ has already ingested.
 SOLVER_DATABASE_URL=… solver-bin cancel-unconfirmed
 ```
 
-It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints how many lineages it closed and how many orders it cancelled per maker. A lineage whose order a settlement still holds, or its maker had cancelled, is closed with no order cancelled. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist.
+It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints how many lineages it closed and how many orders it cancelled per maker. A lineage whose order a settlement still holds, or its maker had cancelled, is closed with no order cancelled. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist (orders their maker cancelled don't count).
 
 **Alerts:**
 - `solver_maker_unknown_notes_named_total` rising for one maker: its transactions reach the node after its `SubmitOrder`, or not at all.
@@ -250,7 +250,7 @@ It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_
 - Several makers' unknown-note refusals at once: the node lost its mempool (a restart). Their orders wait, and return when their notes land or are capped.
 - `solver_maker_watcher_unobserved_notes` above 0 for long: notes the watcher can't read. Unconfirmed ones are still decided by the cap's lookup; activated ones go unwatched for spends until they read again.
 
-**Queries** join on root rows (`orders.note_id = maker_lineages.note_id`): unconfirmed orders are `maker_lineages` rows with `live_at_accept AND state = 'pending'`; `waiting` orders have `orders.status = 'waiting'`.
+**Queries** join on root rows (`orders.note_id = maker_lineages.note_id`): unconfirmed orders are `maker_lineages` rows with `accept_block IS NOT NULL AND state = 'pending'`; `waiting` orders have `orders.status = 'waiting'`.
 
 **After an asynchronous failover**, restart the solver as after any failover: the watcher re-reads every pending lineage, and the cap counts from the database clock.
 

@@ -18,8 +18,8 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 
 ### Words
 
-- **Root row:** the order row of the note the maker submitted (`orders.note_id = maker_lineages.note_id`). Every rule below applies to root rows only: remainders exist only after our settlement committed, which also activates the lineage.
-- **Flagged:** `maker_lineages.live_at_accept = true`: the order went live at accept.
+- **Root row:** the order row of the note the maker submitted (`orders.note_id = maker_lineages.note_id`). Every rule below applies to root rows only: remainders exist only after our settlement committed, which also activates the lineage. One exception: the watcher's spend list tells a remainder by `depth > 0` instead (#79 item 7).
+- **Flagged:** `maker_lineages.accept_block` is set: the order went live at accept. It is null for every other lineage.
 - **Unconfirmed:** flagged, and the lineage is still `pending`: its note is not seen yet.
 - **Eligible:** passes the maker's stops and cutoffs. The `eligible_orders` view is `live_orders` without its status filter.
 - **`waiting`:** a new order status. An unconfirmed order out of the book until its note lands. The maker still sees it as live.
@@ -32,8 +32,8 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 | D2 | Only private notes go live at accept. Public notes keep the confirmed path (ingest and the watcher). |
 | D3 | When a settlement with unconfirmed parents never commits, what the node said decides where they go (table below). |
 | D4 | A `waiting` order comes back only when its note is in a block. |
-| D5 | The maker sees a `waiting` order as LIVE: in `ListActiveMakerOrders`, and as `LIVE` in a voided `SettlementResolved`. No proto change. A cancelled one becomes `stopped` and is reported CANCELLED. |
-| D6 | **The cap.** The watcher cancels an unconfirmed order only when all hold: (a) `maker_unconfirmed_cancel_after_secs` (default 60) since accept, by the database clock; (b) the watcher has synced to `accept_block + maker_unconfirmed_cancel_after_blocks` (default 20); (c) this round did not find the note; (d) one exact lookup of the note and its nullifier confirms it is not on chain. The lookup's answer counts as the round's observation: if it finds the note, the order is activated. Every due note is looked up in one call (one by one only if the node's answer does not decode), so the round keeps submission order and waits for at most one timeout. A failed lookup cancels nothing. |
+| D5 | The maker sees a `waiting` order as LIVE: in `ListActiveMakerOrders`, and as `LIVE` in a voided `SettlementResolved`. No proto change. A `waiting` order the maker cancels leaves the listing at once; its row stays `waiting`, with no event, until its note lands (it is then stored `stopped`) or the cap closes it silently. A parent the maker cancelled while a settlement held it is stored `stopped` at the release and reported `CANCELLED`. |
+| D6 | **The cap.** The watcher cancels an unconfirmed order only when all hold: (a) `maker_unconfirmed_cancel_after_secs` (default 60) since accept, by the database clock; (b) the watcher has synced to `accept_block + maker_unconfirmed_cancel_after_blocks` (default 20); (c) this round did not find the note; (d) one exact lookup of the note and its nullifier confirms it is not on chain. The lookup's answer counts as the round's observation: if it finds the note, the order is activated. Every due note is looked up in one batch: one call per `note_ids_limit` notes the node allows, one by one only if the node's answer does not decode. The round keeps submission order and waits for at most one timeout. A failed lookup cancels nothing. |
 | D7 | **Freshness.** `accept_block` is the watcher's latest synced block, written once at accept. An order goes live at accept only if that block was read from the chain less than 10 s ago. Intake reads it inside its transaction, after it share-locks the owner epoch. |
 | D8 | Settlement isolation (keeping a doubtful maker input out of other settlements) comes later, if the counters show it is needed. |
 | D9 | Accepted risks, below. |
@@ -46,8 +46,8 @@ With the switch on, a newly claimed submit of a private note, in intake's transa
 1. `SELECT owner_epoch … FOR SHARE`, once per round: a new owner's claim waits for this commit, and a round after a takeover fails (and stops the solver) instead of putting a ghost order in a book nobody reads.
 2. Read the watcher's block (D7). Not fresh: the confirmed path.
 3. Insert the root row `ON CONFLICT (note_id) DO NOTHING RETURNING`. An existing row: the confirmed path.
-4. Run `live_book_update_tx` on it, the one place maker tags are added. Not kept (the maker cancelled it first, or a cutoff covers it): delete the row and take the confirmed path, so nothing differs from today.
-5. Only if kept: set `live_at_accept` and `accept_block`, append LIVE.
+4. Run `live_book_update_tx` on it: the cancel rule every book write applies, which also adds the order's maker tag. Not kept (the maker cancelled it first, or a cutoff covers it): delete the row and take the confirmed path, so nothing differs from today.
+5. Only if kept: set `accept_block` to the block read in step 2, append LIVE.
 6. Publish `BookUpdate { active, maker_updates }` in the round's one update, under the publication guard.
 7. After commit, wake the event streams.
 
@@ -60,14 +60,14 @@ The confirmed path is today's: no row until the watcher sees the note. Accept fa
 | The watcher sees the note (in a round, or through the cap's lookup) | Lineage `activated`. A `waiting` root returns to the book through `live_book_update_tx`, with no event. An `active` root needs nothing; existing rows are never sent to the matcher again (this applies with the switch off too). No second LIVE. |
 | Our settlement lands | `confirm_settlement_tx` activates the parents' pending flagged lineages. When the settlement lands in the block that creates the note, the note is erased and the watcher never sees it; this is the only way the lineage learns it was real. |
 | Release of a failed settlement | D3. |
-| Cap | Lineage `rejected` whatever the root's status. An `active` or `waiting` root gets a stop row, is `stopped`, leaves the book, and the maker hears `CANCELLED` `note_not_received` if it saw the order live. A `stopped` or `onchain_nullified` root: closed silently. A `settling` root: skipped until its settlement resolves. |
+| Cap | A `settling` root: skipped until its settlement resolves. Otherwise the lineage is `rejected`, whatever the root's status: an `active` or `waiting` root gets a stop row, is `stopped`, leaves the book, and the maker hears `CANCELLED` `note_not_received` if it saw the order live; a `stopped` or `onchain_nullified` root is closed silently. |
 | Spent elsewhere | By the root's current status: `settling` waits; any other status becomes `onchain_nullified`, the lineage `rejected`, with one `UNAVAILABLE` "note spent outside this solver" if the maker saw it live. A root our own settlement spent is never here: its confirmation activates the lineage in the transaction that writes `executed`. |
 | One bad note in a round | A note the tracker can't look up or import gets no observation this round; the others carry on. A batch lookup whose answer does not decode, or a failed batch import, is retried note by note. A lookup the node did not answer (it is down, or refuses the call) fails the round after that one call, as before. A note whose details a stored record of another note already holds is decided by an exact lookup instead of an import. Once the cap is due, an unread unconfirmed order is decided by the cap's exact lookup. A failure of the chain sync itself still fails the round. `solver_maker_watcher_unobserved_notes` counts the notes a round left unread. |
 | A note found under our ID | It is ours: a note ID commits to the whole note, metadata included, so a node answer whose metadata looks different (a withheld attachment) is the same note. A note that really differs has another ID and is never found; the cap ends its order with `note_not_received`. The tracker therefore has no "different note" observation, and REJECTED is never sent. |
 | Lineage rejected | Its root is no longer watched (its note may never have landed). A remainder is still watched: our committed settlement created it, for example after the escape hatch closed a lineage whose root a settlement held. |
 | Maker cancels | Existing `CancelOrder` / `CancelAll`. A `waiting` root whose note lands later goes through `live_book_update_tx`, so it is stored `stopped`. |
 | Switch off | No new order goes live at accept; existing flagged lineages keep their rules. |
-| Gateway off at startup while unconfirmed orders exist | The solver refuses to start and names the escape hatch. |
+| Gateway off at startup while unconfirmed orders exist | The solver refuses to start and names the escape hatch. It counts what `solver_maker_unconfirmed_orders` shows: orders the maker cancelled are not counted, since without the watcher they can neither trade nor come back. |
 
 ### D3: where unconfirmed parents go
 

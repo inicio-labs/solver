@@ -826,8 +826,8 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
 
                 let url = pg.url.clone();
                 let note_id = order.id().to_bytes();
-                let (status, (lineage, flagged)) =
-                    tokio::task::spawn_blocking(move || -> Result<(String, (String, bool))> {
+                let (status, (lineage, accept_block)) = tokio::task::spawn_blocking(
+                    move || -> Result<(String, (String, Option<i64>))> {
                         use diesel::prelude::*;
                         use solver::db::postgres_schema::{maker_lineages, orders};
                         let mut conn = solver::db::postgres_migrations::connect(&url)?;
@@ -837,16 +837,17 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
                             .get_result(&mut conn)?;
                         let lineage = maker_lineages::table
                             .filter(maker_lineages::note_id.eq(&note_id))
-                            .select((maker_lineages::state, maker_lineages::live_at_accept))
+                            .select((maker_lineages::state, maker_lineages::accept_block))
                             .get_result(&mut conn)?;
                         Ok((status, lineage))
-                    })
-                    .await??;
-                println!("maker order {status}, lineage {lineage}, live at accept {flagged}");
+                    },
+                )
+                .await??;
+                println!("maker order {status}, lineage {lineage}, accept block {accept_block:?}");
                 // The confirmed path also ends `executed` and `activated`
-                // when a block lands quickly: only the flag shows it went
-                // live at accept.
-                ensure!(flagged, "the order took the confirmed path");
+                // when a block lands quickly: only the accept block shows it
+                // went live at accept.
+                ensure!(accept_block.is_some(), "the order took the confirmed path");
                 ensure!(status == "executed" && lineage == "activated");
                 Ok(())
             }

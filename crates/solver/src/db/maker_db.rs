@@ -492,10 +492,7 @@ fn go_live_at_accept_tx(
         return Ok((None, None));
     };
     diesel::update(maker_lineages::table.find(lineage_id))
-        .set((
-            maker_lineages::live_at_accept.eq(true),
-            maker_lineages::accept_block.eq(Some(i64::from(accept_block.as_u32()))),
-        ))
+        .set(maker_lineages::accept_block.eq(Some(i64::from(accept_block.as_u32()))))
         .execute(conn)?;
     let body = order_status(note, proto::OrderState::Live, "");
     gateway::append_event_tx(conn, maker_id, Some(lineage_id), &body)?;
@@ -740,32 +737,19 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
             maker_lineages::lineage_id,
             maker_lineages::maker_id,
             maker_commands::payload,
-            maker_lineages::live_at_accept,
             maker_lineages::accept_block,
             sql::<diesel::sql_types::Double>(
                 "EXTRACT(EPOCH FROM now() - maker_lineages.created_at)::float8",
             ),
             orders::status.nullable(),
         ))
-        .load::<(
-            Vec<u8>,
-            i64,
-            Vec<u8>,
-            bool,
-            Option<i64>,
-            f64,
-            Option<String>,
-        )>(conn)?
+        .load::<(Vec<u8>, i64, Vec<u8>, Option<i64>, f64, Option<String>)>(conn)?
         .into_iter()
         .map(
-            |(lineage_id, maker_id, payload, live_at_accept, accept_block, age_secs, status)| {
-                let accept_block = match (live_at_accept, accept_block) {
-                    (true, Some(block)) => Some(BlockNumber::from(u32::try_from(block)?)),
-                    (true, None) => {
-                        return Err(DbError::Corrupt("flagged lineage lacks its block"))
-                    }
-                    (false, _) => None,
-                };
+            |(lineage_id, maker_id, payload, accept_block, age_secs, status)| {
+                let accept_block = accept_block
+                    .map(|block| u32::try_from(block).map(BlockNumber::from))
+                    .transpose()?;
                 let note = Note::read_from_bytes(&payload)?;
                 Ok(PendingSubmission {
                     lineage_id,
@@ -1177,7 +1161,7 @@ pub fn activate_spent_roots_tx(
     }
     let roots: Vec<(LineageId, MakerId)> = maker_lineages::table
         .filter(maker_lineages::note_id.eq_any(note_ids))
-        .filter(maker_lineages::live_at_accept)
+        .filter(maker_lineages::accept_block.is_not_null())
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
         .select((maker_lineages::lineage_id, maker_lineages::maker_id))
         .load(conn)?;
@@ -1190,13 +1174,13 @@ pub fn activate_spent_roots_tx(
         .collect())
 }
 
-/// Orders that went live at accept whose note is still not seen (ADR 0008).
+/// Orders that went live at accept whose note is still not seen and that can
+/// still trade, wait or settle (ADR 0008): the `solver_maker_unconfirmed_orders`
+/// gauge. The startup guard refuses to run without the watcher while any
+/// exist. An order its maker cancelled is not counted: without the watcher it
+/// can neither trade nor come back. The escape hatch still closes its lineage.
 pub fn unconfirmed_count_tx(conn: &mut PgConnection) -> DbResult<i64> {
-    Ok(maker_lineages::table
-        .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
-        .filter(maker_lineages::live_at_accept)
-        .count()
-        .get_result(conn)?)
+    Ok(pending_lineage_stats_tx(conn)?.unconfirmed)
 }
 
 /// What the escape hatch did.
@@ -1224,7 +1208,7 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
         .execute(conn)?;
     let pending: Vec<(Vec<u8>, i64, Vec<u8>)> = maker_lineages::table
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
-        .filter(maker_lineages::live_at_accept)
+        .filter(maker_lineages::accept_block.is_not_null())
         .select((
             maker_lineages::lineage_id,
             maker_lineages::maker_id,
@@ -1282,26 +1266,27 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
         OrderStatus::Stopped,
     )?;
     let mut per_maker: HashMap<MakerId, usize> = HashMap::new();
+    // An order its maker had cancelled is moved too (its row may still say
+    // `active` or `waiting`), but it was not the hatch's to cancel: only the
+    // orders the maker saw live are counted and told.
     for (note_id, (maker_id, lineage_id)) in &closing {
-        if !stopped.contains(note_id) {
+        if !stopped.contains(note_id) || !shown.contains(note_id) {
             continue;
         }
         *per_maker.entry(*maker_id).or_default() += 1;
-        if shown.contains(note_id) {
-            let note = orders::table
-                .find(note_id)
-                .select(OrderRow::as_select())
-                .first::<OrderRow>(conn)?
-                .note()?;
-            tell_tx(
-                conn,
-                *maker_id,
-                lineage_id,
-                &note,
-                proto::OrderState::Cancelled,
-                NOTE_NOT_RECEIVED,
-            )?;
-        }
+        let note = orders::table
+            .find(note_id)
+            .select(OrderRow::as_select())
+            .first::<OrderRow>(conn)?
+            .note()?;
+        tell_tx(
+            conn,
+            *maker_id,
+            lineage_id,
+            &note,
+            proto::OrderState::Cancelled,
+            NOTE_NOT_RECEIVED,
+        )?;
     }
     let mut cancelled: Vec<_> = per_maker.into_iter().collect();
     cancelled.sort_unstable();
@@ -1417,8 +1402,8 @@ pub fn watched_maker_orders_tx(conn: &mut PgConnection) -> DbResult<Vec<Vec<u8>>
             orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Stopped.as_str()]),
         )
         .filter(
-            maker_lineages::live_at_accept
-                .eq(false)
+            maker_lineages::accept_block
+                .is_null()
                 .or(maker_lineages::state.eq(LineageState::Activated.as_str()))
                 .or(orders::depth.gt(0_i64)),
         )
@@ -1658,8 +1643,8 @@ pub struct PendingLineageStats {
     /// Seconds since the oldest was submitted, by the database clock.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
     pub oldest_age_secs: Option<f64>,
-    /// Of those, orders that went live at accept (ADR 0008) and still
-    /// trade, wait or settle.
+    /// Of those, orders that went live at accept (ADR 0008) and can still
+    /// trade, wait or settle: their maker has not cancelled them.
     #[diesel(sql_type = BigInt)]
     pub unconfirmed: i64,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
@@ -1672,7 +1657,9 @@ pub struct PendingLineageStats {
 /// Count pending lineages through the partial index on pending rows. The age
 /// is computed by PostgreSQL, so it does not depend on the host clock. A
 /// waiting order is always the root of a pending lineage that went live at
-/// accept, so it is counted through the same rows.
+/// accept, so it is counted through the same rows. Roots are read through
+/// `eligible_orders`, so an order its maker cancelled is not unconfirmed,
+/// whatever its row's status still says.
 pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLineageStats> {
     Ok(diesel::sql_query(
         "SELECT count(*) AS count,
@@ -1684,7 +1671,7 @@ pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLine
                     AS oldest_unconfirmed_age_secs,
                 count(o.note_id) FILTER (WHERE o.status = 'waiting') AS waiting
          FROM maker_lineages m
-         LEFT JOIN orders o ON o.note_id = m.note_id AND m.live_at_accept
+         LEFT JOIN eligible_orders o ON o.note_id = m.note_id AND m.accept_block IS NOT NULL
          WHERE m.state = 'pending'",
     )
     .get_result(conn)?)
@@ -1956,7 +1943,7 @@ mod tests {
         // The third went live at accept and now waits for its note.
         let third = hex::encode(note(3).id().to_bytes());
         conn.batch_execute(&format!(
-            "UPDATE maker_lineages SET live_at_accept = true, accept_block = 7
+            "UPDATE maker_lineages SET accept_block = 7
                WHERE note_id = '\\x{third}'::bytea;"
         ))?;
         let row = NewOrderRow::parsed(&note(3), 1)?;

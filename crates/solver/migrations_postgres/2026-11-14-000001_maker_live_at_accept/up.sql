@@ -1,19 +1,17 @@
 -- Maker orders that go live when the gateway accepts them, before their note
 -- is in a block (ADR 0008). A `waiting` order is out of the book until its
--- note lands; the lineage records that it went live at accept, and the
--- watcher's block then.
+-- note lands. A lineage that went live at accept records the watcher's block
+-- then in `accept_block`; it is null for every other lineage.
 ALTER TABLE orders DROP CONSTRAINT orders_status_check;
 ALTER TABLE orders ADD CONSTRAINT orders_status_check
     CHECK (status IN ('active', 'settling', 'executed', 'onchain_nullified', 'stopped', 'waiting'));
 
 ALTER TABLE maker_lineages
-    ADD COLUMN live_at_accept BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN accept_block BIGINT CHECK (accept_block >= 0),
-    ADD CONSTRAINT maker_lineages_live_at_accept_check
-        CHECK (NOT live_at_accept OR accept_block IS NOT NULL);
+    ADD COLUMN accept_block BIGINT CHECK (accept_block >= 0);
 
 -- Settlement release and confirmation find flagged roots by note ID.
-CREATE INDEX maker_lineages_flagged_note_idx ON maker_lineages (note_id) WHERE live_at_accept;
+CREATE INDEX maker_lineages_flagged_note_idx ON maker_lineages (note_id)
+    WHERE accept_block IS NOT NULL;
 -- Orders out of the book until their note lands, for the maker's listing.
 CREATE INDEX orders_waiting_idx ON orders (note_id) WHERE status = 'waiting';
 

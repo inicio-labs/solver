@@ -615,7 +615,7 @@ pub fn finish_discarded_settlement_tx(
     let flagged: HashMap<Vec<u8>, (maker_db::LineageState, crate::maker::MakerId)> =
         maker_lineages::table
             .filter(maker_lineages::note_id.eq_any(&parent_ids))
-            .filter(maker_lineages::live_at_accept)
+            .filter(maker_lineages::accept_block.is_not_null())
             .select((
                 maker_lineages::note_id,
                 maker_lineages::state,

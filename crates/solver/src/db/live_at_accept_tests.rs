@@ -150,15 +150,11 @@ fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> 
     Ok(())
 }
 
-/// The lineage's state, flag and accept block.
-fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, bool, Option<i64>)> {
+/// The lineage's state and accept block (set only if it went live at accept).
+fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, Option<i64>)> {
     Ok(maker_lineages::table
         .filter(maker_lineages::note_id.eq(id(note)))
-        .select((
-            maker_lineages::state,
-            maker_lineages::live_at_accept,
-            maker_lineages::accept_block,
-        ))
+        .select((maker_lineages::state, maker_lineages::accept_block))
         .first(conn)?)
 }
 
@@ -266,7 +262,7 @@ fn an_accepted_private_order_goes_live_once_with_its_tag() -> Result<()> {
     let tag = live_order.maker.expect("tagged");
     assert_eq!((tag.maker_id, tag.root_seq), (alpha, 3));
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
-    assert_eq!(lineage(conn, &order)?, ("pending".into(), true, Some(7)));
+    assert_eq!(lineage(conn, &order)?, ("pending".into(), Some(7)));
     assert_eq!(
         statuses(conn, alpha)?,
         [(id(&order), proto::OrderState::Live, String::new())]
@@ -301,8 +297,8 @@ fn other_submits_take_the_confirmed_path_without_a_trace() -> Result<()> {
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
     let unflagged = |conn: &mut PgConnection, note: &Note| -> Result<()> {
-        let (state, flagged, block) = lineage(conn, note)?;
-        assert_eq!((state.as_str(), flagged, block), ("pending", false, None));
+        let (state, block) = lineage(conn, note)?;
+        assert_eq!((state.as_str(), block), ("pending", None));
         Ok(())
     };
 
@@ -463,7 +459,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     let outcomes = go_live(conn)?;
     assert!(outcomes[0].1.live.is_some());
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
-    assert_eq!(lineage(conn, &order)?, ("pending".into(), true, Some(7)));
+    assert_eq!(lineage(conn, &order)?, ("pending".into(), Some(7)));
     assert_eq!(
         statuses(conn, alpha)?,
         [(id(&order), proto::OrderState::Live, String::new())]
@@ -913,6 +909,51 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     Ok(())
 }
 
+/// The startup guard and the gauge count the same orders: those that went
+/// live at accept and can still trade, wait or settle. An order its maker
+/// cancelled is not counted, whether its row still says `active` or
+/// `waiting` or a release already stored it `stopped`; the escape hatch still
+/// closes its lineage, without telling the maker.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_startup_guard_counts_what_the_gauge_counts() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (open, cancelled, stored_stopped, cancelled_waiting) = (note(1), note(2), note(3), note(4));
+    for (seq, order) in [
+        (1, &open),
+        (2, &cancelled),
+        (3, &stored_stopped),
+        (4, &cancelled_waiting),
+    ] {
+        accept(conn, alpha, seq, order)?;
+    }
+    set_status(conn, &cancelled_waiting, "waiting")?;
+    cancel(conn, alpha, 5, &cancelled)?;
+    cancel(conn, alpha, 6, &stored_stopped)?;
+    cancel(conn, alpha, 7, &cancelled_waiting)?;
+    // A release stores a cancelled parent `stopped`.
+    set_status(conn, &stored_stopped, "stopped")?;
+    assert_eq!(status(conn, &cancelled)?.as_deref(), Some("active"));
+    assert_eq!(
+        status(conn, &cancelled_waiting)?.as_deref(),
+        Some("waiting")
+    );
+
+    let stats = maker_db::pending_lineage_stats_tx(conn)?;
+    assert_eq!((stats.count, stats.unconfirmed, stats.waiting), (4, 1, 0));
+    assert_eq!(maker_db::unconfirmed_count_tx(conn)?, stats.unconfirmed);
+
+    let report = postgres_migrations::cancel_unconfirmed(conn)?;
+    assert_eq!(
+        (report.lineages_closed, report.cancelled),
+        (4, vec![(alpha, 1)])
+    );
+    assert_eq!(maker_db::unconfirmed_count_tx(conn)?, 0);
+    Ok(())
+}
+
 /// The escape hatch closes a lineage whose root a settlement holds; the
 /// settlement then commits. Its remainder is a real note, so it is watched
 /// (and retired once spent), though the lineage is closed.
@@ -1010,10 +1051,9 @@ fn the_hatch_tells_nothing_about_an_order_the_maker_cancelled() -> Result<()> {
     cancel(conn, alpha, 2, &order)?;
     set_status(conn, &order, "waiting")?;
     let before = epoch(conn)?;
-    assert_eq!(
-        postgres_migrations::cancel_unconfirmed(conn)?.cancelled,
-        [(alpha, 1)]
-    );
+    // Closed and stored `stopped`, but the maker cancelled it, not the hatch.
+    let report = postgres_migrations::cancel_unconfirmed(conn)?;
+    assert_eq!((report.lineages_closed, report.cancelled), (1, vec![]));
     assert_eq!(status(conn, &order)?.as_deref(), Some("stopped"));
     assert_eq!(statuses(conn, alpha)?.len(), 1, "LIVE only");
     // An old intake can't put an order live after the hatch.

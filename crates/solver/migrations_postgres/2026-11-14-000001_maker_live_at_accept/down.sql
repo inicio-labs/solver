@@ -1,6 +1,6 @@
 DO $$ BEGIN
  IF EXISTS (SELECT 1 FROM orders WHERE status = 'waiting')
-    OR EXISTS (SELECT 1 FROM maker_lineages WHERE live_at_accept AND state = 'pending') THEN
+    OR EXISTS (SELECT 1 FROM maker_lineages WHERE accept_block IS NOT NULL AND state = 'pending') THEN
  RAISE EXCEPTION 'maker orders that went live at accept are unresolved; stop the solver and run the escape hatch first';
  END IF;
 END $$;
@@ -26,10 +26,7 @@ DROP VIEW eligible_orders;
 DROP INDEX orders_waiting_idx;
 DROP INDEX maker_lineages_flagged_note_idx;
 
-ALTER TABLE maker_lineages
-    DROP CONSTRAINT maker_lineages_live_at_accept_check,
-    DROP COLUMN live_at_accept,
-    DROP COLUMN accept_block;
+ALTER TABLE maker_lineages DROP COLUMN accept_block;
 ALTER TABLE orders DROP CONSTRAINT orders_status_check;
 ALTER TABLE orders ADD CONSTRAINT orders_status_check
     CHECK (status IN ('active', 'settling', 'executed', 'onchain_nullified', 'stopped'));

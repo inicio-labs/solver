@@ -25,11 +25,11 @@ use super::maker_db::{
 };
 use super::postgres_db::{
     self, confirm_settlement_tx, finish_discarded_settlement_tx, live_book_update_tx,
-    prepare_settlement_tx, test_consumer, NodeAnswer,
+    test_consumer, NodeAnswer,
 };
-use super::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
+use super::postgres_models::{NewOrderRow, SettlementInputRow};
 use super::postgres_schema::{maker_lineages, maker_stops, orders, sync_state};
-use super::postgres_test::TestSchema;
+use super::postgres_test::{self, TestSchema};
 use super::{postgres_migrations, DbError};
 use crate::gateway::proto;
 use crate::maker::{
@@ -225,33 +225,9 @@ fn live(state: proto::OrderState) -> bool {
 fn reserve(conn: &mut PgConnection, tx: u8, parents: &[&Note]) -> Result<()> {
     let inputs: Vec<SettlementInputRow> = parents
         .iter()
-        .map(|parent| {
-            let pswap = PswapNote::try_from(*parent).unwrap();
-            let requested = pswap.storage().requested_faucet_id();
-            let (_, remainder) = pswap
-                .execute(
-                    test_consumer(),
-                    None,
-                    Some(FungibleAsset::new(requested, 40).unwrap()),
-                )
-                .unwrap();
-            let remainder = remainder.map(Note::from);
-            SettlementInputRow {
-                tx_id: vec![tx; 32],
-                parent_note_id: id(parent),
-                child_note_id: remainder.as_ref().map(id),
-                child_note_data: remainder.as_ref().map(Serializable::to_bytes),
-                fill_amount: Some(40),
-            }
-        })
+        .map(|parent| postgres_test::fill(tx, parent, 40).0)
         .collect();
-    let attempt = SettlementAttemptRow {
-        tx_id: vec![tx; 32],
-        tx_result: vec![tx],
-        status: "prepared".into(),
-    };
-    conn.transaction::<_, DbError, _>(|conn| prepare_settlement_tx(conn, &attempt, &inputs, None))?;
-    Ok(())
+    postgres_test::prepare(conn, tx, &inputs)
 }
 
 fn release(
@@ -512,6 +488,14 @@ fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {
     assert_eq!(listed.len(), 3);
     assert!(listed.iter().any(|row| row.note_id == id(&waiting)));
     cancel(conn, alpha, 4, &cancelled)?;
+    // A waiting order its maker cancelled drops out of the listing, though
+    // its row is still `waiting`.
+    let listed: Vec<_> = maker_db::active_maker_orders_page_tx(conn, alpha, &[], 10, 0)?
+        .into_iter()
+        .map(|row| row.note_id)
+        .collect();
+    assert_eq!(listed.len(), 2);
+    assert!(!listed.contains(&id(&cancelled)));
     let submissions = [
         pending(conn, &waiting)?,
         pending(conn, &live_one)?,
@@ -877,6 +861,19 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     for (seq, order) in [(1, &active), (2, &waiting), (3, &confirmed)] {
         accept(conn, alpha, seq, order)?;
     }
+    // On the confirmed path, with the row ingest stores for a public note:
+    // pending, but never unconfirmed.
+    let slow = note(4);
+    accept_with(conn, alpha, 4, &MakerCommand::submit(slow.clone())?, None)?;
+    diesel::insert_into(orders::table)
+        .values(&NewOrderRow::parsed(&slow, 1)?)
+        .execute(conn)?;
+    // No row is `waiting` yet, so only the guard can refuse the rollback.
+    let refused = postgres_migrations::revert_last(conn).expect_err("the guard refuses");
+    assert!(
+        refused.to_string().contains("run the escape hatch first"),
+        "{refused}"
+    );
     set_status(conn, &waiting, "waiting")?;
     let submission = pending(conn, &confirmed)?;
     conn.transaction::<_, DbError, _>(|conn| maker_db::activate_tx(conn, &[submission], 1))?;
@@ -898,6 +895,9 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
         assert_eq!(status(conn, order)?.as_deref(), Some("stopped"));
     }
     assert_eq!(status(conn, &confirmed)?.as_deref(), Some("active"));
+    // The confirmed-path order is not the hatch's.
+    assert_eq!(lineage(conn, &slow)?.0, "pending");
+    assert_eq!(status(conn, &slow)?.as_deref(), Some("active"));
     let cancels = statuses(conn, alpha)?
         .into_iter()
         .filter(|(_, state, reason)| {

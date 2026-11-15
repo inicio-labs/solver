@@ -473,14 +473,30 @@ pub(crate) mod tests {
             .select(crate::db::postgres_schema::sync_state::owner_epoch)
             .first(&mut fixture.conn)?;
         let barrier = Arc::new(Barrier::new(2));
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel::<i32>();
         let ingest = std::thread::spawn({
             let (url, barrier) = (fixture.url.clone(), barrier.clone());
             move || -> anyhow::Result<()> {
                 let mut conn = connect(&url)?;
                 conn.batch_execute("BEGIN; UPDATE sync_state SET last_fetched_block = 5")?;
                 barrier.wait();
-                // Let the intake round take whatever it takes first.
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Let the intake round take whatever it takes first: whatever
+                // the order, it ends up waiting on this transaction's lock.
+                let pid = pid_rx.recv()?;
+                let mut watch = connect(&url)?;
+                let started = std::time::Instant::now();
+                while !diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(&format!(
+                    "EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE pid = {pid} AND wait_event_type = 'Lock')"
+                )))
+                .get_result::<bool>(&mut watch)?
+                {
+                    anyhow::ensure!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "the intake round never waited on a lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 conn.batch_execute(&format!(
                     "UPDATE makers SET next_event_seq = next_event_seq WHERE maker_id = {alpha}; COMMIT"
                 ))?;
@@ -497,6 +513,11 @@ pub(crate) mod tests {
                 )];
                 let gate =
                     AcceptGate::new(epoch, || Some(miden_protocol::block::BlockNumber::from(7)));
+                let pid = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>(
+                    "pg_backend_pid()",
+                ))
+                .get_result::<i32>(&mut conn)?;
+                pid_tx.send(pid)?;
                 barrier.wait();
                 let outcomes = conn.transaction::<_, crate::db::DbError, _>(|conn| {
                     intake_round_tx(conn, &commands, Some(&gate))

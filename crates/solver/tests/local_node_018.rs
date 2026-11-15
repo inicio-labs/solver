@@ -31,7 +31,7 @@ use miden_client::rpc::{
 };
 use miden_client::testing::common::{AccountSetup, TestClient};
 use miden_client::transaction::{
-    PaymentNoteDescription, TransactionRequestBuilder, TransactionStatus,
+    DiscardCause, PaymentNoteDescription, TransactionRequestBuilder, TransactionStatus,
 };
 use miden_client::{Client, ClientError};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
@@ -166,7 +166,17 @@ fn consume(note: Note) -> Result<miden_client::transaction::TransactionRequest> 
 
 /// Wait until `tx` is committed or discarded in `client`'s store.
 async fn settled(client: &mut TestClient, tx: TransactionId) -> Result<TransactionStatus> {
-    for _ in 0..120 {
+    settled_within(client, tx, Duration::from_secs(60)).await
+}
+
+/// [`settled`], waiting up to `max_wait`.
+async fn settled_within(
+    client: &mut TestClient,
+    tx: TransactionId,
+    max_wait: Duration,
+) -> Result<TransactionStatus> {
+    let deadline = std::time::Instant::now() + max_wait;
+    while std::time::Instant::now() < deadline {
         client
             .sync_state()
             .await
@@ -183,7 +193,51 @@ async fn settled(client: &mut TestClient, tx: TransactionId) -> Result<Transacti
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    bail!("transaction {tx} still pending after a minute")
+    bail!("transaction {tx} still pending after {max_wait:?}")
+}
+
+/// The protocol caps a transaction moving the fee asset (USDCx) at this many
+/// blocks after its reference block.
+const FEE_ASSET_EXPIRY_CAP_BLOCKS: u32 = 20;
+
+/// `solver_maker_watcher_synced_block` from the solver's `/metrics`.
+async fn watcher_synced_block(obs_port: u16) -> Option<f64> {
+    let body = reqwest::get(format!("http://127.0.0.1:{obs_port}/metrics"))
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    body.lines().find_map(|line| {
+        line.strip_prefix("solver_maker_watcher_synced_block ")?
+            .parse()
+            .ok()
+    })
+}
+
+/// Serialises writes of the refusals fixture.
+static FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set `key` in the refusals fixture, keeping what the other capture tests
+/// wrote, so they can run in any order. A first capture starts the file.
+fn merge_fixture(key: &str, value: serde_json::Value) -> Result<()> {
+    let _one = FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/node-0.18-refusals.json");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut fixture: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    fixture["node"] = serde_json::json!("0.18.0 (local network, commit 076f4db)");
+    fixture["client"] = serde_json::json!("miden-client 0.17.5");
+    fixture[key] = value;
+    std::fs::write(&path, serde_json::to_string_pretty(&fixture)? + "\n")?;
+    println!("updated {}", path.display());
+    Ok(())
 }
 
 fn state_conflict_message(error: &ClientError) -> Option<&str> {
@@ -273,6 +327,13 @@ async fn a_note_waiting_in_the_mempool_can_be_spent() -> Result<()> {
                 "created in block {ab}, spent in block {bb}; note found by ID: {}",
                 !found.is_empty()
             );
+            // In one block the note is erased: no longer found by its ID. A
+            // block apart, it is on chain.
+            ensure!(
+                (ab == bb) == found.is_empty(),
+                "created in block {ab}, spent in block {bb}, found by ID: {}",
+                !found.is_empty()
+            );
             Ok(())
         })
         .await
@@ -321,19 +382,13 @@ async fn the_node_names_unknown_notes_in_its_refusal() -> Result<()> {
             );
 
             if std::env::var("SOLVER_LOCAL_NODE_WRITE_FIXTURE").as_deref() == Ok("1") {
-                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/node-0.18-refusals.json");
-                std::fs::create_dir_all(path.parent().unwrap())?;
-                let fixture = serde_json::json!({
-                    "node": "0.18.0 (local network, commit 076f4db)",
-                    "client": "miden-client 0.17.5",
-                    "unknown_notes": {
+                merge_fixture(
+                    "unknown_notes",
+                    serde_json::json!({
                         "message": message,
                         "unknown_note": hex::encode(unsent.to_bytes()),
-                    },
-                });
-                std::fs::write(&path, serde_json::to_string_pretty(&fixture)? + "\n")?;
-                println!("wrote {}", path.display());
+                    }),
+                )?;
             }
             Ok(())
         })
@@ -356,11 +411,17 @@ async fn a_fee_asset_transfer_expires_within_its_cap() -> Result<()> {
             let executed = result.executed_transaction();
             let reference = executed.block_header().block_num();
             let expiration = executed.expiration_block_num();
-            println!(
-                "reference block {reference}, expires at {expiration} ({} blocks)",
-                expiration.as_u32() - reference.as_u32()
+            let blocks = expiration
+                .as_u32()
+                .checked_sub(reference.as_u32())
+                .with_context(|| {
+                    format!("expires at {expiration}, before its reference {reference}")
+                })?;
+            println!("reference block {reference}, expires at {expiration} ({blocks} blocks)");
+            ensure!(
+                (1..=FEE_ASSET_EXPIRY_CAP_BLOCKS).contains(&blocks),
+                "expires {blocks} blocks after its reference, cap {FEE_ASSET_EXPIRY_CAP_BLOCKS}"
             );
-            ensure!(expiration.as_u32() > reference.as_u32());
             Ok(())
         })
         .await
@@ -373,10 +434,8 @@ async fn a_fee_asset_transfer_expires_within_its_cap() -> Result<()> {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a local Miden node 0.18 (see the module docs)"]
 async fn a_node_restart_loses_a_waiting_transaction() -> Result<()> {
-    let Ok(compose_dir) = std::env::var("SOLVER_LOCAL_NODE_COMPOSE_DIR") else {
-        println!("SOLVER_LOCAL_NODE_COMPOSE_DIR not set; skipped");
-        return Ok(());
-    };
+    let compose_dir = std::env::var("SOLVER_LOCAL_NODE_COMPOSE_DIR")
+        .context("set SOLVER_LOCAL_NODE_COMPOSE_DIR to the node's docker compose directory")?;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -404,16 +463,31 @@ async fn a_node_restart_loses_a_waiting_transaction() -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            let spend = Box::pin(w.bob_client.submit_new_transaction(w.bob, consume(note.clone())?)).await;
-            match &spend {
-                Ok(_) => println!("after the restart, the spend was ACCEPTED: the node kept the waiting transaction"),
-                Err(error) => println!(
-                    "after the restart, the spend was refused: {}",
-                    state_conflict_message(error).map_or_else(|| format!("{error:?}"), str::to_owned)
-                ),
-            }
-            let status = settled(&mut w.alice_client, created).await;
+            // The waiting transaction is gone, so its note is unknown again.
+            // A node that keeps its mempool across restarts fails here.
+            let refused = Box::pin(
+                w.bob_client
+                    .submit_new_transaction(w.bob, consume(note.clone())?),
+            )
+            .await
+            .expect_err("the node kept the waiting transaction across its restart");
+            let message = state_conflict_message(&refused)
+                .with_context(|| format!("not a state conflict: {refused:?}"))?;
+            println!("after the restart, the spend was refused:\n{message}");
+            ensure!(
+                message.contains("unauthenticated input notes are unknown")
+                    && message.contains(&format!("{:?}", note.id())),
+                "the refusal does not name the note: {message}"
+            );
+            // The maker's client learns it only when the transaction expires,
+            // 20 blocks of about 3 s after its reference block.
+            let status =
+                settled_within(&mut w.alice_client, created, Duration::from_secs(180)).await?;
             println!("the maker's own transaction: {status:?}");
+            ensure!(
+                matches!(status, TransactionStatus::Discarded(DiscardCause::Expired)),
+                "the maker's transaction is {status:?}, not expired"
+            );
             Ok(())
         })
         .await
@@ -488,16 +562,13 @@ async fn a_second_spend_of_a_waiting_spend_is_refused_by_nullifier() -> Result<(
             ensure!(message.contains("nullifiers already exist"), "{message}");
 
             if std::env::var("SOLVER_LOCAL_NODE_WRITE_FIXTURE").as_deref() == Ok("1") {
-                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/node-0.18-refusals.json");
-                let mut fixture: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-                fixture["mempool_nullifiers"] = serde_json::json!({
-                    "message": message,
-                    "spent_note": hex::encode(note.to_bytes()),
-                });
-                std::fs::write(&path, serde_json::to_string_pretty(&fixture)? + "\n")?;
-                println!("updated {}", path.display());
+                merge_fixture(
+                    "mempool_nullifiers",
+                    serde_json::json!({
+                        "message": message,
+                        "spent_note": hex::encode(note.to_bytes()),
+                    }),
+                )?;
             }
             Ok(())
         })
@@ -630,7 +701,7 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
             engine.fetch_interval_ms = 500;
             engine.obs_port = free_port();
             engine.maker_live_at_accept = true;
-            let port = engine.maker_gateway_port;
+            let (port, obs_port) = (engine.maker_gateway_port, engine.obs_port);
             let ingest_store = dir.path().join("ingest.sqlite3");
             let config = SolverConfig {
                 rpc: RpcConfig {
@@ -698,8 +769,16 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
                     );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                // Give the watcher a fresh block before the maker submits.
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // The watcher must have read a block, or the order would
+                // fall back to the confirmed path as `watcher_stale`.
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while watcher_synced_block(obs_port).await.unwrap_or(0.0) <= 0.0 {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "the maker watcher never synced"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
 
                 // The maker: transaction first, then SubmitOrder.
                 let request = TransactionRequestBuilder::new()
@@ -747,8 +826,8 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
 
                 let url = pg.url.clone();
                 let note_id = order.id().to_bytes();
-                let (status, lineage) =
-                    tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+                let (status, (lineage, flagged)) =
+                    tokio::task::spawn_blocking(move || -> Result<(String, (String, bool))> {
                         use diesel::prelude::*;
                         use solver::db::postgres_schema::{maker_lineages, orders};
                         let mut conn = solver::db::postgres_migrations::connect(&url)?;
@@ -758,12 +837,16 @@ async fn the_solver_settles_a_live_at_accept_order_on_node_0_18() -> Result<()> 
                             .get_result(&mut conn)?;
                         let lineage = maker_lineages::table
                             .filter(maker_lineages::note_id.eq(&note_id))
-                            .select(maker_lineages::state)
+                            .select((maker_lineages::state, maker_lineages::live_at_accept))
                             .get_result(&mut conn)?;
                         Ok((status, lineage))
                     })
                     .await??;
-                println!("maker order {status}, lineage {lineage}");
+                println!("maker order {status}, lineage {lineage}, live at accept {flagged}");
+                // The confirmed path also ends `executed` and `activated`
+                // when a block lands quickly: only the flag shows it went
+                // live at accept.
+                ensure!(flagged, "the order took the confirmed path");
                 ensure!(status == "executed" && lineage == "activated");
                 Ok(())
             }

@@ -34,7 +34,7 @@ fn expected_versions() -> DbResult<BTreeSet<String>> {
         .collect())
 }
 
-fn applied_versions(conn: &mut PgConnection) -> DbResult<BTreeSet<String>> {
+pub(crate) fn applied_versions(conn: &mut PgConnection) -> DbResult<BTreeSet<String>> {
     Ok(
         diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
             .load::<AppliedVersion>(conn)

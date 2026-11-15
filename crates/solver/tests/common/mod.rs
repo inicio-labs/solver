@@ -35,19 +35,27 @@ use tempfile::TempDir;
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Held by every live [`PgSchema`]: the database URLs it sets are the whole
+/// process's, so two at once would let one test's solver open the other's
+/// schema.
+static ONE_SCHEMA: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One fresh PostgreSQL application schema for a full solver integration test.
-/// Each integration file has one solver test, so its process-local URL settings
-/// cannot race another test in the same process.
+/// It sets the process's database URLs, so the tests of one file run one at a
+/// time whatever the thread count: a second `new` waits for the first schema
+/// to drop.
 pub struct PgSchema {
     pub url: String,
     base_url: String,
     name: String,
     prior_writer: Option<String>,
     prior_reader: Option<String>,
+    _one: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl PgSchema {
     pub async fn new() -> Result<Self> {
+        let one = ONE_SCHEMA.lock().await;
         let base_url = std::env::var("SOLVER_TEST_DATABASE_URL")?;
         let setup_url = base_url.clone();
         let (name, url) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -75,6 +83,7 @@ impl PgSchema {
             name,
             prior_writer,
             prior_reader,
+            _one: one,
         })
     }
 }

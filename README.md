@@ -142,6 +142,7 @@ SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integrat
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_three_user_direct -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_partial_fill -- --ignored
 SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_unpriced_direct -- --ignored
+SOLVER_TEST_DATABASE_URL='postgresql://…' cargo test -p solver --test integration_maker_gateway -- --ignored
 ```
 
 `integration_unpriced_direct` locks audit finding C2: a pair whose Binance

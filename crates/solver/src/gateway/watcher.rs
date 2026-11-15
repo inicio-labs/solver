@@ -570,6 +570,8 @@ pub struct Watcher<T> {
     watched: HashMap<Vec<u8>, Note>,
     height: SyncedHeight,
     cap: UnconfirmedCap,
+    /// Watched notes the last round could not read; `/metrics` shows it.
+    unobserved: usize,
     /// Where this round's cap lookups start among the pending submissions,
     /// moved on every round so notes whose lookups keep failing can't hold
     /// the per-round budget.
@@ -585,6 +587,7 @@ impl<T: MakerTracker> Watcher<T> {
             watched: HashMap::new(),
             height: SyncedHeight::default(),
             cap: UnconfirmedCap::default(),
+            unobserved: 0,
             lookup_start: 0,
         }
     }
@@ -643,6 +646,7 @@ impl<T: MakerTracker> Watcher<T> {
             .chain(self.watched.values())
             .filter(|note| !observations.contains_key(&note.id()))
             .count();
+        self.unobserved = unobserved;
         UNOBSERVED.store(unobserved as u64, Ordering::Relaxed);
         if unobserved > 0 {
             tracing::warn!(unobserved, "maker notes without an observation this round");
@@ -1978,10 +1982,9 @@ mod tests {
         // Not due yet: no decision for either.
         f.watcher.round().await.unwrap();
         assert_eq!(f.chain.state().lookups, 0);
-        assert_eq!(
-            crate::gateway::watcher_gauges().map(|g| g.unobserved >= 2),
-            Some(true)
-        );
+        // The process-wide gauge is shared with other tests' rounds: read the
+        // watcher's own count.
+        assert_eq!(f.watcher.unobserved, 2);
         f.age(3600).await;
         f.watcher.round().await.unwrap();
         assert_eq!(f.chain.state().lookups, 2);

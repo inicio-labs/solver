@@ -482,6 +482,20 @@ impl Scenario {
         Ok(())
     }
 
+    /// Wait until a transaction in the mock's mempool spends `note`.
+    async fn wait_in_mempool(&self, note: &Note) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !self.rpc.waiting_spends(note.nullifier()) {
+            ensure!(!self.stopped(), "solver stopped before submitting");
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "no transaction spending the order reached the mempool"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
     /// Prove blocks until the maker's settlement resolves as committed, well
     /// inside its 20-block validity window.
     async fn prove_until_committed(&mut self) -> Result<()> {
@@ -669,6 +683,10 @@ async fn a_live_at_accept_order_trades_in_the_block_that_creates_it() -> Result<
                 s.wait_for_live(&order, Duration::from_secs(10)).await?;
                 wait_for_submitted_settlement(&s.pg.url, Duration::from_secs(900), || s.stopped())
                     .await?;
+                // The attempt row is written before the node is called: the
+                // first block must hold the settlement too, or the watcher
+                // would see the note first.
+                s.wait_in_mempool(&order).await?;
                 s.prove_until_committed().await?;
 
                 let (status, lineage) = s.state(&order).await?;

@@ -119,6 +119,16 @@ impl NodeLikeRpc {
         })
     }
 
+    /// Whether a transaction waiting in the mempool spends `nullifier`.
+    pub fn waiting_spends(&self, nullifier: Nullifier) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .waiting
+            .values()
+            .any(|effects| effects.nullifiers.contains(&nullifier))
+    }
+
     /// Commit every queued transaction in one block. A note created and
     /// spent in that block was erased and is unknown again.
     pub fn prove_block(&self) {

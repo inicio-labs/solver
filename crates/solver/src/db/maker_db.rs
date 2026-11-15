@@ -1800,7 +1800,10 @@ mod tests {
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
     use crate::db::postgres_schema::live_orders;
-    use crate::db::postgres_test::TestSchema;
+    use crate::db::postgres_test::{fill, prepare, revert_after, TestSchema};
+
+    /// The migration that adds the maker tables.
+    const MAKER_GATEWAY: &str = "20261003000001";
     use crate::types::OrderKeys;
     use crate::types::{BookOrder, BookUpdate, SettlementError};
     use anyhow::Result;
@@ -2768,41 +2771,6 @@ mod tests {
         Ok(())
     }
 
-    /// A settlement input filling `parent` with `amount` exactly as the executor
-    /// does, and the payback and remainder notes the transaction creates.
-    fn fill(tx: u8, parent: &Note, amount: u64) -> (SettlementInputRow, Note, Option<Note>) {
-        let pswap = PswapNote::try_from(parent).unwrap();
-        let requested = pswap.storage().requested_faucet_id();
-        let (payback, remainder) = pswap
-            .execute(
-                test_consumer(),
-                None,
-                Some(FungibleAsset::new(requested, amount).unwrap()),
-            )
-            .unwrap();
-        let remainder = remainder.map(Note::from);
-        let row = SettlementInputRow {
-            tx_id: vec![tx; 32],
-            parent_note_id: parent.id().to_bytes().to_vec(),
-            child_note_id: remainder.as_ref().map(|note| note.id().to_bytes().to_vec()),
-            child_note_data: remainder.as_ref().map(Serializable::to_bytes),
-            fill_amount: Some(i64::try_from(amount).unwrap()),
-        };
-        (row, payback, remainder)
-    }
-
-    fn prepare(conn: &mut PgConnection, tx: u8, inputs: &[SettlementInputRow]) -> Result<()> {
-        let attempt = SettlementAttemptRow {
-            tx_id: vec![tx; 32],
-            tx_result: vec![tx],
-            status: "prepared".into(),
-        };
-        conn.transaction::<_, DbError, _>(|conn| {
-            prepare_settlement_tx(conn, &attempt, inputs, None)
-        })?;
-        Ok(())
-    }
-
     fn settlement_events(
         conn: &mut PgConnection,
         maker_id: MakerId,
@@ -3545,17 +3513,12 @@ mod tests {
         let conn = &mut fixture.conn;
         let alpha = maker(conn, "alpha")?;
         run(conn, alpha, "s1", 1, submit(&note(1)))?;
-        // Live at accept (ADR 0008), the token column (ADR 0004), expiry and
-        // the later columns go first; the maker tables refuse.
-        for _ in 0..5 {
-            postgres_migrations::revert_last(conn)?;
-        }
+        // Every migration after the maker tables goes first; they refuse.
+        revert_after(conn, MAKER_GATEWAY)?;
         assert!(postgres_migrations::revert_last(conn).is_err());
 
         let mut empty = TestSchema::migrated()?;
-        for _ in 0..6 {
-            postgres_migrations::revert_last(&mut empty.conn)?;
-        }
+        revert_after(&mut empty.conn, "20260930000001")?;
         postgres_migrations::migrate(&mut empty.conn)?;
         Ok(())
     }
@@ -3576,11 +3539,8 @@ mod tests {
             let conn = &mut fixture.conn;
             let alpha = maker(conn, "alpha")?;
             run(conn, alpha, "c1", 1, cancel)?;
-            // Live at accept (ADR 0008), the token column (ADR 0004), expiry
-            // and the later columns go first; the maker tables refuse.
-            for _ in 0..5 {
-                postgres_migrations::revert_last(conn)?;
-            }
+            // Every migration after the maker tables goes first; they refuse.
+            revert_after(conn, MAKER_GATEWAY)?;
             assert!(postgres_migrations::revert_last(conn).is_err());
         }
         Ok(())
@@ -3642,10 +3602,8 @@ mod tests {
         })?;
         assert_eq!(update.active[0].id(), child.unwrap().id());
         assert_eq!(update.active[0].maker.unwrap().expires_at_unix_ms, Some(1));
-        // Live at accept (ADR 0008) and the token column (ADR 0004) go first;
-        // the expiry refuses.
-        postgres_migrations::revert_last(conn)?;
-        postgres_migrations::revert_last(conn)?;
+        // Every migration after the expiry goes first; it refuses.
+        revert_after(conn, "20261005000002")?;
         assert!(
             postgres_migrations::revert_last(conn).is_err(),
             "rollback cannot discard a recorded expiry"

@@ -112,7 +112,7 @@ pub fn revert_last(conn: &mut PgConnection) -> DbResult<String> {
 /// The live-at-accept escape hatch (ADR 0008): with the solver stopped, close
 /// every order that went live at accept and still lacks its note. Refuses
 /// while a solver owns the database.
-pub fn cancel_unconfirmed(conn: &mut PgConnection) -> DbResult<Vec<(i64, usize)>> {
+pub fn cancel_unconfirmed(conn: &mut PgConnection) -> DbResult<super::maker_db::HatchReport> {
     verify(conn)?;
     super::postgres_pool::with_ownership_lock(conn, |conn| {
         conn.transaction(super::maker_db::cancel_unconfirmed_tx)

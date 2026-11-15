@@ -614,7 +614,7 @@ pub fn finish_discarded_settlement_tx(
     // Roots that went live at accept: their lineage's state and maker.
     let flagged: HashMap<Vec<u8>, (String, i64)> = maker_lineages::table
         .filter(maker_lineages::note_id.eq_any(&parent_ids))
-        .filter(maker_lineages::live_at_accept.eq(true))
+        .filter(maker_lineages::live_at_accept)
         .select((
             maker_lineages::note_id,
             maker_lineages::state,
@@ -731,9 +731,9 @@ pub fn finish_discarded_settlement_tx(
     Ok(released)
 }
 
-/// [`confirm_settlement_with_tx`], for tests that need only the book update.
+/// [`confirm_settlement_tx`], for tests that need only the book update.
 #[cfg(test)]
-pub fn confirm_settlement_tx(
+pub fn confirm_settlement_update_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
@@ -741,7 +741,7 @@ pub fn confirm_settlement_tx(
     consumer: AccountId,
     cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<BookUpdate> {
-    Ok(confirm_settlement_with_tx(
+    Ok(confirm_settlement_tx(
         conn,
         tx_id,
         consumed_children,
@@ -771,7 +771,7 @@ pub struct ConfirmedSettlement {
 /// OnchainNullified and never activated.
 ///
 /// Also returns the makers whose unconfirmed orders it activated (ADR 0008).
-pub fn confirm_settlement_with_tx(
+pub fn confirm_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed_children: &HashSet<OrderId>,
@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!((attempts, mappings), (1, 511));
 
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &attempt.tx_id,
                 &HashSet::new(),
@@ -1143,7 +1143,7 @@ mod tests {
             );
         }
         let duplicate = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &attempt.tx_id,
                 &HashSet::new(),
@@ -1200,7 +1200,7 @@ mod tests {
                 conn.batch_execute(&format!("SET search_path TO {schema}"))?;
                 barrier.wait();
                 let update = conn.transaction::<_, DbError, _>(|conn| {
-                    confirm_settlement_tx(
+                    confirm_settlement_update_tx(
                         conn,
                         &[7],
                         &HashSet::new(),
@@ -1322,7 +1322,7 @@ mod tests {
             conn.batch_execute(&format!("SET search_path TO {confirm_schema}"))?;
             confirm_barrier.wait();
             conn.transaction::<_, DbError, _>(|conn| {
-                confirm_settlement_tx(
+                confirm_settlement_update_tx(
                     conn,
                     &[41],
                     &HashSet::new(),

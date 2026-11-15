@@ -29,8 +29,7 @@ DROP INDEX maker_lineages_flagged_note_idx;
 ALTER TABLE maker_lineages
     DROP CONSTRAINT maker_lineages_live_at_accept_check,
     DROP COLUMN live_at_accept,
-    DROP COLUMN accept_block,
-    DROP COLUMN activated_at;
+    DROP COLUMN accept_block;
 ALTER TABLE orders DROP CONSTRAINT orders_status_check;
 ALTER TABLE orders ADD CONSTRAINT orders_status_check
     CHECK (status IN ('active', 'settling', 'executed', 'onchain_nullified', 'stopped'));

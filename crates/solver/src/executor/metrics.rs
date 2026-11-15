@@ -108,14 +108,6 @@ pub(crate) fn refusal_code(error: &ClientError) -> RefusalCode {
     }
 }
 
-/// A refusal as text for logs, with what the node said. `ClientError`
-/// displays only "RPC error"; the inner error names the endpoint and the gRPC
-/// status, and carries the node's message when it is typed, otherwise its
-/// source (the gRPC status) does.
-pub(crate) fn refusal_detail(error: &ClientError) -> String {
-    crate::ingest::client_error_detail(error)
-}
-
 pub(crate) fn record_refusal(code: RefusalCode, attempt: RefusalAttempt) {
     REFUSALS[code as usize][attempt as usize].fetch_add(1, Ordering::Relaxed);
 }
@@ -284,29 +276,5 @@ mod tests {
         record_release(ReleaseCause::Dropped, 0, true);
         record_release(ReleaseCause::Refused, 0, true);
         assert_eq!(count("true"), before + 1);
-    }
-
-    #[test]
-    fn refusal_detail_carries_the_node_text() {
-        let typed = refused(Some(AddTransactionError::StateConflict {
-            message: "unauthenticated input notes are unknown: [NoteId(..)]".into(),
-        }));
-        let detail = refusal_detail(&typed);
-        assert!(
-            detail.contains("unauthenticated input notes are unknown"),
-            "{detail}"
-        );
-        assert!(detail.contains("submit_proven_transaction"), "{detail}");
-
-        // Untyped: the node's text is only in the source status.
-        let untyped = ClientError::RpcError(RpcError::RequestError {
-            endpoint: RpcEndpoint::SubmitProvenTx,
-            error_kind: GrpcError::InvalidArgument,
-            endpoint_error: None,
-            source: Some(Box::new(std::io::Error::other(
-                "Invalid proof for transaction",
-            ))),
-        });
-        assert!(refusal_detail(&untyped).ends_with(": Invalid proof for transaction"));
     }
 }

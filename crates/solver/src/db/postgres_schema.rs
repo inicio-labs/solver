@@ -90,7 +90,6 @@ diesel::table! {
         expires_at_unix_ms -> Nullable<BigInt>,
         live_at_accept -> Bool,
         accept_block -> Nullable<BigInt>,
-        activated_at -> Nullable<Timestamptz>,
     }
 }
 

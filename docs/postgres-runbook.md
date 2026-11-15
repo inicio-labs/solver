@@ -239,7 +239,7 @@ has already ingested.
 SOLVER_DATABASE_URL=… solver-bin cancel-unconfirmed
 ```
 
-It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints the count per maker. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist.
+It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints how many lineages it closed and how many orders it cancelled per maker. A lineage whose order a settlement still holds, or its maker had cancelled, is closed with no order cancelled. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist.
 
 **Alerts:**
 - `solver_maker_unknown_notes_named_total` rising for one maker: its transactions reach the node after its `SubmitOrder`, or not at all.

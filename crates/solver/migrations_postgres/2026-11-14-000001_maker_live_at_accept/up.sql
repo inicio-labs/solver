@@ -1,6 +1,7 @@
 -- Maker orders that go live when the gateway accepts them, before their note
 -- is in a block (ADR 0008). A `waiting` order is out of the book until its
--- note lands; the lineage records that it went live at accept and when.
+-- note lands; the lineage records that it went live at accept, and the
+-- watcher's block then.
 ALTER TABLE orders DROP CONSTRAINT orders_status_check;
 ALTER TABLE orders ADD CONSTRAINT orders_status_check
     CHECK (status IN ('active', 'settling', 'executed', 'onchain_nullified', 'stopped', 'waiting'));
@@ -8,7 +9,6 @@ ALTER TABLE orders ADD CONSTRAINT orders_status_check
 ALTER TABLE maker_lineages
     ADD COLUMN live_at_accept BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN accept_block BIGINT CHECK (accept_block >= 0),
-    ADD COLUMN activated_at TIMESTAMPTZ,
     ADD CONSTRAINT maker_lineages_live_at_accept_check
         CHECK (NOT live_at_accept OR accept_block IS NOT NULL);
 

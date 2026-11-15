@@ -688,7 +688,8 @@ impl IntakeSession {
         self
     }
 
-    /// Wake `wake` instead of the process's event streams (tests).
+    /// Wake `wake` instead of the process's event streams.
+    #[cfg(test)]
     pub fn with_event_wake(mut self, wake: crate::maker::EventWake) -> Self {
         self.wake = wake;
         self

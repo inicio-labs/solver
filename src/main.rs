@@ -183,12 +183,15 @@ fn main() -> anyhow::Result<()> {
             let url = env::var("SOLVER_DATABASE_URL")
                 .context("set SOLVER_DATABASE_URL for cancel-unconfirmed")?;
             let mut conn = solver::db::postgres_migrations::connect(&url)?;
-            let cancelled = solver::db::postgres_migrations::cancel_unconfirmed(&mut conn)
+            let report = solver::db::postgres_migrations::cancel_unconfirmed(&mut conn)
                 .context("cancel unconfirmed maker orders (is the solver stopped?)")?;
-            if cancelled.is_empty() {
+            if report.lineages_closed == 0 && report.cancelled.is_empty() {
                 println!("No unconfirmed maker orders");
             }
-            for (maker_id, orders) in cancelled {
+            if report.lineages_closed > 0 {
+                println!("{} unconfirmed lineage(s) closed", report.lineages_closed);
+            }
+            for (maker_id, orders) in report.cancelled {
                 println!("maker {maker_id}: {orders} order(s) cancelled (note_not_received)");
             }
             return Ok(());

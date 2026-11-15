@@ -1816,7 +1816,7 @@ mod tests {
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn b1_s1_s2_through_a_clearing_round_and_its_reservation() -> anyhow::Result<()> {
-        use crate::db::maker_db::{create_maker_tx, execute_command_tx, read_events_tx};
+        use crate::db::maker_db::{create_maker_tx, execute_command_confirmed_tx, read_events_tx};
         use crate::db::postgres_db::{
             insert_orders_batch_tx, load_live_orders_tx, reserve_settlement_tx, test_consumer,
         };
@@ -1854,7 +1854,7 @@ mod tests {
                 let header = CommandHeader::new(maker, format!("s{seq}"), seq)?;
                 let submit = MakerCommand::submit(order.note.as_ref().clone())?;
                 conn.transaction::<_, DbError, _>(|conn| {
-                    execute_command_tx(conn, &header, &submit)
+                    execute_command_confirmed_tx(conn, &header, &submit)
                 })?;
             }
             let rows: Vec<_> = named

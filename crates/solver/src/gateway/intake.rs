@@ -13,7 +13,7 @@ use diesel::pg::PgConnection;
 use miden_protocol::note::NoteType;
 
 use super::metrics as gateway_metrics;
-use crate::db::maker_db::{execute_command_with_tx, AcceptGate, AcceptMode, CommandOutcome};
+use crate::db::maker_db::{execute_command_tx, AcceptGate, AcceptMode, CommandOutcome};
 use crate::db::{DbResult, IntakeSession};
 use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerId};
 
@@ -232,7 +232,7 @@ pub(crate) fn intake_round_tx(
     commands
         .iter()
         .map(|(header, command)| {
-            let outcome = execute_command_with_tx(conn, header, command, accept)?;
+            let outcome = execute_command_tx(conn, header, command, accept)?;
             Ok((header.maker_id, outcome))
         })
         .collect()
@@ -791,7 +791,8 @@ pub(crate) mod tests {
             let mut conn = crate::db::postgres_migrations::connect(&url)?;
             let stored = maker_db::stored_result_tx(&mut conn, alpha, &request_id)?;
             let live = crate::db::postgres_db::load_live_orders_tx(&mut conn)?;
-            let replay = maker_db::execute_command_tx(&mut conn, &retry_header, &retry_command)?;
+            let replay =
+                maker_db::execute_command_confirmed_tx(&mut conn, &retry_header, &retry_command)?;
             Ok((stored, live, replay))
         })
         .await

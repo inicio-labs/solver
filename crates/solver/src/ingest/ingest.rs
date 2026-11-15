@@ -650,7 +650,7 @@ pub mod tests {
         // retired, so confirmation retires the parent and activates nothing.
         let consumed_child: HashSet<_> = [child.id()].into_iter().collect();
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            db::postgres_db::confirm_settlement_tx(
+            db::postgres_db::confirm_settlement_update_tx(
                 conn,
                 &tx_id,
                 &consumed_child,
@@ -821,7 +821,7 @@ pub mod tests {
         // already-ingested remainder is not announced to the matcher again.
         let update = pool
             .write(move |conn| {
-                db::postgres_db::confirm_settlement_tx(
+                db::postgres_db::confirm_settlement_update_tx(
                     conn,
                     &tx_id,
                     &HashSet::new(),

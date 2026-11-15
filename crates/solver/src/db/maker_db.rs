@@ -168,7 +168,7 @@ pub fn prelock_watcher_tx(
 ) -> DbResult<()> {
     let submissions = || activations.iter().chain(rejections).chain(capped);
     let mut note_ids = spent_ids.to_vec();
-    note_ids.extend(submissions().map(|s| s.note.id().to_bytes().to_vec()));
+    note_ids.extend(submissions().map(|s| s.note_id.clone()));
     note_ids.sort();
     note_ids.dedup();
     if !note_ids.is_empty() {
@@ -193,23 +193,21 @@ pub fn prelock_watcher_tx(
     lock_makers_ordered_tx(conn, &makers)
 }
 
-/// [`execute_command_with_tx`] on the confirmed path, for tests that need
+/// [`execute_command_tx`] on the confirmed path, for tests that need
 /// only the reply and the matcher's update.
 #[cfg(test)]
-pub fn execute_command_tx(
+pub fn execute_command_confirmed_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     command: &MakerCommand,
 ) -> DbResult<(CommandReply, Option<MakerUpdate>)> {
-    let outcome = execute_command_with_tx(conn, header, command, AcceptMode::Off)?;
+    let outcome = execute_command_tx(conn, header, command, AcceptMode::Off)?;
     Ok((outcome.reply, outcome.update))
 }
 
 /// Why a submit with live at accept switched on still took the confirmed path
 /// (ADR 0008), for `/metrics`.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum AcceptFallback {
     /// The watcher's latest block was not read recently enough.
@@ -300,7 +298,7 @@ pub struct CommandOutcome {
 /// Unless `accept` is off, a newly claimed private note goes live in this
 /// transaction (ADR 0008) if the round's watcher block is fresh and the
 /// order is not cancelled already; otherwise it takes the confirmed path.
-pub fn execute_command_with_tx(
+pub fn execute_command_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     command: &MakerCommand,
@@ -706,6 +704,8 @@ pub struct PendingSubmission {
     pub lineage_id: LineageId,
     pub maker_id: MakerId,
     pub note: Note,
+    /// The note's ID as stored, the key of its order row.
+    pub note_id: Vec<u8>,
     /// For an order that went live at accept (ADR 0008): the watcher's
     /// latest block then.
     pub accept_block: Option<BlockNumber>,
@@ -766,10 +766,12 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
                     }
                     (false, _) => None,
                 };
+                let note = Note::read_from_bytes(&payload)?;
                 Ok(PendingSubmission {
                     lineage_id,
                     maker_id,
-                    note: Note::read_from_bytes(&payload)?,
+                    note_id: note.id().to_bytes().to_vec(),
+                    note,
                     accept_block,
                     age_secs,
                     root_settling: status.as_deref() == Some(OrderStatus::Settling.as_str()),
@@ -804,23 +806,12 @@ fn settle_lineages(
     if lineages.is_empty() {
         return Ok(HashSet::new());
     }
-    // Only an activation is stamped; the column is null until then.
-    let activated_at = if state == LineageState::Activated {
-        "now()"
-    } else {
-        "NULL"
-    };
     let changed = diesel::update(
         maker_lineages::table
             .filter(maker_lineages::lineage_id.eq_any(lineages))
             .filter(maker_lineages::state.eq(LineageState::Pending.as_str())),
     )
-    .set((
-        maker_lineages::state.eq(state.as_str()),
-        maker_lineages::activated_at.eq(sql::<
-            diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-        >(activated_at)),
-    ))
+    .set(maker_lineages::state.eq(state.as_str()))
     .returning(maker_lineages::lineage_id)
     .get_results::<Vec<u8>>(conn)?;
     Ok(changed.into_iter().collect())
@@ -939,13 +930,13 @@ pub fn activate_tx(
     // stopped by `write_book` and never reaches it.
     let returned_makers = submissions
         .iter()
-        .map(|s| (s, s.note.id().to_bytes().to_vec()))
+        .map(|s| (s, s.note_id.clone()))
         .filter(|(_, id)| returned.contains(id) && live.contains(id))
         .map(|(s, _)| s.maker_id)
         .collect();
     sent.extend(returned);
     for submission in submissions {
-        let id = submission.note.id().to_bytes().to_vec();
+        let id = submission.note_id.clone();
         if activated.contains(&submission.lineage_id)
             && !submission.unconfirmed()
             && live.contains(&id)
@@ -995,12 +986,10 @@ pub struct Activated {
 /// What a watcher write did beyond its book update, for `/metrics`.
 #[derive(Debug, Default)]
 pub struct WatcherWrites {
-    /// The maker of each order that came back from `waiting`.
-    pub returned: Vec<MakerId>,
+    /// The activation, its update taken out for the book.
+    pub activated: Activated,
     /// The maker of each order the cap cancelled.
     pub cap_cancels: Vec<MakerId>,
-    /// Lineages that went live at accept that the write activated.
-    pub activated: HashSet<LineageId>,
 }
 
 /// Close submissions whose note the watcher found spent before they were
@@ -1018,15 +1007,12 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
         .iter()
         .partition(|submission| submission.unconfirmed());
     let removed = reject_unconfirmed_tx(conn, &unconfirmed)?;
-    let ids: Vec<Vec<u8>> = spent
-        .iter()
-        .map(|s| s.note.id().to_bytes().to_vec())
-        .collect();
+    let ids: Vec<Vec<u8>> = spent.iter().map(|s| s.note_id.clone()).collect();
     let statuses = order_statuses(conn, &ids)?;
     let mut traded = Vec::new();
     let mut unusable = Vec::new();
     for submission in spent {
-        let note_id = submission.note.id().to_bytes().to_vec();
+        let note_id = submission.note_id.clone();
         match statuses.get(&note_id).map(String::as_str) {
             // Our settlement is still in flight: decide once it resolves.
             Some(status) if status == OrderStatus::Settling.as_str() => {}
@@ -1074,17 +1060,14 @@ fn reject_unconfirmed_tx(
     if spent.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<Vec<u8>> = spent
-        .iter()
-        .map(|s| s.note.id().to_bytes().to_vec())
-        .collect();
+    let ids: Vec<Vec<u8>> = spent.iter().map(|s| s.note_id.clone()).collect();
     let statuses = order_statuses(conn, &ids)?;
     let shown = shown_live_ids(conn, &ids)?;
     let closing: Vec<_> = spent
         .iter()
         .filter(|s| {
             statuses
-                .get(s.note.id().to_bytes().as_slice())
+                .get(s.note_id.as_slice())
                 .is_none_or(|status| status != OrderStatus::Settling.as_str())
         })
         .collect();
@@ -1094,10 +1077,7 @@ fn reject_unconfirmed_tx(
         .into_iter()
         .filter(|s| rejected.contains(&s.lineage_id))
         .collect();
-    let closed_ids: Vec<Vec<u8>> = closed
-        .iter()
-        .map(|s| s.note.id().to_bytes().to_vec())
-        .collect();
+    let closed_ids: Vec<Vec<u8>> = closed.iter().map(|s| s.note_id.clone()).collect();
     let removed = move_orders(
         conn,
         &closed_ids,
@@ -1110,7 +1090,7 @@ fn reject_unconfirmed_tx(
     )?;
     for submission in closed {
         // Nothing for an order the maker cancelled itself.
-        if !shown.contains(submission.note.id().to_bytes().as_slice()) {
+        if !shown.contains(submission.note_id.as_slice()) {
             continue;
         }
         let body = order_status(
@@ -1140,7 +1120,7 @@ pub fn activate_spent_roots_tx(
     }
     let roots: Vec<(LineageId, MakerId)> = maker_lineages::table
         .filter(maker_lineages::note_id.eq_any(note_ids))
-        .filter(maker_lineages::live_at_accept.eq(true))
+        .filter(maker_lineages::live_at_accept)
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
         .select((maker_lineages::lineage_id, maker_lineages::maker_id))
         .load(conn)?;
@@ -1157,9 +1137,19 @@ pub fn activate_spent_roots_tx(
 pub fn unconfirmed_count_tx(conn: &mut PgConnection) -> DbResult<i64> {
     Ok(maker_lineages::table
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
-        .filter(maker_lineages::live_at_accept.eq(true))
+        .filter(maker_lineages::live_at_accept)
         .count()
         .get_result(conn)?)
+}
+
+/// What the escape hatch did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HatchReport {
+    /// Unconfirmed lineages it closed.
+    pub lineages_closed: usize,
+    /// Orders it cancelled, per maker. A closed lineage whose root a
+    /// settlement holds, or its maker had cancelled, adds none.
+    pub cancelled: Vec<(MakerId, usize)>,
 }
 
 /// The escape hatch (ADR 0008), run with the solver stopped: close every
@@ -1168,16 +1158,16 @@ pub fn unconfirmed_count_tx(conn: &mut PgConnection) -> DbResult<i64> {
 /// hears CANCELLED `note_not_received`. A root a settlement still holds stays
 /// with that settlement: if it fails, the closed lineage keeps it out of the
 /// book; if it commits, its remainder is reported CANCELLED, since the
-/// lineage is stopped. Returns how many orders it closed, per maker.
+/// lineage is stopped.
 ///
 /// Its first statement claims a new owner epoch, so an intake session left
 /// over from a stopped solver can no longer put an order live afterwards.
-pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, usize)>> {
+pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
     diesel::sql_query("UPDATE sync_state SET owner_epoch = owner_epoch + 1 WHERE id = 1")
         .execute(conn)?;
     let pending: Vec<(Vec<u8>, i64, Vec<u8>)> = maker_lineages::table
         .filter(maker_lineages::state.eq(LineageState::Pending.as_str()))
-        .filter(maker_lineages::live_at_accept.eq(true))
+        .filter(maker_lineages::live_at_accept)
         .select((
             maker_lineages::lineage_id,
             maker_lineages::maker_id,
@@ -1214,7 +1204,7 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, 
 
     let shown = shown_live_ids(conn, &rows)?;
     let lineages: Vec<&LineageId> = pending.iter().map(|(lineage, ..)| lineage).collect();
-    settle_lineages(conn, &lineages, LineageState::Rejected)?;
+    let lineages_closed = settle_lineages(conn, &lineages, LineageState::Rejected)?.len();
     // By root note: a waiting row is usually also a pending lineage's root.
     let closing: std::collections::BTreeMap<Vec<u8>, (MakerId, Vec<u8>)> = pending
         .into_iter()
@@ -1256,9 +1246,12 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<Vec<(MakerId, 
             gateway::append_event_tx(conn, *maker_id, Some(lineage_id), &body)?;
         }
     }
-    let mut per_maker: Vec<_> = per_maker.into_iter().collect();
-    per_maker.sort_unstable();
-    Ok(per_maker)
+    let mut cancelled: Vec<_> = per_maker.into_iter().collect();
+    cancelled.sort_unstable();
+    Ok(HatchReport {
+        lineages_closed,
+        cancelled,
+    })
 }
 
 /// The maker's reason when the cap cancels an order whose note never arrived.
@@ -1281,18 +1274,13 @@ pub fn cap_unconfirmed_tx(
     if capped.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let ids: Vec<Vec<u8>> = capped
-        .iter()
-        .map(|s| s.note.id().to_bytes().to_vec())
-        .collect();
+    let ids: Vec<Vec<u8>> = capped.iter().map(|s| s.note_id.clone()).collect();
     let statuses = order_statuses(conn, &ids)?;
     let shown = shown_live_ids(conn, &ids)?;
     let closing: Vec<&PendingSubmission> = capped
         .iter()
         .filter(|s| {
-            statuses
-                .get(s.note.id().to_bytes().as_slice())
-                .map(String::as_str)
+            statuses.get(s.note_id.as_slice()).map(String::as_str)
                 != Some(OrderStatus::Settling.as_str())
         })
         .collect();
@@ -1302,10 +1290,7 @@ pub fn cap_unconfirmed_tx(
         .into_iter()
         .filter(|s| rejected.contains(&s.lineage_id))
         .collect();
-    let closed_ids: Vec<Vec<u8>> = closed
-        .iter()
-        .map(|s| s.note.id().to_bytes().to_vec())
-        .collect();
+    let closed_ids: Vec<Vec<u8>> = closed.iter().map(|s| s.note_id.clone()).collect();
     let stopped = move_orders(
         conn,
         &closed_ids,
@@ -1316,7 +1301,7 @@ pub fn cap_unconfirmed_tx(
     // stopped or spent root's lineage is closed silently.
     let stopped_now: Vec<&PendingSubmission> = closed
         .into_iter()
-        .filter(|s| stopped.contains(&s.note.id().to_bytes().to_vec()))
+        .filter(|s| stopped.contains(&s.note_id))
         .collect();
     for submission in &stopped_now {
         diesel::insert_into(maker_stops::table)
@@ -1329,7 +1314,7 @@ pub fn cap_unconfirmed_tx(
     }
     let mut makers = Vec::new();
     for submission in stopped_now {
-        if shown.contains(submission.note.id().to_bytes().as_slice()) {
+        if shown.contains(submission.note_id.as_slice()) {
             let body = order_status(
                 &submission.note,
                 proto::OrderState::Cancelled,
@@ -1826,7 +1811,7 @@ pub fn append_event_tx(
 mod tests {
     use super::*;
     use crate::db::postgres_db::{
-        backfill_order_keys_tx, confirm_settlement_tx, finish_discarded_settlement_tx,
+        backfill_order_keys_tx, confirm_settlement_update_tx, finish_discarded_settlement_tx,
         insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
         reserve_settlement_tx, test_consumer, NodeAnswer,
     };
@@ -1910,7 +1895,7 @@ mod tests {
         command: MakerCommand,
     ) -> Result<(CommandReply, Option<MakerUpdate>)> {
         Ok(conn.transaction::<_, DbError, _>(|conn| {
-            execute_command_tx(conn, &header(maker_id, request_id, seq), &command)
+            execute_command_confirmed_tx(conn, &header(maker_id, request_id, seq), &command)
         })?)
     }
 
@@ -2302,7 +2287,7 @@ mod tests {
                 (header(alpha, "s3", 3), submit(&note(3))),
             ]
             .iter()
-            .map(|(header, command)| Ok(execute_command_tx(conn, header, command)?.0))
+            .map(|(header, command)| Ok(execute_command_confirmed_tx(conn, header, command)?.0))
             .collect::<DbResult<Vec<_>>>()
         })?;
         assert_eq!(
@@ -2629,7 +2614,7 @@ mod tests {
         canceller.transaction::<_, DbError, _>(|conn| {
             prelock_command_makers_tx(conn, &commands)?;
             for (header, command) in &commands {
-                execute_command_tx(conn, header, command)?;
+                execute_command_confirmed_tx(conn, header, command)?;
             }
             Ok(())
         })?;
@@ -3090,7 +3075,7 @@ mod tests {
 
         let block = BlockNumber::from(42_u32);
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),
@@ -3129,7 +3114,7 @@ mod tests {
         let (row, payback, second) = fill(2, &remainder, 20);
         prepare(conn, 2, &[row])?;
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[2; 32],
                 &HashSet::new(),
@@ -3171,7 +3156,7 @@ mod tests {
             })
         );
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),
@@ -3297,7 +3282,7 @@ mod tests {
         let first = fills.keys().min().unwrap();
         let incomplete = HashMap::from([(first.clone(), fills[first].clone())]);
         let failed = conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),
@@ -3313,7 +3298,7 @@ mod tests {
         assert_eq!(read_events_tx(conn, alpha, 0, 100)?.len(), 2);
         assert_eq!(load_unresolved_attempts_tx(conn)?.len(), 1);
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),
@@ -3336,7 +3321,7 @@ mod tests {
         assert_eq!(replay[0].payload, events[2].payload);
         // Repeated observations cannot append another resolution.
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),
@@ -3364,7 +3349,7 @@ mod tests {
             run(conn, alpha, "s1", 1, submit(&quote))?;
             if committed {
                 conn.transaction::<_, DbError, _>(|conn| {
-                    confirm_settlement_tx(
+                    confirm_settlement_update_tx(
                         conn,
                         &[1; 32],
                         &HashSet::new(),
@@ -3422,7 +3407,7 @@ mod tests {
             let resolving = std::thread::spawn(move || -> DbResult<()> {
                 resolver.transaction(|conn| {
                     if committed {
-                        confirm_settlement_tx(
+                        confirm_settlement_update_tx(
                             conn,
                             &[1; 32],
                             &HashSet::new(),
@@ -3458,7 +3443,7 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            execute_command_tx(
+            execute_command_confirmed_tx(
                 &mut fixture.conn,
                 &header(alpha, "c2", 2),
                 &cancel_all(CutoffScope::all()),
@@ -3526,7 +3511,7 @@ mod tests {
         let (row, _, remainder) = fill(2, &partial, 40);
         prepare(conn, 2, &[row])?;
         conn.transaction::<_, DbError, _>(|conn| {
-            confirm_settlement_tx(
+            confirm_settlement_update_tx(
                 conn,
                 &[2; 32],
                 &HashSet::new(),
@@ -3663,7 +3648,7 @@ mod tests {
         // matcher selected earlier. Expiry is not a live_orders SQL predicate.
         prepare(conn, 1, &[input])?;
         let update = conn.transaction::<_, DbError, _>(|conn| {
-            let update = confirm_settlement_tx(
+            let update = confirm_settlement_update_tx(
                 conn,
                 &[1; 32],
                 &HashSet::new(),

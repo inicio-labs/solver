@@ -565,42 +565,32 @@ async fn release_rejected_settlement(
     // already resolved elsewhere is not a release.
     let released = pool
         .write_book_with(book_tx, move |conn| {
-            let db::postgres_db::DiscardedSettlement {
-                mut update,
-                found,
-                unconfirmed,
-                named_makers,
-                waiting_makers,
-            } = db::postgres_db::finish_discarded_settlement_tx(
+            let mut released = db::postgres_db::finish_discarded_settlement_tx(
                 conn,
                 &attempt_id,
                 &consumed,
                 &answer,
             )?;
-            let released = found.then_some((
-                update.active.len(),
-                unconfirmed,
-                named_makers,
-                waiting_makers,
-            ));
+            let mut update = std::mem::take(&mut released.update);
+            let returned = update.active.len();
             // Its sit-outs stay cancelled.
             update.removed.extend(cancelled);
-            Ok((update, released))
+            Ok((update, released.found.then_some((returned, released))))
         })
         .await?;
-    if let Some((returned, unconfirmed, named, waiting)) = released {
-        metrics::record_release(cause, returned, unconfirmed > 0);
-        for maker_id in named {
+    if let Some((returned, released)) = released {
+        metrics::record_release(cause, returned, released.unconfirmed > 0);
+        for maker_id in released.named_makers {
             gateway_metrics::count(gateway_metrics::UNKNOWN_NOTES_NAMED, maker_id);
         }
-        for &maker_id in &waiting {
+        for &maker_id in &released.waiting_makers {
             gateway_metrics::count(gateway_metrics::SENT_TO_WAITING, maker_id);
         }
-        if !waiting.is_empty() {
+        if !released.waiting_makers.is_empty() {
             tracing::info!(
                 tx_id = %settlement.id(),
-                waiting = waiting.len(),
-                unconfirmed,
+                waiting = released.waiting_makers.len(),
+                unconfirmed = released.unconfirmed,
                 "maker orders wait for their notes"
             );
         }
@@ -1229,7 +1219,7 @@ impl Executor {
             metrics::record_conflict(kind);
         }
         tracing::error!(
-            error = %metrics::refusal_detail(&error),
+            error = %crate::ingest::client_error_detail(&error),
             code = <&str>::from(code),
             conflict = conflict.map(<&str>::from),
             "settlement transaction rejected; releasing its inputs by nullifier"
@@ -1573,7 +1563,7 @@ impl Executor {
         let activated = self
             .pool
             .write_book_with(&self.book_tx, move |conn| {
-                let confirmed = db::postgres_db::confirm_settlement_with_tx(
+                let confirmed = db::postgres_db::confirm_settlement_tx(
                     conn,
                     &attempt_id,
                     &consumed_children,
@@ -1642,7 +1632,7 @@ impl Executor {
                 );
                 tracing::warn!(
                     tx_id = %result.id(),
-                    error = %metrics::refusal_detail(&error),
+                    error = %crate::ingest::client_error_detail(&error),
                     "recovery retry rejected; waiting for expiry"
                 );
             }

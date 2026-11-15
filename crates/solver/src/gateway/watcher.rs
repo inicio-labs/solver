@@ -117,20 +117,9 @@ pub enum NoteObservation {
 /// Check a set of exact notes without deciding whether their orders may trade.
 #[async_trait(?Send)]
 pub trait MakerTracker {
-    /// Observe `notes`. A note new to the tracker that is in `import_from`
-    /// has its history searched from that block: an order that went live at
-    /// accept (ADR 0008), whose note may have landed while a lagging node
-    /// still answered that it didn't. A note the tracker could not read this
-    /// round is left out of the result.
-    async fn observe_from(
-        &mut self,
-        notes: &[Note],
-        import_from: &HashMap<NoteId, BlockNumber>,
-    ) -> ChainResult<HashMap<NoteId, NoteObservation>>;
-
-    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
-        self.observe_from(notes, &HashMap::new()).await
-    }
+    /// Observe `notes`. A note the tracker could not read this round is left
+    /// out of the result.
+    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
 
     /// One exact lookup of `note` and its nullifier on the node.
     async fn lookup(&mut self, note: &Note) -> ChainResult<NoteObservation>;
@@ -206,10 +195,6 @@ impl UnconfirmedCap {
                 >= u64::from(accept_block.as_u32()) + u64::from(self.blocks)
     }
 }
-
-/// Blocks before an order's accept block from which its note's history is
-/// searched, in case the watcher's block lagged the maker's transaction.
-const IMPORT_MARGIN_BLOCKS: u32 = 10;
 
 /// Whether the node answered a lookup with something that did not decode.
 /// One note's content can do that to a whole batch, so its notes are then
@@ -371,11 +356,7 @@ impl MakerTracker for SdkTracker {
         Ok(found)
     }
 
-    async fn observe_from(
-        &mut self,
-        notes: &[Note],
-        import_from: &HashMap<NoteId, BlockNumber>,
-    ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+    async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
         self.client.ensure_genesis_in_place().await?;
         self.client.ensure_rpc_limits_in_place().await?;
         // Capture before lookup: a note committed during import must still be
@@ -459,16 +440,10 @@ impl MakerTracker for SdkTracker {
                         }
                     } else {
                         // Forward sync starts at the captured cursor and
-                        // covers commitments racing this lookup. A note that
-                        // went live at accept is searched from its accept
-                        // block too.
-                        let after = import_from.get(&note.id()).map_or(cursor.child(), |block| {
-                            BlockNumber::from(block.as_u32().saturating_sub(IMPORT_MARGIN_BLOCKS))
-                                .min(cursor.child())
-                        });
+                        // covers commitments racing this lookup.
                         NoteFile::ExpectedNote {
                             details: (*note).clone().into(),
-                            sync_hint: NoteSyncHint::new(after, note.metadata().tag()),
+                            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
                         }
                     };
                     imports.push((note.id(), file));
@@ -636,13 +611,9 @@ impl<T: MakerTracker> Watcher<T> {
             .map(|submission| (submission.note.id(), submission.note.clone()))
             .chain(self.watched.values().map(|note| (note.id(), note.clone())))
             .collect();
-        let import_from: HashMap<NoteId, BlockNumber> = pending
-            .iter()
-            .filter_map(|s| Some((s.note.id(), s.accept_block?)))
-            .collect();
         let observations = self
             .tracker
-            .observe_from(&notes.into_values().collect::<Vec<_>>(), &import_from)
+            .observe(&notes.into_values().collect::<Vec<_>>())
             .await?;
         let unobserved = pending
             .iter()
@@ -743,22 +714,21 @@ impl<T: MakerTracker> Watcher<T> {
                     let rejected = maker_db::reject_tx(conn, &rejections)?;
                     let (stopped, cap_cancels) = maker_db::cap_unconfirmed_tx(conn, &capped)?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
-                    let activated = maker_db::activate_tx(conn, &activations, now_unix())?;
-                    let mut update = activated.update;
+                    let mut activated = maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let mut update = std::mem::take(&mut activated.update);
                     update.removed.extend(removed);
                     update.removed.extend(rejected);
                     update.removed.extend(stopped);
                     let done = maker_db::WatcherWrites {
-                        returned: activated.returned_makers,
+                        activated,
                         cap_cancels,
-                        activated: activated.unconfirmed,
                     };
                     Ok((update, done))
                 })
                 .await?;
             for submission in activations
                 .iter()
-                .filter(|s| done.activated.contains(&s.lineage_id))
+                .filter(|s| done.activated.unconfirmed.contains(&s.lineage_id))
             {
                 let via = if looked_up.contains(&submission.lineage_id) {
                     "lookup"
@@ -767,7 +737,7 @@ impl<T: MakerTracker> Watcher<T> {
                 };
                 super::metrics::count_activation(submission.maker_id, via);
             }
-            for maker_id in done.returned {
+            for maker_id in done.activated.returned_makers {
                 super::metrics::count(super::metrics::WAITING_RETURNED, maker_id);
             }
             for maker_id in &done.cap_cancels {
@@ -966,10 +936,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl MakerTracker for FakeChain {
-        async fn observe_from(
+        async fn observe(
             &mut self,
             notes: &[Note],
-            _import_from: &HashMap<NoteId, BlockNumber>,
         ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
             let mut state = self.state();
             up(&state)?;
@@ -1279,7 +1248,7 @@ mod tests {
             let header = CommandHeader::new(self.maker_id, request_id.into(), seq).unwrap();
             self.db
                 .pool
-                .write(move |conn| maker_db::execute_command_tx(conn, &header, &command))
+                .write(move |conn| maker_db::execute_command_confirmed_tx(conn, &header, &command))
                 .await
                 .unwrap();
         }
@@ -1538,7 +1507,7 @@ mod tests {
 
         f.db.pool
             .write(move |conn| {
-                postgres_db::confirm_settlement_tx(
+                postgres_db::confirm_settlement_update_tx(
                     conn,
                     &tx_id,
                     &HashSet::new(),
@@ -1621,7 +1590,7 @@ mod tests {
                 .pool
                 .write(move |conn| {
                     let accept = maker_db::AcceptMode::Fresh(BlockNumber::from(block));
-                    maker_db::execute_command_with_tx(conn, &header, &command, accept)
+                    maker_db::execute_command_tx(conn, &header, &command, accept)
                 })
                 .await
                 .unwrap();

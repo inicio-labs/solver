@@ -187,7 +187,7 @@ async fn a_solver_without_its_gateway_refuses_unconfirmed_orders() -> Result<()>
         let header = CommandHeader::new(maker, "s1".into(), 1)?;
         let submit = MakerCommand::submit(note)?;
         let outcome = conn.transaction::<_, solver::db::DbError, _>(|conn| {
-            maker_db::execute_command_with_tx(conn, &header, &submit, accept)
+            maker_db::execute_command_tx(conn, &header, &submit, accept)
         })?;
         anyhow::ensure!(outcome.live.is_some(), "the order went live at accept");
         Ok(())

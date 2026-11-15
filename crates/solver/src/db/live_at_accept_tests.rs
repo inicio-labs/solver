@@ -24,7 +24,7 @@ use super::maker_db::{
     self, AcceptFallback, AcceptGate, AcceptMode, CommandOutcome, PendingSubmission,
 };
 use super::postgres_db::{
-    self, confirm_settlement_with_tx, finish_discarded_settlement_tx, live_book_update_tx,
+    self, confirm_settlement_tx, finish_discarded_settlement_tx, live_book_update_tx,
     prepare_settlement_tx, test_consumer, NodeAnswer,
 };
 use super::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
@@ -93,7 +93,7 @@ fn accept_with(
     });
     let header = CommandHeader::new(maker_id, format!("r{seq}"), seq).unwrap();
     Ok(conn.transaction::<_, DbError, _>(|conn| {
-        maker_db::execute_command_with_tx(conn, &header, command, accept)
+        maker_db::execute_command_tx(conn, &header, command, accept)
     })?)
 }
 
@@ -120,7 +120,7 @@ fn command(
 ) -> Result<()> {
     let header = CommandHeader::new(maker_id, format!("r{seq}"), seq).unwrap();
     conn.transaction::<_, DbError, _>(|conn| {
-        maker_db::execute_command_tx(conn, &header, &command)
+        maker_db::execute_command_confirmed_tx(conn, &header, &command)
     })?;
     Ok(())
 }
@@ -150,15 +150,14 @@ fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> 
     Ok(())
 }
 
-/// The lineage's state, flag, accept block and whether it has `activated_at`.
-fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, bool, Option<i64>, bool)> {
+/// The lineage's state, flag and accept block.
+fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, bool, Option<i64>)> {
     Ok(maker_lineages::table
         .filter(maker_lineages::note_id.eq(id(note)))
         .select((
             maker_lineages::state,
             maker_lineages::live_at_accept,
             maker_lineages::accept_block,
-            maker_lineages::activated_at.is_not_null(),
         ))
         .first(conn)?)
 }
@@ -291,10 +290,7 @@ fn an_accepted_private_order_goes_live_once_with_its_tag() -> Result<()> {
     let tag = live_order.maker.expect("tagged");
     assert_eq!((tag.maker_id, tag.root_seq), (alpha, 3));
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
-    assert_eq!(
-        lineage(conn, &order)?,
-        ("pending".into(), true, Some(7), false)
-    );
+    assert_eq!(lineage(conn, &order)?, ("pending".into(), true, Some(7)));
     assert_eq!(
         statuses(conn, alpha)?,
         [(id(&order), proto::OrderState::Live, String::new())]
@@ -329,7 +325,7 @@ fn other_submits_take_the_confirmed_path_without_a_trace() -> Result<()> {
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
     let unflagged = |conn: &mut PgConnection, note: &Note| -> Result<()> {
-        let (state, flagged, block, _) = lineage(conn, note)?;
+        let (state, flagged, block) = lineage(conn, note)?;
         assert_eq!((state.as_str(), flagged, block), ("pending", false, None));
         Ok(())
     };
@@ -491,10 +487,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     let outcomes = go_live(conn)?;
     assert!(outcomes[0].1.live.is_some());
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
-    assert_eq!(
-        lineage(conn, &order)?,
-        ("pending".into(), true, Some(7), false)
-    );
+    assert_eq!(lineage(conn, &order)?, ("pending".into(), true, Some(7)));
     assert_eq!(
         statuses(conn, alpha)?,
         [(id(&order), proto::OrderState::Live, String::new())]
@@ -541,8 +534,7 @@ fn activation_returns_waiting_roots_and_sends_nothing_else() -> Result<()> {
     assert_eq!(status(conn, &live_one)?.as_deref(), Some("active"));
     assert_eq!(status(conn, &cancelled)?.as_deref(), Some("stopped"));
     for order in [&waiting, &live_one, &cancelled] {
-        let (state, _, _, activated_at) = lineage(conn, order)?;
-        assert_eq!((state.as_str(), activated_at), ("activated", true));
+        assert_eq!(lineage(conn, order)?.0, "activated");
     }
     // LIVE came at accept: none again.
     assert_eq!(statuses(conn, alpha)?.len(), 3);
@@ -562,7 +554,7 @@ fn our_confirmed_settlement_activates_a_root_it_erased() -> Result<()> {
     accept(conn, alpha, 1, &order)?;
     reserve(conn, 9, &[&order])?;
     let confirmed = conn.transaction::<_, DbError, _>(|conn| {
-        confirm_settlement_with_tx(
+        confirm_settlement_tx(
             conn,
             &[9; 32],
             &HashSet::new(),
@@ -573,8 +565,7 @@ fn our_confirmed_settlement_activates_a_root_it_erased() -> Result<()> {
     })?;
     assert_eq!(confirmed.activated_makers, [alpha]);
     assert_eq!(status(conn, &order)?.as_deref(), Some("executed"));
-    let (state, _, _, activated_at) = lineage(conn, &order)?;
-    assert_eq!((state.as_str(), activated_at), ("activated", true));
+    assert_eq!(lineage(conn, &order)?.0, "activated");
     Ok(())
 }
 
@@ -894,8 +885,11 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     let refused = postgres_migrations::revert_last(conn);
     assert!(refused.is_err(), "{refused:?}");
 
-    let cancelled = postgres_migrations::cancel_unconfirmed(conn)?;
-    assert_eq!(cancelled, [(alpha, 2)]);
+    let report = postgres_migrations::cancel_unconfirmed(conn)?;
+    assert_eq!(
+        (report.lineages_closed, report.cancelled),
+        (2, vec![(alpha, 2)])
+    );
     assert_eq!(maker_db::unconfirmed_count_tx(conn)?, 0);
     for order in [&active, &waiting] {
         assert_eq!(status(conn, order)?.as_deref(), Some("stopped"));
@@ -908,7 +902,10 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
         })
         .count();
     assert_eq!(cancels, 2);
-    assert!(postgres_migrations::cancel_unconfirmed(conn)?.is_empty());
+    assert_eq!(
+        postgres_migrations::cancel_unconfirmed(conn)?,
+        maker_db::HatchReport::default()
+    );
     postgres_migrations::revert_last(conn)?;
     Ok(())
 }
@@ -927,11 +924,12 @@ fn a_remainder_of_a_closed_lineage_is_still_watched() -> Result<()> {
     reserve(conn, 9, &[&order])?;
     // The confirmation deletes the settlement's inputs.
     let remainder = settlement_child(conn, &order)?;
-    // Nothing stopped: a settlement holds the root.
-    assert!(postgres_migrations::cancel_unconfirmed(conn)?.is_empty());
+    // Closed, but nothing stopped: a settlement holds the root.
+    let report = postgres_migrations::cancel_unconfirmed(conn)?;
+    assert_eq!((report.lineages_closed, report.cancelled), (1, vec![]));
     assert_eq!(lineage(conn, &order)?.0, "rejected");
     conn.transaction::<_, DbError, _>(|conn| {
-        let confirmed = confirm_settlement_with_tx(
+        let confirmed = confirm_settlement_tx(
             conn,
             &[9; 32],
             &HashSet::new(),
@@ -1009,7 +1007,10 @@ fn the_hatch_tells_nothing_about_an_order_the_maker_cancelled() -> Result<()> {
     cancel(conn, alpha, 2, &order)?;
     set_status(conn, &order, "waiting")?;
     let before = epoch(conn)?;
-    assert_eq!(postgres_migrations::cancel_unconfirmed(conn)?, [(alpha, 1)]);
+    assert_eq!(
+        postgres_migrations::cancel_unconfirmed(conn)?.cancelled,
+        [(alpha, 1)]
+    );
     assert_eq!(status(conn, &order)?.as_deref(), Some("stopped"));
     assert_eq!(statuses(conn, alpha)?.len(), 1, "LIVE only");
     // An old intake can't put an order live after the hatch.

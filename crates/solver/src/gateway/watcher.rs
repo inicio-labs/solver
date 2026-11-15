@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{NoteFile, NoteSyncHint};
-use miden_client::rpc::domain::note::CommittedNote;
+use miden_client::rpc::domain::note::{CommittedNote, FetchedNote};
 use miden_client::rpc::{NodeRpcClient, RpcError};
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::sync::{NoteUpdateAction, OnNoteReceived, StateSync, StateSyncInput};
@@ -239,6 +239,23 @@ pub struct SdkTracker {
     last_sync: Option<SyncRead>,
 }
 
+/// How a new note is imported. Found by our ID, it is our note (the ID
+/// commits to the metadata), so it is imported committed, with our own
+/// metadata; otherwise it is expected, and the forward sync from `cursor`
+/// covers a commitment racing the lookup.
+fn import_file(note: &Note, found: Option<&FetchedNote>, cursor: BlockNumber) -> NoteFile {
+    match found {
+        Some(found) => NoteFile::Committed {
+            note: note.clone(),
+            proof: found.inclusion_proof().clone(),
+        },
+        None => NoteFile::ExpectedNote {
+            details: note.clone().into(),
+            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
+        },
+    }
+}
+
 impl SdkTracker {
     pub fn new(client: Client<FilesystemKeyStore>, rpc: Arc<dyn NodeRpcClient>) -> Self {
         Self {
@@ -308,6 +325,89 @@ impl SdkTracker {
             });
         }
         Ok(())
+    }
+
+    /// Look `ids` up on the node in one call. One note the node answers with
+    /// something that does not decode fails the whole call, so then each is
+    /// looked up alone, and the ones that still fail are returned as
+    /// unreadable. Any other failure (the node is down, or refuses the call)
+    /// would fail each lookup the same way, so it fails this one.
+    async fn lookup_batch(
+        &self,
+        ids: &[NoteId],
+    ) -> ChainResult<(HashMap<NoteId, FetchedNote>, HashSet<NoteId>)> {
+        let mut unreadable = HashSet::new();
+        let found = match self.rpc.get_notes_by_id(ids).await {
+            Ok(found) => found,
+            Err(error) if !is_decode_error(&error) => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(error = %ChainError::from(error).detail(), notes = ids.len(), "maker note lookup failed; looking notes up one by one");
+                let mut found = Vec::with_capacity(ids.len());
+                for id in ids {
+                    match self.rpc.get_notes_by_id(&[*id]).await {
+                        Ok(note) => found.extend(note),
+                        Err(error) if !is_decode_error(&error) => return Err(error.into()),
+                        Err(error) => {
+                            tracing::warn!(note_id = %id, error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
+                            unreadable.insert(*id);
+                        }
+                    }
+                }
+                found
+            }
+        };
+        let found = found.into_iter().map(|note| (note.id(), note)).collect();
+        Ok((found, unreadable))
+    }
+
+    /// Import `imports` in one call. One note's import can fail the whole
+    /// call, so then each is imported alone; returns the ones that still
+    /// fail, to skip this round.
+    async fn import_batch(&mut self, imports: Vec<(NoteId, NoteFile)>) -> HashSet<NoteId> {
+        let mut failed = HashSet::new();
+        if imports.is_empty() {
+            return failed;
+        }
+        let files: Vec<_> = imports.iter().map(|(_, file)| file.clone()).collect();
+        if let Err(error) = self.client.import_notes(&files).await {
+            tracing::warn!(error = %crate::ingest::client_error_detail(&error), notes = imports.len(), "maker note import failed; importing notes one by one");
+            for (id, file) in imports {
+                if let Err(error) = self.client.import_notes(&[file]).await {
+                    tracing::warn!(note_id = %id, error = %crate::ingest::client_error_detail(&error), "maker note import failed; skipped this round");
+                    failed.insert(id);
+                }
+            }
+        }
+        failed
+    }
+
+    /// A note's state from its stored record. The SDK stores only one
+    /// expected record per details commitment, so two submitted notes that
+    /// share one (`shared`), or a record of another note, take an exact
+    /// lookup instead of trusting the record.
+    async fn record_state(
+        &self,
+        note: &Note,
+        record: Option<&InputNoteRecord>,
+        shared: bool,
+    ) -> ChainResult<NoteObservation> {
+        match record {
+            _ if shared => self.exact_lookup(note).await,
+            None => Err(ChainError::MissingSyncedNote(note.id())),
+            Some(record)
+                if record.id() == Some(note.id()) && record.metadata() == Some(note.metadata()) =>
+            {
+                Ok(if record.is_consumed() {
+                    NoteObservation::Consumed
+                } else if record.is_committed() {
+                    NoteObservation::Committed
+                } else {
+                    NoteObservation::Pending
+                })
+            }
+            Some(record) if record.id().is_some() => self.exact_lookup(note).await,
+            Some(_) => Ok(NoteObservation::Pending),
+        }
     }
 
     async fn exact_lookup(&self, note: &Note) -> ChainResult<NoteObservation> {
@@ -390,79 +490,19 @@ impl MakerTracker for SdkTracker {
             })
             .collect();
         // Decided per note: one note's failure never fails the round.
-        let mut observed = HashMap::with_capacity(notes.len());
         let mut unreadable = HashSet::new();
         if !new_notes.is_empty() {
             let limit = self.rpc.get_rpc_limits().await?.note_ids_limit.max(1) as usize;
             for batch in new_notes.chunks(limit) {
                 let ids: Vec<_> = batch.iter().map(|note| note.id()).collect();
-                let found = match self.rpc.get_notes_by_id(&ids).await {
-                    Ok(found) => found,
-                    // The node did not answer: every lookup would fail the
-                    // same way, so the round fails after this one call.
-                    Err(error) if !is_decode_error(&error) => return Err(error.into()),
-                    // One note that fails to decode fails the whole batch:
-                    // look each one up alone.
-                    Err(error) if ids.len() > 1 => {
-                        tracing::warn!(error = %ChainError::from(error).detail(), notes = ids.len(), "maker note batch lookup failed; looking notes up one by one");
-                        let mut found = Vec::with_capacity(ids.len());
-                        for id in &ids {
-                            match self.rpc.get_notes_by_id(&[*id]).await {
-                                Ok(note) => found.extend(note),
-                                Err(error) if !is_decode_error(&error) => return Err(error.into()),
-                                Err(error) => {
-                                    tracing::warn!(note_id = %id, error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
-                                    unreadable.insert(*id);
-                                }
-                            }
-                        }
-                        found
-                    }
-                    Err(error) => {
-                        tracing::warn!(note_id = %ids[0], error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
-                        unreadable.insert(ids[0]);
-                        Vec::new()
-                    }
-                };
-                let found: HashMap<_, _> =
-                    found.into_iter().map(|note| (note.id(), note)).collect();
-                let mut imports = Vec::with_capacity(batch.len());
-                for note in batch {
-                    if unreadable.contains(&note.id()) {
-                        continue;
-                    }
-                    // Found by our ID: it is our note (the ID commits to the
-                    // metadata), so it is imported with our own metadata.
-                    let file = if let Some(found) = found.get(&note.id()) {
-                        NoteFile::Committed {
-                            note: (*note).clone(),
-                            proof: found.inclusion_proof().clone(),
-                        }
-                    } else {
-                        // Forward sync starts at the captured cursor and
-                        // covers commitments racing this lookup.
-                        NoteFile::ExpectedNote {
-                            details: (*note).clone().into(),
-                            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
-                        }
-                    };
-                    imports.push((note.id(), file));
-                }
-                if imports.is_empty() {
-                    continue;
-                }
-                let files: Vec<_> = imports.iter().map(|(_, file)| file.clone()).collect();
-                if let Err(error) = self.client.import_notes(&files).await {
-                    // One note's import can fail the batch: import each
-                    // alone, and skip the ones that still fail this round.
-                    tracing::warn!(error = %crate::ingest::client_error_detail(&error), notes = imports.len(), "maker note import failed; importing notes one by one");
-                    for (id, file) in imports {
-                        if let Err(error) = self.client.import_notes(&[file]).await {
-                            tracing::warn!(note_id = %id, error = %crate::ingest::client_error_detail(&error), "maker note import failed; skipped this round");
-                            unreadable.insert(id);
-                        }
-                    }
-                }
+                let (found, failed) = self.lookup_batch(&ids).await?;
+                unreadable.extend(failed);
+                let imports = batch
+                    .iter()
+                    .filter(|note| !unreadable.contains(&note.id()))
+                    .map(|note| (note.id(), import_file(note, found.get(&note.id()), cursor)))
+                    .collect();
+                unreadable.extend(self.import_batch(imports).await);
             }
         }
         let synced: Vec<Note> = notes
@@ -478,32 +518,14 @@ impl MakerTracker for SdkTracker {
             .into_iter()
             .map(|record| (record.details_commitment(), record))
             .collect();
+        let mut observed = HashMap::with_capacity(notes.len());
         for note in &synced {
-            // The SDK stores only one expected record per details commitment.
-            // If two submitted IDs share it, use exact SDK RPC lookup for both
-            // rather than treating either record as the other's commitment.
-            let state = if count_by_commitment[&note.details_commitment()] > 1 {
-                self.exact_lookup(note).await
-            } else {
-                match records.get(&note.details_commitment()) {
-                    None => Err(ChainError::MissingSyncedNote(note.id())),
-                    Some(record)
-                        if record.id() == Some(note.id())
-                            && record.metadata() == Some(note.metadata()) =>
-                    {
-                        Ok(if record.is_consumed() {
-                            NoteObservation::Consumed
-                        } else if record.is_committed() {
-                            NoteObservation::Committed
-                        } else {
-                            NoteObservation::Pending
-                        })
-                    }
-                    Some(record) if record.id().is_some() => self.exact_lookup(note).await,
-                    Some(_) => Ok(NoteObservation::Pending),
-                }
-            };
-            match state {
+            let commitment = note.details_commitment();
+            let shared = count_by_commitment[&commitment] > 1;
+            match self
+                .record_state(note, records.get(&commitment), shared)
+                .await
+            {
                 Ok(state) => {
                     observed.insert(note.id(), state);
                 }
@@ -712,7 +734,11 @@ impl<T: MakerTracker> Watcher<T> {
                         &spent_ids,
                     )?;
                     let rejected = maker_db::reject_tx(conn, &rejections)?;
-                    let (stopped, cap_cancels) = maker_db::cap_unconfirmed_tx(conn, &capped)?;
+                    let (stopped, cap_cancels) = maker_db::close_unconfirmed_tx(
+                        conn,
+                        &capped,
+                        maker_db::Close::NoteNotReceived,
+                    )?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
                     let mut activated = maker_db::activate_tx(conn, &activations, now_unix())?;
                     let mut update = std::mem::take(&mut activated.update);

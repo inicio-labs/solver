@@ -612,25 +612,38 @@ pub fn finish_discarded_settlement_tx(
         .load(conn)?;
     let parent_ids: Vec<Vec<u8>> = inputs.iter().map(|(_, row)| row.note_id.clone()).collect();
     // Roots that went live at accept: their lineage's state and maker.
-    let flagged: HashMap<Vec<u8>, (String, i64)> = maker_lineages::table
-        .filter(maker_lineages::note_id.eq_any(&parent_ids))
-        .filter(maker_lineages::live_at_accept)
-        .select((
-            maker_lineages::note_id,
-            maker_lineages::state,
-            maker_lineages::maker_id,
-        ))
-        .load::<(Vec<u8>, String, i64)>(conn)?
-        .into_iter()
-        .map(|(note_id, state, maker_id)| (note_id, (state, maker_id)))
-        .collect();
-    let state_of = |id: &[u8]| flagged.get(id).map(|(state, _)| state.as_str());
-    let unconfirmed = |id: &[u8]| state_of(id) == Some(maker_db::LineageState::Pending.as_str());
+    let flagged: HashMap<Vec<u8>, (maker_db::LineageState, crate::maker::MakerId)> =
+        maker_lineages::table
+            .filter(maker_lineages::note_id.eq_any(&parent_ids))
+            .filter(maker_lineages::live_at_accept)
+            .select((
+                maker_lineages::note_id,
+                maker_lineages::state,
+                maker_lineages::maker_id,
+            ))
+            .load::<(Vec<u8>, String, i64)>(conn)?
+            .into_iter()
+            .map(|(note_id, state, maker_id)| {
+                let state = state
+                    .parse()
+                    .map_err(|_| DbError::Corrupt("unknown maker lineage state"))?;
+                Ok((note_id, (state, maker_id)))
+            })
+            .collect::<DbResult<_>>()?;
 
-    let mut active_ids = Vec::new();
+    /// Where a reserved parent goes.
+    enum Release {
+        Book,
+        Consumed,
+        /// Its lineage was closed while it was reserved: it never returns.
+        Stopped,
+        /// It went live at accept and the node may lack its note.
+        Waiting(crate::maker::MakerId),
+    }
+    let mut book_ids = Vec::new();
     let mut consumed_ids = Vec::new();
-    let mut waiting_ids = Vec::new();
     let mut stopped_ids = Vec::new();
+    let mut waiting = Vec::new();
     let mut released = DiscardedSettlement {
         found: true,
         ..DiscardedSettlement::default()
@@ -644,19 +657,10 @@ pub fn finish_discarded_settlement_tx(
         let parent = row.clone().into_book_order()?;
         let id = parent.id();
         let note_id = id.to_bytes().to_vec();
-        if consumed.contains(&id) {
-            consumed_ids.push(note_id);
-            released.update.removed.push(id);
-            continue;
-        }
-        match state_of(&note_id) {
-            // Closed while reserved: it never returns.
-            Some(state) if state == maker_db::LineageState::Rejected.as_str() => {
-                stopped_ids.push(note_id);
-                released.update.removed.push(id);
-                continue;
-            }
-            _ if unconfirmed(&note_id) => {
+        let release = match flagged.get(&note_id) {
+            _ if consumed.contains(&id) => Release::Consumed,
+            Some((maker_db::LineageState::Rejected, _)) => Release::Stopped,
+            Some(&(maker_db::LineageState::Pending, maker_id)) => {
                 released.unconfirmed += 1;
                 // The node names every unknown note in one refusal: an
                 // unnamed parent was known. (Node 0.18 collects every
@@ -668,41 +672,63 @@ pub fn finish_discarded_settlement_tx(
                 let waits = match answer {
                     NodeAnswer::NotSent | NodeAnswer::AccountMismatch => false,
                     NodeAnswer::UnknownNotes(named) if named.contains(&id) => {
-                        released.named_makers.push(flagged[&note_id].1);
+                        released.named_makers.push(maker_id);
                         true
                     }
                     NodeAnswer::UnknownNotes(named) => named.is_empty(),
                     NodeAnswer::Unclear => true,
                 };
                 if waits {
-                    waiting_ids.push(note_id);
-                    released.update.removed.push(id);
-                    continue;
+                    Release::Waiting(maker_id)
+                } else {
+                    Release::Book
                 }
             }
-            _ => {}
+            // Activated, or not live at accept.
+            _ => Release::Book,
+        };
+        match release {
+            Release::Book => {
+                book_ids.push(note_id);
+                released.update.active.push(parent);
+            }
+            Release::Consumed => {
+                consumed_ids.push(note_id);
+                released.update.removed.push(id);
+            }
+            Release::Stopped => {
+                stopped_ids.push(note_id);
+                released.update.removed.push(id);
+            }
+            Release::Waiting(maker_id) => {
+                waiting.push((note_id, maker_id));
+                released.update.removed.push(id);
+            }
         }
-        active_ids.push(note_id);
-        released.update.active.push(parent);
     }
     // A waiting parent the maker has cancelled is stopped at once.
-    let eligible: HashSet<Vec<u8>> = if waiting_ids.is_empty() {
+    let eligible: HashSet<Vec<u8>> = if waiting.is_empty() {
         HashSet::new()
     } else {
+        let ids: Vec<&Vec<u8>> = waiting.iter().map(|(id, _)| id).collect();
         eligible_orders::table
-            .filter(eligible_orders::note_id.eq_any(&waiting_ids))
+            .filter(eligible_orders::note_id.eq_any(ids))
             .select(eligible_orders::note_id)
             .load::<Vec<u8>>(conn)?
             .into_iter()
             .collect()
     };
-    let (waiting_ids, cancelled): (Vec<_>, Vec<_>) = waiting_ids
-        .into_iter()
-        .partition(|id| eligible.contains(id));
-    stopped_ids.extend(cancelled);
-    released.waiting_makers = waiting_ids.iter().map(|id| flagged[id].1).collect();
+    let mut waiting_ids = Vec::new();
+    for (note_id, maker_id) in waiting {
+        if eligible.contains(&note_id) {
+            waiting_ids.push(note_id);
+            released.waiting_makers.push(maker_id);
+        } else {
+            stopped_ids.push(note_id);
+        }
+    }
     for (ids, status) in [
-        (&active_ids, OrderStatus::Active),
+        (&book_ids, OrderStatus::Active),
         (&consumed_ids, OrderStatus::OnchainNullified),
         (&waiting_ids, OrderStatus::Waiting),
         (&stopped_ids, OrderStatus::Stopped),
@@ -721,7 +747,7 @@ pub fn finish_discarded_settlement_tx(
     diesel::delete(settlement_attempts::table.find(tx_id)).execute(conn)?;
     tracing::info!(
         tx_id = %hex::encode(tx_id),
-        reactivated = active_ids.len(),
+        reactivated = book_ids.len(),
         consumed = consumed_ids.len(),
         waiting = waiting_ids.len(),
         stopped = stopped_ids.len(),

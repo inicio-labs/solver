@@ -782,7 +782,7 @@ pub fn pending_submissions_tx(conn: &mut PgConnection) -> DbResult<Vec<PendingSu
 }
 
 /// A lineage's chain verification by the maker-note watcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum LineageState {
     Pending,
@@ -1001,12 +1001,12 @@ pub struct WatcherWrites {
 /// events already told the maker, so the claim is activated without an
 /// event; while that settlement is still in flight, the claim waits for the
 /// next round. The caller holds the order rows (`prelock_watcher_tx`).
-/// Orders that went live at accept follow [`reject_unconfirmed_tx`].
+/// Orders that went live at accept are closed by [`close_unconfirmed_tx`].
 pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResult<Vec<OrderId>> {
     let (unconfirmed, spent): (Vec<_>, Vec<_>) = spent
         .iter()
         .partition(|submission| submission.unconfirmed());
-    let removed = reject_unconfirmed_tx(conn, &unconfirmed)?;
+    let (removed, _) = close_unconfirmed_tx(conn, unconfirmed, Close::Spent)?;
     let ids: Vec<Vec<u8>> = spent.iter().map(|s| s.note_id.clone()).collect();
     let statuses = order_statuses(conn, &ids)?;
     let mut traded = Vec::new();
@@ -1044,68 +1044,125 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
     Ok(removed)
 }
 
-/// [`reject_tx`] for orders that went live at accept (ADR 0008), decided by
-/// the root's current status:
-/// - `settling`: wait for that settlement to resolve;
-/// - any other: the row is retired `onchain_nullified`, the lineage rejected,
-///   and the maker hears one UNAVAILABLE if it saw the order live.
+/// How [`close_unconfirmed_tx`] closes an order that went live at accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Close {
+    /// Its note was spent elsewhere: the row is retired `onchain_nullified`
+    /// and the maker hears UNAVAILABLE.
+    Spent,
+    /// The cap (ADR 0008 D6): its note never arrived. The row gets a stop row
+    /// and is stopped, and the maker hears CANCELLED `note_not_received`.
+    NoteNotReceived,
+}
+
+/// Close orders that went live at accept (ADR 0008), decided by the root's
+/// current status. While a settlement holds the root, nothing changes: that
+/// settlement decides it. Otherwise the lineage is closed whatever the root's
+/// status, and an active or waiting root (also a stopped one, for
+/// [`Close::Spent`]) is moved as `close` says. The maker hears of it only if
+/// it saw the order live, so an order it cancelled itself is only tidied up.
 ///
 /// A root our own settlement spent is not here: its confirmation activates
-/// the lineage in the transaction that writes `executed`. The maker hears
-/// nothing for an order it cancelled itself.
-fn reject_unconfirmed_tx(
+/// the lineage in the transaction that writes `executed`.
+///
+/// Returns the orders to take out of the book, and the maker of each order
+/// it told.
+pub fn close_unconfirmed_tx<'a>(
     conn: &mut PgConnection,
-    spent: &[&PendingSubmission],
-) -> DbResult<Vec<OrderId>> {
-    if spent.is_empty() {
-        return Ok(Vec::new());
+    roots: impl IntoIterator<Item = &'a PendingSubmission>,
+    close: Close,
+) -> DbResult<(Vec<OrderId>, Vec<MakerId>)> {
+    let roots: Vec<&PendingSubmission> = roots.into_iter().collect();
+    if roots.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
-    let ids: Vec<Vec<u8>> = spent.iter().map(|s| s.note_id.clone()).collect();
+    let ids: Vec<Vec<u8>> = roots.iter().map(|s| s.note_id.clone()).collect();
     let statuses = order_statuses(conn, &ids)?;
     let shown = shown_live_ids(conn, &ids)?;
-    let closing: Vec<_> = spent
-        .iter()
-        .filter(|s| {
-            statuses
-                .get(s.note_id.as_slice())
-                .is_none_or(|status| status != OrderStatus::Settling.as_str())
-        })
-        .collect();
+    let settling = |s: &PendingSubmission| {
+        statuses.get(&s.note_id).map(String::as_str) == Some(OrderStatus::Settling.as_str())
+    };
+    let closing: Vec<&PendingSubmission> = roots.into_iter().filter(|s| !settling(s)).collect();
     let lineages: Vec<_> = closing.iter().map(|s| &s.lineage_id).collect();
     let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
-    let closed: Vec<_> = closing
+    let closed: Vec<&PendingSubmission> = closing
         .into_iter()
         .filter(|s| rejected.contains(&s.lineage_id))
         .collect();
     let closed_ids: Vec<Vec<u8>> = closed.iter().map(|s| s.note_id.clone()).collect();
-    let removed = move_orders(
-        conn,
-        &closed_ids,
-        &[
-            OrderStatus::Active,
-            OrderStatus::Waiting,
-            OrderStatus::Stopped,
-        ],
-        OrderStatus::OnchainNullified,
-    )?;
-    for submission in closed {
-        // Nothing for an order the maker cancelled itself.
-        if !shown.contains(submission.note_id.as_slice()) {
-            continue;
-        }
-        let body = order_status(
-            &submission.note,
+    let (from, to, state, reason): (&[OrderStatus], _, _, _) = match close {
+        Close::Spent => (
+            &[
+                OrderStatus::Active,
+                OrderStatus::Waiting,
+                OrderStatus::Stopped,
+            ],
+            OrderStatus::OnchainNullified,
             proto::OrderState::Unavailable,
             "note spent outside this solver",
-        );
-        gateway::append_event_tx(
-            conn,
-            submission.maker_id,
-            Some(&submission.lineage_id),
-            &body,
-        )?;
+        ),
+        Close::NoteNotReceived => (
+            &[OrderStatus::Active, OrderStatus::Waiting],
+            OrderStatus::Stopped,
+            proto::OrderState::Cancelled,
+            NOTE_NOT_RECEIVED,
+        ),
+    };
+    let moved = move_orders(conn, &closed_ids, from, to)?;
+    let moved_now: HashSet<&Vec<u8>> = moved.iter().collect();
+    let mut told = Vec::new();
+    // Only the orders it moved: a spent or stopped root's lineage is closed
+    // silently.
+    for submission in closed
+        .into_iter()
+        .filter(|s| moved_now.contains(&s.note_id))
+    {
+        if close == Close::NoteNotReceived {
+            stop_lineage_tx(conn, submission.maker_id, &submission.lineage_id)?;
+        }
+        if shown.contains(&submission.note_id) {
+            tell_tx(
+                conn,
+                submission.maker_id,
+                &submission.lineage_id,
+                &submission.note,
+                state,
+                reason,
+            )?;
+            told.push(submission.maker_id);
+        }
     }
-    order_ids(&removed)
+    Ok((order_ids(&moved)?, told))
+}
+
+/// A lineage's stop row, as `CancelOrder` writes it.
+fn stop_lineage_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    lineage_id: &LineageId,
+) -> DbResult<()> {
+    diesel::insert_into(maker_stops::table)
+        .values((
+            maker_stops::maker_id.eq(maker_id),
+            maker_stops::lineage_id.eq(lineage_id),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)?;
+    Ok(())
+}
+
+/// Tell a maker its order `note` is now `state`, for `reason`.
+fn tell_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    lineage_id: &LineageId,
+    note: &Note,
+    state: proto::OrderState,
+    reason: &str,
+) -> DbResult<()> {
+    let body = order_status(note, state, reason);
+    gateway::append_event_tx(conn, maker_id, Some(lineage_id), &body)?;
+    Ok(())
 }
 
 /// Activate the lineages of orders that went live at accept whose root our
@@ -1216,13 +1273,7 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
         )
         .collect();
     for (maker_id, lineage_id) in closing.values() {
-        diesel::insert_into(maker_stops::table)
-            .values((
-                maker_stops::maker_id.eq(maker_id),
-                maker_stops::lineage_id.eq(lineage_id),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?;
+        stop_lineage_tx(conn, *maker_id, lineage_id)?;
     }
     let stopped = move_orders(
         conn,
@@ -1242,8 +1293,14 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
                 .select(OrderRow::as_select())
                 .first::<OrderRow>(conn)?
                 .note()?;
-            let body = order_status(&note, proto::OrderState::Cancelled, NOTE_NOT_RECEIVED);
-            gateway::append_event_tx(conn, *maker_id, Some(lineage_id), &body)?;
+            tell_tx(
+                conn,
+                *maker_id,
+                lineage_id,
+                &note,
+                proto::OrderState::Cancelled,
+                NOTE_NOT_RECEIVED,
+            )?;
         }
     }
     let mut cancelled: Vec<_> = per_maker.into_iter().collect();
@@ -1256,81 +1313,6 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
 
 /// The maker's reason when the cap cancels an order whose note never arrived.
 pub const NOTE_NOT_RECEIVED: &str = "note_not_received";
-
-/// The cap (ADR 0008 D6): cancel orders that went live at accept whose note
-/// never arrived. The watcher checked the time, the blocks and an exact
-/// lookup; this decides by the root's current status, under the watcher's
-/// prelock. While a settlement holds the root, nothing changes and a later
-/// round decides. Otherwise the lineage is closed whatever the root's status;
-/// an active or waiting root gets a stop row and is stopped, and the maker
-/// hears CANCELLED `note_not_received` if it saw the order live. Returns the
-/// orders to take out of the book, and the maker of each order it cancelled:
-/// one its maker saw live. An order the maker had cancelled is only tidied
-/// up.
-pub fn cap_unconfirmed_tx(
-    conn: &mut PgConnection,
-    capped: &[PendingSubmission],
-) -> DbResult<(Vec<OrderId>, Vec<MakerId>)> {
-    if capped.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let ids: Vec<Vec<u8>> = capped.iter().map(|s| s.note_id.clone()).collect();
-    let statuses = order_statuses(conn, &ids)?;
-    let shown = shown_live_ids(conn, &ids)?;
-    let closing: Vec<&PendingSubmission> = capped
-        .iter()
-        .filter(|s| {
-            statuses.get(s.note_id.as_slice()).map(String::as_str)
-                != Some(OrderStatus::Settling.as_str())
-        })
-        .collect();
-    let lineages: Vec<_> = closing.iter().map(|s| &s.lineage_id).collect();
-    let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
-    let closed: Vec<&PendingSubmission> = closing
-        .into_iter()
-        .filter(|s| rejected.contains(&s.lineage_id))
-        .collect();
-    let closed_ids: Vec<Vec<u8>> = closed.iter().map(|s| s.note_id.clone()).collect();
-    let stopped = move_orders(
-        conn,
-        &closed_ids,
-        &[OrderStatus::Active, OrderStatus::Waiting],
-        OrderStatus::Stopped,
-    )?;
-    // A stop row, like `CancelOrder`'s, only for the orders it stops; a
-    // stopped or spent root's lineage is closed silently.
-    let stopped_now: Vec<&PendingSubmission> = closed
-        .into_iter()
-        .filter(|s| stopped.contains(&s.note_id))
-        .collect();
-    for submission in &stopped_now {
-        diesel::insert_into(maker_stops::table)
-            .values((
-                maker_stops::maker_id.eq(submission.maker_id),
-                maker_stops::lineage_id.eq(&submission.lineage_id),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?;
-    }
-    let mut makers = Vec::new();
-    for submission in stopped_now {
-        if shown.contains(submission.note_id.as_slice()) {
-            let body = order_status(
-                &submission.note,
-                proto::OrderState::Cancelled,
-                NOTE_NOT_RECEIVED,
-            );
-            gateway::append_event_tx(
-                conn,
-                submission.maker_id,
-                Some(&submission.lineage_id),
-                &body,
-            )?;
-            makers.push(submission.maker_id);
-        }
-    }
-    Ok((order_ids(&stopped)?, makers))
-}
 
 /// Report Unavailable for the maker orders among `note_ids` that the maker
 /// sees as live (active, or waiting for their note: ADR 0008), which are

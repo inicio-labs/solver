@@ -21,7 +21,7 @@ use miden_standards::note::{PswapNote, PswapNoteStorage};
 use prost::Message as _;
 
 use super::maker_db::{
-    self, AcceptFallback, AcceptGate, AcceptMode, CommandOutcome, PendingSubmission,
+    self, AcceptFallback, AcceptGate, AcceptMode, Close, CommandOutcome, PendingSubmission,
 };
 use super::postgres_db::{
     self, confirm_settlement_tx, finish_discarded_settlement_tx, live_book_update_tx,
@@ -675,8 +675,9 @@ fn a_release_decides_by_the_rows_as_they_are_now() -> Result<()> {
     // The cap closes the cancelled order's lineage later, silently.
     let before = statuses(conn, alpha)?.len();
     let stale = pending(conn, &cancelled)?;
-    let (removed, closed) =
-        conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &[stale]))?;
+    let (removed, closed) = conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::close_unconfirmed_tx(conn, &[stale], Close::NoteNotReceived)
+    })?;
     assert!(removed.is_empty());
     assert!(closed.is_empty(), "closed silently, nothing stopped");
     assert_eq!(lineage(conn, &cancelled)?.0, "rejected");
@@ -823,8 +824,9 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
     .collect::<Result<_>>()?;
     let before = statuses(conn, alpha)?.len();
 
-    let (removed, closed) =
-        conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &capped))?;
+    let (removed, closed) = conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::close_unconfirmed_tx(conn, &capped, Close::NoteNotReceived)
+    })?;
     let removed: HashSet<_> = removed.into_iter().collect();
     assert_eq!(
         removed,
@@ -857,8 +859,9 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
     );
     // Closed lineages are no longer watched, and a second cap does nothing.
     assert!(maker_db::watched_maker_orders_tx(conn)?.is_empty());
-    let again =
-        conn.transaction::<_, DbError, _>(|conn| maker_db::cap_unconfirmed_tx(conn, &capped))?;
+    let again = conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::close_unconfirmed_tx(conn, &capped, Close::NoteNotReceived)
+    })?;
     assert!(again.0.is_empty() && again.1.is_empty());
     assert_eq!(statuses(conn, alpha)?.len(), before + 2);
     Ok(())

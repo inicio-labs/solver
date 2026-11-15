@@ -179,8 +179,12 @@ transaction latency, order status counts, unresolved attempts by status and
 age, and matcher/executor channel capacity. `GET /metrics` on the same
 loopback-only observability port exposes solver-side DB call/error counters,
 wait and duration histograms, timeout/deadlock counters, connection, writer
-ownership and fatal-shutdown gauges, channel remaining capacity, and skipped
-matching ticks.
+ownership and fatal-shutdown gauges, channel remaining capacity, skipped
+matching ticks, settlement refusals by node code, dropped settlements, and
+released inputs; with the maker gateway enabled, also the maker-note
+watcher's synced block and read age and the pending submissions it waits on
+(see the README's Observability section). These are all held in memory: a
+scrape reads no database.
 Scrape PostgreSQL statistics separately for order/attempt counts and server
 deadlocks; the solver endpoint does not scan the full orders table on every
 scrape. Do not log credentials, serialized notes, or transaction payloads.

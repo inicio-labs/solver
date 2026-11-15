@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+pub mod maker;
+pub mod node_like;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,11 +100,11 @@ impl Drop for PgSchema {
     }
 }
 
-/// Build a `Client<FilesystemKeyStore>` backed by `MockRpcApi` + a tempdir-scoped
-/// SQLite store + keystore. Each test gets a fresh tempdir so they don't share
+/// Build a `Client<FilesystemKeyStore>` backed by the mock chain's RPC (or
+/// [`node_like::NodeLikeRpc`]) + a tempdir-scoped SQLite store + keystore. Each test gets a fresh tempdir so they don't share
 /// on-disk state.
 pub async fn build_test_client(
-    rpc: Arc<MockRpcApi>,
+    rpc: Arc<dyn NodeRpcClient>,
     keystore_dir: PathBuf,
     store_path: PathBuf,
 ) -> Result<Client<FilesystemKeyStore>> {
@@ -109,10 +112,8 @@ pub async fn build_test_client(
         FilesystemKeyStore::new(keystore_dir)
             .map_err(|e| anyhow!("FilesystemKeyStore::new: {e}"))?,
     );
-    let rpc_dyn: Arc<dyn NodeRpcClient> = rpc;
-
     let mut client = ClientBuilder::new()
-        .rpc(rpc_dyn)
+        .rpc(rpc)
         .sqlite_store(store_path)
         .authenticator(keystore)
         .build()
@@ -148,17 +149,15 @@ async fn seed_encryption_key(client: &mut Client<FilesystemKeyStore>) -> Result<
 }
 
 /// Build a keyless **ingest** `Client<FilesystemKeyStore>` backed by the same
-/// `MockRpcApi` (shared mock chain) but with **no authenticator and no tracked
+/// mock chain RPC but with **no authenticator and no tracked
 /// account** — the chain-watching path. Mirrors production `build_ingest_client`.
 /// The `FilesystemKeyStore` type parameter is only a phantom here.
 pub async fn build_test_ingest_client(
-    rpc: Arc<MockRpcApi>,
+    rpc: Arc<dyn NodeRpcClient>,
     store_path: PathBuf,
 ) -> Result<Client<FilesystemKeyStore>> {
-    let rpc_dyn: Arc<dyn NodeRpcClient> = rpc;
-
     ClientBuilder::new()
-        .rpc(rpc_dyn)
+        .rpc(rpc)
         .sqlite_store(store_path)
         .build()
         .await
@@ -181,7 +180,8 @@ pub fn temp_paths() -> Result<(TempDir, PathBuf, PathBuf)> {
 /// in test setup) — the rebuilt executor client reloads them from there, just
 /// as a production restart would.
 pub struct MockClientFactory {
-    pub rpc: Arc<MockRpcApi>,
+    /// The mock chain's RPC, or [`node_like::NodeLikeRpc`] in front of it.
+    pub rpc: Arc<dyn NodeRpcClient>,
     pub ingest_store: PathBuf,
     pub executor_store: PathBuf,
     pub keystore: PathBuf,

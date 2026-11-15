@@ -554,6 +554,14 @@ fn insert_remainders(
         .collect())
 }
 
+/// What a release did with the settlement's parents.
+#[derive(Debug, Default)]
+pub struct DiscardedSettlement {
+    pub update: BookUpdate,
+    /// Whether the attempt was still unresolved, so this call released it.
+    pub found: bool,
+}
+
 /// Release a settlement whose transaction never commits, once the parents'
 /// on-chain nullifiers are known. Consumed parents retire, the rest return to
 /// the book, and the attempt is deleted. A missing attempt was already
@@ -562,9 +570,9 @@ pub fn finish_discarded_settlement_tx(
     conn: &mut PgConnection,
     tx_id: &[u8],
     consumed: &HashSet<OrderId>,
-) -> DbResult<BookUpdate> {
+) -> DbResult<DiscardedSettlement> {
     if !lock_attempt(conn, tx_id)? {
-        return Ok(BookUpdate::default());
+        return Ok(DiscardedSettlement::default());
     }
     let inputs: Vec<(SettlementInputRow, OrderRow)> = settlement_inputs::table
         .inner_join(orders::table.on(settlement_inputs::parent_note_id.eq(orders::note_id)))
@@ -616,7 +624,10 @@ pub fn finish_discarded_settlement_tx(
         status = "discarded",
         "persisted discarded settlement"
     );
-    Ok(update)
+    Ok(DiscardedSettlement {
+        update,
+        found: true,
+    })
 }
 
 /// Called only by the executor, after the node confirmed our transaction ID:
@@ -1187,6 +1198,7 @@ mod tests {
             conn.transaction::<_, DbError, _>(|conn| {
                 finish_discarded_settlement_tx(conn, &[41], &HashSet::new())
             })
+            .map(|released| released.update)
             .map_err(Into::into)
         });
         let confirmed = confirmer.join().expect("confirmation worker panicked")?;
@@ -1208,6 +1220,52 @@ mod tests {
             assert!(confirmed.is_empty());
             assert_eq!(discarded.active.len(), 1);
         }
+        Ok(())
+    }
+
+    /// A release is counted by the attempt it resolved, not by the orders it
+    /// moved: one whose parent was retired meanwhile changes no order.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_release_that_moves_no_order_is_still_found() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let note = order_note(Word::default())?;
+        let order_row = NewOrderRow::ingested(&note, 10)?;
+        conn.transaction::<_, DbError, _>(|conn| {
+            insert_orders_batch_tx(conn, &[order_row], 1)?;
+            prepare_settlement_tx(
+                conn,
+                &SettlementAttemptRow {
+                    tx_id: vec![41],
+                    tx_result: vec![42],
+                    status: "prepared".into(),
+                },
+                &[SettlementInputRow {
+                    tx_id: vec![41],
+                    parent_note_id: note.id().to_bytes(),
+                    child_note_id: None,
+                    child_note_data: None,
+                    fill_amount: None,
+                }],
+                None,
+            )?;
+            // Spent elsewhere while reserved.
+            diesel::update(orders::table.find(note.id().to_bytes()))
+                .set(orders::status.eq(OrderStatus::OnchainNullified.as_str()))
+                .execute(conn)?;
+            Ok(())
+        })?;
+        let mut release = || {
+            conn.transaction::<_, DbError, _>(|conn| {
+                finish_discarded_settlement_tx(conn, &[41], &HashSet::new())
+            })
+        };
+        let released = release()?;
+        assert!(released.found);
+        assert!(released.update.is_empty());
+        // The attempt is gone: a second release finds nothing.
+        assert!(!release()?.found);
         Ok(())
     }
 

@@ -4,5 +4,6 @@
 
 mod error;
 mod executor;
+pub(crate) mod metrics;
 pub use error::{BatchError, ExecResult, ExecutorError};
 pub use executor::*;

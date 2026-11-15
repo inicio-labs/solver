@@ -17,6 +17,7 @@ pub use events::append_event_tx;
 pub use intake::{run_intake, IntakeReceiver, IntakeSender};
 pub use service::{spawn_gateway_thread, MakerGatewayService};
 pub use watcher::{run_watcher, MakerTracker, NoteObservation, SdkTracker, WatchError, Watcher};
+pub(crate) use watcher::{watcher_gauges, WatcherGauges};
 
 /// Generated from `proto/maker/v1/gateway.proto`.
 pub mod proto {

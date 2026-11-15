@@ -1091,6 +1091,21 @@ impl PgPool {
     where
         F: FnOnce(&mut PgConnection) -> DbResult<BookUpdate> + Send + 'static,
     {
+        self.write_book_with(sender, move |conn| Ok((operation(conn)?, ())))
+            .await
+    }
+
+    /// [`Self::write_book`] for a transaction that also reports something to
+    /// its caller, returned once the update is published.
+    pub async fn write_book_with<F, T>(
+        &self,
+        sender: &mpsc::Sender<BookUpdate>,
+        operation: F,
+    ) -> DbResult<T>
+    where
+        F: FnOnce(&mut PgConnection) -> DbResult<(BookUpdate, T)> + Send + 'static,
+        T: Send + 'static,
+    {
         let pool = self.clone();
         let sender = sender.clone();
         // The owned task keeps the guard through send even if its caller is
@@ -1103,10 +1118,11 @@ impl PgPool {
                 complete: false,
             };
             let result = async {
-                let update = pool
+                let (update, report) = pool
                     .write(move |conn| {
-                        let update = operation(conn)?;
-                        super::postgres_db::live_book_update_tx(conn, update)
+                        let (update, report) = operation(conn)?;
+                        let update = super::postgres_db::live_book_update_tx(conn, update)?;
+                        Ok((update, report))
                     })
                     .await?;
                 if !update.is_empty() {
@@ -1115,7 +1131,7 @@ impl PgPool {
                         .await
                         .map_err(|_| pool.stop(DbError::MatcherStopped))?;
                 }
-                Ok(())
+                Ok(report)
             }
             .await;
             publication.complete();

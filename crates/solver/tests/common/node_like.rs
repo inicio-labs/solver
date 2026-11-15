@@ -40,8 +40,9 @@ use miden_protocol::vm::ExecutionProof;
 use miden_protocol::Word;
 
 /// A code-2 refusal in the shape miden-client 0.17.5 reports for a node's
-/// mempool conflicts. The text is built to match the node's (`{:?}` of the
-/// IDs); it is not a captured sample.
+/// mempool conflicts. The text matches what a local node 0.18.0 sent
+/// (`tests/fixtures/node-0.18-refusals.json`): `{:?}` of the note IDs, hex
+/// nullifiers.
 fn state_conflict(cause: String) -> RpcError {
     RpcError::RequestError {
         endpoint: RpcEndpoint::SubmitProvenTx,
@@ -116,6 +117,16 @@ impl NodeLikeRpc {
             inner,
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// Whether a transaction waiting in the mempool spends `nullifier`.
+    pub fn waiting_spends(&self, nullifier: Nullifier) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .waiting
+            .values()
+            .any(|effects| effects.nullifiers.contains(&nullifier))
     }
 
     /// Commit every queued transaction in one block. A note created and

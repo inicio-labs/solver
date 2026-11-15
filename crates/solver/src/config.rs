@@ -57,6 +57,15 @@ pub(crate) enum ConfigError {
     InvalidClearingFee { fee: u32, maximum: u32 },
     #[error("engine.{0} must be at least 1")]
     ZeroMakerIntakeLimit(&'static str),
+    #[error("engine.{name} must be between {min} and {max}, got {value}")]
+    MakerSettingOutOfRange {
+        name: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
+    },
+    #[error("engine.maker_live_at_accept needs {0}")]
+    MakerLiveAtAccept(&'static str),
     #[error("pair {pair}: invalid {side}_faucet_id: {reason}")]
     InvalidFaucet {
         pair: String,
@@ -393,6 +402,20 @@ pub struct EngineConfig {
     /// `true`; `false` matches as before.
     #[serde(default = "default_maker_self_trade_prevention")]
     pub maker_self_trade_prevention: bool,
+    /// Maker orders with a private note go live when the gateway accepts
+    /// them, before their note is in a block (ADR 0008). Needs the gateway.
+    /// Default `false`: an order goes live once its note is in a block.
+    #[serde(default)]
+    pub maker_live_at_accept: bool,
+    /// An order that went live at accept is cancelled when its note is not in
+    /// a block this many seconds after accept AND
+    /// `maker_unconfirmed_cancel_after_blocks` blocks after the block the
+    /// watcher had read at accept. 10 to 3600; default 60.
+    #[serde(default = "default_maker_unconfirmed_cancel_after_secs")]
+    pub maker_unconfirmed_cancel_after_secs: u64,
+    /// See `maker_unconfirmed_cancel_after_secs`. 2 to 1000; default 20.
+    #[serde(default = "default_maker_unconfirmed_cancel_after_blocks")]
+    pub maker_unconfirmed_cancel_after_blocks: u32,
 }
 
 fn default_admin_port() -> u16 {
@@ -482,6 +505,12 @@ fn default_maker_settlement_buffer_ms() -> u64 {
 }
 fn default_maker_self_trade_prevention() -> bool {
     true
+}
+fn default_maker_unconfirmed_cancel_after_secs() -> u64 {
+    60
+}
+fn default_maker_unconfirmed_cancel_after_blocks() -> u32 {
+    20
 }
 fn default_maker_watch_interval_ms() -> u64 {
     1_000
@@ -607,6 +636,43 @@ impl SolverConfig {
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroMakerIntakeLimit(name));
+            }
+        }
+        for (name, value, min, max) in [
+            (
+                "maker_unconfirmed_cancel_after_secs",
+                self.engine.maker_unconfirmed_cancel_after_secs,
+                10,
+                3600,
+            ),
+            (
+                "maker_unconfirmed_cancel_after_blocks",
+                u64::from(self.engine.maker_unconfirmed_cancel_after_blocks),
+                2,
+                1000,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(ConfigError::MakerSettingOutOfRange {
+                    name,
+                    value,
+                    min,
+                    max,
+                });
+            }
+        }
+        if self.engine.maker_live_at_accept {
+            if !self.engine.maker_gateway_enabled {
+                return Err(ConfigError::MakerLiveAtAccept(
+                    "engine.maker_gateway_enabled = true",
+                ));
+            }
+            // The freshness rule reads the watcher's latest block; a slower
+            // watcher would send every order down the confirmed path.
+            if self.engine.maker_watch_interval_ms > 2_000 {
+                return Err(ConfigError::MakerLiveAtAccept(
+                    "engine.maker_watch_interval_ms of at most 2000",
+                ));
             }
         }
         check_binance(&self.binance)?;
@@ -949,5 +1015,48 @@ mod tests {
         assert_eq!(config.engine.maker_settlement_buffer_ms, 0);
         config.validate().unwrap();
         assert!(check(|c| c.engine.maker_stream_buffer = 0).contains("maker_stream_buffer"));
+    }
+
+    #[test]
+    fn live_at_accept_is_off_by_default_and_needs_the_gateway() {
+        let engine = &example().engine;
+        assert!(!engine.maker_live_at_accept);
+        assert_eq!(engine.maker_unconfirmed_cancel_after_secs, 60);
+        assert_eq!(engine.maker_unconfirmed_cancel_after_blocks, 20);
+
+        let on = |c: &mut SolverConfig| {
+            c.engine.maker_gateway_enabled = true;
+            c.engine.maker_live_at_accept = true;
+        };
+        accepted(on);
+        assert!(check(|c| c.engine.maker_live_at_accept = true).contains("maker_gateway_enabled"));
+        assert!(check(|c| {
+            on(c);
+            c.engine.maker_watch_interval_ms = 2_001;
+        })
+        .contains("maker_watch_interval_ms"));
+        accepted(|c| {
+            on(c);
+            c.engine.maker_watch_interval_ms = 2_000;
+        });
+    }
+
+    #[test]
+    fn the_unconfirmed_cap_has_bounds() {
+        for (secs, ok) in [(9, false), (10, true), (3_600, true), (3_601, false)] {
+            let mut config = example();
+            config.engine.maker_unconfirmed_cancel_after_secs = secs;
+            assert_eq!(config.validate().is_ok(), ok, "secs {secs}");
+        }
+        for (blocks, ok) in [(1, false), (2, true), (1_000, true), (1_001, false)] {
+            let mut config = example();
+            config.engine.maker_unconfirmed_cancel_after_blocks = blocks;
+            assert_eq!(config.validate().is_ok(), ok, "blocks {blocks}");
+        }
+        assert!(
+            check(|c| c.engine.maker_unconfirmed_cancel_after_blocks = 0).contains(
+                "maker_unconfirmed_cancel_after_blocks must be between 2 and 1000, got 0"
+            )
+        );
     }
 }

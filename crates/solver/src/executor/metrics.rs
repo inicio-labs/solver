@@ -8,11 +8,16 @@ use miden_client::rpc::{AddTransactionError, EndpointError, RpcEndpoint, RpcErro
 use miden_client::ClientError;
 use strum::{EnumCount, IntoEnumIterator};
 
+use super::refusal::ConflictKind;
+
 static REFUSALS: [[AtomicU64; RefusalAttempt::COUNT]; RefusalCode::COUNT] =
     [const { [const { AtomicU64::new(0) }; RefusalAttempt::COUNT] }; RefusalCode::COUNT];
-static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Indexed by whether the settlement spent an unconfirmed maker order.
+static DROPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BOUNCED: [AtomicU64; ReleaseCause::COUNT] =
     [const { AtomicU64::new(0) }; ReleaseCause::COUNT];
+static CONFLICTS: [AtomicU64; ConflictKind::COUNT] =
+    [const { AtomicU64::new(0) }; ConflictKind::COUNT];
 
 /// Why a submission of ours was refused, by the node's error code.
 #[derive(
@@ -103,36 +108,24 @@ pub(crate) fn refusal_code(error: &ClientError) -> RefusalCode {
     }
 }
 
-/// A refusal as text for logs, with what the node said. `ClientError`
-/// displays only "RPC error"; the inner error names the endpoint and the gRPC
-/// status, and carries the node's message when it is typed, otherwise its
-/// source (the gRPC status) does.
-pub(crate) fn refusal_detail(error: &ClientError) -> String {
-    match error {
-        ClientError::RpcError(rpc) => match rpc {
-            RpcError::RequestError {
-                endpoint_error: None,
-                source: Some(source),
-                ..
-            } => format!("{rpc}: {source}"),
-            _ => rpc.to_string(),
-        },
-        other => other.to_string(),
-    }
-}
-
 pub(crate) fn record_refusal(code: RefusalCode, attempt: RefusalAttempt) {
     REFUSALS[code as usize][attempt as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A release that committed and returned `inputs` parents to the book,
 /// before the maker liveness check. Called once per committed release, so a
-/// retried release counts once.
-pub(crate) fn record_release(cause: ReleaseCause, inputs: usize) {
+/// retried release counts once. `unconfirmed`: the settlement spent a maker
+/// order that went live at accept and whose note was not seen yet.
+pub(crate) fn record_release(cause: ReleaseCause, inputs: usize, unconfirmed: bool) {
     BOUNCED[cause as usize].fetch_add(inputs as u64, Ordering::Relaxed);
     if cause == ReleaseCause::Dropped {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
+        DROPPED[usize::from(unconfirmed)].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// A first refusal that was a state conflict (code 2), by what it was about.
+pub(crate) fn record_conflict(kind: ConflictKind) {
+    CONFLICTS[kind as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Refused submissions, per node error code and attempt.
@@ -148,9 +141,22 @@ pub(crate) fn refusals() -> impl Iterator<Item = (&'static str, &'static str, u6
     })
 }
 
-/// Settlements the node accepted that never landed.
-pub(crate) fn dropped() -> u64 {
-    DROPPED.load(Ordering::Relaxed)
+/// Settlements the node accepted that never landed, by whether they spent
+/// an unconfirmed maker order (`"true"`/`"false"`).
+pub(crate) fn dropped() -> impl Iterator<Item = (&'static str, u64)> {
+    [("false", 0), ("true", 1)]
+        .into_iter()
+        .map(|(label, index)| (label, DROPPED[index].load(Ordering::Relaxed)))
+}
+
+/// First refusals that were state conflicts, per kind.
+pub(crate) fn conflicts() -> impl Iterator<Item = (&'static str, u64)> {
+    ConflictKind::iter().map(|kind| {
+        (
+            kind.into(),
+            CONFLICTS[kind as usize].load(Ordering::Relaxed),
+        )
+    })
 }
 
 /// Inputs released by failed settlements, per cause.
@@ -259,27 +265,16 @@ mod tests {
         }
     }
 
+    /// The counters are process-wide. Only this test records a drop of a
+    /// settlement with an unconfirmed maker input, and it returns no inputs,
+    /// so it moves nothing the executor's release test compares (the
+    /// `false` label and the inputs returned by drops).
     #[test]
-    fn refusal_detail_carries_the_node_text() {
-        let typed = refused(Some(AddTransactionError::StateConflict {
-            message: "unauthenticated input notes are unknown: [NoteId(..)]".into(),
-        }));
-        let detail = refusal_detail(&typed);
-        assert!(
-            detail.contains("unauthenticated input notes are unknown"),
-            "{detail}"
-        );
-        assert!(detail.contains("submit_proven_transaction"), "{detail}");
-
-        // Untyped: the node's text is only in the source status.
-        let untyped = ClientError::RpcError(RpcError::RequestError {
-            endpoint: RpcEndpoint::SubmitProvenTx,
-            error_kind: GrpcError::InvalidArgument,
-            endpoint_error: None,
-            source: Some(Box::new(std::io::Error::other(
-                "Invalid proof for transaction",
-            ))),
-        });
-        assert!(refusal_detail(&untyped).ends_with(": Invalid proof for transaction"));
+    fn a_drop_is_labelled_by_whether_it_spent_an_unconfirmed_order() {
+        let count = |label| dropped().find(|(l, _)| *l == label).unwrap().1;
+        let before = count("true");
+        record_release(ReleaseCause::Dropped, 0, true);
+        record_release(ReleaseCause::Refused, 0, true);
+        assert_eq!(count("true"), before + 1);
     }
 }

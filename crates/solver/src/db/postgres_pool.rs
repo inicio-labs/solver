@@ -620,10 +620,16 @@ struct Writer {
 }
 
 /// The maker intake's session: group-commit transactions of maker commands
-/// beside the core writer, never through it. Maker commands only append facts
-/// (commands, lineage claims, cutoffs, stops) and never move orders or
-/// settlements, so it needs no ownership lock. Cancels and reservations still
-/// serialize through the maker control row, which works across sessions.
+/// beside the core writer, never through it. It holds no ownership lock.
+/// Maker commands append facts (commands, lineage claims, cutoffs, stops),
+/// which are safe from any session: cancels and reservations still serialize
+/// through the maker control row, which works across sessions.
+///
+/// With live at accept on (ADR 0008) a round also inserts, stops and deletes
+/// order rows. Such a round first share-locks the owner epoch this session
+/// was opened under and fails if a new owner has claimed it (see
+/// [`AcceptGate::resolve`](super::maker_db::AcceptGate::resolve)), so it
+/// never writes an order into a book another process owns.
 pub struct IntakeSession {
     url: String,
     application_name: String,
@@ -631,6 +637,12 @@ pub struct IntakeSession {
     fatal_db: CancellationToken,
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
+    owner_epoch: i64,
+    /// Set when private submits go live at accept (ADR 0008). `None` keeps
+    /// every submit on the confirmed path.
+    gate: Option<Arc<super::maker_db::AcceptGate>>,
+    /// Woken after a round that put orders live at accept.
+    wake: crate::maker::EventWake,
     #[cfg(test)]
     drop_next_commit_reply: bool,
 }
@@ -661,6 +673,35 @@ impl IntakeSession {
     #[cfg(test)]
     pub(crate) fn simulate_lost_commit_reply(&mut self) {
         self.drop_next_commit_reply = true;
+    }
+
+    /// Let private submits go live at accept (ADR 0008) while `fresh_block`
+    /// returns the watcher's latest block.
+    pub fn with_live_at_accept(
+        mut self,
+        fresh_block: impl Fn() -> Option<miden_protocol::block::BlockNumber> + Send + Sync + 'static,
+    ) -> Self {
+        self.gate = Some(Arc::new(super::maker_db::AcceptGate::new(
+            self.owner_epoch,
+            fresh_block,
+        )));
+        self
+    }
+
+    /// Wake `wake` instead of the process's event streams.
+    #[cfg(test)]
+    pub fn with_event_wake(mut self, wake: crate::maker::EventWake) -> Self {
+        self.wake = wake;
+        self
+    }
+
+    pub(crate) fn event_wake(&self) -> crate::maker::EventWake {
+        self.wake.clone()
+    }
+
+    /// The live-at-accept gate; `None` when it is off.
+    pub(crate) fn accept_gate(&self) -> Option<Arc<super::maker_db::AcceptGate>> {
+        self.gate.clone()
     }
 
     /// Serialize the intake commit and publication with all book writers.
@@ -771,6 +812,7 @@ impl PgPool {
                 let mut writer = postgres_migrations::connect(&writer_url)?;
                 configure_session(&mut writer, &application_name)?;
                 postgres_migrations::verify(&mut writer)?;
+                postgres_migrations::verify_access(&mut writer)?;
                 let writer_identity = database_identity(&mut writer)?;
                 let lock_key = schema_lock_key(&writer_identity.schema_name);
                 let writer_backend =
@@ -788,6 +830,7 @@ impl PgPool {
                 {
                     let mut reader = readers.get()?;
                     postgres_migrations::verify(&mut reader)?;
+                    postgres_migrations::verify_access(&mut reader)?;
                     let reader_identity = database_identity(&mut reader)?;
                     if reader_identity != writer_identity {
                         return Err(DbError::ReaderTargetMismatch {
@@ -860,6 +903,9 @@ impl PgPool {
             fatal_db: self.fatal_db.clone(),
             deadline: self.operation_deadline,
             publish_order: self.publish_order.clone(),
+            owner_epoch: self.writer_config.owner_epoch,
+            gate: None,
+            wake: crate::maker::EventWake::global().clone(),
             #[cfg(test)]
             drop_next_commit_reply: false,
         }

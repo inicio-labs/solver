@@ -200,7 +200,9 @@ async fn quote(cfg: &Config, journal: &mut Journal, args: &[String]) -> Result<(
     let text = describe_reply(&reply);
     journal.finish(&request_id, text.clone())?;
     println!("{request_id}: {text}\n  {detail}\n  lineage {lineage_hex}\n  note    {}", note.id().to_hex());
-    println!("accepted is not live yet: `maker events` shows OrderStatus LIVE once the solver sees the note on chain");
+    // The note's transaction was accepted by the node above, before this
+    // submit (rule 9): with live at accept on, the order can be LIVE at once.
+    println!("`maker events` shows OrderStatus LIVE once the order is live: when the solver sees the note on chain, or at once with live at accept");
     Ok(())
 }
 

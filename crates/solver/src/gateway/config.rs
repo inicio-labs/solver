@@ -30,4 +30,9 @@ pub struct GatewayConfig {
     /// (`maker_settlement_buffer_ms`). The active-order listing uses the same
     /// cutoff, so a maker never sees an order the matcher has already dropped.
     pub settlement_buffer: Duration,
+    /// Private submits go live at accept (ADR 0008).
+    pub live_at_accept: bool,
+    /// When the watcher cancels an order that went live at accept whose note
+    /// never arrived. It applies whether or not the switch is on.
+    pub unconfirmed_cap: super::UnconfirmedCap,
 }

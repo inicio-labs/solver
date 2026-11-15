@@ -60,6 +60,11 @@ pub enum DbError {
          (owner epoch {ours} -> {current})"
     )]
     OwnerEpochMoved { ours: i64, current: i64 },
+    #[error(
+        "another solver, or the cancel-unconfirmed escape hatch, took over the database \
+         (owner epoch {ours} -> {current}); maker intake stopped"
+    )]
+    IntakeEpochMoved { ours: i64, current: i64 },
     #[error("cannot determine whether transaction {xid} committed (status {status:?})")]
     CommitOutcomeUnknown { xid: String, status: Option<String> },
     #[error("PostgreSQL writer session was lost before commit; reconnected, nothing was written")]
@@ -83,6 +88,15 @@ pub enum DbError {
     },
     #[error("PostgreSQL migration failed: {0}")]
     Migration(String),
+    #[error(
+        "this PostgreSQL role cannot read `{relation}`: grant it SELECT on that relation \
+         (docs/postgres-runbook.md, production setup, step 2)"
+    )]
+    Unreadable {
+        relation: &'static str,
+        #[source]
+        source: diesel::result::Error,
+    },
 
     // ---- stored and incoming data ----
     #[error("PostgreSQL sync cursor row is missing")]
@@ -131,6 +145,7 @@ impl DbError {
                 | Self::OwnershipLost
                 | Self::LockTakenAfterDisconnect
                 | Self::OwnerEpochMoved { .. }
+                | Self::IntakeEpochMoved { .. }
                 | Self::CommitOutcomeUnknown { .. }
                 | Self::WriterPanicked(_)
                 | Self::WriteDeadline(_)

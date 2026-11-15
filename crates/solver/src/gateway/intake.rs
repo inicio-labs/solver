@@ -9,9 +9,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::error::IntakeError;
-use crate::db::maker_db::execute_command_tx;
+use diesel::pg::PgConnection;
+use miden_protocol::note::NoteType;
+
+use super::metrics as gateway_metrics;
+use crate::db::maker_db::{execute_command_tx, AcceptGate, AcceptMode, CommandOutcome};
 use crate::db::{DbResult, IntakeSession};
-use crate::maker::{CommandHeader, CommandReply, MakerCommand};
+use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerId};
 
 type Reply = oneshot::Sender<Result<CommandReply, IntakeError>>;
 
@@ -82,6 +86,10 @@ impl IntakeSender {
 /// Applied knows its cutoff is already queued there, then every handler gets
 /// its reply. A failed or uncertain round replies `OutcomeUnknown` to all of
 /// its commands; a retry with the same request ID resolves the durable result.
+///
+/// With live at accept on (ADR 0008), orders that went live in the round go
+/// to the matcher in the same update, and the event streams are woken for
+/// their LIVE.
 pub async fn run_intake(
     mut session: IntakeSession,
     mut intake: IntakeReceiver,
@@ -89,6 +97,7 @@ pub async fn run_intake(
     max_submits: usize,
     cancel: CancellationToken,
 ) {
+    let wake = session.event_wake();
     loop {
         let first = tokio::select! {
             biased;
@@ -126,30 +135,35 @@ pub async fn run_intake(
             .map(|request| ((request.header, request.command), request.reply))
             .unzip();
         let size = commands.len();
+        let gate = session.accept_gate();
         let mut publication = session.publication_guard().await;
         let outcome = session
-            .transaction(move |conn| {
-                crate::db::maker_db::prelock_submission_orders_tx(conn, &commands)?;
-                crate::db::maker_db::prelock_command_makers_tx(conn, &commands)?;
-                commands
-                    .iter()
-                    .map(|(header, command)| execute_command_tx(conn, header, command))
-                    .collect::<DbResult<Vec<_>>>()
-            })
+            .transaction(move |conn| intake_round_tx(conn, &commands, gate.as_deref()))
             .await;
         match outcome {
             Ok(mut outcomes) => {
                 let maker_updates: Vec<_> = outcomes
                     .iter_mut()
-                    .filter_map(|(_, update)| update.take())
+                    .filter_map(|(_, outcome)| outcome.update.take())
                     .collect();
-                if !maker_updates.is_empty() {
+                let mut active = Vec::new();
+                for (maker_id, outcome) in &mut outcomes {
+                    if let Some(order) = outcome.live.take() {
+                        gateway_metrics::count(gateway_metrics::LIVE_AT_ACCEPT, *maker_id);
+                        active.push(order);
+                    }
+                    if let Some(reason) = outcome.fallback {
+                        gateway_metrics::count_fallback(*maker_id, reason);
+                    }
+                }
+                let went_live = !active.is_empty();
+                if !maker_updates.is_empty() || went_live {
                     // The publication guard makes this the next committed
                     // matcher update after every earlier book transaction.
                     if book_tx
                         .send(crate::types::BookUpdate {
                             removed: Vec::new(),
-                            active: Vec::new(),
+                            active,
                             maker_updates,
                         })
                         .await
@@ -162,8 +176,16 @@ pub async fn run_intake(
                         return;
                     }
                 }
-                for (reply, (result, _)) in replies.into_iter().zip(outcomes) {
-                    let _ = reply.send(Ok(result));
+                for (reply, (_, outcome)) in replies.into_iter().zip(outcomes) {
+                    let _ = reply.send(Ok(outcome.reply));
+                }
+                // After the replies, so the maker usually hears Accepted
+                // first. Not always: LIVE is committed already, and a stream
+                // that wakes for another reason (a keep-alive, another event)
+                // reads it; the reply and the stream are separate calls. The
+                // core writer's append flag is not ours to take.
+                if went_live {
+                    wake.notify();
                 }
             }
             Err(error) => {
@@ -179,8 +201,45 @@ pub async fn run_intake(
     }
 }
 
+/// One intake round's writes, in its transaction: with live at accept on and
+/// a private submit in the round, the owner-epoch guard first (see
+/// [`AcceptGate::resolve`]), then the order rows and maker rows the round
+/// may touch, in the reservation's lock order, then every command.
+///
+/// `commands` must hold the round's cancels before its submits, as
+/// [`run_intake`] orders them: the matcher applies a round's cancels before
+/// its new orders, so a submit cancelled in the same round would otherwise
+/// reach the book.
+pub(crate) fn intake_round_tx(
+    conn: &mut PgConnection,
+    commands: &[(CommandHeader, MakerCommand)],
+    gate: Option<&AcceptGate>,
+) -> DbResult<Vec<(MakerId, CommandOutcome)>> {
+    let private_submit = commands.iter().any(|(_, command)| {
+        matches!(command, MakerCommand::Submit { note, .. }
+            if note.metadata().note_type() == NoteType::Private)
+    });
+    let accept = match gate {
+        None => AcceptMode::Off,
+        // The round's first statement, before any other lock.
+        Some(gate) if private_submit => gate.resolve(conn)?,
+        // Nothing here can go live at accept, so no block is read and no
+        // lock taken; a public submit still reports its fallback.
+        Some(_) => AcceptMode::Stale,
+    };
+    crate::db::maker_db::prelock_submission_orders_tx(conn, commands)?;
+    crate::db::maker_db::prelock_command_makers_tx(conn, commands)?;
+    commands
+        .iter()
+        .map(|(header, command)| {
+            let outcome = execute_command_tx(conn, header, command, accept)?;
+            Ok((header.maker_id, outcome))
+        })
+        .collect()
+}
+
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::postgres_test::TestDb;
     use crate::db::{maker_db, DbError};
@@ -386,6 +445,161 @@ pub(super) mod tests {
             live,
             [pswap_note(6).id().to_bytes().to_vec()],
             "only the submit above the barrier can trade"
+        );
+        stop.cancel();
+        writer.await.unwrap();
+    }
+
+    /// Ingest advances `sync_state` and then appends maker events, which
+    /// lock maker rows. In one solver the two never overlap (both hold the
+    /// publication guard through their transaction), but during a takeover
+    /// the old process's intake runs beside the new owner's ingest. A
+    /// live-at-accept round share-locks `sync_state` before any maker row, so
+    /// the two queue one behind the other. Taking it after the maker lock
+    /// deadlocks, and an intake round that fails stops the solver.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    fn a_live_at_accept_round_and_ingest_never_deadlock() -> anyhow::Result<()> {
+        use crate::db::postgres_migrations::connect;
+        use crate::db::postgres_test::TestSchema;
+        use diesel::connection::SimpleConnection;
+        use diesel::prelude::*;
+        use std::sync::{Arc, Barrier};
+
+        let mut fixture = TestSchema::migrated()?;
+        let alpha = maker_db::create_maker_tx(&mut fixture.conn, "alpha")?.unwrap();
+        let epoch: i64 = crate::db::postgres_schema::sync_state::table
+            .find(1_i16)
+            .select(crate::db::postgres_schema::sync_state::owner_epoch)
+            .first(&mut fixture.conn)?;
+        let barrier = Arc::new(Barrier::new(2));
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel::<i32>();
+        let ingest = std::thread::spawn({
+            let (url, barrier) = (fixture.url.clone(), barrier.clone());
+            move || -> anyhow::Result<()> {
+                let mut conn = connect(&url)?;
+                conn.batch_execute("BEGIN; UPDATE sync_state SET last_fetched_block = 5")?;
+                barrier.wait();
+                // Let the intake round take whatever it takes first: whatever
+                // the order, it ends up waiting on this transaction's lock.
+                let pid = pid_rx.recv()?;
+                let mut watch = connect(&url)?;
+                let started = std::time::Instant::now();
+                while !diesel::select(diesel::dsl::sql::<diesel::sql_types::Bool>(&format!(
+                    "EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE pid = {pid} AND wait_event_type = 'Lock')"
+                )))
+                .get_result::<bool>(&mut watch)?
+                {
+                    anyhow::ensure!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "the intake round never waited on a lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                conn.batch_execute(&format!(
+                    "UPDATE makers SET next_event_seq = next_event_seq WHERE maker_id = {alpha}; COMMIT"
+                ))?;
+                Ok(())
+            }
+        });
+        let intake = std::thread::spawn({
+            let (url, barrier) = (fixture.url.clone(), barrier.clone());
+            move || -> anyhow::Result<bool> {
+                let mut conn = connect(&url)?;
+                let commands = [(
+                    header(alpha, "s1", 1),
+                    MakerCommand::submit(pswap_note(1)).unwrap(),
+                )];
+                let gate =
+                    AcceptGate::new(epoch, || Some(miden_protocol::block::BlockNumber::from(7)));
+                let pid = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>(
+                    "pg_backend_pid()",
+                ))
+                .get_result::<i32>(&mut conn)?;
+                pid_tx.send(pid)?;
+                barrier.wait();
+                let outcomes = conn.transaction::<_, crate::db::DbError, _>(|conn| {
+                    intake_round_tx(conn, &commands, Some(&gate))
+                })?;
+                Ok(outcomes[0].1.live.is_some())
+            }
+        });
+        ingest.join().expect("ingest thread")?;
+        assert!(
+            intake.join().expect("intake thread")?,
+            "went live at accept"
+        );
+        Ok(())
+    }
+
+    /// With live at accept on, a fresh private submit is in the round's one
+    /// matcher update, tagged, next to its attribution, and the event
+    /// streams wake for its LIVE. A stale watcher sends it the confirmed way.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_live_at_accept_round_publishes_the_order_and_wakes_streams() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let fresh = Arc::new(AtomicBool::new(true));
+        let wake = crate::maker::EventWake::default();
+        let mut woken = wake.subscribe();
+        let session = db
+            .pool
+            .intake_session()
+            .with_event_wake(wake)
+            .with_live_at_accept({
+                let fresh = fresh.clone();
+                move || {
+                    fresh
+                        .load(Ordering::Relaxed)
+                        .then(|| miden_protocol::block::BlockNumber::from(7))
+                }
+            });
+        let (intake, queues) = IntakeSender::new(4, 4);
+        let (book_tx, mut book_rx) = mpsc::channel(4);
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn(run_intake(session, queues, book_tx, 10, stop.clone()));
+
+        let order = pswap_note(1);
+        assert_eq!(
+            intake
+                .execute(
+                    header(alpha, "s1", 1),
+                    MakerCommand::submit(order.clone()).unwrap()
+                )
+                .await
+                .unwrap(),
+            CommandReply::Committed(CommandResult::Accepted)
+        );
+        let update = book_rx.recv().await.unwrap();
+        assert_eq!(update.active.len(), 1);
+        assert_eq!(update.active[0].id(), order.id());
+        assert_eq!(update.active[0].maker.map(|tag| tag.maker_id), Some(alpha));
+        assert!(matches!(
+            update.maker_updates.as_slice(),
+            [MakerUpdate::OrdersAttributed { .. }]
+        ));
+        // The wake follows the reply.
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken.changed())
+            .await
+            .expect("streams woken for LIVE")
+            .unwrap();
+
+        fresh.store(false, Ordering::Relaxed);
+        intake
+            .execute(
+                header(alpha, "s2", 2),
+                MakerCommand::submit(pswap_note(2)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let update = book_rx.recv().await.unwrap();
+        assert!(
+            update.active.is_empty(),
+            "a stale watcher: the confirmed path"
         );
         stop.cancel();
         writer.await.unwrap();
@@ -598,7 +812,8 @@ pub(super) mod tests {
             let mut conn = crate::db::postgres_migrations::connect(&url)?;
             let stored = maker_db::stored_result_tx(&mut conn, alpha, &request_id)?;
             let live = crate::db::postgres_db::load_live_orders_tx(&mut conn)?;
-            let replay = maker_db::execute_command_tx(&mut conn, &retry_header, &retry_command)?;
+            let replay =
+                maker_db::execute_command_confirmed_tx(&mut conn, &retry_header, &retry_command)?;
             Ok((stored, live, replay))
         })
         .await

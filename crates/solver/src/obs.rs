@@ -140,8 +140,8 @@ fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceS
 }
 
 /// How often the node refuses or drops our settlements, and how many inputs
-/// failed settlements release. `unconfirmed_maker_input` is always "false"
-/// until maker orders can go live before their note is confirmed.
+/// failed settlements release. `unconfirmed_maker_input` marks a settlement
+/// that spent a maker order whose note was not seen yet (ADR 0008).
 fn append_settlement_metrics(body: &mut String) {
     for (code, attempt, count) in crate::executor::metrics::refusals() {
         let _ = writeln!(
@@ -149,11 +149,18 @@ fn append_settlement_metrics(body: &mut String) {
             "solver_executor_settlement_refusals_total{{code=\"{code}\",attempt=\"{attempt}\"}} {count}"
         );
     }
-    let _ = writeln!(
-        body,
-        "solver_executor_settlements_dropped_total{{unconfirmed_maker_input=\"false\"}} {}",
-        crate::executor::metrics::dropped()
-    );
+    for (kind, count) in crate::executor::metrics::conflicts() {
+        let _ = writeln!(
+            body,
+            "solver_executor_settlement_conflicts_total{{kind=\"{kind}\"}} {count}"
+        );
+    }
+    for (unconfirmed, count) in crate::executor::metrics::dropped() {
+        let _ = writeln!(
+            body,
+            "solver_executor_settlements_dropped_total{{unconfirmed_maker_input=\"{unconfirmed}\"}} {count}"
+        );
+    }
     for (reason, count) in crate::executor::metrics::bounced() {
         let _ = writeln!(
             body,
@@ -172,11 +179,19 @@ fn append_maker_metrics(body: &mut String, watcher: Option<WatcherGauges>) {
             "solver_maker_watcher_synced_block {}\n\
              solver_maker_watcher_block_read_age_seconds {}\n\
              solver_maker_pending_lineages {}\n\
-             solver_maker_oldest_pending_lineage_age_seconds {}",
+             solver_maker_oldest_pending_lineage_age_seconds {}\n\
+             solver_maker_unconfirmed_orders {}\n\
+             solver_maker_oldest_unconfirmed_order_age_seconds {}\n\
+             solver_maker_waiting_orders {}\n\
+             solver_maker_watcher_unobserved_notes {}",
             gauges.synced_block,
             gauges.read_age_secs,
             gauges.pending_lineages,
-            gauges.oldest_pending_age_secs
+            gauges.oldest_pending_age_secs,
+            gauges.unconfirmed,
+            gauges.oldest_unconfirmed_age_secs,
+            gauges.waiting,
+            gauges.unobserved
         );
     }
 }
@@ -233,6 +248,7 @@ async fn metrics(
     append_price_metrics(&mut body, &state.feed_metrics, &snapshot);
     append_settlement_metrics(&mut body);
     append_maker_metrics(&mut body, crate::gateway::watcher_gauges());
+    crate::gateway::metrics::render(&mut body);
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
@@ -374,7 +390,7 @@ mod tests {
         let mut before = String::new();
         append_settlement_metrics(&mut before);
         record_refusal(RefusalCode::Capacity, RefusalAttempt::Resubmission);
-        record_release(ReleaseCause::Expired, 3);
+        record_release(ReleaseCause::Expired, 3, false);
         let mut after = String::new();
         append_settlement_metrics(&mut after);
         assert_eq!(value(&after, refused), value(&before, refused) + 1);
@@ -391,6 +407,10 @@ mod tests {
                 read_age_secs: 1.5,
                 pending_lineages: 3,
                 oldest_pending_age_secs: 42.25,
+                unconfirmed: 2,
+                oldest_unconfirmed_age_secs: 4.5,
+                waiting: 1,
+                unobserved: 0,
             }),
         );
         assert_eq!(
@@ -398,7 +418,11 @@ mod tests {
             "solver_maker_watcher_synced_block 120\n\
              solver_maker_watcher_block_read_age_seconds 1.5\n\
              solver_maker_pending_lineages 3\n\
-             solver_maker_oldest_pending_lineage_age_seconds 42.25\n"
+             solver_maker_oldest_pending_lineage_age_seconds 42.25\n\
+             solver_maker_unconfirmed_orders 2\n\
+             solver_maker_oldest_unconfirmed_order_age_seconds 4.5\n\
+             solver_maker_waiting_orders 1\n\
+             solver_maker_watcher_unobserved_notes 0\n"
         );
         // With the gateway disabled no watcher runs, and the lines are absent.
         let mut empty = String::new();

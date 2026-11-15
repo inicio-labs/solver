@@ -34,7 +34,7 @@ fn expected_versions() -> DbResult<BTreeSet<String>> {
         .collect())
 }
 
-fn applied_versions(conn: &mut PgConnection) -> DbResult<BTreeSet<String>> {
+pub(crate) fn applied_versions(conn: &mut PgConnection) -> DbResult<BTreeSet<String>> {
     Ok(
         diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
             .load::<AppliedVersion>(conn)
@@ -109,6 +109,16 @@ pub fn revert_last(conn: &mut PgConnection) -> DbResult<String> {
     })
 }
 
+/// The live-at-accept escape hatch (ADR 0008): with the solver stopped, close
+/// every order that went live at accept and still lacks its note. Refuses
+/// while a solver owns the database.
+pub fn cancel_unconfirmed(conn: &mut PgConnection) -> DbResult<super::maker_db::HatchReport> {
+    verify(conn)?;
+    super::postgres_pool::with_ownership_lock(conn, |conn| {
+        conn.transaction(super::maker_db::cancel_unconfirmed_tx)
+    })
+}
+
 /// Check, without DDL, that the applied migration history equals the set
 /// compiled into this binary. Each migration creates its own tables, so an
 /// exact history match also means the schema this binary expects is present.
@@ -117,6 +127,26 @@ pub fn verify(conn: &mut PgConnection) -> DbResult<()> {
         Some(mismatch) => Err(mismatch),
         None => Ok(()),
     }
+}
+
+/// Views a solver session reads directly, so its own role needs `SELECT` on
+/// each. A view reached only through another view is checked against that
+/// view's owner instead.
+const DIRECTLY_READ_VIEWS: [&str; 2] = ["live_orders", "eligible_orders"];
+
+/// Check that this session's role can read the views the solver reads
+/// directly. A migration that adds one needs a grant of its own unless the
+/// deployment's default grants cover it. Without this check a missing grant
+/// passes startup, since hydration reads `live_orders` and reaches
+/// `eligible_orders` as that view's owner, and then fails the first ingest
+/// or settlement write with "permission denied".
+pub fn verify_access(conn: &mut PgConnection) -> DbResult<()> {
+    for relation in DIRECTLY_READ_VIEWS {
+        diesel::sql_query(format!("SELECT 1 FROM {relation} LIMIT 0"))
+            .execute(conn)
+            .map_err(|source| DbError::Unreadable { relation, source })?;
+    }
+    Ok(())
 }
 
 pub fn connect(database_url: &str) -> DbResult<PgConnection> {
@@ -146,6 +176,79 @@ mod tests {
             result.is_err(),
             "statement unexpectedly succeeded: {statement}"
         );
+        Ok(())
+    }
+
+    /// Reverting the live-at-accept migration keeps the grants on
+    /// `live_orders`: the previous binary reads it at startup.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_revert_keeps_the_grants_on_live_orders() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        conn.batch_execute(&format!("GRANT SELECT ON {schema}.live_orders TO PUBLIC"))?;
+        #[derive(QueryableByName)]
+        struct Acl {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            acl: Option<String>,
+        }
+        let public_reads = |conn: &mut PgConnection| -> Result<bool> {
+            let acl = diesel::sql_query(format!(
+                "SELECT relacl::text AS acl FROM pg_class WHERE oid = '{schema}.live_orders'::regclass"
+            ))
+            .get_result::<Acl>(conn)?
+            .acl
+            .unwrap_or_default();
+            // PUBLIC's entry has an empty grantee: "=r/owner".
+            Ok(acl.contains("\"=r/") || acl.contains(",=r/") || acl.contains("{=r/"))
+        };
+        assert!(public_reads(conn)?);
+        assert_eq!(revert_last(conn)?, "20261114000001");
+        assert!(public_reads(conn)?, "the revert dropped the grant");
+        Ok(())
+    }
+
+    /// A runtime role that was granted the old view but not the new one
+    /// passes the history check and can still read the book (`live_orders`
+    /// reaches `eligible_orders` as its owner). The access check names the
+    /// view it cannot read.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_role_that_cannot_read_a_view_is_refused_by_name() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        let role = format!("{schema}_r");
+        // Rolled back at the end, so the role never outlives the test.
+        conn.batch_execute(&format!(
+            "BEGIN; CREATE ROLE {role} NOLOGIN;
+             GRANT USAGE ON SCHEMA {schema} TO {role};
+             GRANT SELECT ON {schema}.__diesel_schema_migrations, {schema}.live_orders TO {role}"
+        ))?;
+        let as_role = |conn: &mut PgConnection| -> Result<DbResult<()>> {
+            conn.batch_execute(&format!("SAVEPOINT as_role; SET LOCAL ROLE {role}"))?;
+            let checked = verify(conn).and_then(|()| {
+                diesel::sql_query("SELECT 1 FROM live_orders LIMIT 0").execute(conn)?;
+                verify_access(conn)
+            });
+            conn.batch_execute("ROLLBACK TO SAVEPOINT as_role; RELEASE SAVEPOINT as_role")?;
+            Ok(checked)
+        };
+        let refused = as_role(conn)?.expect_err("eligible_orders is not granted");
+        assert!(
+            matches!(
+                refused,
+                DbError::Unreadable {
+                    relation: "eligible_orders",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        conn.batch_execute(&format!(
+            "GRANT SELECT ON {schema}.eligible_orders TO {role}"
+        ))?;
+        as_role(conn)??;
+        conn.batch_execute("ROLLBACK")?;
         Ok(())
     }
 

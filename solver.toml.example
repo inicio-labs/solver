@@ -125,6 +125,9 @@ admin_port = 3001
 # maker_settlement_buffer_ms = 30000 # selection stops this long before MM expiry
 # maker_watch_interval_ms = 1000     # maker-note watcher: new blocks, spends
 # maker_self_trade_prevention = true # ADR 0005: crossed maker orders never fill each other
+# maker_live_at_accept = false # ADR 0008: private maker orders trade before their note is in a block; needs maker_gateway_enabled and maker_watch_interval_ms <= 2000
+# maker_unconfirmed_cancel_after_secs = 60 # ...and are cancelled if the note is not in a block this long after accept (10 to 3600)
+# maker_unconfirmed_cancel_after_blocks = 20 # ...and this many blocks after accept, both must pass (2 to 1000)
 
 # ── Binance Spot public market data (the only price source) ─────────────────
 # Two readers stream <symbol>@bookTicker; the price is the exact (bid + ask) / 2.

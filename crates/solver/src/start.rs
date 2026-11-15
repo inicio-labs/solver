@@ -212,6 +212,23 @@ pub async fn start(
     .context("open PostgreSQL application database")?;
     let db_fatal = db_pool.fatal_token();
 
+    // Orders that went live at accept are capped and activated by the maker
+    // gateway's watcher. Without it they would trade unchecked, and waiting
+    // ones would never return (ADR 0008).
+    if !config.engine.maker_gateway_enabled {
+        let unconfirmed = db_pool
+            .read(db::maker_db::unconfirmed_count_tx)
+            .await
+            .context("count maker orders that went live at accept")?;
+        if unconfirmed > 0 {
+            anyhow::bail!(
+                "{unconfirmed} maker order(s) went live at accept and still lack their note, \
+                 but engine.maker_gateway_enabled is false: enable the gateway, or stop the \
+                 solver and run `solver-bin cancel-unconfirmed` first"
+            );
+        }
+    }
+
     // 2. Env-sourced secrets.
     let admin_token = std::env::var("SOLVER_ADMIN_TOKEN").ok();
     if admin_token.is_none() {
@@ -552,6 +569,11 @@ pub async fn start(
                 heartbeat: Duration::from_millis(config.engine.maker_stream_heartbeat_ms),
             },
             settlement_buffer: Duration::from_millis(config.engine.maker_settlement_buffer_ms),
+            live_at_accept: config.engine.maker_live_at_accept,
+            unconfirmed_cap: crate::gateway::UnconfirmedCap {
+                secs: config.engine.maker_unconfirmed_cancel_after_secs,
+                blocks: config.engine.maker_unconfirmed_cancel_after_blocks,
+            },
         };
         // The core writer notifies it after every commit that appended maker
         // events.

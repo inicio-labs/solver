@@ -30,7 +30,8 @@ active-active mode in V1.
    future migrations as well.
 3. Set `SOLVER_MIGRATION_DATABASE_URL` to the migration-role URL and run
    `solver-bin migrate-db` once. Set `SOLVER_DATABASE_URL` to the writer URL
-   and run `solver-bin check-db` (it checks the writer connection only). Set
+   and run `solver-bin check-db` (it checks the writer connection only: the
+   migration history, and `SELECT` on the views the solver reads directly). Set
    `SOLVER_READ_DATABASE_URL` to the reader URL for the runtime; startup
    verifies that both URLs resolve the same database and schema. Use `sslmode=verify-full`, a trusted root CA,
    `connect_timeout=5`, and libpq TCP keepalives in remote URLs, for example
@@ -69,7 +70,14 @@ every schema change is a stop-then-start deploy:
 
 1. Stop the solver.
 2. With the **new** binary: `solver-bin migrate-db` (migration role).
-3. Start the new binary.
+3. If the migration adds a table or view and your default grants don't cover
+   new relations, grant it to the writer and reader roles now. The
+   live-at-accept migration adds the view `eligible_orders`; both roles need
+   `SELECT` on it.
+4. `solver-bin check-db` with the writer URL. It checks the migration history
+   and that the role can read the views the solver reads directly.
+5. Start the new binary. Startup runs the same checks for the writer and the
+   reader, and stops with the name of a view a role cannot read.
 
 To roll back after step 2, revert the migration with the new binary before
 starting the old one: `solver-bin revert-db` (migration role, same
@@ -216,6 +224,35 @@ speed does not degrade with history; storage and backup size do (roughly
 800 bytes per order). A retention policy for retired orders needs its own
 design, because startup recovery uses stored note IDs to recognise notes it
 has already ingested.
+
+## Maker orders live at accept
+
+`engine.maker_live_at_accept` (off by default, [ADR 0008](adr/0008-maker-orders-live-at-accept.md)) lets a private maker order trade before its note is in a block. It needs the maker gateway and a watch interval of at most 2 s.
+
+**Switching.** Changing it needs a restart. Turning it off stops new orders going live at accept; orders that already did keep their rules (the watcher still activates or caps them).
+
+**Rollback.** The migration's `down.sql` refuses while any maker order went live at accept and still lacks its note, or any order is `waiting`. Stop the solver, run the escape hatch, then `revert-db`.
+
+**Escape hatch.** With the solver stopped (it takes the ownership lock and refuses otherwise):
+
+```bash
+SOLVER_DATABASE_URL=… solver-bin cancel-unconfirmed
+```
+
+It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_received`) for the ones it saw live, and prints how many lineages it closed and how many orders it cancelled per maker. A lineage whose order a settlement still holds, or its maker had cancelled, is closed with no order cancelled. Use it before a rollback, when the gateway must stay off, and after a testnet chain reset (the notes will never arrive). The solver refuses to start with the gateway off while such orders exist (orders their maker cancelled don't count).
+
+**Alerts:**
+- `solver_maker_unknown_notes_named_total` rising for one maker: its transactions reach the node after its `SubmitOrder`, or not at all.
+- `solver_maker_cap_cancels_total` rising: notes that never arrive.
+- `solver_executor_settlements_dropped_total{unconfirmed_maker_input="true"}` above 0: a maker transaction dropped from the mempool took our settlement with it.
+- `solver_executor_settlement_conflicts_total{kind="unreadable"}` or `{kind="unknown_notes_unmatched"}` above 0: the node words its refusals differently; every unconfirmed order now waits. On every node upgrade, re-capture the text: start the node's local network and run `SOLVER_LOCAL_NODE_WRITE_FIXTURE=1 cargo test -p solver --test local_node_018 -- --ignored --test-threads=1`, which rewrites `tests/fixtures/node-0.18-refusals.json` for the parser's unit test.
+- `solver_maker_watcher_block_read_age_seconds` above 10 for long: every order takes the confirmed path (`solver_maker_accept_fallbacks_total{reason="watcher_stale"}`).
+- Several makers' unknown-note refusals at once: the node lost its mempool (a restart). Their orders wait, and return when their notes land or are capped.
+- `solver_maker_watcher_unobserved_notes` above 0 for long: notes the watcher can't read. Unconfirmed ones are still decided by the cap's lookup; activated ones go unwatched for spends until they read again.
+
+**Queries** join on root rows (`orders.note_id = maker_lineages.note_id`): unconfirmed orders are `maker_lineages` rows with `accept_block IS NOT NULL AND state = 'pending'`; `waiting` orders have `orders.status = 'waiting'`.
+
+**After an asynchronous failover**, restart the solver as after any failover: the watcher re-reads every pending lineage, and the cap counts from the database clock.
 
 ## Backup and restore
 

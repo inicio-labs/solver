@@ -8,14 +8,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{NoteFile, NoteSyncHint};
-use miden_client::rpc::domain::note::CommittedNote;
-use miden_client::rpc::NodeRpcClient;
+use miden_client::rpc::domain::note::{CommittedNote, FetchedNote};
+use miden_client::rpc::{NodeRpcClient, RpcError};
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::sync::{NoteUpdateAction, OnNoteReceived, StateSync, StateSyncInput};
 use miden_client::{Client, ClientError};
@@ -25,7 +25,6 @@ use miden_protocol::note::{Note, NoteId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::proto::OrderState;
 use crate::db::maker_db;
 use crate::db::{postgres_db, DbPool};
 use crate::ingest::{ChainError, ChainResult};
@@ -38,8 +37,13 @@ static SYNCED_BLOCK: AtomicU64 = AtomicU64::new(0);
 static READ_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 static PENDING_LINEAGES: AtomicU64 = AtomicU64::new(0);
 // When the oldest pending lineage was submitted (0: none), not its age: the
-// age is computed at scrape, so it keeps growing while rounds fail.
+// age is computed at scrape, so it keeps growing while rounds fail. The same
+// for the oldest unconfirmed order.
 static OLDEST_PENDING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
+static OLDEST_UNCONFIRMED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static WAITING: AtomicU64 = AtomicU64::new(0);
+static UNOBSERVED: AtomicU64 = AtomicU64::new(0);
 
 /// The host-clock time of something `age_secs` old by the database clock; 0
 /// for `None`.
@@ -72,6 +76,13 @@ pub(crate) struct WatcherGauges {
     /// Age of the oldest of them: its age by the database clock at the last
     /// successful round, plus the time since.
     pub oldest_pending_age_secs: f64,
+    /// Of those, orders that went live at accept (ADR 0008).
+    pub unconfirmed: u64,
+    pub oldest_unconfirmed_age_secs: f64,
+    /// Of those, orders out of the book until their note lands.
+    pub waiting: u64,
+    /// Watched notes the last round could not read.
+    pub unobserved: u64,
 }
 
 /// `None` when no watcher runs in this process (gateway disabled).
@@ -86,6 +97,13 @@ pub(crate) fn watcher_gauges() -> Option<WatcherGauges> {
         read_age_secs: age_secs(read_ms, now_ms),
         pending_lineages: PENDING_LINEAGES.load(Ordering::Relaxed),
         oldest_pending_age_secs: age_secs(OLDEST_PENDING_SINCE_MS.load(Ordering::Relaxed), now_ms),
+        unconfirmed: UNCONFIRMED.load(Ordering::Relaxed),
+        oldest_unconfirmed_age_secs: age_secs(
+            OLDEST_UNCONFIRMED_SINCE_MS.load(Ordering::Relaxed),
+            now_ms,
+        ),
+        waiting: WAITING.load(Ordering::Relaxed),
+        unobserved: UNOBSERVED.load(Ordering::Relaxed),
     })
 }
 
@@ -94,19 +112,99 @@ pub enum NoteObservation {
     Pending,
     Committed,
     Consumed,
-    Mismatched,
 }
 
 /// Check a set of exact notes without deciding whether their orders may trade.
 #[async_trait(?Send)]
 pub trait MakerTracker {
+    /// Observe `notes`. A note the tracker could not read this round is left
+    /// out of the result.
     async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
 
-    /// The block the last `observe` synced to and when, in Unix
-    /// milliseconds, it started reading the chain. For `/metrics` only.
-    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+    /// An exact lookup of each of `notes` and its nullifier on the node, all
+    /// in one call. A note the node's answer could not be read for is left
+    /// out of the result; a node that does not answer fails the call.
+    async fn lookup(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>>;
+
+    /// The block the last `observe` synced to, and when it started reading
+    /// the chain.
+    fn last_sync(&self) -> Option<SyncRead> {
         None
     }
+}
+
+/// A tracker's chain read: the block it synced to, and when it started
+/// reading, by the wall clock (for `/metrics`) and by a monotonic clock (for
+/// freshness, which a wall-clock step must not fake).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncRead {
+    pub block: BlockNumber,
+    pub read_unix_ms: u64,
+    pub read_at: std::time::Instant,
+}
+
+/// The watcher's latest synced block and when it was read from the chain,
+/// shared with intake: an order goes live at accept only while this is fresh
+/// (ADR 0008, D7).
+#[derive(Clone, Default)]
+pub struct SyncedHeight(Arc<Mutex<Option<(BlockNumber, std::time::Instant)>>>);
+
+impl SyncedHeight {
+    /// The longest a block read may be old for an order to go live at accept.
+    pub const MAX_AGE: Duration = Duration::from_secs(10);
+
+    fn publish(&self, read: SyncRead) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((read.block, read.read_at));
+    }
+
+    /// The block, if it was read from the chain less than `max_age` ago.
+    pub fn fresh(&self, max_age: Duration) -> Option<BlockNumber> {
+        let (block, read_at) = (*self.0.lock().unwrap_or_else(|e| e.into_inner()))?;
+        (read_at.elapsed() < max_age).then_some(block)
+    }
+}
+
+/// When the watcher cancels an order that went live at accept whose note
+/// never arrived (ADR 0008, D6): both must have passed since accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnconfirmedCap {
+    pub secs: u64,
+    pub blocks: u32,
+}
+
+impl Default for UnconfirmedCap {
+    fn default() -> Self {
+        Self {
+            secs: 60,
+            blocks: 20,
+        }
+    }
+}
+
+impl UnconfirmedCap {
+    /// Whether the time and block parts of the cap have passed for
+    /// `submission`, with the watcher synced to `synced`.
+    fn due(&self, submission: &maker_db::PendingSubmission, synced: Option<BlockNumber>) -> bool {
+        let (Some(accept_block), Some(synced)) = (submission.accept_block, synced) else {
+            return false;
+        };
+        submission.age_secs >= self.secs as f64
+            && u64::from(synced.as_u32())
+                >= u64::from(accept_block.as_u32()) + u64::from(self.blocks)
+    }
+}
+
+/// Whether the node answered a lookup with something that did not decode.
+/// One note's content can do that to a whole batch, so its notes are then
+/// looked up one by one. Any other failure (the node is down, or refuses the
+/// call) would fail each of those lookups the same way.
+fn is_decode_error(error: &RpcError) -> bool {
+    matches!(
+        error,
+        RpcError::DeserializationError(_)
+            | RpcError::ExpectedDataMissing(_)
+            | RpcError::InvalidResponse(_)
+    )
 }
 
 /// Only exact notes supplied by PostgreSQL may enter the maker client store.
@@ -136,7 +234,24 @@ pub struct SdkTracker {
     // Recheck exact identity and historic spends when a note enters the watch
     // set, including after restart or a period excluded from scoped sync.
     tracked: HashSet<NoteId>,
-    last_sync: Option<(BlockNumber, u64)>,
+    last_sync: Option<SyncRead>,
+}
+
+/// How a new note is imported. Found by our ID, it is our note (the ID
+/// commits to the metadata), so it is imported committed, with our own
+/// metadata; otherwise it is expected, and the forward sync from `cursor`
+/// covers a commitment racing the lookup.
+fn import_file(note: &Note, found: Option<&FetchedNote>, cursor: BlockNumber) -> NoteFile {
+    match found {
+        Some(found) => NoteFile::Committed {
+            note: note.clone(),
+            proof: found.inclusion_proof().clone(),
+        },
+        None => NoteFile::ExpectedNote {
+            details: note.clone().into(),
+            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
+        },
+    }
 }
 
 impl SdkTracker {
@@ -191,19 +306,106 @@ impl SdkTracker {
             None,
             self.client.get_validator_config().await?,
         );
-        let started_ms = now_millis();
+        let (started_ms, started_at) = (now_millis(), std::time::Instant::now());
         let mut update = sync
             .fetch_state(self.client.get_sync_height().await?, input)
             .await?;
         sync.derive_state_updates(&mut update).await?;
         sync.fetch_nullifiers(&mut update).await?;
         self.client.apply_chain_updates(&sync, update).await?;
-        // For `/metrics` only: a failed read leaves the last value and never
-        // fails the round.
+        // The cap's blocks, intake's freshness and `/metrics` read this. A
+        // failed height read leaves the last value and never fails the round.
         if let Ok(synced) = self.client.get_sync_height().await {
-            self.last_sync = Some((synced, started_ms));
+            self.last_sync = Some(SyncRead {
+                block: synced,
+                read_unix_ms: started_ms,
+                read_at: started_at,
+            });
         }
         Ok(())
+    }
+
+    /// Look `ids` up on the node in one call. One note the node answers with
+    /// something that does not decode fails the whole call, so then each is
+    /// looked up alone, and the ones that still fail are returned as
+    /// unreadable. Any other failure (the node is down, or refuses the call)
+    /// would fail each lookup the same way, so it fails this one.
+    async fn lookup_batch(
+        &self,
+        ids: &[NoteId],
+    ) -> ChainResult<(HashMap<NoteId, FetchedNote>, HashSet<NoteId>)> {
+        let mut unreadable = HashSet::new();
+        let found = match self.rpc.get_notes_by_id(ids).await {
+            Ok(found) => found,
+            Err(error) if !is_decode_error(&error) => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(error = %ChainError::from(error).detail(), notes = ids.len(), "maker note lookup failed; looking notes up one by one");
+                let mut found = Vec::with_capacity(ids.len());
+                for id in ids {
+                    match self.rpc.get_notes_by_id(&[*id]).await {
+                        Ok(note) => found.extend(note),
+                        Err(error) if !is_decode_error(&error) => return Err(error.into()),
+                        Err(error) => {
+                            tracing::warn!(note_id = %id, error = %ChainError::from(error).detail(), "maker note lookup failed; skipped this round");
+                            unreadable.insert(*id);
+                        }
+                    }
+                }
+                found
+            }
+        };
+        let found = found.into_iter().map(|note| (note.id(), note)).collect();
+        Ok((found, unreadable))
+    }
+
+    /// Import `imports` in one call. One note's import can fail the whole
+    /// call, so then each is imported alone; returns the ones that still
+    /// fail, to skip this round.
+    async fn import_batch(&mut self, imports: Vec<(NoteId, NoteFile)>) -> HashSet<NoteId> {
+        let mut failed = HashSet::new();
+        if imports.is_empty() {
+            return failed;
+        }
+        let files: Vec<_> = imports.iter().map(|(_, file)| file.clone()).collect();
+        if let Err(error) = self.client.import_notes(&files).await {
+            tracing::warn!(error = %crate::ingest::client_error_detail(&error), notes = imports.len(), "maker note import failed; importing notes one by one");
+            for (id, file) in imports {
+                if let Err(error) = self.client.import_notes(&[file]).await {
+                    tracing::warn!(note_id = %id, error = %crate::ingest::client_error_detail(&error), "maker note import failed; skipped this round");
+                    failed.insert(id);
+                }
+            }
+        }
+        failed
+    }
+
+    /// A note's state from its stored record. The SDK stores only one
+    /// expected record per details commitment, so two submitted notes that
+    /// share one (`shared`), or a record of another note, take an exact
+    /// lookup instead of trusting the record.
+    async fn record_state(
+        &self,
+        note: &Note,
+        record: Option<&InputNoteRecord>,
+        shared: bool,
+    ) -> ChainResult<NoteObservation> {
+        match record {
+            _ if shared => self.exact_lookup(note).await,
+            None => Err(ChainError::MissingSyncedNote(note.id())),
+            Some(record)
+                if record.id() == Some(note.id()) && record.metadata() == Some(note.metadata()) =>
+            {
+                Ok(if record.is_consumed() {
+                    NoteObservation::Consumed
+                } else if record.is_committed() {
+                    NoteObservation::Committed
+                } else {
+                    NoteObservation::Pending
+                })
+            }
+            Some(record) if record.id().is_some() => self.exact_lookup(note).await,
+            Some(_) => Ok(NoteObservation::Pending),
+        }
     }
 
     async fn exact_lookup(&self, note: &Note) -> ChainResult<NoteObservation> {
@@ -216,8 +418,11 @@ impl SdkTracker {
         else {
             return Ok(NoteObservation::Pending);
         };
-        if found.id() != note.id() || found.metadata() != note.metadata() {
-            return Ok(NoteObservation::Mismatched);
+        // A note ID commits to the metadata, so the note under our ID is
+        // ours, however the node renders its metadata (a withheld
+        // attachment, for one).
+        if found.id() != note.id() {
+            return Ok(NoteObservation::Pending);
         }
         let spent = self
             .rpc
@@ -235,8 +440,57 @@ impl SdkTracker {
 
 #[async_trait(?Send)]
 impl MakerTracker for SdkTracker {
-    fn last_sync(&self) -> Option<(BlockNumber, u64)> {
+    fn last_sync(&self) -> Option<SyncRead> {
         self.last_sync
+    }
+
+    async fn lookup(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+        if notes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let limit = self.rpc.get_rpc_limits().await?.note_ids_limit.max(1) as usize;
+        let (mut found, mut unreadable) = (HashMap::new(), HashSet::new());
+        for batch in notes.chunks(limit) {
+            let ids: Vec<_> = batch.iter().map(Note::id).collect();
+            let (batch_found, batch_unreadable) = self.lookup_batch(&ids).await?;
+            found.extend(batch_found);
+            unreadable.extend(batch_unreadable);
+        }
+        // A note ID commits to the metadata, so the note under our ID is
+        // ours, however the node renders its metadata (a withheld
+        // attachment, for one).
+        let nullifiers: BTreeSet<_> = notes
+            .iter()
+            .filter(|note| found.contains_key(&note.id()))
+            .map(Note::nullifier)
+            .collect();
+        let spent = if nullifiers.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.rpc
+                .get_nullifier_commit_heights(nullifiers, BlockNumber::GENESIS)
+                .await?
+        };
+        let mut observed = HashMap::with_capacity(notes.len());
+        for note in notes {
+            if unreadable.contains(&note.id()) {
+                continue;
+            }
+            let state = if !found.contains_key(&note.id()) {
+                NoteObservation::Pending
+            } else if spent.get(&note.nullifier()).copied().flatten().is_some() {
+                NoteObservation::Consumed
+            } else {
+                NoteObservation::Committed
+            };
+            if state != NoteObservation::Pending {
+                // Its record is still an expected note: import it again next
+                // round, so the store holds it committed and sees it spent.
+                self.tracked.remove(&note.id());
+            }
+            observed.insert(note.id(), state);
+        }
+        Ok(observed)
     }
 
     async fn observe(&mut self, notes: &[Note]) -> ChainResult<HashMap<NoteId, NoteObservation>> {
@@ -250,60 +504,50 @@ impl MakerTracker for SdkTracker {
         for commitment in &commitments {
             *count_by_commitment.entry(*commitment).or_insert(0_usize) += 1;
         }
-        let known: BTreeSet<_> = self
+        // Each stored record's ID by details commitment (none while expected).
+        let known: BTreeMap<_, _> = self
             .client
             .get_input_notes(NoteFilter::DetailsCommitments(commitments.clone()))
             .await?
             .iter()
-            .map(|record| record.details_commitment())
+            .map(|record| (record.details_commitment(), record.id()))
             .collect();
         let mut queued = BTreeSet::new();
         let new_notes: Vec<_> = notes
             .iter()
             .filter(|note| {
                 let commitment = note.details_commitment();
-                (!known.contains(&commitment) || !self.tracked.contains(&note.id()))
+                // A record of another note with the same details can't be
+                // replaced: the exact lookup below decides this one.
+                let held_by_other =
+                    matches!(known.get(&commitment), Some(Some(id)) if *id != note.id());
+                (!known.contains_key(&commitment) || !self.tracked.contains(&note.id()))
+                    && !held_by_other
                     && queued.insert(commitment)
             })
             .collect();
+        // Decided per note: one note's failure never fails the round.
+        let mut unreadable = HashSet::new();
         if !new_notes.is_empty() {
             let limit = self.rpc.get_rpc_limits().await?.note_ids_limit.max(1) as usize;
             for batch in new_notes.chunks(limit) {
                 let ids: Vec<_> = batch.iter().map(|note| note.id()).collect();
-                let found: HashMap<_, _> = self
-                    .rpc
-                    .get_notes_by_id(&ids)
-                    .await?
-                    .into_iter()
-                    .map(|note| (note.id(), note))
+                let (found, failed) = self.lookup_batch(&ids).await?;
+                unreadable.extend(failed);
+                let imports = batch
+                    .iter()
+                    .filter(|note| !unreadable.contains(&note.id()))
+                    .map(|note| (note.id(), import_file(note, found.get(&note.id()), cursor)))
                     .collect();
-                let mut imports = Vec::with_capacity(batch.len());
-                for note in batch {
-                    imports.push(if let Some(found) = found.get(&note.id()) {
-                        if found.metadata() != note.metadata() {
-                            return Err(ClientError::NoteImportError(
-                                "committed maker note metadata differs from submission".into(),
-                            )
-                            .into());
-                        }
-                        NoteFile::Committed {
-                            note: (*note).clone(),
-                            proof: found.inclusion_proof().clone(),
-                        }
-                    } else {
-                        NoteFile::ExpectedNote {
-                            details: (*note).clone().into(),
-                            // Skip historical import; forward sync starts at the
-                            // captured cursor and covers commitments racing lookup.
-                            sync_hint: NoteSyncHint::new(cursor.child(), note.metadata().tag()),
-                        }
-                    });
-                }
-                self.client.import_notes(&imports).await?;
+                unreadable.extend(self.import_batch(imports).await);
             }
         }
-
-        self.sync_maker_notes(notes).await?;
+        let synced: Vec<Note> = notes
+            .iter()
+            .filter(|note| !unreadable.contains(&note.id()))
+            .cloned()
+            .collect();
+        self.sync_maker_notes(&synced).await?;
         let records: BTreeMap<_, _> = self
             .client
             .get_input_notes(NoteFilter::DetailsCommitments(commitments))
@@ -312,34 +556,26 @@ impl MakerTracker for SdkTracker {
             .map(|record| (record.details_commitment(), record))
             .collect();
         let mut observed = HashMap::with_capacity(notes.len());
-        for note in notes {
-            // The SDK stores only one expected record per details commitment.
-            // If two submitted IDs share it, use exact SDK RPC lookup for both
-            // rather than treating either record as the other's commitment.
-            if count_by_commitment[&note.details_commitment()] > 1 {
-                observed.insert(note.id(), self.exact_lookup(note).await?);
-                continue;
+        for note in &synced {
+            let commitment = note.details_commitment();
+            let shared = count_by_commitment[&commitment] > 1;
+            match self
+                .record_state(note, records.get(&commitment), shared)
+                .await
+            {
+                Ok(state) => {
+                    observed.insert(note.id(), state);
+                }
+                Err(error) => {
+                    tracing::warn!(note_id = %note.id(), error = %error.detail(), "maker note not observed this round");
+                }
             }
-            let record = records
-                .get(&note.details_commitment())
-                .ok_or(ChainError::MissingSyncedNote(note.id()))?;
-            let state =
-                if record.id() == Some(note.id()) && record.metadata() == Some(note.metadata()) {
-                    if record.is_consumed() {
-                        NoteObservation::Consumed
-                    } else if record.is_committed() {
-                        NoteObservation::Committed
-                    } else {
-                        NoteObservation::Pending
-                    }
-                } else if record.id().is_some() {
-                    self.exact_lookup(note).await?
-                } else {
-                    NoteObservation::Pending
-                };
-            observed.insert(note.id(), state);
         }
-        self.tracked = notes.iter().map(Note::id).collect();
+        self.tracked = notes
+            .iter()
+            .map(Note::id)
+            .filter(|id| !unreadable.contains(id))
+            .collect();
         Ok(observed)
     }
 }
@@ -350,8 +586,16 @@ pub enum WatchError {
     Chain(#[from] ChainError),
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
-    #[error("tracker omitted note {0}")]
-    MissingObservation(NoteId),
+}
+
+impl WatchError {
+    /// For logs: a chain error's inner RPC error and the node's message.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Chain(error) => error.detail(),
+            Self::Db(error) => error.to_string(),
+        }
+    }
 }
 
 pub struct Watcher<T> {
@@ -361,6 +605,10 @@ pub struct Watcher<T> {
     // PostgreSQL supplies the authoritative set; this cache avoids decoding
     // every unchanged live note on every round. It is rebuilt after restart.
     watched: HashMap<Vec<u8>, Note>,
+    height: SyncedHeight,
+    cap: UnconfirmedCap,
+    /// Watched notes the last round could not read; `/metrics` shows it.
+    unobserved: usize,
 }
 
 impl<T: MakerTracker> Watcher<T> {
@@ -370,12 +618,31 @@ impl<T: MakerTracker> Watcher<T> {
             tracker,
             book_tx,
             watched: HashMap::new(),
+            height: SyncedHeight::default(),
+            cap: UnconfirmedCap::default(),
+            unobserved: 0,
         }
+    }
+
+    pub fn with_cap(mut self, cap: UnconfirmedCap) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Where this watcher publishes its latest synced block, for intake.
+    pub fn synced_height(&self) -> SyncedHeight {
+        self.height.clone()
     }
 
     /// Reconcile pending submissions and previously live maker orders against
     /// the SDK, then commit every resulting order and event change together.
+    ///
+    /// An order that went live at accept (ADR 0008) whose note is still not
+    /// found once the cap's time and blocks have passed gets one exact lookup.
+    /// Its answer counts as this round's observation; if the note is still
+    /// not on chain, the order is cancelled.
     pub async fn round(&mut self) -> Result<(), WatchError> {
+        // Oldest first: activations take their FIFO slots in this order.
         let pending = self.pool.read(maker_db::pending_submissions_tx).await?;
         let watched_ids = self.pool.read(maker_db::watched_maker_orders_tx).await?;
         let wanted: HashSet<_> = watched_ids.iter().cloned().collect();
@@ -401,31 +668,74 @@ impl<T: MakerTracker> Watcher<T> {
             .tracker
             .observe(&notes.into_values().collect::<Vec<_>>())
             .await?;
-        for note in pending
+        let unobserved = pending
             .iter()
             .map(|submission| &submission.note)
             .chain(self.watched.values())
-        {
-            if !observations.contains_key(&note.id()) {
-                return Err(WatchError::MissingObservation(note.id()));
-            }
+            .filter(|note| !observations.contains_key(&note.id()))
+            .count();
+        self.unobserved = unobserved;
+        UNOBSERVED.store(unobserved as u64, Ordering::Relaxed);
+        if unobserved > 0 {
+            tracing::warn!(unobserved, "maker notes without an observation this round");
         }
+        let read = self.tracker.last_sync();
+        // Publish the block now: the cap's lookups and the write below must
+        // not age it for intake.
+        if let Some(read) = read {
+            self.height.publish(read);
+        }
+        let synced = read.map(|read| read.block);
+
+        // An unread or still pending note gets no decision, unless the cap is
+        // due: an exact lookup decides then, so it can't stay live forever.
+        // A root a settlement holds is decided by that settlement.
+        let due: Vec<Note> = pending
+            .iter()
+            .filter(|submission| {
+                matches!(
+                    observations.get(&submission.note.id()),
+                    None | Some(NoteObservation::Pending)
+                ) && !submission.root_settling
+                    && self.cap.due(submission, synced)
+            })
+            .map(|submission| submission.note.clone())
+            .collect();
+        // Every due note in one call. If the node does not answer, the cap
+        // waits for the next round and cancels nothing.
+        let looked_up = match self.tracker.lookup(&due).await {
+            Ok(looked_up) => looked_up,
+            Err(error) => {
+                tracing::warn!(notes = due.len(), error = %error.detail(), "cap lookup failed; next round");
+                HashMap::new()
+            }
+        };
+        let due: HashSet<NoteId> = due.iter().map(Note::id).collect();
 
         let mut activations = Vec::new();
         let mut rejections = Vec::new();
+        let mut capped = Vec::new();
         for submission in pending {
-            match observations[&submission.note.id()] {
+            let id = submission.note.id();
+            let observation = if due.contains(&id) {
+                match looked_up.get(&id) {
+                    Some(NoteObservation::Pending) => {
+                        capped.push(submission);
+                        continue;
+                    }
+                    Some(found) => *found,
+                    // Unreadable, or the lookup failed: next round.
+                    None => continue,
+                }
+            } else if let Some(observed) = observations.get(&id) {
+                *observed
+            } else {
+                continue;
+            };
+            match observation {
                 NoteObservation::Committed => activations.push(submission),
-                NoteObservation::Consumed => rejections.push((
-                    submission,
-                    OrderState::Unavailable,
-                    "note spent before it became live",
-                )),
-                NoteObservation::Mismatched => rejections.push((
-                    submission,
-                    OrderState::Rejected,
-                    "committed note differs from the submitted note",
-                )),
+                // Spent before it was confirmed.
+                NoteObservation::Consumed => rejections.push(submission),
                 NoteObservation::Pending => {}
             }
         }
@@ -436,26 +746,73 @@ impl<T: MakerTracker> Watcher<T> {
             .map(|(id, _)| id.clone())
             .collect();
 
-        if !activations.is_empty() || !rejections.is_empty() || !spent_ids.is_empty() {
+        if !activations.is_empty()
+            || !rejections.is_empty()
+            || !capped.is_empty()
+            || !spent_ids.is_empty()
+        {
             let removed = spent_ids
                 .iter()
                 .map(|id| Ok(OrderId::read_from_bytes(id)?))
                 .collect::<Result<Vec<_>, crate::db::DbError>>()?;
-            let writes = (activations.clone(), rejections.clone(), spent_ids.clone());
-            self.pool
-                .write_book(&self.book_tx, move |conn| {
-                    let (activations, rejections, spent_ids) = writes;
-                    maker_db::prelock_watcher_tx(conn, &activations, &rejections, &spent_ids)?;
-                    maker_db::reject_tx(conn, &rejections)?;
+            let writes = (
+                activations.clone(),
+                rejections.clone(),
+                capped.clone(),
+                spent_ids.clone(),
+            );
+            let done = self
+                .pool
+                .write_book_with(&self.book_tx, move |conn| {
+                    let (activations, rejections, capped, spent_ids) = writes;
+                    maker_db::prelock_watcher_tx(
+                        conn,
+                        &activations,
+                        &rejections,
+                        &capped,
+                        &spent_ids,
+                    )?;
+                    let rejected = maker_db::reject_tx(conn, &rejections)?;
+                    let (stopped, cap_cancels) = maker_db::close_unconfirmed_tx(
+                        conn,
+                        &capped,
+                        maker_db::Close::NoteNotReceived,
+                    )?;
                     postgres_db::mark_orders_onchain_nullified_tx(conn, &spent_ids)?;
-                    let mut update = maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let mut activated = maker_db::activate_tx(conn, &activations, now_unix())?;
+                    let mut update = std::mem::take(&mut activated.update);
                     update.removed.extend(removed);
-                    Ok(update)
+                    update.removed.extend(rejected);
+                    update.removed.extend(stopped);
+                    let done = maker_db::WatcherWrites {
+                        activated,
+                        cap_cancels,
+                    };
+                    Ok((update, done))
                 })
                 .await?;
+            for submission in activations
+                .iter()
+                .filter(|s| done.activated.unconfirmed.contains(&s.lineage_id))
+            {
+                // A due note was decided by the cap's lookup.
+                let via = if due.contains(&submission.note.id()) {
+                    "lookup"
+                } else {
+                    "watcher"
+                };
+                super::metrics::count_activation(submission.maker_id, via);
+            }
+            for maker_id in done.activated.returned_makers {
+                super::metrics::count(super::metrics::WAITING_RETURNED, maker_id);
+            }
+            for maker_id in &done.cap_cancels {
+                super::metrics::count(super::metrics::CAP_CANCELS, *maker_id);
+            }
             tracing::info!(
                 activated = activations.len(),
                 rejected = rejections.len(),
+                capped = done.cap_cancels.len(),
                 spent = spent_ids.len(),
                 "maker notes verified"
             );
@@ -470,17 +827,25 @@ impl<T: MakerTracker> Watcher<T> {
     /// Publish what this successful round saw for `/metrics`. A failed count
     /// leaves the previous values; it never fails the round.
     async fn publish_gauges(&self) {
-        if let Some((block, read_ms)) = self.tracker.last_sync() {
-            SYNCED_BLOCK.store(u64::from(block.as_u32()), Ordering::Relaxed);
-            READ_UNIX_MS.store(read_ms, Ordering::Relaxed);
+        if let Some(read) = self.tracker.last_sync() {
+            SYNCED_BLOCK.store(u64::from(read.block.as_u32()), Ordering::Relaxed);
+            READ_UNIX_MS.store(read.read_unix_ms, Ordering::Relaxed);
         }
         match self.pool.read(maker_db::pending_lineage_stats_tx).await {
             Ok(stats) => {
                 PENDING_LINEAGES.store(u64::try_from(stats.count).unwrap_or(0), Ordering::Relaxed);
-                OLDEST_PENDING_SINCE_MS.store(
-                    since_ms(stats.oldest_age_secs, now_millis()),
+                let now_ms = now_millis();
+                OLDEST_PENDING_SINCE_MS
+                    .store(since_ms(stats.oldest_age_secs, now_ms), Ordering::Relaxed);
+                UNCONFIRMED.store(
+                    u64::try_from(stats.unconfirmed).unwrap_or(0),
                     Ordering::Relaxed,
                 );
+                OLDEST_UNCONFIRMED_SINCE_MS.store(
+                    since_ms(stats.oldest_unconfirmed_age_secs, now_ms),
+                    Ordering::Relaxed,
+                );
+                WAITING.store(u64::try_from(stats.waiting).unwrap_or(0), Ordering::Relaxed);
             }
             Err(error) => tracing::debug!(%error, "pending lineage count failed"),
         }
@@ -492,8 +857,10 @@ pub async fn run_watcher<T: MakerTracker>(
     interval: Duration,
     cancel: CancellationToken,
 ) {
-    // Until a round succeeds, the read age counts from now.
+    // Until a round succeeds, the read age counts from now, and no block is
+    // reported.
     READ_UNIX_MS.store(now_millis(), Ordering::Relaxed);
+    SYNCED_BLOCK.store(0, Ordering::Relaxed);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -501,7 +868,7 @@ pub async fn run_watcher<T: MakerTracker>(
             _ = cancel.cancelled() => return,
             _ = tick.tick() => {
                 if let Err(error) = watcher.round().await {
-                    tracing::warn!(%error, "maker-note watcher round failed; retrying");
+                    tracing::warn!(error = %error.detail(), "maker-note watcher round failed; retrying");
                 }
             }
         }
@@ -520,7 +887,7 @@ mod tests {
     use miden_client::testing::mock::MockRpcApi;
     use miden_client_sqlite_store::ClientBuilderSqliteExt;
     use miden_protocol::asset::{AssetAmount, FungibleAsset};
-    use miden_protocol::note::{Note, NoteMetadata, NoteType, Nullifier};
+    use miden_protocol::note::{Note, NoteType, Nullifier};
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
         ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
@@ -530,6 +897,37 @@ mod tests {
     use miden_testing::MockChain;
     use prost::Message;
     use std::sync::Mutex;
+
+    /// Only an answer that did not decode sends a batch to one-by-one
+    /// lookups; a node that is down fails the round after one call.
+    #[test]
+    fn only_a_decode_failure_falls_back_to_single_lookups() {
+        use miden_client::rpc::{GrpcError, RpcEndpoint};
+        for error in [
+            RpcError::DeserializationError("bad note".into()),
+            RpcError::ExpectedDataMissing("metadata".into()),
+            RpcError::InvalidResponse("two notes for one ID".into()),
+        ] {
+            assert!(is_decode_error(&error), "{error}");
+        }
+        for error in [
+            RpcError::ConnectionError("connection refused".into()),
+            RpcError::RequestError {
+                endpoint: RpcEndpoint::GetNotesById,
+                error_kind: GrpcError::Unavailable,
+                endpoint_error: None,
+                source: None,
+            },
+            RpcError::RequestError {
+                endpoint: RpcEndpoint::GetNotesById,
+                error_kind: GrpcError::DeadlineExceeded,
+                endpoint_error: None,
+                source: None,
+            },
+        ] {
+            assert!(!is_decode_error(&error), "{error}");
+        }
+    }
 
     /// The oldest-pending gauge keeps ageing between rounds: it is stored as
     /// a time, and the age is taken when it is read.
@@ -549,9 +947,21 @@ mod tests {
     #[derive(Default)]
     struct ChainState {
         tip: u32,
-        notes: HashMap<NoteId, (u32, NoteMetadata)>,
+        /// The block each landed note is in.
+        notes: HashMap<NoteId, u32>,
         spent: HashMap<Nullifier, u32>,
         down: bool,
+        /// Notes the tracker cannot read: no observation, no lookup answer.
+        unreadable: HashSet<NoteId>,
+        /// Notes a lagging round misses although they landed; the exact
+        /// lookup still finds them.
+        hidden: HashSet<NoteId>,
+        synced: Option<SyncRead>,
+        lookups: usize,
+        /// The exact lookup fails, as on an RPC error.
+        lookup_fails: bool,
+        /// Notes whose exact lookup always fails.
+        failing_lookups: HashSet<NoteId>,
     }
 
     #[derive(Default, Clone)]
@@ -565,7 +975,7 @@ mod tests {
         fn commit(&self, note: &Note, block: u32) {
             let mut state = self.state();
             state.tip = state.tip.max(block);
-            state.notes.insert(note.id(), (block, *note.metadata()));
+            state.notes.insert(note.id(), block);
         }
 
         fn spend(&self, note: &Note, block: u32) {
@@ -582,30 +992,64 @@ mod tests {
         Ok(())
     }
 
+    fn observed(state: &ChainState, note: &Note) -> NoteObservation {
+        match state.notes.get(&note.id()) {
+            None => NoteObservation::Pending,
+            Some(_) if state.spent.contains_key(&note.nullifier()) => NoteObservation::Consumed,
+            Some(_) => NoteObservation::Committed,
+        }
+    }
+
     #[async_trait(?Send)]
     impl MakerTracker for FakeChain {
         async fn observe(
             &mut self,
             notes: &[Note],
         ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
-            let state = self.state();
+            let mut state = self.state();
             up(&state)?;
-            Ok(notes
+            let observations = notes
                 .iter()
+                .filter(|note| !state.unreadable.contains(&note.id()))
                 .map(|note| {
-                    let observation = match state.notes.get(&note.id()) {
-                        None => NoteObservation::Pending,
-                        Some((_, metadata)) if metadata != note.metadata() => {
-                            NoteObservation::Mismatched
-                        }
-                        Some(_) if state.spent.contains_key(&note.nullifier()) => {
-                            NoteObservation::Consumed
-                        }
-                        Some(_) => NoteObservation::Committed,
+                    let observation = if state.hidden.contains(&note.id()) {
+                        NoteObservation::Pending
+                    } else {
+                        observed(&state, note)
                     };
                     (note.id(), observation)
                 })
+                .collect();
+            state.synced = Some(SyncRead {
+                block: BlockNumber::from(state.tip),
+                read_unix_ms: now_millis(),
+                read_at: std::time::Instant::now(),
+            });
+            Ok(observations)
+        }
+
+        async fn lookup(
+            &mut self,
+            notes: &[Note],
+        ) -> ChainResult<HashMap<NoteId, NoteObservation>> {
+            let mut state = self.state();
+            up(&state)?;
+            if notes.is_empty() {
+                return Ok(HashMap::new());
+            }
+            state.lookups += 1;
+            if state.lookup_fails {
+                return Err(ChainError::Test("lookup failed"));
+            }
+            Ok(notes
+                .iter()
+                .filter(|note| !state.failing_lookups.contains(&note.id()))
+                .map(|note| (note.id(), observed(&state, note)))
                 .collect())
+        }
+
+        fn last_sync(&self) -> Option<SyncRead> {
+            self.state().synced
         }
     }
 
@@ -665,9 +1109,9 @@ mod tests {
             .unwrap();
         assert_eq!(first[&committed.id()], NoteObservation::Committed);
         // The sync it made is what `/metrics` reports.
-        let (block, read_ms) = tracker.last_sync().unwrap();
-        assert_eq!(block, tracker.client.get_sync_height().await.unwrap());
-        assert!(read_ms > 0);
+        let read = tracker.last_sync().unwrap();
+        assert_eq!(read.block, tracker.client.get_sync_height().await.unwrap());
+        assert!(read.read_unix_ms > 0);
 
         drop(tracker);
         let reopened = ClientBuilder::new()
@@ -880,7 +1324,7 @@ mod tests {
             let header = CommandHeader::new(self.maker_id, request_id.into(), seq).unwrap();
             self.db
                 .pool
-                .write(move |conn| maker_db::execute_command_tx(conn, &header, &command))
+                .write(move |conn| maker_db::execute_command_confirmed_tx(conn, &header, &command))
                 .await
                 .unwrap();
         }
@@ -982,38 +1426,23 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn a_differing_or_spent_note_is_rejected_with_its_reason() {
+    async fn a_note_spent_before_it_was_confirmed_is_unavailable() {
         let mut f = fixture().await;
-        let (differs, spent) = (note(1, NoteType::Private), note(2, NoteType::Private));
-        f.submit(1, &differs).await;
+        let spent = note(2, NoteType::Private);
         f.submit(2, &spent).await;
-        // The chain holds a note with this ID but other metadata.
-        let other = note(1, NoteType::Public);
-        f.chain
-            .state()
-            .notes
-            .insert(differs.id(), (4, *other.metadata()));
         f.chain.commit(&spent, 4);
         f.chain.spend(&spent, 5);
         f.watcher.round().await.unwrap();
 
         assert!(f.book.try_recv().is_err(), "nothing goes live");
-        let mut statuses = f.statuses().await;
-        statuses.sort();
-        let mut expected = vec![
-            (
-                id(&differs),
-                proto::OrderState::Rejected,
-                "committed note differs from the submitted note".to_string(),
-            ),
-            (
+        assert_eq!(
+            f.statuses().await,
+            [(
                 id(&spent),
                 proto::OrderState::Unavailable,
                 "note spent before it became live".to_string(),
-            ),
-        ];
-        expected.sort();
-        assert_eq!(statuses, expected);
+            )]
+        );
         let pending =
             f.db.pool
                 .read(maker_db::pending_submissions_tx)
@@ -1061,13 +1490,20 @@ mod tests {
         f.chain.commit(&order, 2);
         f.watcher.round().await.unwrap();
 
-        let update = f.book.try_recv().unwrap();
-        assert_eq!(update.active[0].id(), order.id());
-        assert!(
-            update.active[0].maker.is_some(),
-            "now tagged as a maker order"
+        // Ingest put the order in the book, and the submit's attribution
+        // tagged it there, so activation sends nothing again.
+        assert!(f.book.try_recv().is_err());
+        assert_eq!(
+            f.statuses().await,
+            [(id(&order), proto::OrderState::Live, String::new())]
         );
-        assert_eq!(f.statuses().await.len(), 1);
+        assert_eq!(f.status(&order).await, "active");
+        let tagged =
+            f.db.pool
+                .read(postgres_db::load_live_orders_tx)
+                .await
+                .unwrap();
+        assert!(tagged[0].maker.is_some(), "now a maker order");
     }
 
     /// A public maker note can trade before the watcher activates its claim:
@@ -1147,7 +1583,7 @@ mod tests {
 
         f.db.pool
             .write(move |conn| {
-                postgres_db::confirm_settlement_tx(
+                postgres_db::confirm_settlement_update_tx(
                     conn,
                     &tx_id,
                     &HashSet::new(),
@@ -1218,5 +1654,500 @@ mod tests {
         f.chain.state().down = false;
         f.watcher.round().await.unwrap();
         assert_eq!(f.book.try_recv().unwrap().active[0].id(), order.id());
+    }
+
+    impl Fixture {
+        /// Submit with live at accept on, the watcher's block at `block`.
+        async fn accept(&self, seq: u64, note: &Note, block: u32) {
+            let header = CommandHeader::new(self.maker_id, format!("a{seq}"), seq).unwrap();
+            let command = MakerCommand::submit(note.clone()).unwrap();
+            let outcome = self
+                .db
+                .pool
+                .write(move |conn| {
+                    let accept = maker_db::AcceptMode::Fresh(BlockNumber::from(block));
+                    maker_db::execute_command_tx(conn, &header, &command, accept)
+                })
+                .await
+                .unwrap();
+            assert!(outcome.live.is_some(), "live at accept");
+        }
+
+        /// Make every pending submission `secs` older.
+        async fn age(&self, secs: u32) {
+            self.db
+                .pool
+                .write(move |conn| {
+                    use diesel::connection::SimpleConnection;
+                    conn.batch_execute(&format!(
+                        "UPDATE maker_lineages SET created_at = created_at - interval '{secs} seconds'"
+                    ))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn set_status(&self, note: &Note, status: &'static str) {
+            let id = note.id().to_bytes().to_vec();
+            self.db
+                .pool
+                .write(move |conn| {
+                    use crate::db::postgres_schema::orders;
+                    use diesel::prelude::*;
+                    diesel::update(orders::table.find(id))
+                        .set(orders::status.eq(status))
+                        .execute(conn)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The cap needs its time AND its blocks since accept, then a lookup that
+    /// still misses the note.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_waits_for_time_and_blocks_then_cancels() {
+        let mut f = fixture().await;
+        f.watcher = Watcher::new(
+            f.db.pool.clone(),
+            f.chain.clone(),
+            f.watcher.book_tx.clone(),
+        )
+        .with_cap(UnconfirmedCap {
+            secs: 60,
+            blocks: 20,
+        });
+        let order = note(1, NoteType::Private);
+        f.chain.state().tip = 10;
+        f.accept(1, &order, 10).await;
+
+        // Blocks passed, time not.
+        f.chain.state().tip = 40;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "active");
+        // Time passed, blocks not.
+        f.chain.state().tip = 29;
+        f.age(61).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "active");
+        assert_eq!(f.chain.state().lookups, 0);
+        // Both: one lookup, still missing, so the order is cancelled.
+        f.chain.state().tip = 30;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "stopped");
+        let update = f.book.try_recv().unwrap();
+        assert_eq!(update.removed, [order.id()]);
+        assert_eq!(
+            f.statuses().await,
+            [
+                (id(&order), proto::OrderState::Live, String::new()),
+                (
+                    id(&order),
+                    proto::OrderState::Cancelled,
+                    maker_db::NOTE_NOT_RECEIVED.to_owned()
+                ),
+            ]
+        );
+        // Closed: neither pending nor watched any more.
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.statuses().await.len(), 2);
+    }
+
+    /// A due root that a settlement holds takes no cap lookup: the
+    /// settlement decides it. Once it is back, the cap looks it up.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_settling_root_takes_no_cap_lookup() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.set_status(&order, "settling").await;
+        f.watcher.round().await.unwrap();
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 0);
+        assert_eq!(f.status(&order).await, "settling");
+
+        f.set_status(&order, "active").await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "stopped");
+    }
+
+    /// A round that missed a landed note (a lagging node) does not cap it:
+    /// the exact lookup finds it and counts as the round's observation.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_lookup_finds_a_note_the_round_missed() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.set_status(&order, "waiting").await;
+        f.chain.commit(&order, 5);
+        f.chain.state().hidden.insert(order.id());
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "active");
+        let update = f.book.try_recv().unwrap();
+        assert_eq!(update.active[0].id(), order.id(), "back from waiting");
+        assert!(update.active[0].maker.is_some());
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only at accept");
+    }
+
+    /// One note the tracker cannot read gets no decision; the others do.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn one_unreadable_note_does_not_stop_the_round() {
+        let mut f = fixture().await;
+        let (bad, good) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &bad, 0).await;
+        f.accept(2, &good, 0).await;
+        f.set_status(&good, "waiting").await;
+        f.chain.commit(&good, 3);
+        f.chain.state().unreadable.insert(bad.id());
+        f.chain.state().tip = 100;
+        f.watcher.round().await.unwrap();
+
+        assert_eq!(f.status(&good).await, "active");
+        // Unread, and the cap not due yet: no decision, no lookup.
+        assert_eq!(f.status(&bad).await, "active");
+        assert_eq!(f.chain.state().lookups, 0);
+    }
+
+    /// A waiting order comes back once its note lands; an active one is
+    /// activated in place and not sent again.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn landed_notes_activate_unconfirmed_orders_quietly() {
+        let mut f = fixture().await;
+        let (waiting, active) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &waiting, 0).await;
+        f.accept(2, &active, 0).await;
+        f.set_status(&waiting, "waiting").await;
+        f.chain.commit(&waiting, 2);
+        f.chain.commit(&active, 2);
+        f.watcher.round().await.unwrap();
+
+        let update = f.book.try_recv().unwrap();
+        let sent: Vec<_> = update.active.iter().map(|order| order.id()).collect();
+        assert_eq!(sent, [waiting.id()]);
+        assert_eq!(f.status(&waiting).await, "active");
+        assert_eq!(f.statuses().await.len(), 2, "LIVE only at accept");
+        // Activated: now watched like any live maker order.
+        f.chain.spend(&active, 3);
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&active).await, "onchain_nullified");
+        assert_eq!(
+            f.statuses().await.last().unwrap(),
+            &(
+                id(&active),
+                proto::OrderState::Unavailable,
+                "note spent outside this solver".to_owned()
+            )
+        );
+    }
+
+    /// The watcher publishes its block for intake, fresh only while recent.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_synced_height_is_fresh_only_after_a_recent_round() {
+        let mut f = fixture().await;
+        let height = f.watcher.synced_height();
+        assert_eq!(height.fresh(SyncedHeight::MAX_AGE), None);
+        f.chain.state().tip = 12;
+        f.watcher.round().await.unwrap();
+        assert_eq!(
+            height.fresh(SyncedHeight::MAX_AGE),
+            Some(BlockNumber::from(12))
+        );
+        assert_eq!(height.fresh(Duration::ZERO), None);
+        // A failed round publishes nothing new.
+        f.chain.state().down = true;
+        f.chain.state().tip = 13;
+        assert!(f.watcher.round().await.is_err());
+        assert_eq!(
+            height.fresh(SyncedHeight::MAX_AGE),
+            Some(BlockNumber::from(12))
+        );
+    }
+
+    /// A spawn note committed by a maker wallet, and the wallet's executed
+    /// transaction that spends it, on a mock chain.
+    async fn spawned_note() -> (
+        Note,
+        miden_protocol::transaction::ExecutedTransaction,
+        Arc<MockRpcApi>,
+    ) {
+        use miden_protocol::transaction::RawOutputNote;
+        use miden_testing::Auth;
+        let mut builder = MockChain::builder();
+        let asset =
+            FungibleAsset::new(ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap(), 100).unwrap();
+        let sender = builder
+            .add_existing_wallet_with_assets(Auth::IncrNonce, [asset.into()])
+            .unwrap();
+        let out = note_for_creator(720, NoteType::Public, sender.id());
+        let spawn = builder.add_spawn_note([&out]).unwrap();
+        let chain = builder.build().unwrap();
+        let spend = chain
+            .build_transaction(sender)
+            .authenticated_input_note(spawn.id())
+            .expected_output_note(RawOutputNote::Full(out))
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let rpc = Arc::new(MockRpcApi::new(chain));
+        rpc.prove_block();
+        (spawn, spend, rpc)
+    }
+
+    async fn tracker(rpc: &Arc<MockRpcApi>, dir: &tempfile::TempDir) -> SdkTracker {
+        let client = ClientBuilder::new()
+            .rpc(rpc.clone())
+            .sqlite_store(dir.path().join("maker.sqlite3"))
+            .build()
+            .await
+            .unwrap();
+        SdkTracker::new(client, rpc.clone())
+    }
+
+    /// The cap's lookup finds a note an earlier round missed (a lagging
+    /// node). The next round imports it again, so the store holds it
+    /// committed and later sees it spent.
+    #[tokio::test]
+    async fn sdk_tracker_resolves_a_note_its_cap_lookup_found() {
+        let (spawn, spend, rpc) = spawned_note().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(&rpc, &dir).await;
+        tracker.observe(&[]).await.unwrap();
+        let cursor = tracker.client.get_sync_height().await.unwrap();
+        // What a round leaves when the node answered "not found".
+        tracker
+            .client
+            .import_notes(&[NoteFile::ExpectedNote {
+                details: spawn.clone().into(),
+                sync_hint: NoteSyncHint::new(cursor.child(), spawn.metadata().tag()),
+            }])
+            .await
+            .unwrap();
+        tracker.tracked.insert(spawn.id());
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Pending);
+        assert_eq!(
+            tracker.lookup(std::slice::from_ref(&spawn)).await.unwrap()[&spawn.id()],
+            NoteObservation::Committed
+        );
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Committed);
+        // The maker spends it: the next round sees it.
+        rpc.mock_chain
+            .write()
+            .add_pending_executed_transaction(&spend)
+            .unwrap();
+        rpc.prove_block();
+        assert_eq!(seen(&mut tracker, &spawn).await, NoteObservation::Consumed);
+    }
+
+    /// The cap's lookup decides every due note with one note lookup: one on
+    /// chain, one not.
+    #[tokio::test]
+    async fn sdk_tracker_looks_up_every_due_note_in_one_call() {
+        let (spawn, _, rpc) = spawned_note().await;
+        let missing = note(740, NoteType::Private);
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(&rpc, &dir).await;
+        tracker.observe(&[]).await.unwrap();
+        let calls = rpc.get_notes_by_id_call_count();
+        let found = tracker
+            .lookup(&[spawn.clone(), missing.clone()])
+            .await
+            .unwrap();
+        assert_eq!(rpc.get_notes_by_id_call_count(), calls + 1);
+        assert_eq!(found[&spawn.id()], NoteObservation::Committed);
+        assert_eq!(found[&missing.id()], NoteObservation::Pending);
+        // Nothing due: no call.
+        assert!(tracker.lookup(&[]).await.unwrap().is_empty());
+        assert_eq!(rpc.get_notes_by_id_call_count(), calls + 1);
+    }
+
+    async fn seen(tracker: &mut SdkTracker, note: &Note) -> NoteObservation {
+        tracker.observe(std::slice::from_ref(note)).await.unwrap()[&note.id()]
+    }
+
+    /// A stored record of another note with the same details can't be
+    /// replaced by an import: the new note is decided by an exact lookup, and
+    /// the round goes on for every other note.
+    #[tokio::test]
+    async fn sdk_tracker_decides_a_note_sharing_details_with_a_record_by_lookup() {
+        use miden_protocol::transaction::RawOutputNote;
+        let old = note(730, NoteType::Public);
+        let new = note(730, NoteType::Private);
+        assert_eq!(old.details_commitment(), new.details_commitment());
+        assert_ne!(old.id(), new.id());
+        let good = note(731, NoteType::Private);
+        let mut builder = MockChain::builder();
+        for committed in [&old, &new, &good] {
+            builder.add_output_note(RawOutputNote::Full(committed.clone()));
+        }
+        let rpc = Arc::new(MockRpcApi::new(builder.build().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(&rpc, &dir).await;
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&old)).await.unwrap()[&old.id()],
+            NoteObservation::Committed
+        );
+        for _ in 0..2 {
+            let seen = tracker.observe(&[new.clone(), good.clone()]).await.unwrap();
+            assert_eq!(seen[&new.id()], NoteObservation::Committed);
+            assert_eq!(seen[&good.id()], NoteObservation::Committed);
+        }
+    }
+
+    /// A node error on the cap's lookup cancels nothing; the next round
+    /// tries again.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_failed_cap_lookup_cancels_nothing() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.chain.state().lookup_fails = true;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&order).await, "active");
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only");
+
+        f.chain.state().lookup_fails = false;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.status(&order).await, "stopped");
+    }
+
+    /// An unconfirmed order whose note the tracker can never read is still
+    /// decided once the cap is due, by its exact lookup.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_decides_an_unreadable_note() {
+        let mut f = fixture().await;
+        let (missing, landed) = (note(1, NoteType::Private), note(2, NoteType::Private));
+        f.accept(1, &missing, 0).await;
+        f.accept(2, &landed, 0).await;
+        f.chain.commit(&landed, 3);
+        for order in [&missing, &landed] {
+            f.chain.state().unreadable.insert(order.id());
+        }
+        f.chain.state().tip = 100;
+        // Not due yet: no decision for either.
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 0);
+        // The process-wide gauge is shared with other tests' rounds: read the
+        // watcher's own count.
+        assert_eq!(f.watcher.unobserved, 2);
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+        // Both in one call.
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&missing).await, "stopped");
+        assert_eq!(f.status(&landed).await, "active");
+    }
+
+    /// The cap tells a maker nothing about an order it cancelled itself.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn the_cap_sends_nothing_after_a_cancel_all() {
+        let mut f = fixture().await;
+        let order = note(1, NoteType::Private);
+        f.accept(1, &order, 0).await;
+        f.command(
+            "c2",
+            2,
+            MakerCommand::CancelAll {
+                scope: CutoffScope::all(),
+            },
+        )
+        .await;
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.statuses().await.len(), 1, "LIVE only, no CANCELLED");
+    }
+
+    /// Every due note is decided by one lookup call, however many there are,
+    /// and a note the answer can't be read for waits without holding up the
+    /// others.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn every_due_note_takes_one_lookup() {
+        let mut f = fixture().await;
+        let orders: Vec<_> = (1..=20)
+            .map(|serial| note(serial, NoteType::Private))
+            .collect();
+        for (seq, order) in orders.iter().enumerate() {
+            f.accept(seq as u64 + 1, order, 0).await;
+        }
+        let (unreadable, missing) = orders.split_at(19);
+        f.chain
+            .state()
+            .failing_lookups
+            .extend(unreadable.iter().map(Note::id));
+        f.chain.state().tip = 100;
+        f.age(3600).await;
+        f.watcher.round().await.unwrap();
+        assert_eq!(f.chain.state().lookups, 1);
+        assert_eq!(f.status(&missing[0]).await, "stopped");
+        for order in unreadable {
+            assert_eq!(f.status(order).await, "active");
+        }
+    }
+
+    /// Orders whose notes land in the same round take their FIFO slots in
+    /// the order they were submitted, in every round, not only the first.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn notes_landing_together_keep_their_submit_order() {
+        let mut f = fixture().await;
+        let orders: Vec<_> = (1..=3)
+            .map(|serial| note(serial, NoteType::Private))
+            .collect();
+        for (seq, order) in orders.iter().enumerate() {
+            f.submit(seq as u64 + 1, order).await;
+        }
+        // A round with nothing on chain yet, then all three land at once.
+        f.watcher.round().await.unwrap();
+        for order in &orders {
+            f.chain.commit(order, 5);
+        }
+        f.watcher.round().await.unwrap();
+        let ids: Vec<Vec<u8>> = orders
+            .iter()
+            .map(|order| order.id().to_bytes().to_vec())
+            .collect();
+        let seqs =
+            f.db.pool
+                .read(move |conn| {
+                    use crate::db::postgres_schema::orders;
+                    use diesel::prelude::*;
+                    ids.iter()
+                        .map(|id| {
+                            Ok(orders::table
+                                .find(id)
+                                .select(orders::priority_seq)
+                                .first::<i64>(conn)?)
+                        })
+                        .collect::<crate::db::DbResult<Vec<_>>>()
+                })
+                .await
+                .unwrap();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
     }
 }

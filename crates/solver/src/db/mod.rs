@@ -2,6 +2,8 @@
 //! remain SQLite and are not part of this module.
 
 pub mod error;
+#[cfg(test)]
+mod live_at_accept_tests;
 pub mod maker_db;
 pub mod postgres_db;
 pub mod postgres_migrations;

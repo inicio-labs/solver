@@ -55,7 +55,7 @@ The reply carries the transaction and note IDs. The tokens arrive as a public no
 ## 4. How your orders trade
 
 1. **You create an order note.** An order is a PSWAP note offering an amount of one token for an amount of another, created and committed on chain by your own account. We recommend private order notes with public paybacks.
-2. **You register it.** `SubmitOrder` with the note's bytes. The reply `accepted` means stored, not yet live. Once the solver sees the note committed and unspent, you receive `OrderStatus LIVE`.
+2. **You register it.** Send the note's transaction first, then `SubmitOrder` with the note's bytes. The reply `accepted` means stored, not yet live. Once the solver sees the note committed and unspent, you receive `OrderStatus LIVE`. On a solver with live at accept on (guide, section 13), a private order is `LIVE` at once, before its note is in a block, and is cancelled with `note_not_received` if the note never arrives.
 3. **The solver matches it.** Each pair clears in batches at one price, the Binance mid for that pair, every few seconds. Your order is eligible when its limit is at or better than that price after the fee. `/v2/pair-price` returns that threshold as `fillPrice`.
 4. **Settlement.** The solver consumes your note in an on-chain transaction. You receive `SettlementPending`, then `SettlementResolved` with the fill. A fill pays you at least your order's own price. A full fill pays the clearing price less the fee. A partial fill leaves a remainder note that keeps trading as the same order (same lineage ID).
 5. **You collect.** Each fill creates a payback note addressed to your account. Consume it to move the tokens into your account.
@@ -63,7 +63,7 @@ The reply carries the transaction and note IDs. The tokens arrive as a public no
 | Typical testnet timing | |
 |---|---|
 | Create and prove an order note | 3 to 8 s |
-| Note transaction sent → `LIVE` | about 4 s |
+| Note transaction sent → `LIVE` | about 4 s (at once with live at accept) |
 | Matched → settlement confirmed on chain | about 8 s (median), 25 s (slow cases) |
 | Block time | about 3 s |
 
@@ -102,6 +102,6 @@ To start with Claude Code: run `claude` in `maker-kit/` and ask, for example, *"
 
 ## 7. Before you trade
 
-Run the checklist in section 14 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
+Run the checklist in section 15 of `market-maker-guide.md`: submit, cancel, cancel-all, retry with the same request ID, reconnect the event stream from a saved cursor, follow one order to a committed fill and claim the payback.
 
 Questions: your Inicio Labs contact.

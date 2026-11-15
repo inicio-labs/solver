@@ -100,7 +100,9 @@ struct State {
     /// it.
     included: BTreeSet<TransactionId>,
     scanned: usize,
-    /// Notes spent by this wrapper's transactions that are now in a block.
+    /// Nullifiers the blocks record as spent. A note created and spent in one
+    /// block is erased: the block leaves its nullifier out, so a later spend
+    /// of it is refused as unknown, as a real node does.
     spent: BTreeSet<Nullifier>,
 }
 
@@ -131,20 +133,25 @@ impl NodeLikeRpc {
     /// stays in the mempool until a block really holds it.
     fn settle(&self) {
         let mut state = self.state.lock().unwrap();
-        let included: Vec<TransactionId> = {
+        let (included, spent): (Vec<TransactionId>, Vec<Nullifier>) = {
             let chain = self.inner.mock_chain.read();
             let blocks = chain.proven_blocks();
             let new = &blocks[state.scanned.min(blocks.len())..];
             state.scanned = blocks.len();
-            new.iter()
-                .flat_map(|block| block.body().transactions().as_slice())
-                .map(|transaction| transaction.id())
-                .collect()
+            (
+                new.iter()
+                    .flat_map(|block| block.body().transactions().as_slice())
+                    .map(|transaction| transaction.id())
+                    .collect(),
+                new.iter()
+                    .flat_map(|block| block.body().created_nullifiers())
+                    .copied()
+                    .collect(),
+            )
         };
+        state.spent.extend(spent);
         for id in included {
-            if let Some(effects) = state.waiting.remove(&id) {
-                state.spent.extend(effects.nullifiers);
-            }
+            state.waiting.remove(&id);
             state.included.insert(id);
         }
     }
@@ -168,15 +175,18 @@ impl NodeRpcClient for NodeLikeRpc {
             .iter()
             .filter_map(|note| note.header().map(|header| header.id()))
             .collect();
-        let off_chain: Vec<NoteId> = {
-            let chain = self.inner.mock_chain.read();
-            unauthenticated
-                .into_iter()
-                .filter(|id| !chain.committed_notes().contains_key(id))
-                .collect()
-        };
         {
+            // Read the chain under the same lock as the mempool, in the order
+            // `settle` takes them, so a block proven between the two reads
+            // can't hide a note from both.
             let state = self.state.lock().unwrap();
+            let off_chain: Vec<NoteId> = {
+                let chain = self.inner.mock_chain.read();
+                unauthenticated
+                    .into_iter()
+                    .filter(|id| !chain.committed_notes().contains_key(id))
+                    .collect()
+            };
             let committed: Vec<Nullifier> = nullifiers
                 .iter()
                 .copied()
@@ -218,10 +228,9 @@ impl NodeRpcClient for NodeLikeRpc {
             .await?;
         let id = proven_transaction.id();
         let mut state = self.state.lock().unwrap();
-        if state.included.contains(&id) {
-            // A block took it before this line ran.
-            state.spent.extend(nullifiers);
-        } else {
+        // A block that took it before this line ran already recorded what it
+        // spent.
+        if !state.included.contains(&id) {
             let outputs = proven_transaction
                 .output_notes()
                 .iter()

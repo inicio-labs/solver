@@ -309,7 +309,8 @@ pub struct EngineConfig {
     /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default 50.
     #[serde(default = "default_price_query_max_batch")]
     pub price_query_max_batch: usize,
-    /// Per-request timeout in ms. Default 3000.
+    /// Ordinary per-request timeout in ms. Default 3000. `/v2/swap-eta`
+    /// adds its 10-second liquidity wait to this processing margin.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
     /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`.

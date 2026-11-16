@@ -229,8 +229,37 @@ freshness rule, so a missing or stale quote is `503` `no_price`.
 
 ### `GET /v2/swap-eta` — will this order fill?
 
-What the solver would do **now** with the order the wallet is about to sign,
+What the solver would do with the order the wallet is about to sign,
 by the solver's own rules, plus how long it takes.
+
+**Brief liquidity gaps:** the endpoint checks immediately. While the order is
+at market, the executor is accepting settlements, and only part or none of the
+order can fill, it checks fresh book, price and executor snapshots every 250 ms
+for up to 10 seconds. It returns as soon as a full fill is predicted. The
+original amounts, limit and minimum fill step stay unchanged throughout.
+
+At the deadline it returns the latest ordinary **HTTP 200** verdict, including
+`partial` or `none` if full liquidity did not return. It does not reuse an old
+quote, reserve liquidity, or guarantee execution after the response. A book
+update does not reset the deadline.
+
+Malformed requests, unknown faucets, unavailable prices/markets, off-market or
+tolerated limits, and paused settlements keep their immediate responses. This
+wait only bridges liquidity shortfalls; it is not a general retry of API errors.
+`/v2/pair-price`, `/v2/pairs` and all `/v1` routes retain their existing behavior.
+
+**Caller timeouts:** allow more than 10 seconds for this endpoint. The server's
+outer request timeout is the 10-second liquidity window plus
+`price_query_timeout_ms` (13 seconds with its 3000 ms default). Set client and
+reverse-proxy budgets to at least 15 seconds at those defaults; increase them if
+the configured server margin is larger. A caller that aborts at exactly 10
+seconds can lose the final JSON verdict. The inspected wallet and swap monitor
+currently use 10-second fetch limits, so update those budgets before rollout.
+Waiting requests still count toward `price_query_max_inflight`; overload can
+still return HTTP 503 immediately.
+Dropping a handler future releases its permit, but a disconnected HTTP peer
+is not always noticed immediately (for example with buffered pipelining).
+Such a request remains bounded by the same liquidity deadline.
 
 | Param | Required | Meaning |
 |---|---|---|
@@ -319,7 +348,7 @@ with a band the batch price can be up to the band away from it.
 | `200` | OK |
 | `400` | `bad_faucet_id`: missing or malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
 | `404` | `unknown_faucet`: not registered with the solver |
-| `408` | the request took longer than `price_query_timeout_ms` (empty body) |
+| `408` | the request exceeded its outer processing timeout (empty body): `price_query_timeout_ms` on ordinary routes, plus the 10-second liquidity window on `/v2/swap-eta`. Exhausting the liquidity window itself returns a normal 200 verdict, not 408. |
 | `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `overloaded`: more than `price_query_max_inflight` requests in flight, retry shortly; `not_ready` (`/v2/pairs` only): the solver is still confirming its Binance markets at startup |
 
 Without a price, both swap-eta endpoints still answer `200`: `/v2` with reason

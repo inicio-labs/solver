@@ -53,6 +53,10 @@ use crate::swap_eta::{
     VerdictTerms,
 };
 
+/// Bridge brief maker cancel/repost gaps without changing an order's terms.
+const LIQUIDITY_WAIT: Duration = Duration::from_secs(10);
+const LIQUIDITY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
 #[derive(Debug, Clone)]
 pub struct PriceApiConfig {
@@ -99,6 +103,7 @@ pub struct PriceApiState {
     /// Next-batch ETA (secs) = ceil((sync + trigger + proving + block)/1000).
     swap_eta_secs: u64,
     verdict_terms: VerdictTerms,
+    liquidity_wait: Duration,
 }
 
 impl PriceApiState {
@@ -130,6 +135,7 @@ impl PriceApiState {
                 + cfg.swap_proving_ms
                 + cfg.swap_block_ms)
                 .div_ceil(1000),
+            liquidity_wait: LIQUIDITY_WAIT,
             verdict_terms: VerdictTerms {
                 fee_ppm: cfg.clearing_fee_ppm,
                 tolerance_bps: cfg.swap_offmarket_tolerance_bps,
@@ -648,6 +654,30 @@ async fn get_swap_eta(
     // 404 unless both are registered.
     registered_decimals(&state, a, b)?;
 
+    let deadline = tokio::time::Instant::now() + state.liquidity_wait;
+    loop {
+        let response = swap_eta_response(&state, a, b, order)?;
+        // Only transient liquidity shortfalls wait. Price/market errors,
+        // tolerated limits and a paused executor keep their existing answers.
+        let waiting_for_liquidity = response.settlements_running
+            && response.price_band == Some(PriceBand::AtMarket)
+            && response.fill_status != FillStatus::Full;
+        let now = tokio::time::Instant::now();
+        if !waiting_for_liquidity || now >= deadline {
+            return Ok(no_store(Json(response)));
+        }
+        tokio::time::sleep_until((now + LIQUIDITY_RECHECK_INTERVAL).min(deadline)).await;
+    }
+}
+
+/// Evaluate fresh snapshots on every check, including at the deadline. No
+/// watch borrow or snapshot survives the caller's sleep between checks.
+fn swap_eta_response(
+    state: &PriceApiState,
+    a: AccountId,
+    b: AccountId,
+    order: ProposedOrder,
+) -> Result<SwapEtaResponse, ApiError> {
     // One price snapshot, one book snapshot, one clock reading.
     let book = state.book_rx.borrow().clone();
     let terms = state.verdict_terms;
@@ -697,7 +727,7 @@ async fn get_swap_eta(
     let median24h_seconds = stats.median_secs((a, b), now_unix);
     let settlements_running = stats.executor_accepting;
 
-    Ok(no_store(Json(SwapEtaResponse {
+    Ok(SwapEtaResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         offered_amount: order.offered.to_string(),
@@ -720,7 +750,7 @@ async fn get_swap_eta(
             && status != FillStatus::None)
             .then_some(state.swap_eta_secs),
         median24h_seconds,
-    })))
+    })
 }
 
 /// Don't let the router-level `max-age` layer cache a swap answer: it comes
@@ -866,11 +896,24 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .route("/prices", get(get_prices))
         // Frozen for wallets built against it; new wallets use /v2.
         .route("/swap-eta", get(get_swap_eta_v1))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_millis(cfg.timeout_ms),
+        ))
         .with_state(state.clone());
     let v2 = Router::new()
         .route("/pairs", get(get_pairs))
         .route("/pair-price", get(get_pair_price))
-        .route("/swap-eta", get(get_swap_eta))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_millis(cfg.timeout_ms),
+        ))
+        .merge(Router::new().route("/swap-eta", get(get_swap_eta)).layer(
+            TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_millis(cfg.timeout_ms).saturating_add(state.liquidity_wait),
+            ),
+        ))
         .with_state(state);
 
     // Public read-only price data → permissive CORS so browser wallets /
@@ -887,10 +930,6 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             cache_value,
-        ))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_millis(cfg.timeout_ms),
         ))
         .layer(DefaultBodyLimit::max(4 * 1024))
         .layer(from_fn_with_state(sem, concurrency_guard))

@@ -1,5 +1,6 @@
 //! Price-API tests, in memory: the API reads no database.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,9 @@ fn received(fresh: bool) -> Instant {
 
 struct Harness {
     server: TestServer,
+    prices: watch::Sender<Arc<PriceSnapshot>>,
+    book: watch::Sender<Arc<SwapBookSnapshot>>,
+    stats: watch::Sender<Arc<SettlementStats>>,
 }
 
 fn cfg() -> PriceApiConfig {
@@ -91,6 +95,16 @@ async fn serve(
     book: SwapBookSnapshot,
     stats: SettlementStats,
 ) -> Harness {
+    serve_with_wait(registered, snapshot, book, stats, false).await
+}
+
+async fn serve_with_wait(
+    registered: &[(AccountId, Option<u8>, Option<&str>)],
+    snapshot: PriceSnapshot,
+    book: SwapBookSnapshot,
+    stats: SettlementStats,
+    wait_for_liquidity: bool,
+) -> Harness {
     let tokens = registered
         .iter()
         .map(|(id, decimals, ticker)| RegisteredTokenRow {
@@ -99,13 +113,19 @@ async fn serve(
             ticker: ticker.map(str::to_owned),
         })
         .collect();
-    // The receivers keep the values after their senders drop.
-    let (_tx, prices) = watch::channel(Arc::new(snapshot));
-    let (_book_tx, book_rx) = watch::channel(Arc::new(book));
-    let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState::new(&cfg(), prices, tokens, &markets(), book_rx, stats_rx);
+    let (prices_tx, prices) = watch::channel(Arc::new(snapshot));
+    let (book_tx, book_rx) = watch::channel(Arc::new(book));
+    let (stats_tx, stats_rx) = watch::channel(Arc::new(stats));
+    let mut state = PriceApiState::new(&cfg(), prices, tokens, &markets(), book_rx, stats_rx);
+    if !wait_for_liquidity {
+        // Existing snapshot tests exercise the verdict, not the liquidity wait.
+        state.liquidity_wait = Duration::ZERO;
+    }
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
+        prices: prices_tx,
+        book: book_tx,
+        stats: stats_tx,
     }
 }
 
@@ -1343,4 +1363,471 @@ async fn a_failed_walk_quotes_the_mid() {
     .await;
     assert_eq!(v["expectedPrice"], "0.5");
     assert_eq!(v["reason"], "liquidity");
+}
+
+// Default production wait, with virtual time so these tests do not sleep for
+// ten seconds. PriceSnapshot uses std::Instant; keep its TTL long, and publish
+// explicit fresh/stale snapshots when exercising price changes.
+async fn waiting_server(book: SwapBookSnapshot) -> Harness {
+    let snapshot =
+        PriceSnapshot::for_tests(&[(faucet_a(), faucet_b(), "2", received(true))], &[], TTL);
+    let tokens: Vec<_> = registered()
+        .iter()
+        .map(|(id, decimals)| (*id, *decimals, None))
+        .collect();
+    serve_with_wait(&tokens, snapshot, book, running(), true).await
+}
+
+fn wait_order() -> String {
+    a_for_b("offered_amount=1000000&requested_amount=1990000")
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_returns_a_full_quote_immediately() {
+    let h = waiting_server(buyers(3_000_000)).await;
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_rechecks_until_full_before_the_deadline() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let book_tx = h.book.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        book_tx.send_replace(Arc::new(buyers(1_000_000))); // only partial
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        book_tx.send_replace(Arc::new(buyers(3_000_000))); // full at 3s
+    });
+    let start = tokio::time::Instant::now();
+    let response = h
+        .server
+        .get(&format!("/v2/swap-eta?{}", wait_order()))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(response.json::<Value>()["fillStatus"], "full");
+    assert!(start.elapsed() >= Duration::from_secs(3));
+    assert!(start.elapsed() <= Duration::from_millis(3_250));
+    // The ordinary request timeout in cfg() is only 2s. A successful 3s
+    // response proves the ETA route has room for the liquidity wait.
+    assert_eq!(response.header("cache-control"), "no-store");
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_returns_latest_none_at_ten_seconds() {
+    let h = waiting_server(buyers(1_000_000)).await;
+    let book_tx = h.book.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(9_500)).await;
+        book_tx.send_replace(Arc::new(SwapBookSnapshot::default()));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(10));
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "liquidity");
+    assert_eq!(v["fillableOfferedAmount"], "0");
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_returns_latest_partial_at_ten_seconds() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let book_tx = h.book.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(9_500)).await;
+        book_tx.send_replace(Arc::new(buyers(1_000_000)));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(10));
+    assert_eq!(v["fillStatus"], "partial");
+    assert_eq!(v["fillableOfferedAmount"], "500000");
+    assert_eq!(v["fillableRequestedAmount"], "995000");
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_accepts_full_depth_just_before_the_deadline() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let book_tx = h.book.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(9_750)).await;
+        book_tx.send_replace(Arc::new(buyers(3_000_000)));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(v["fillStatus"], "full");
+    assert!(start.elapsed() >= Duration::from_millis(9_750));
+    assert!(start.elapsed() <= Duration::from_secs(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_rechecks_price_instead_of_using_the_initial_price() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let book_tx = h.book.clone();
+    let prices_tx = h.prices.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        prices_tx.send_replace(Arc::new(PriceSnapshot::for_tests(
+            &[(faucet_a(), faucet_b(), "1", received(true))],
+            &[],
+            TTL,
+        )));
+        book_tx.send_replace(Arc::new(buyers(3_000_000)));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(v["marketPrice"], "1");
+    assert_eq!(v["priceBand"], "off_market");
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "price");
+    assert!(start.elapsed() <= Duration::from_millis(1_250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_does_not_delay_non_liquidity_answers() {
+    let h = waiting_server(buyers(3_000_000)).await;
+    let start = tokio::time::Instant::now();
+    let bad = a_for_b("offered_amount=0&requested_amount=1990000");
+    assert_eq!(swap_status(&h, &bad).await, StatusCode::BAD_REQUEST);
+    let off_market = a_for_b("offered_amount=1000000&requested_amount=3000000");
+    assert_eq!(swap_get(&h, &off_market).await["reason"], "price");
+    let tolerated = a_for_b("offered_amount=1000000&requested_amount=2005000");
+    assert_eq!(swap_get(&h, &tolerated).await["priceBand"], "tolerated");
+    h.stats.send_replace(Arc::new(SettlementStats::new()));
+    h.book.send_replace(Arc::new(SwapBookSnapshot::default()));
+    assert_eq!(
+        swap_get(&h, &wait_order()).await["settlementsRunning"],
+        false
+    );
+    h.prices
+        .send_replace(Arc::new(PriceSnapshot::for_tests(&[], &[], TTL)));
+    assert_eq!(swap_get(&h, &wait_order()).await["reason"], "no_market");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_stops_when_price_becomes_stale() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let prices_tx = h.prices.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        prices_tx.send_replace(Arc::new(PriceSnapshot::for_tests(
+            &[(faucet_a(), faucet_b(), "2", received(false))],
+            &[],
+            TTL,
+        )));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(v["reason"], "no_price");
+    assert!(v["marketPrice"].is_null());
+    assert!(start.elapsed() <= Duration::from_millis(1_250));
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_does_not_block_unrelated_routes() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let request = h
+        .server
+        .get(&format!("/v2/swap-eta?{}", wait_order()))
+        .into_future();
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        _ = &mut request => panic!("empty liquidity must wait"),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    let start = tokio::time::Instant::now();
+    h.server
+        .get(&pair_url(faucet_a(), faucet_b()))
+        .await
+        .assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    // Cancelling a request drops the wait future; no detached retry task.
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_handler_future_cancellation_releases_the_concurrency_permit() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let mut config = cfg();
+    config.max_inflight = 1;
+    let tokens = registered()
+        .iter()
+        .map(|(id, decimals)| RegisteredTokenRow {
+            token_id: id.to_bytes(),
+            decimals: decimals.map(i32::from),
+            ticker: None,
+        })
+        .collect();
+    let state = PriceApiState::new(
+        &config,
+        h.prices.subscribe(),
+        tokens,
+        &markets(),
+        h.book.subscribe(),
+        h.stats.subscribe(),
+    );
+    let server = TestServer::new(build_app(state, &config));
+    {
+        let request = server
+            .get(&format!("/v2/swap-eta?{}", wait_order()))
+            .into_future();
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            _ = &mut request => panic!("empty liquidity must wait"),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        server
+            .get("/v2/pairs")
+            .await
+            .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    } // Dropping the request also drops its semaphore permit.
+    server.get("/v2/pairs").await.assert_status_ok();
+}
+
+#[tokio::test(start_paused = true)]
+async fn liquidity_wait_returns_latest_executor_state() {
+    let h = waiting_server(SwapBookSnapshot::default()).await;
+    let stats_tx = h.stats.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stats_tx.send_replace(Arc::new(SettlementStats::new()));
+    });
+    let start = tokio::time::Instant::now();
+    let v = swap_get(&h, &wait_order()).await;
+    assert_eq!(v["settlementsRunning"], false);
+    assert!(v["estimatedSeconds"].is_null());
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert!(start.elapsed() <= Duration::from_millis(1_250));
+}
+
+/// Production router over a real loopback TCP socket. Unlike the virtual-time
+/// cases above, these tests use ordinary wall-clock time and a reqwest client.
+async fn http_waiting_server(
+    book: SwapBookSnapshot,
+    max_inflight: usize,
+) -> (Harness, Arc<tokio::sync::Notify>) {
+    let mut h = waiting_server(book).await;
+    let mut config = cfg();
+    config.max_inflight = max_inflight;
+    let tokens = registered()
+        .iter()
+        .map(|(id, decimals)| RegisteredTokenRow {
+            token_id: id.to_bytes(),
+            decimals: decimals.map(i32::from),
+            ticker: None,
+        })
+        .collect();
+    let state = PriceApiState::new(
+        &config,
+        h.prices.subscribe(),
+        tokens,
+        &markets(),
+        h.book.subscribe(),
+        h.stats.subscribe(),
+    );
+    let admitted = Arc::new(tokio::sync::Notify::new());
+    let notify = admitted.clone();
+    let app = build_app(state, &config).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let notify = notify.clone();
+            async move {
+                if request.uri().path() != "/v2/swap-eta" {
+                    return next.run(request).await;
+                }
+                let response = next.run(request);
+                tokio::pin!(response);
+                // Signal only after the real handler has acquired its permit
+                // and yielded. Probes cannot steal its slot during admission.
+                tokio::select! {
+                    biased;
+                    response = &mut response => response,
+                    _ = std::future::ready(()) => {
+                        notify.notify_one();
+                        response.await
+                    }
+                }
+            }
+        },
+    ));
+    h.server = TestServer::builder()
+        .http_transport_with_ip_port(Some(std::net::Ipv4Addr::LOCALHOST.into()), None)
+        .build(app);
+    (h, admitted)
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liquidity_wait_http_recovers_early_and_other_routes_stay_responsive() {
+    let (h, admitted) = http_waiting_server(SwapBookSnapshot::default(), 4).await;
+    let client = http_client();
+    let pending_client = client.clone();
+    let endpoint = h
+        .server
+        .server_url(&format!("/v2/swap-eta?{}", wait_order()))
+        .unwrap();
+    let pending = tokio::spawn(async move {
+        let start = Instant::now();
+        let response = pending_client
+            .get(endpoint)
+            .header("Origin", "https://wallet.example")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let cache = response.headers()["cache-control"].clone();
+        let cors = response.headers()["access-control-allow-origin"].clone();
+        let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        (start.elapsed(), status, cache, cors, body)
+    });
+    tokio::time::timeout(Duration::from_secs(2), admitted.notified())
+        .await
+        .expect("request must enter the real handler");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !pending.is_finished(),
+        "an empty book must keep the request pending"
+    );
+    for path in [
+        "/v2/pairs".to_string(),
+        pair_url(faucet_a(), faucet_b()),
+        v1_url(faucet_a(), 1_000_000, faucet_b(), 1_990_000),
+    ] {
+        let response = client
+            .get(h.server.server_url(&path).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    h.server
+        .get("/v2/swap-eta?offered_amount=0")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    // Recover after a real 3s gap, longer than cfg()'s ordinary 2s timeout.
+    tokio::time::sleep(Duration::from_millis(2_750)).await;
+    h.book.send_replace(Arc::new(buyers(3_000_000)));
+    let (elapsed, status, cache, cors, body) = pending.await.unwrap();
+    eprintln!("real HTTP recovered after {:.3}s", elapsed.as_secs_f64());
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache, "no-store");
+    assert_eq!(cors, "*");
+    assert_eq!(body["fillStatus"], "full");
+    assert_eq!(body["offeredAmount"], "1000000");
+    assert_eq!(body["requestedAmount"], "1990000");
+    assert!(elapsed >= Duration::from_secs(3));
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "must return before the full wait deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liquidity_wait_http_deadline_returns_latest_json_not_408() {
+    let (h, _) = http_waiting_server(SwapBookSnapshot::default(), 4).await;
+    let (other, admitted) = http_waiting_server(buyers(1_000_000), 4).await;
+    let client = http_client();
+    let partial_client = client.clone();
+    let endpoint = other
+        .server
+        .server_url(&format!("/v2/swap-eta?{}", wait_order()))
+        .unwrap();
+    let partial = tokio::spawn(async move {
+        let start = Instant::now();
+        let response = partial_client.get(endpoint).send().await.unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        (start.elapsed(), status, body)
+    });
+    tokio::time::timeout(Duration::from_secs(2), admitted.notified())
+        .await
+        .expect("partial request must enter the handler");
+    let book_tx = other.book.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        book_tx.send_replace(Arc::new(buyers(500_000)));
+    });
+    let start = Instant::now();
+    let response = client
+        .get(
+            h.server
+                .server_url(&format!("/v2/swap-eta?{}", wait_order()))
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(body["fillStatus"], "none");
+    assert_eq!(body["reason"], "liquidity");
+    assert!(elapsed >= Duration::from_secs(10));
+    assert!(elapsed < Duration::from_secs(13));
+    let (partial_elapsed, status, partial_body) = partial.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(partial_body["fillStatus"], "partial");
+    assert_eq!(partial_body["fillableOfferedAmount"], "250000");
+    assert_eq!(partial_body["offeredAmount"], "1000000");
+    assert_eq!(partial_body["requestedAmount"], "1990000");
+    assert!(partial_elapsed >= Duration::from_secs(10));
+    assert!(partial_elapsed < Duration::from_secs(13));
+    eprintln!(
+        "real HTTP deadlines: none {:.3}s; partial {:.3}s",
+        elapsed.as_secs_f64(),
+        partial_elapsed.as_secs_f64()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liquidity_wait_http_disconnected_pipeline_is_bounded_by_deadline() {
+    use tokio::io::AsyncWriteExt;
+    let (h, admitted) = http_waiting_server(SwapBookSnapshot::default(), 1).await;
+    let client = http_client();
+    let base = h.server.server_url("/").unwrap();
+    let mut socket =
+        tokio::net::TcpStream::connect((base.host_str().unwrap(), base.port().unwrap()))
+            .await
+            .unwrap();
+    let start = Instant::now();
+    let path = format!("/v2/swap-eta?{}", wait_order());
+    // Buffered pipelining can prevent Hyper from observing EOF until the first
+    // response is ready. Even then, the handler must release its permit at
+    // the normal deadline rather than leak a detached waiter indefinitely.
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\nGET /v2/pairs HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let pairs = h.server.server_url("/v2/pairs").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), admitted.notified())
+        .await
+        .expect("waiting request must enter the real handler");
+    assert_eq!(
+        client.get(pairs.clone()).send().await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if client.get(pairs.clone()).send().await.unwrap().status() == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("disconnected request must not retain capacity past its wait deadline");
+    eprintln!(
+        "disconnected pipeline released capacity after {:.3}s",
+        start.elapsed().as_secs_f64()
+    );
+    assert!(start.elapsed() < Duration::from_secs(13));
 }

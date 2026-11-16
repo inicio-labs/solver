@@ -1823,4 +1823,3 @@ async fn a_resting_ask_restarts_a_clock_started_while_unpriced() {
     h.change(ask_removed()).await;
     assert_eq!(h.buyer_price().await, ASK_PRICE);
 }
-

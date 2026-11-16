@@ -148,14 +148,17 @@ On a pair without a band, `expectedPrice` equals `marketPrice` and every
 other field is as before.
 
 **Short gaps in the book.** Makers' orders leave the book for a few seconds
-while a maker re-quotes or a matched order settles. So that a quote does not
-jump to the mid in that moment, the solver remembers, for each pair and
+while a maker re-quotes or a matched order settles. So that the price does
+not jump to the mid in that moment, the solver remembers, for each pair and
 direction, the makers' price its walk last found in the book. While the book
-has nothing crossing inside the band, both endpoints price from that
+has nothing crossing inside the band, `/v2/pair-price` prices from that
 remembered order as the solver's rule would with it back (or the mid, if the
-rule would not use it at today's mid), for at most 10 seconds after the book
-went empty. An order priced between the mid and the makers' price is judged
-at the makers' price, so it gets `price`, not `liquidity`.
+rule would not use it at today's mid), for at most 10 seconds after the makers
+left the book. It is a best estimate, not a promise that they return at that
+price. `/v2/swap-eta` judges only the live book: an order priced between the
+mid and the makers' price in the book is judged at the makers' price, so
+within the off-market tolerance it is `tolerated` (reason `liquidity`), beyond
+it `off_market` (reason `price`).
 
 The expected price is an estimate for the next batch, on the book as it is
 now. Not modelled: a maker's own crossed orders, which the solver leaves out
@@ -242,23 +245,25 @@ freshness rule, so a missing or stale quote is `503` `no_price`.
 What the solver would do with the order the wallet is about to sign, by the
 solver's own rules, plus how long it takes.
 
-**Waiting for liquidity (long polling).** When the order is at market but
-the book has nothing for it right now, and liquidity was in the book a moment
-ago (the remembered price above), the request waits for the book to change,
-up to `wait_ms`, the way SQS `ReceiveMessage` waits with `WaitTimeSeconds`.
-It is re-checked on every book change and answers as soon as the order fills
-in full or waiting can no longer help, or at the deadline with the latest
-ordinary answer (`200`, `partial` or `none`). Orders that cannot be helped
-by waiting answer at once: they fill already, they are not at market,
-settlements are paused, or nothing was in the book a moment ago. Set your own
-request timeout above your wait plus about 3 seconds.
+**Waiting for liquidity (long polling).** When the order is at market and
+settlements are running but the book cannot fill it in full right now, the
+request waits up to `wait_ms` for makers to come, the way SQS `ReceiveMessage`
+waits with `WaitTimeSeconds`. It is re-checked on the live book at every book
+change, at the price the makers are really at, and answers as soon as the
+order fills in full or is no longer at market, or at the deadline with the
+latest ordinary answer (`200`, `partial` or `none`). An order that fills
+already, is not at market, or meets paused settlements answers at once, as
+does any request once 256 are waiting. An order that can never fill in full
+(larger than the pair's liquidity) waits the whole `wait_ms`; send `wait_ms=0`
+for an immediate answer. Set your own request timeout above your wait plus
+about 3 seconds.
 
 | Param | Required | Meaning |
 |---|---|---|
 | `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
 | `offered_amount`, `requested_amount` | yes | the order, in base units |
 | `min_fill_step` | no | the note's smallest partial fill, in requested-token base units; `0` or omitted means none, as in PSWAP. If only part of the order can fill and that part is smaller, `fillStatus` is `none` (reason `liquidity`). Send `requested_amount` for all-or-nothing |
-| `wait_ms` | no | the longest this request may wait for liquidity, in milliseconds; omitted: the solver's `swap_eta_wait_ms` (default 5000), which is also the maximum; `0`: answer at once |
+| `wait_ms` | no | the longest this request may wait for makers, in milliseconds; omitted: the solver's `swap_eta_wait_ms` (default 5000), which is also the maximum; `0`: answer at once |
 
 **200 response** — offering 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with buyers for 3.2 ETH (8000 USDT) in the book:
 

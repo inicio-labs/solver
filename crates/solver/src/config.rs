@@ -310,9 +310,9 @@ pub struct EngineConfig {
     /// timeout is this plus `swap_eta_wait_ms`.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
-    /// `/v2/swap-eta`: how long a request may wait for liquidity that was just
-    /// in the book (the default and the maximum of its `wait_ms`). `0` turns
-    /// waiting off. Default 5000.
+    /// `/v2/swap-eta`: how long an at-market order that cannot fill in full
+    /// may wait for makers (the default and the maximum of its `wait_ms`).
+    /// `0` turns waiting off. Default 5000.
     #[serde(default = "default_swap_eta_wait_ms")]
     pub swap_eta_wait_ms: u64,
     /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`.

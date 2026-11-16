@@ -18,9 +18,9 @@
 //! memory, so public traffic never touches PostgreSQL; a registration change
 //! shows after a restart. The book depth for swap quotes comes from
 //! [`mirror_depth`], which this thread runs: the matcher only sends changes.
-//! The mirror also remembers each pair's last makers' price, which quotes use
-//! for a few seconds while the book has nothing crossing inside the band
-//! (a maker re-quoting, or a matched order settling).
+//! The mirror also remembers each pair's last makers' price, which
+//! `/v2/pair-price` uses for a few seconds while the book has nothing
+//! crossing inside the band (a maker re-quoting, or a matched order settling).
 //! `/v2/pairs` lists the configured clearing pairs and their tokens, built
 //! once at startup.
 
@@ -601,30 +601,25 @@ fn pair_sides(
     }
 }
 
-/// The price a quote is judged at, found as the clearing finds it (ADR 0007).
-struct QuotePrice {
-    price: BatchPrice,
-    /// The price came from the remembered makers' price: the book has
-    /// nothing crossing inside the band right now.
-    from_memory: bool,
-}
-
-/// The quote's price on `book` for the order offering `a` for `b`:
+/// The price a quote is judged at, found as the clearing finds it (ADR 0007),
+/// on `book` for the order offering `a` for `b`:
 /// 1. the walk with `probe` (the user's order, or the reference order);
 /// 2. else, for an order that crosses nothing, the reference walk: the price
-///    the makers in the book clear at;
-/// 3. else, while the book has nothing crossing and the pair's remembered
-///    price is alive, the clearing's price with that makers' order back;
+///    the makers in the book clear at (an order priced inside the spread is
+///    judged at it);
+/// 3. else, given `remembered` (pair-price only), while the book has nothing
+///    crossing and the pair's remembered price is alive, the clearing's price
+///    with that makers' order back;
 /// 4. else the mid. A walk error (an overflow on extreme amounts) also gives
 ///    the mid: what the matcher clears at in that case too.
 fn quote_price(
     market: &OrderMarket,
     fee_ppm: u32,
     book: &SwapBookSnapshot,
-    remembered: &RememberedPrices,
+    remembered: Option<&RememberedPrices>,
     (a, b): (AccountId, AccountId),
     probe: Probe,
-) -> QuotePrice {
+) -> BatchPrice {
     let walk = |probe| {
         let (sells, buys) = pair_sides(book, market.side, a, b);
         walk_levels(market, fee_ppm, sells, buys, probe).unwrap_or_else(|error| {
@@ -638,20 +633,14 @@ fn quote_price(
         Probe::Order(_) => walk(probe).or(reference),
     };
     if let Some(walked) = found {
-        return QuotePrice {
-            price: walked.price,
-            from_memory: false,
-        };
+        return walked.price;
     }
     let now = tokio::time::Instant::now();
-    let recalled = remembered
-        .get(&(a, b))
-        .filter(|memory| reference.is_none() && memory.alive(now))
-        .and_then(|memory| remembered_price(market, memory).ok().flatten());
-    QuotePrice {
-        price: recalled.unwrap_or(market.price),
-        from_memory: recalled.is_some(),
-    }
+    remembered
+        .and_then(|remembered| remembered.get(&(a, b)))
+        .filter(|memory| memory.alive(now))
+        .and_then(|memory| remembered_price(market, memory).ok().flatten())
+        .unwrap_or(market.price)
 }
 
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
@@ -679,11 +668,10 @@ async fn get_pair_price(
         &market,
         fee_ppm,
         &book,
-        &remembered,
+        Some(&remembered),
         (a, b),
         Probe::Reference,
-    )
-    .price;
+    );
     let expected = whole_price(&market, price).ok_or(ApiError::NoPrice)?;
     let fill = fill_price(market.side, expected, fee_ppm).ok_or(ApiError::NoPrice)?;
     Ok(Json(PairPriceResponse {
@@ -705,11 +693,11 @@ async fn get_pair_price(
 /// B, base units), plus the time estimates.
 ///
 /// Long polling (the pattern of SQS `WaitTimeSeconds`): when the order is at
-/// market but the book has nothing crossing for it and the pair's remembered
-/// makers' price says liquidity was just there, the request waits up to
-/// `wait_ms` (default and maximum: `swap_eta_wait_ms`; `0`: no wait) and is
-/// re-checked on every book change. It answers as soon as waiting can no
-/// longer help, or at the deadline with the latest ordinary answer.
+/// market and settlements run but it does not fill in full, the request
+/// waits up to `wait_ms` (default and maximum: `swap_eta_wait_ms`; `0`: no
+/// wait) for any maker, re-checked on the live book at every book change. It
+/// answers as soon as it fills in full or is no longer a liquidity
+/// shortfall, or at the deadline with the latest ordinary answer.
 async fn get_swap_eta(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
@@ -763,37 +751,33 @@ async fn get_swap_eta(
 }
 
 /// One check of the order against fresh snapshots: the answer, and whether
-/// waiting for the book to change could still make it fill in full.
+/// it is a liquidity shortfall that a book change could still fill.
 fn swap_eta_answer(
     state: &PriceApiState,
     a: AccountId,
     b: AccountId,
     order: ProposedOrder,
 ) -> Result<(SwapEtaResponse, bool), ApiError> {
-    // One price snapshot, one book snapshot, one clock reading. The book
-    // first: the remembered prices are published before it.
+    // One price snapshot, one book snapshot, one clock reading.
     let book = state.book_rx.borrow().clone();
-    let remembered = state.remembered_rx.borrow().clone();
     let terms = state.verdict_terms;
     let market = state.prices.borrow().order_market(a, b, Instant::now());
-    let mut from_memory = false;
     let (verdict, market_price, expected, fill, unpriced) = match market {
         Ok(market) => {
             let cannot_price = |error| ApiError::BadAmount(format!("cannot price: {error}"));
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
             // The batch price with this order in the book (ADR 0007); the
-            // order is judged at it, as the matcher would clear it. Whether
-            // it fills is judged on the live book only.
-            let quote = quote_price(
+            // order is judged at it, as the matcher would clear it, on the
+            // live book only: no remembered price, so a re-check after a
+            // wait judges the makers who are really back, at their price.
+            let price = quote_price(
                 &market,
                 terms.fee_ppm,
                 &book,
-                &remembered,
+                None,
                 (a, b),
                 Probe::Order(order),
             );
-            from_memory = quote.from_memory;
-            let price = quote.price;
             let verdict = judge(
                 market.side,
                 price,
@@ -855,10 +839,9 @@ fn swap_eta_answer(
             .then_some(state.swap_eta_secs),
         median24h_seconds,
     };
-    let worth_waiting = from_memory
-        && settlements_running
-        && band == Some(PriceBand::AtMarket)
-        && status != FillStatus::Full;
+    // Only a liquidity shortfall waits: anything else answers as today.
+    let worth_waiting =
+        settlements_running && band == Some(PriceBand::AtMarket) && status != FillStatus::Full;
     Ok((answer, worth_waiting))
 }
 
@@ -978,6 +961,7 @@ async fn mirror_depth(
 ) {
     let mut depth = DepthBook::default();
     let mut remembered = RememberedPrices::new();
+    let mut previous = Arc::new(SwapBookSnapshot::default());
     while let Some(change) = changes.recv().await {
         let first = change.pair();
         depth.apply(change);
@@ -987,6 +971,7 @@ async fn mirror_depth(
         let snapshot = prices.borrow().clone();
         remember_prices(
             &mut remembered,
+            &previous,
             &book,
             &snapshot,
             fee_ppm,
@@ -994,19 +979,25 @@ async fn mirror_depth(
             tokio::time::Instant::now(),
         );
         remembered_tx.send_replace(Arc::new(remembered.clone()));
-        book_tx.send_replace(book);
+        book_tx.send_replace(Arc::clone(&book));
+        previous = book;
         tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
     }
 }
 
 /// For each pair in `touched`, both directions: the reference walk (as
 /// `/v2/pair-price` runs it) on `book`. Found the makers → remember their
-/// price. Anything else (nothing crosses, no market right now, a walk error)
-/// → keep the old price but start its clock ([`Remembered::empty_since`]), so
-/// a memory never outlives [`crate::swap_eta::REMEMBER_FOR`] unconfirmed;
-/// its clock ran out → forget it.
+/// price. Nothing found → the clock ([`Remembered::empty_since`]) starts when
+/// the makers left the book:
+/// - if `previous` (the book before these changes) still has makers at
+///   today's price, they left with these changes: remember them, clock now;
+/// - else keep the old memory and start its clock if not running (also when
+///   there is no price right now), so a memory never outlives
+///   [`crate::swap_eta::REMEMBER_FOR`] unconfirmed; its clock ran out →
+///   forget it.
 pub(crate) fn remember_prices(
     remembered: &mut RememberedPrices,
+    previous: &SwapBookSnapshot,
     book: &SwapBookSnapshot,
     prices: &PriceSnapshot,
     fee_ppm: u32,
@@ -1018,31 +1009,52 @@ pub(crate) fn remember_prices(
         .flat_map(|&(x, y)| [(x, y), (y, x)])
         .collect();
     for (a, b) in directions {
-        let found = prices
-            .order_market(a, b, Instant::now())
-            .ok()
-            .and_then(|market| {
-                let (sells, buys) = pair_sides(book, market.side, a, b);
-                match walk_levels(&market, fee_ppm, sells, buys, Probe::Reference) {
-                    Ok(walked) => walked.map(|walked| Remembered::found(market.side, &walked)),
-                    Err(error) => {
-                        tracing::debug!(%error, "depth mirror: reference walk failed");
-                        None
-                    }
+        let Ok(market) = prices.order_market(a, b, Instant::now()) else {
+            start_clock(remembered, (a, b), now);
+            continue;
+        };
+        let makers = |book| {
+            let (sells, buys) = pair_sides(book, market.side, a, b);
+            match walk_levels(&market, fee_ppm, sells, buys, Probe::Reference) {
+                Ok(walked) => walked.map(|walked| Remembered::found(market.side, &walked)),
+                Err(error) => {
+                    tracing::debug!(%error, "depth mirror: reference walk failed");
+                    None
                 }
-            });
-        match found {
+            }
+        };
+        if let Some(memory) = makers(book) {
+            remembered.insert((a, b), memory);
+            continue;
+        }
+        // Only if the memory is missing or its clock already runs: else the
+        // makers it holds were found by the last walk, and left just now.
+        let unsure = remembered
+            .get(&(a, b))
+            .is_none_or(|memory| memory.empty_since.is_some());
+        match makers(previous).filter(|_| unsure) {
             Some(memory) => {
+                let memory = Remembered {
+                    empty_since: Some(now),
+                    ..memory
+                };
                 remembered.insert((a, b), memory);
             }
-            None => {
-                if let Some(memory) = remembered.get_mut(&(a, b)) {
-                    memory.empty_since.get_or_insert(now);
-                    if !memory.alive(now) {
-                        remembered.remove(&(a, b));
-                    }
-                }
-            }
+            None => start_clock(remembered, (a, b), now),
+        }
+    }
+}
+
+/// Start `pair`'s clock if it isn't running; forget the memory once it ran out.
+fn start_clock(
+    remembered: &mut RememberedPrices,
+    pair: (TokenId, TokenId),
+    now: tokio::time::Instant,
+) {
+    if let Some(memory) = remembered.get_mut(&pair) {
+        memory.empty_since.get_or_insert(now);
+        if !memory.alive(now) {
+            remembered.remove(&pair);
         }
     }
 }

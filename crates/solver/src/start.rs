@@ -458,9 +458,9 @@ pub async fn start(
     let price_api_cfg = crate::price_api::PriceApiConfig {
         bind: config.engine.price_query_bind.clone(),
         port: config.engine.price_query_port,
-        max_inflight: config.engine.price_query_max_inflight,
         max_batch: config.engine.price_query_max_batch,
         timeout_ms: config.engine.price_query_timeout_ms,
+        swap_eta_wait_ms: config.engine.swap_eta_wait_ms,
         vs_currency: config
             .binance
             .valuation_quote_asset

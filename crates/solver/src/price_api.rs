@@ -7,8 +7,9 @@
 //! ISOLATION (P0): this is a public, unauthenticated surface, so it runs on its
 //! OWN OS thread + multi-thread runtime. It never touches the `!Send` miden
 //! `Client` or the matcher's single-threaded `LocalSet`, so wallet traffic
-//! cannot starve fund settlement. Protections: a tokio-`Semaphore` concurrency
-//! limiter (sheds excess with `503`), request timeout, body cap, batch cap.
+//! cannot starve fund settlement. Protections: request timeout, body cap,
+//! batch cap, and a cap on `/v2/swap-eta` requests waiting for liquidity.
+//! No handler blocks a worker: the only await is that wait.
 //!
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
@@ -17,19 +18,21 @@
 //! memory, so public traffic never touches PostgreSQL; a registration change
 //! shows after a restart. The book depth for swap quotes comes from
 //! [`mirror_depth`], which this thread runs: the matcher only sends changes.
+//! The mirror also remembers each pair's last makers' price, which quotes use
+//! for a few seconds while the book has nothing crossing inside the band
+//! (a maker re-quoting, or a matched order settling).
 //! `/v2/pairs` lists the configured clearing pairs and their tokens, built
 //! once at startup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -48,19 +51,22 @@ use crate::matching::types::{BookLevel, SwapBookSnapshot};
 use crate::price::PricePrecision;
 use crate::price::{MarketPlan, OrderMarket, PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
-    eval_can_fill, eval_off_market, expected_price, fill_price, judge, whole_price, DepthBook,
-    DepthChange, FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, SettlementStats,
-    VerdictTerms,
+    eval_can_fill, eval_off_market, fill_price, judge, remembered_price, walk_levels, whole_price,
+    DepthBook, DepthChange, FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, Remembered,
+    RememberedPrices, SettlementStats, VerdictTerms,
 };
+use crate::types::TokenId;
 
 /// Knobs for the price-query server (sourced from `EngineConfig` and `BinanceConfig`).
 #[derive(Debug, Clone)]
 pub struct PriceApiConfig {
     pub bind: String,
     pub port: u16,
-    pub max_inflight: usize,
     pub max_batch: usize,
     pub timeout_ms: u64,
+    /// `/v2/swap-eta`: how long a request may wait for liquidity (its
+    /// `wait_ms` default and maximum); `0` turns waiting off.
+    pub swap_eta_wait_ms: u64,
     /// The valuation quote asset, as reported in responses (e.g. `"usdt"`).
     pub vs_currency: String,
     /// Default precision (`"full"` or `"0".."18"`); overridable per request.
@@ -94,12 +100,23 @@ pub struct PriceApiState {
     // ── swap-eta ──
     /// The matcher's resting levels, from [`mirror_depth`] (read lock-free).
     book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+    /// Each pair's last makers' price, from [`mirror_depth`]; published just
+    /// before the book it was found in.
+    remembered_rx: watch::Receiver<Arc<RememberedPrices>>,
     /// In-memory settlement-time window from the executor.
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     /// Next-batch ETA (secs) = ceil((sync + trigger + proving + block)/1000).
     swap_eta_secs: u64,
     verdict_terms: VerdictTerms,
+    /// `/v2/swap-eta` liquidity wait: default and maximum.
+    swap_eta_wait: Duration,
+    /// Places for requests waiting for liquidity ([`MAX_WAITERS`]).
+    waiters: Arc<Semaphore>,
 }
+
+/// At most this many `/v2/swap-eta` requests wait for liquidity at once; the
+/// next one answers straight away.
+const MAX_WAITERS: usize = 256;
 
 impl PriceApiState {
     pub fn new(
@@ -108,6 +125,7 @@ impl PriceApiState {
         tokens: Vec<RegisteredTokenRow>,
         markets: &MarketPlan,
         book_rx: watch::Receiver<Arc<SwapBookSnapshot>>,
+        remembered_rx: watch::Receiver<Arc<RememberedPrices>>,
         stats_rx: watch::Receiver<Arc<SettlementStats>>,
     ) -> Self {
         let tokens = tokens
@@ -124,6 +142,7 @@ impl PriceApiState {
                 .unwrap_or(PricePrecision::Full),
             max_batch: cfg.max_batch,
             book_rx,
+            remembered_rx,
             stats_rx,
             swap_eta_secs: (cfg.swap_sync_ms
                 + cfg.swap_matching_trigger_ms
@@ -134,6 +153,8 @@ impl PriceApiState {
                 fee_ppm: cfg.clearing_fee_ppm,
                 tolerance_bps: cfg.swap_offmarket_tolerance_bps,
             },
+            swap_eta_wait: Duration::from_millis(cfg.swap_eta_wait_ms),
+            waiters: Arc::new(Semaphore::new(MAX_WAITERS)),
         }
     }
 }
@@ -580,19 +601,57 @@ fn pair_sides(
     }
 }
 
-/// The expected batch price, or the mid if the walk fails (an overflow on
-/// extreme amounts): what the matcher clears at in that case too.
-fn walked_or_mid(
+/// The price a quote is judged at, found as the clearing finds it (ADR 0007).
+struct QuotePrice {
+    price: BatchPrice,
+    /// The price came from the remembered makers' price: the book has
+    /// nothing crossing inside the band right now.
+    from_memory: bool,
+}
+
+/// The quote's price on `book` for the order offering `a` for `b`:
+/// 1. the walk with `probe` (the user's order, or the reference order);
+/// 2. else, for an order that crosses nothing, the reference walk: the price
+///    the makers in the book clear at;
+/// 3. else, while the book has nothing crossing and the pair's remembered
+///    price is alive, the clearing's price with that makers' order back;
+/// 4. else the mid. A walk error (an overflow on extreme amounts) also gives
+///    the mid: what the matcher clears at in that case too.
+fn quote_price(
     market: &OrderMarket,
     fee_ppm: u32,
-    sells: &[BookLevel],
-    buys: &[BookLevel],
+    book: &SwapBookSnapshot,
+    remembered: &RememberedPrices,
+    (a, b): (AccountId, AccountId),
     probe: Probe,
-) -> BatchPrice {
-    expected_price(market, fee_ppm, sells, buys, probe).unwrap_or_else(|error| {
-        tracing::debug!(%error, "bounded price failed; quoting at the mid");
-        market.price
-    })
+) -> QuotePrice {
+    let walk = |probe| {
+        let (sells, buys) = pair_sides(book, market.side, a, b);
+        walk_levels(market, fee_ppm, sells, buys, probe).unwrap_or_else(|error| {
+            tracing::debug!(%error, "bounded price failed; quoting at the mid");
+            None
+        })
+    };
+    let reference = walk(Probe::Reference);
+    let found = match probe {
+        Probe::Reference => reference,
+        Probe::Order(_) => walk(probe).or(reference),
+    };
+    if let Some(walked) = found {
+        return QuotePrice {
+            price: walked.price,
+            from_memory: false,
+        };
+    }
+    let now = tokio::time::Instant::now();
+    let recalled = remembered
+        .get(&(a, b))
+        .filter(|memory| reference.is_none() && memory.alive(now))
+        .and_then(|memory| remembered_price(market, memory).ok().flatten());
+    QuotePrice {
+        price: recalled.unwrap_or(market.price),
+        from_memory: recalled.is_some(),
+    }
 }
 
 /// `GET /v2/pair-price?offered_faucet=&requested_faucet=`
@@ -612,9 +671,19 @@ async fn get_pair_price(
     let now = Instant::now();
     let market = state.prices.borrow().order_market(a, b, now)?;
     let fee_ppm = state.verdict_terms.fee_ppm;
+    // The book first: the remembered prices are published before it, so
+    // they are at least as new.
     let book = state.book_rx.borrow().clone();
-    let (sells, buys) = pair_sides(&book, market.side, a, b);
-    let price = walked_or_mid(&market, fee_ppm, sells, buys, Probe::Reference);
+    let remembered = state.remembered_rx.borrow().clone();
+    let price = quote_price(
+        &market,
+        fee_ppm,
+        &book,
+        &remembered,
+        (a, b),
+        Probe::Reference,
+    )
+    .price;
     let expected = whole_price(&market, price).ok_or(ApiError::NoPrice)?;
     let fill = fill_price(market.side, expected, fee_ppm).ok_or(ApiError::NoPrice)?;
     Ok(Json(PairPriceResponse {
@@ -630,10 +699,17 @@ async fn get_pair_price(
     }))
 }
 
-/// `GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=`
+/// `GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=&wait_ms=`
 ///
 /// The [`crate::swap_eta::Verdict`] on the order a wallet is about to sign (offer A / request
 /// B, base units), plus the time estimates.
+///
+/// Long polling (the pattern of SQS `WaitTimeSeconds`): when the order is at
+/// market but the book has nothing crossing for it and the pair's remembered
+/// makers' price says liquidity was just there, the request waits up to
+/// `wait_ms` (default and maximum: `swap_eta_wait_ms`; `0`: no wait) and is
+/// re-checked on every book change. It answers as soon as waiting can no
+/// longer help, or at the deadline with the latest ordinary answer.
 async fn get_swap_eta(
     State(state): State<PriceApiState>,
     Query(q): Query<HashMap<String, String>>,
@@ -645,21 +721,79 @@ async fn get_swap_eta(
         // As in PSWAP, 0 (the default) means no minimum.
         min_fill_step: parse_amount(&q, "min_fill_step")?.unwrap_or(0),
     };
+    let wait =
+        match q.get("wait_ms") {
+            None => state.swap_eta_wait,
+            Some(raw) => Duration::from_millis(raw.parse().map_err(|_| {
+                ApiError::BadRequest(format!("`wait_ms` must be a u64, got {raw:?}"))
+            })?)
+            .min(state.swap_eta_wait),
+        };
     // 404 unless both are registered.
     registered_decimals(&state, a, b)?;
 
-    // One price snapshot, one book snapshot, one clock reading.
+    // Mark the current book seen before the first check: a change between a
+    // check and the wait still wakes the request.
+    let mut book_changes = state.book_rx.clone();
+    book_changes.borrow_and_update();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut place = None;
+    loop {
+        let (answer, worth_waiting) = swap_eta_answer(&state, a, b, order)?;
+        if !worth_waiting || tokio::time::Instant::now() >= deadline {
+            return Ok(no_store(Json(answer)));
+        }
+        if place.is_none() {
+            match Arc::clone(&state.waiters).try_acquire_owned() {
+                Ok(permit) => place = Some(permit),
+                // Too many waiting already: today's immediate answer.
+                Err(_) => return Ok(no_store(Json(answer))),
+            }
+        }
+        tokio::select! {
+            changed = book_changes.changed() => {
+                // The mirror stopped (shutdown): nothing more will change.
+                if changed.is_err() {
+                    return Ok(no_store(Json(answer)));
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
+/// One check of the order against fresh snapshots: the answer, and whether
+/// waiting for the book to change could still make it fill in full.
+fn swap_eta_answer(
+    state: &PriceApiState,
+    a: AccountId,
+    b: AccountId,
+    order: ProposedOrder,
+) -> Result<(SwapEtaResponse, bool), ApiError> {
+    // One price snapshot, one book snapshot, one clock reading. The book
+    // first: the remembered prices are published before it.
     let book = state.book_rx.borrow().clone();
+    let remembered = state.remembered_rx.borrow().clone();
     let terms = state.verdict_terms;
     let market = state.prices.borrow().order_market(a, b, Instant::now());
+    let mut from_memory = false;
     let (verdict, market_price, expected, fill, unpriced) = match market {
         Ok(market) => {
             let cannot_price = |error| ApiError::BadAmount(format!("cannot price: {error}"));
             let levels = |pair| book.get(&pair).map_or(&[][..], Vec::as_slice);
             // The batch price with this order in the book (ADR 0007); the
-            // order is judged at it, as the matcher would clear it.
-            let (sells, buys) = pair_sides(&book, market.side, a, b);
-            let price = walked_or_mid(&market, terms.fee_ppm, sells, buys, Probe::Order(order));
+            // order is judged at it, as the matcher would clear it. Whether
+            // it fills is judged on the live book only.
+            let quote = quote_price(
+                &market,
+                terms.fee_ppm,
+                &book,
+                &remembered,
+                (a, b),
+                Probe::Order(order),
+            );
+            from_memory = quote.from_memory;
+            let price = quote.price;
             let verdict = judge(
                 market.side,
                 price,
@@ -697,7 +831,7 @@ async fn get_swap_eta(
     let median24h_seconds = stats.median_secs((a, b), now_unix);
     let settlements_running = stats.executor_accepting;
 
-    Ok(no_store(Json(SwapEtaResponse {
+    let answer = SwapEtaResponse {
         offered_faucet: a.to_hex(),
         requested_faucet: b.to_hex(),
         offered_amount: order.offered.to_string(),
@@ -720,7 +854,12 @@ async fn get_swap_eta(
             && status != FillStatus::None)
             .then_some(state.swap_eta_secs),
         median24h_seconds,
-    })))
+    };
+    let worth_waiting = from_memory
+        && settlements_running
+        && band == Some(PriceBand::AtMarket)
+        && status != FillStatus::Full;
+    Ok((answer, worth_waiting))
 }
 
 /// Don't let the router-level `max-age` layer cache a swap answer: it comes
@@ -824,32 +963,87 @@ const DEPTH_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 /// Mirror the matcher's book depth from its changes and publish it for the
 /// quote handlers, at most every [`DEPTH_PUBLISH_INTERVAL`]. Runs on this
 /// thread: the matcher only sends the changes its index already made.
+///
+/// After each round of changes it also walks every pair those changes
+/// touched, both directions, and remembers the makers' price the walk finds
+/// (see [`remember_prices`]); pairs nothing touched cost nothing. The
+/// remembered prices go out just before the book, so a handler that reads
+/// the book first never sees older ones.
 async fn mirror_depth(
     mut changes: mpsc::UnboundedReceiver<DepthChange>,
     book_tx: watch::Sender<Arc<SwapBookSnapshot>>,
+    remembered_tx: watch::Sender<Arc<RememberedPrices>>,
+    prices: watch::Receiver<Arc<PriceSnapshot>>,
+    fee_ppm: u32,
 ) {
     let mut depth = DepthBook::default();
+    let mut remembered = RememberedPrices::new();
     while let Some(change) = changes.recv().await {
+        let first = change.pair();
         depth.apply(change);
-        depth.drain(&mut changes);
-        book_tx.send_replace(Arc::new(depth.snapshot()));
+        let mut touched = depth.drain(&mut changes);
+        touched.insert(first);
+        let book = Arc::new(depth.snapshot());
+        let snapshot = prices.borrow().clone();
+        remember_prices(
+            &mut remembered,
+            &book,
+            &snapshot,
+            fee_ppm,
+            &touched,
+            tokio::time::Instant::now(),
+        );
+        remembered_tx.send_replace(Arc::new(remembered.clone()));
+        book_tx.send_replace(book);
         tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
     }
 }
 
-/// Concurrency limiter: acquire a permit per request, shed with `503` if none.
-async fn concurrency_guard(
-    State(sem): State<Arc<Semaphore>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    match sem.try_acquire_owned() {
-        Ok(_permit) => next.run(req).await,
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "overloaded", "message": "price API at capacity" })),
-        )
-            .into_response(),
+/// For each pair in `touched`, both directions: the reference walk (as
+/// `/v2/pair-price` runs it) on `book`. Found the makers → remember their
+/// price. Anything else (nothing crosses, no market right now, a walk error)
+/// → keep the old price but start its clock ([`Remembered::empty_since`]), so
+/// a memory never outlives [`crate::swap_eta::REMEMBER_FOR`] unconfirmed;
+/// its clock ran out → forget it.
+pub(crate) fn remember_prices(
+    remembered: &mut RememberedPrices,
+    book: &SwapBookSnapshot,
+    prices: &PriceSnapshot,
+    fee_ppm: u32,
+    touched: &HashSet<(TokenId, TokenId)>,
+    now: tokio::time::Instant,
+) {
+    let directions: HashSet<_> = touched
+        .iter()
+        .flat_map(|&(x, y)| [(x, y), (y, x)])
+        .collect();
+    for (a, b) in directions {
+        let found = prices
+            .order_market(a, b, Instant::now())
+            .ok()
+            .and_then(|market| {
+                let (sells, buys) = pair_sides(book, market.side, a, b);
+                match walk_levels(&market, fee_ppm, sells, buys, Probe::Reference) {
+                    Ok(walked) => walked.map(|walked| Remembered::found(market.side, &walked)),
+                    Err(error) => {
+                        tracing::debug!(%error, "depth mirror: reference walk failed");
+                        None
+                    }
+                }
+            });
+        match found {
+            Some(memory) => {
+                remembered.insert((a, b), memory);
+            }
+            None => {
+                if let Some(memory) = remembered.get_mut(&(a, b)) {
+                    memory.empty_since.get_or_insert(now);
+                    if !memory.alive(now) {
+                        remembered.remove(&(a, b));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -857,7 +1051,6 @@ async fn concurrency_guard(
 
 /// Build the full router (used by the server thread AND unit tests).
 pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
-    let sem = Arc::new(Semaphore::new(cfg.max_inflight.max(1)));
     // Quotes move continuously; let shared caches hold a response briefly.
     let cache_value = HeaderValue::from_static("public, max-age=1");
 
@@ -888,14 +1081,15 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
             header::CACHE_CONTROL,
             cache_value,
         ))
+        // One timeout for every route: the processing margin plus the
+        // longest `/v2/swap-eta` liquidity wait (no other route waits).
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_millis(cfg.timeout_ms),
+            Duration::from_millis(cfg.timeout_ms.saturating_add(cfg.swap_eta_wait_ms)),
         ))
         .layer(DefaultBodyLimit::max(4 * 1024))
-        .layer(from_fn_with_state(sem, concurrency_guard))
         // CORS is outermost: it answers preflight + tags every response
-        // (including 503/timeout) without consuming a concurrency permit.
+        // (including timeouts).
         .layer(cors)
 }
 
@@ -927,8 +1121,24 @@ pub fn spawn_price_api_thread(
             };
             rt.block_on(async move {
                 let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
-                tokio::spawn(mirror_depth(depth_rx, book_tx));
-                let state = PriceApiState::new(&cfg, prices, tokens, &markets, book_rx, stats_rx);
+                let (remembered_tx, remembered_rx) =
+                    watch::channel(Arc::new(RememberedPrices::new()));
+                tokio::spawn(mirror_depth(
+                    depth_rx,
+                    book_tx,
+                    remembered_tx,
+                    prices.clone(),
+                    cfg.clearing_fee_ppm,
+                ));
+                let state = PriceApiState::new(
+                    &cfg,
+                    prices,
+                    tokens,
+                    &markets,
+                    book_rx,
+                    remembered_rx,
+                    stats_rx,
+                );
                 let app = build_app(state, &cfg);
 
                 let addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {

@@ -92,9 +92,10 @@ admin_port = 3001
 # Binance market (see [binance]); decimals + ticker are fetched on-chain.
 # price_query_port = 8080
 # price_query_bind = "127.0.0.1"     # "0.0.0.0" to expose publicly (front w/ a proxy)
-# price_query_max_inflight = 128     # concurrent requests; excess → 503
 # price_query_max_batch = 50         # max ids per /v1/prices request
 # price_query_timeout_ms = 3000
+# swap_eta_wait_ms = 5000            # /v2/swap-eta waits up to this for makers when an at-market
+#                                    # order can't fill in full (its wait_ms default + max); 0 = off
 # price_precision = "full"           # decimals of the PRICE number: "full" or 0..=18
 #                                    # (per-request override: ?precision=). NOT the token's decimals.
 # swap_offmarket_tolerance_bps = 50  # /v2/swap-eta: an order that fills if the mid

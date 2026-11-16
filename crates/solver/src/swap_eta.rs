@@ -9,8 +9,9 @@
 //!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
 //!    built from the [`DepthChange`]s the matcher sends as orders enter and
 //!    leave its book, so no depth work runs on the matcher.
-//!  * [`expected_price`] — the batch price the matcher's walk finds on the
-//!    mirrored levels (ADR 0007), with a probe order added.
+//!  * [`walk_levels`] — the matcher's walk (ADR 0007) on the mirrored
+//!    levels, with a probe order added; [`remembered_price`] — the price it
+//!    would find with a pair's remembered makers' order back.
 //!  * [`fill_price`] — the price an ask is built from: the expected price
 //!    less the fee.
 //!  * [`judge`] — the [`Verdict`] on the order a wallet is about to sign:
@@ -18,7 +19,8 @@
 //!    it the live book can fill.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use miden_protocol::asset::AssetAmount;
 use ruint::aliases::U256;
@@ -27,7 +29,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::clearing::bounded::{self, compare, Band, Leg, Legs};
+use crate::clearing::bounded::{self, compare, Band, Leg, Legs, Walked};
 use crate::clearing::{
     checked_mul, eligible_units, full_fill_fee, mul_div_floor, BatchPrice, ClearingConfig,
     ClearingError, FillInterval, FillScale, OrderSide, PPM_DENOMINATOR,
@@ -136,6 +138,15 @@ pub enum DepthChange {
     },
 }
 
+impl DepthChange {
+    /// The directed pair the change is on.
+    pub(crate) fn pair(&self) -> (TokenId, TokenId) {
+        match *self {
+            DepthChange::Added { pair, .. } | DepthChange::Removed { pair, .. } => pair,
+        }
+    }
+}
+
 /// The matcher's resting levels, rebuilt from its [`DepthChange`]s on the
 /// price API's thread.
 #[derive(Debug, Default)]
@@ -183,11 +194,17 @@ impl DepthBook {
         }
     }
 
-    /// Apply every change already queued.
-    pub(crate) fn drain(&mut self, changes: &mut mpsc::UnboundedReceiver<DepthChange>) {
+    /// Apply every change already queued; the directed pairs they touched.
+    pub(crate) fn drain(
+        &mut self,
+        changes: &mut mpsc::UnboundedReceiver<DepthChange>,
+    ) -> HashSet<(TokenId, TokenId)> {
+        let mut touched = HashSet::new();
         while let Ok(change) = changes.try_recv() {
+            touched.insert(change.pair());
             self.apply(change);
         }
+        touched
     }
 
     pub(crate) fn snapshot(&self) -> SwapBookSnapshot {
@@ -422,6 +439,7 @@ pub(crate) enum Probe {
 /// Levels carry no maker identity, so there is no self-trade prevention here:
 /// a maker crossed with itself can make this differ from the matcher's price.
 /// A level counts as one order toward the per-side cap (issue #64).
+#[cfg(test)]
 pub(crate) fn expected_price(
     market: &OrderMarket,
     fee_ppm: u32,
@@ -429,8 +447,21 @@ pub(crate) fn expected_price(
     buys: &[BookLevel],
     probe: Probe,
 ) -> Result<BatchPrice, ClearingError> {
+    Ok(walk_levels(market, fee_ppm, sells, buys, probe)?
+        .map_or(market.price, |walked| walked.price))
+}
+
+/// [`expected_price`]'s walk without its mid fallback: `None` when the pair
+/// has no band or nothing crosses inside it.
+pub(crate) fn walk_levels(
+    market: &OrderMarket,
+    fee_ppm: u32,
+    sells: &[BookLevel],
+    buys: &[BookLevel],
+    probe: Probe,
+) -> Result<Option<Walked<()>>, ClearingError> {
     if market.rules.band_bps == 0 {
-        return Ok(market.price);
+        return Ok(None);
     }
     let band = Band::new(market.price, market.rules.band_bps)?;
     let extra = match probe {
@@ -455,7 +486,85 @@ pub(crate) fn expected_price(
     };
     // The matcher runs with the default cap; it is not configurable.
     let cap = ClearingConfig::default().max_orders_per_side;
-    Ok(bounded::walk(&band, cap, &mut legs)?.map_or(market.price, |walked| walked.price))
+    bounded::walk(&band, cap, &mut legs)
+}
+
+/// How long a remembered price is used after the book stops crossing
+/// inside the band: longer than a settlement or a maker's re-quote, short
+/// enough that a maker who stopped quoting is not shown for long.
+pub(crate) const REMEMBER_FOR: Duration = Duration::from_secs(10);
+
+/// The makers' price a pair's reference walk (`/v2/pair-price`) last found
+/// in the book, for one direction. While the book has nothing crossing
+/// inside the band, quotes price from it instead of the mid, for at most
+/// [`REMEMBER_FOR`] after the book went empty.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Remembered {
+    /// The limit of the makers' order the walk last paired with the
+    /// reference order: an ask for a buyer, a bid for a seller.
+    pub(crate) limit: BatchPrice,
+    /// When a book change first left nothing crossing; `None` while the
+    /// last walk still found the makers.
+    pub(crate) empty_since: Option<tokio::time::Instant>,
+}
+
+impl Remembered {
+    /// From a reference walk that found the makers.
+    pub(crate) fn found(side: OrderSide, walked: &Walked<()>) -> Self {
+        Self {
+            limit: match side {
+                OrderSide::BuyBase => walked.sell_limit,
+                OrderSide::SellBase => walked.buy_limit,
+            },
+            empty_since: None,
+        }
+    }
+
+    /// Still usable at `now`.
+    pub(crate) fn alive(&self, now: tokio::time::Instant) -> bool {
+        self.empty_since
+            .is_none_or(|since| now.saturating_duration_since(since) <= REMEMBER_FOR)
+    }
+}
+
+/// Remembered prices by directed `(offered, requested)` pair.
+pub type RememberedPrices = HashMap<(TokenId, TokenId), Remembered>;
+
+/// The price the clearing would find now if the remembered makers' order
+/// were back, with the reference order on the asked side: the walk's rule
+/// for one crossing pair (ADR 0007). `None` when the pair has no band or
+/// the remembered limit is outside the current band (then: the mid).
+pub(crate) fn remembered_price(
+    market: &OrderMarket,
+    remembered: &Remembered,
+) -> Result<Option<BatchPrice>, ClearingError> {
+    if market.rules.band_bps == 0 {
+        return Ok(None);
+    }
+    let band = Band::new(market.price, market.rules.band_bps)?;
+    let limit = remembered.limit;
+    Ok(match market.side {
+        // The makers' ask against a buy at the band's top.
+        OrderSide::BuyBase => {
+            if compare(limit, band.high)? == Ordering::Greater {
+                None
+            } else if compare(band.mid, limit)? == Ordering::Less {
+                Some(limit)
+            } else {
+                Some(band.mid)
+            }
+        }
+        // The makers' bid against a sell at the band's bottom.
+        OrderSide::SellBase => {
+            if compare(limit, band.low)? == Ordering::Less {
+                None
+            } else if compare(band.mid, limit)? == Ordering::Greater {
+                Some(limit)
+            } else {
+                Some(band.mid)
+            }
+        }
+    })
 }
 
 /// The pretend order of `/v2/pair-price`: the pair's reference amount of
@@ -731,6 +840,86 @@ mod tests {
                 reference_amount: Some(Decimal::from(reference)),
             },
         }
+    }
+
+    // ── remembered price ─────────────────────────────────────────────────
+    /// The remembered rule gives what the walk itself gives with that one
+    /// makers' order back, at the mid it was found at and at moved mids:
+    /// inside the band, below or above the mid, and outside the band.
+    #[test]
+    fn the_remembered_price_is_the_walks_price_with_the_order_back() {
+        let at = |side, quote: u64| {
+            let mut market = banded(side, 10);
+            market.price = BatchPrice::from_ratio(quote, 1_000).unwrap();
+            market
+        };
+        // Asks (for buyers) and bids (for sellers) around the 2 B per A mid.
+        let asks = [1_990, 1_999, 2_001, 2_005, 2_009, 2_020].map(|b| level(b, 1_000, 1_000));
+        let bids = [1_980, 1_991, 1_995, 1_999, 2_001, 2_010].map(|b| level(1_000, b, 2_000));
+        let mids = [1_990, 1_996, 2_000, 2_004, 2_012];
+        let (mut checked, mut recalled) = (0, 0);
+        for (side, levels) in [(OrderSide::BuyBase, &asks), (OrderSide::SellBase, &bids)] {
+            for maker in levels {
+                let (sells, buys): (&[_], &[_]) = match side {
+                    OrderSide::BuyBase => (std::slice::from_ref(maker), &[]),
+                    OrderSide::SellBase => (&[], std::slice::from_ref(maker)),
+                };
+                let found =
+                    walk_levels(&at(side, 2_000), 0, sells, buys, Probe::Reference).unwrap();
+                let Some(walked) = found else {
+                    continue;
+                };
+                let memory = Remembered::found(side, &walked);
+                for mid in mids {
+                    let market = at(side, mid);
+                    let walk = walk_levels(&market, 0, sells, buys, Probe::Reference)
+                        .unwrap()
+                        .map(|walked| walked.price);
+                    checked += 1;
+                    recalled += usize::from(walk.is_some_and(|price| price != market.price));
+                    assert_eq!(
+                        remembered_price(&market, &memory).unwrap(),
+                        walk,
+                        "{side:?} maker {:?} mid {mid}",
+                        maker.rate
+                    );
+                }
+            }
+        }
+        // Not vacuous: makers inside the band, some setting the price.
+        assert!(
+            checked >= 30 && recalled >= 6,
+            "{checked} checked, {recalled} recalled"
+        );
+    }
+
+    #[test]
+    fn a_pair_without_a_band_remembers_nothing() {
+        let mut market = banded(OrderSide::BuyBase, 10);
+        market.rules.band_bps = 0;
+        let asks = [level(2_001, 1_000, 1_000)];
+        assert!(walk_levels(&market, 0, &asks, &[], Probe::Reference)
+            .unwrap()
+            .is_none());
+        let memory = Remembered {
+            limit: BatchPrice::from_ratio(2_001, 1_000).unwrap(),
+            empty_since: None,
+        };
+        assert_eq!(remembered_price(&market, &memory).unwrap(), None);
+    }
+
+    #[test]
+    fn a_remembered_price_lives_ten_seconds_after_the_book_empties() {
+        let start = tokio::time::Instant::now();
+        let mut memory = Remembered {
+            limit: BatchPrice::from_ratio(2_001, 1_000).unwrap(),
+            empty_since: None,
+        };
+        // Found in the book: alive however long ago.
+        assert!(memory.alive(start + Duration::from_secs(3_600)));
+        memory.empty_since = Some(start);
+        assert!(memory.alive(start + REMEMBER_FOR));
+        assert!(!memory.alive(start + REMEMBER_FOR + Duration::from_millis(1)));
     }
 
     // ── expected price ────────────────────────────────────────────────────

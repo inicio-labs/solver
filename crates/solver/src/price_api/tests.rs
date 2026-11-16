@@ -1,5 +1,6 @@
 //! Price-API tests, in memory: the API reads no database.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::test_support::{asset, btc, eth, market, usdt};
 use crate::price::{MarketPlan, PairRules, PriceSnapshot};
-use crate::swap_eta::SettlementStats;
+use crate::swap_eta::{DepthChange, RememberedPrices, SettlementStats};
 use rust_decimal::Decimal;
 
 /// Long enough that a slow test cannot make a fresh quote stale.
@@ -53,9 +54,9 @@ fn cfg() -> PriceApiConfig {
     PriceApiConfig {
         bind: "127.0.0.1".into(),
         port: 0,
-        max_inflight: 64,
         max_batch: 3,
         timeout_ms: 2000,
+        swap_eta_wait_ms: 5000,
         vs_currency: "usdt".into(),
         precision: "full".into(),
         swap_matching_trigger_ms: 1000,
@@ -102,8 +103,17 @@ async fn serve(
     // The receivers keep the values after their senders drop.
     let (_tx, prices) = watch::channel(Arc::new(snapshot));
     let (_book_tx, book_rx) = watch::channel(Arc::new(book));
+    let (_remembered_tx, remembered_rx) = watch::channel(Arc::new(RememberedPrices::new()));
     let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
-    let state = PriceApiState::new(&cfg(), prices, tokens, &markets(), book_rx, stats_rx);
+    let state = PriceApiState::new(
+        &cfg(),
+        prices,
+        tokens,
+        &markets(),
+        book_rx,
+        remembered_rx,
+        stats_rx,
+    );
     Harness {
         server: TestServer::new(build_app(state, &cfg())),
     }
@@ -1343,4 +1353,473 @@ async fn a_failed_walk_quotes_the_mid() {
     .await;
     assert_eq!(v["expectedPrice"], "0.5");
     assert_eq!(v["reason"], "liquidity");
+}
+
+// ── Remembered price + swap-eta long polling ─────────────────────────────────
+
+/// The v2 endpoints on the banded A/B pair, fed by the real depth mirror:
+/// tests send the matcher's changes and move the Binance price.
+struct Live {
+    server: TestServer,
+    depth: tokio::sync::mpsc::UnboundedSender<DepthChange>,
+    prices: watch::Sender<Arc<PriceSnapshot>>,
+    waiters: Arc<tokio::sync::Semaphore>,
+}
+
+fn banded_snapshot(mid: &str) -> PriceSnapshot {
+    let rules = PairRules {
+        band_bps: 30,
+        quote_ttl: None,
+        reference_amount: Some(Decimal::from(10)),
+    };
+    PriceSnapshot::for_tests(&[(faucet_a(), faucet_b(), mid, received(true))], &[], TTL)
+        .with_pair_rules(faucet_a(), faucet_b(), rules)
+}
+
+async fn live_server(wait_ms: u64, stats: SettlementStats) -> Live {
+    let tokens = registered()
+        .iter()
+        .map(|(id, decimals)| RegisteredTokenRow {
+            token_id: id.to_bytes(),
+            decimals: decimals.map(i32::from),
+            ticker: None,
+        })
+        .collect();
+    let mut config = cfg();
+    config.swap_eta_wait_ms = wait_ms;
+    let (prices_tx, prices) = watch::channel(Arc::new(banded_snapshot("2")));
+    let (book_tx, book_rx) = watch::channel(Arc::new(SwapBookSnapshot::default()));
+    let (remembered_tx, remembered_rx) = watch::channel(Arc::new(RememberedPrices::new()));
+    let (_stats_tx, stats_rx) = watch::channel(Arc::new(stats));
+    let (depth, depth_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(super::mirror_depth(
+        depth_rx,
+        book_tx,
+        remembered_tx,
+        prices.clone(),
+        config.clearing_fee_ppm,
+    ));
+    let state = PriceApiState::new(
+        &config,
+        prices,
+        tokens,
+        &markets(),
+        book_rx,
+        remembered_rx,
+        stats_rx,
+    );
+    let waiters = Arc::clone(&state.waiters);
+    Live {
+        server: TestServer::new(build_app(state, &config)),
+        depth,
+        prices: prices_tx,
+        waiters,
+    }
+}
+
+fn ask_added() -> DepthChange {
+    let level = ask_level();
+    DepthChange::Added {
+        pair: (faucet_a(), faucet_b()),
+        rate: level.rate,
+        volume: level.volume,
+    }
+}
+
+fn ask_removed() -> DepthChange {
+    let level = ask_level();
+    DepthChange::Removed {
+        pair: (faucet_a(), faucet_b()),
+        rate: level.rate,
+        volume: level.volume,
+    }
+}
+
+impl Live {
+    /// Send a matcher change and let the mirror publish it (it republishes
+    /// at most every 250 ms).
+    async fn change(&self, change: DepthChange) {
+        self.depth.send(change).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// The maker's ask was in the book and has just left it.
+    async fn gap(&self) {
+        self.change(ask_added()).await;
+        self.change(ask_removed()).await;
+    }
+
+    async fn buyer_price(&self) -> Value {
+        let v: Value = self
+            .server
+            .get(&pair_url(faucet_b(), faucet_a()))
+            .await
+            .json();
+        v["expectedPrice"].clone()
+    }
+}
+
+/// The maker's ask price as pair-price shows it (see
+/// `pair_price_with_a_band_quotes_the_makers_ask`).
+const ASK_PRICE: &str = "0.499175535901663918";
+
+/// 1,000,000 B for at least 495,000 A: fills in full at the maker's ask.
+fn buy_order(wait: &str) -> String {
+    format!(
+        "/v2/swap-eta?{}{wait}",
+        b_for_a("offered_amount=1000000&requested_amount=495000")
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn pair_price_remembers_the_makers_price_while_the_book_is_empty() {
+    let h = live_server(5000, running()).await;
+    // No liquidity has been seen yet: the mid, as today.
+    assert_eq!(h.buyer_price().await, "0.5");
+    h.change(ask_added()).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    h.change(ask_removed()).await;
+    // The book is empty: the remembered ask, not the mid.
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    tokio::time::sleep(Duration::from_millis(9_500)).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    // 10 s after the book went empty it is forgotten.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(h.buyer_price().await, "0.5");
+    // Selling A: nothing crossed either way, so there was nothing to remember.
+    let v: Value = h.server.get(&pair_url(faucet_a(), faucet_b())).await.json();
+    assert_eq!(v["expectedPrice"], "2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_remembered_price_follows_the_clearing_when_binance_moves() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    // The mid rises above the ask: the clearing would take the mid.
+    h.prices.send_replace(Arc::new(banded_snapshot("2.01")));
+    assert_eq!(h.buyer_price().await, "0.497512437810945274");
+    // The mid falls so far that the ask is above the band: the mid.
+    h.prices.send_replace(Arc::new(banded_snapshot("1.99")));
+    assert_eq!(h.buyer_price().await, "0.502512562814070352");
+    // Back inside: the ask again.
+    h.prices.send_replace(Arc::new(banded_snapshot("2")));
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_order_replaces_the_remembered_price() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    // A dearer ask arrives: the live book is priced, not the memory.
+    let dearer = DepthChange::Added {
+        pair: (faucet_a(), faucet_b()),
+        rate: RateKey::new(2_002_000, 1_000_000),
+        volume: 1_000_000_000,
+    };
+    h.change(dearer).await;
+    let live = h.buyer_price().await;
+    assert_ne!(live, ASK_PRICE);
+    assert_ne!(live, "0.5");
+}
+
+#[tokio::test(start_paused = true)]
+async fn swap_eta_waits_for_the_book_and_answers_full_on_its_change() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    let request = h.server.get(&buy_order("")).into_future();
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        _ = &mut request => panic!("liquidity was just in the book: it must wait"),
+        _ = tokio::time::sleep(Duration::from_millis(1_300)) => {}
+    }
+    let start = tokio::time::Instant::now();
+    h.depth.send(ask_added()).unwrap();
+    let v: Value = request.await.json();
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(v["expectedPrice"], ASK_PRICE);
+    // On the book change itself, not on a timer.
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn swap_eta_answers_the_latest_verdict_at_its_deadline() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    let start = tokio::time::Instant::now();
+    let response = h.server.get(&buy_order("")).await;
+    response.assert_status_ok();
+    let v: Value = response.json();
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    assert_eq!(v["priceBand"], "at_market");
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "liquidity");
+    // Judged on the live book only: the mid while it is empty (pair-price
+    // alone uses the remembered price).
+    assert_eq!(v["expectedPrice"], "0.5");
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn swap_eta_wait_ms_chooses_the_wait_up_to_the_configured_one() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    let start = tokio::time::Instant::now();
+    h.server
+        .get(&buy_order("&wait_ms=0"))
+        .await
+        .assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    let start = tokio::time::Instant::now();
+    h.server
+        .get(&buy_order("&wait_ms=1200"))
+        .await
+        .assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::from_millis(1_200));
+    // Longer than the solver allows: its own wait.
+    h.gap().await;
+    let start = tokio::time::Instant::now();
+    h.server
+        .get(&buy_order("&wait_ms=60000"))
+        .await
+        .assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    let response = h.server.get(&buy_order("&wait_ms=soon")).await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+}
+
+/// No memory needed: an at-market shortfall waits for any maker, even on a
+/// pair whose book has been empty all along; anything else answers at once.
+#[tokio::test(start_paused = true)]
+async fn swap_eta_waits_only_for_a_liquidity_shortfall() {
+    // Nothing was ever in the book: it still waits, for any maker.
+    let h = live_server(5000, running()).await;
+    let start = tokio::time::Instant::now();
+    let v: Value = h.server.get(&buy_order("")).await.json();
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+
+    // Fills in full already.
+    let h = live_server(5000, running()).await;
+    h.change(ask_added()).await;
+    let start = tokio::time::Instant::now();
+    let v: Value = h.server.get(&buy_order("")).await.json();
+    assert_eq!(v["fillStatus"], "full");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+
+    // Off market: 1,000,000 B for 600,000 A is far below any price.
+    let off = format!(
+        "/v2/swap-eta?{}",
+        b_for_a("offered_amount=1000000&requested_amount=600000")
+    );
+    let start = tokio::time::Instant::now();
+    let v: Value = h.server.get(&off).await.json();
+    assert_eq!(v["priceBand"], "off_market");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+
+    // Waiting off in the config.
+    let h = live_server(0, running()).await;
+    let start = tokio::time::Instant::now();
+    h.server.get(&buy_order("")).await.assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+
+    // Settlements paused.
+    let h = live_server(5000, SettlementStats::new()).await;
+    let start = tokio::time::Instant::now();
+    let v: Value = h.server.get(&buy_order("")).await.json();
+    assert_eq!(v["settlementsRunning"], false);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+
+    // Every waiting place taken: today's immediate answer, never a 503.
+    let h = live_server(5000, running()).await;
+    let _taken = Arc::clone(&h.waiters)
+        .acquire_many_owned(super::MAX_WAITERS as u32)
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    h.server.get(&buy_order("")).await.assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// No assumption that the maker returns at its old price: the re-check on
+/// the book change judges whoever is really back, at their price.
+#[tokio::test(start_paused = true)]
+async fn a_waiting_order_is_judged_at_the_price_the_makers_return_at() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    // A different, dearer maker comes back: still inside the band, but
+    // above what 1,000,000 B for 498,800 A pays (about 2.0028 with the fee).
+    let order = format!(
+        "/v2/swap-eta?{}",
+        b_for_a("offered_amount=1000000&requested_amount=498800")
+    );
+    let request = h.server.get(&order).into_future();
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        _ = &mut request => panic!("an at-market shortfall waits"),
+        _ = tokio::time::sleep(Duration::from_millis(800)) => {}
+    }
+    let start = tokio::time::Instant::now();
+    h.depth
+        .send(DepthChange::Added {
+            pair: (faucet_a(), faucet_b()),
+            rate: RateKey::new(2_003_000, 1_000_000),
+            volume: 1_000_000_000,
+        })
+        .unwrap();
+    let v: Value = request.await.json();
+    // Judged at the new maker's price: no longer at market, so it answers
+    // on that change instead of waiting on.
+    assert_eq!(v["priceBand"], "tolerated");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// An order priced between the mid and the makers' price, after the fee,
+/// is judged at the makers' price while they are in the book: inside the
+/// off-market tolerance it is `tolerated` (reason `liquidity`) at once.
+#[tokio::test(start_paused = true)]
+async fn an_order_inside_the_spread_is_judged_at_the_makers_price() {
+    // 1,000,000 B for at least 498,800 A: about 2.0028 B per A after the
+    // fee; the mid is 2, the maker's ask about 2.0033 with the fee.
+    let query = b_for_a("offered_amount=1000000&requested_amount=498800");
+    let order = format!("/v2/swap-eta?{query}");
+    // Without a band (judged at the mid) the same order is at market.
+    let h = banded_server(0, makers_ask()).await;
+    assert_eq!(swap_get(&h, &query).await["priceBand"], "at_market");
+
+    let h = live_server(5000, running()).await;
+    h.change(ask_added()).await;
+    let start = tokio::time::Instant::now();
+    let v: Value = h.server.get(&order).await.json();
+    assert_eq!(v["priceBand"], "tolerated");
+    assert_eq!(v["fillStatus"], "none");
+    assert_eq!(v["reason"], "liquidity");
+    assert_eq!(v["expectedPrice"], ASK_PRICE);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+/// The makers were there but unseen when the clock started (no price for a
+/// moment); a book change that removes them restarts it: the gap gets its
+/// full 10 s even with no remembered price at all before it.
+#[tokio::test(start_paused = true)]
+async fn the_clock_starts_when_the_makers_leave() {
+    let h = live_server(5000, running()).await;
+    // The ask arrives while the pair has no price: nothing remembered.
+    h.prices.send_replace(Arc::new(PriceSnapshot::default()));
+    h.change(ask_added()).await;
+    h.prices.send_replace(Arc::new(banded_snapshot("2")));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    // It leaves: the book before this change still had it.
+    h.change(ask_removed()).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    tokio::time::sleep(Duration::from_millis(9_500)).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(h.buyer_price().await, "0.5");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_answers_when_the_mirror_stops() {
+    let Live { server, depth, .. } = live_server(5000, running()).await;
+    depth.send(ask_added()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    depth.send(ask_removed()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let request = server.get(&buy_order("")).into_future();
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        _ = &mut request => panic!("must wait"),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    // Shutdown: the matcher drops its sender, the mirror ends.
+    let start = tokio::time::Instant::now();
+    drop(depth);
+    request.await.assert_status_ok();
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_routes_answer_while_requests_wait() {
+    let h = live_server(5000, running()).await;
+    h.gap().await;
+    let request = h.server.get(&buy_order("")).into_future();
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        _ = &mut request => panic!("must wait"),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    let start = tokio::time::Instant::now();
+    h.server
+        .get(&pair_url(faucet_b(), faucet_a()))
+        .await
+        .assert_status_ok();
+    assert_eq!(start.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_memory_the_mirror_cannot_confirm_expires() {
+    // The book empties while the pair has no Binance price: the makers'
+    // price cannot be confirmed, so its clock starts all the same.
+    let key = (faucet_b(), faucet_a());
+    let mut remembered = RememberedPrices::new();
+    remembered.insert(
+        key,
+        crate::swap_eta::Remembered {
+            limit: crate::clearing::BatchPrice::from_ratio(2_001, 1_000).unwrap(),
+            empty_since: None,
+        },
+    );
+    let touched = [(faucet_a(), faucet_b())].into_iter().collect();
+    let book = SwapBookSnapshot::default();
+    let no_prices = PriceSnapshot::default();
+    let start = tokio::time::Instant::now();
+    super::remember_prices(
+        &mut remembered,
+        &book,
+        &book,
+        &no_prices,
+        0,
+        &touched,
+        start,
+    );
+    assert_eq!(remembered[&key].empty_since, Some(start));
+    let later = start + Duration::from_secs(11);
+    super::remember_prices(
+        &mut remembered,
+        &book,
+        &book,
+        &no_prices,
+        0,
+        &touched,
+        later,
+    );
+    assert!(!remembered.contains_key(&key));
+}
+
+/// The clock starts on a book change while the pair has no usable price;
+/// the price recovers and the maker's ask keeps resting, untouched, for
+/// 11 s; then the ask leaves (a real gap). The gap must still get the ask.
+#[tokio::test(start_paused = true)]
+async fn a_resting_ask_restarts_a_clock_started_while_unpriced() {
+    let h = live_server(5000, running()).await;
+    h.change(ask_added()).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    // No usable price, and some other order on the pair changes meanwhile.
+    h.prices.send_replace(Arc::new(PriceSnapshot::default()));
+    let far_ask = DepthChange::Added {
+        pair: (faucet_a(), faucet_b()),
+        rate: RateKey::new(3_000_000, 1_000_000),
+        volume: 1_000_000,
+    };
+    h.change(far_ask).await;
+    h.prices.send_replace(Arc::new(banded_snapshot("2")));
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
+    // The real gap: the maker re-quotes.
+    h.change(ask_removed()).await;
+    assert_eq!(h.buyer_price().await, ASK_PRICE);
 }

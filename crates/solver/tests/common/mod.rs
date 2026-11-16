@@ -395,9 +395,9 @@ pub fn engine_config() -> solver::config::EngineConfig {
         // Any free port: a fixed one fails startup when something else holds it.
         price_query_port: 0,
         price_query_bind: "127.0.0.1".to_string(),
-        price_query_max_inflight: 128,
         price_query_max_batch: 50,
         price_query_timeout_ms: 3000,
+        swap_eta_wait_ms: 0,
         price_precision: "full".to_string(),
         swap_proving_estimate_ms: 2000,
         swap_block_time_ms: 6000,

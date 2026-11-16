@@ -147,6 +147,19 @@ own rule run on its book:
 On a pair without a band, `expectedPrice` equals `marketPrice` and every
 other field is as before.
 
+**Short gaps in the book.** Makers' orders leave the book for a few seconds
+while a maker re-quotes or a matched order settles. So that the price does
+not jump to the mid in that moment, the solver remembers, for each pair and
+direction, the makers' price its walk last found in the book. While the book
+has nothing crossing inside the band, `/v2/pair-price` prices from that
+remembered order as the solver's rule would with it back (or the mid, if the
+rule would not use it at today's mid), for at most 10 seconds after the makers
+left the book. It is a best estimate, not a promise that they return at that
+price. `/v2/swap-eta` judges only the live book: an order priced between the
+mid and the makers' price in the book is judged at the makers' price, so
+within the off-market tolerance it is `tolerated` (reason `liquidity`), beyond
+it `off_market` (reason `price`).
+
 The expected price is an estimate for the next batch, on the book as it is
 now. Not modelled: a maker's own crossed orders, which the solver leaves out
 while pricing; all-or-nothing orders; the solver's fallback to the mid when
@@ -229,14 +242,28 @@ freshness rule, so a missing or stale quote is `503` `no_price`.
 
 ### `GET /v2/swap-eta` — will this order fill?
 
-What the solver would do **now** with the order the wallet is about to sign,
-by the solver's own rules, plus how long it takes.
+What the solver would do with the order the wallet is about to sign, by the
+solver's own rules, plus how long it takes.
+
+**Waiting for liquidity (long polling).** When the order is at market and
+settlements are running but the book cannot fill it in full right now, the
+request waits up to `wait_ms` for makers to come, the way SQS `ReceiveMessage`
+waits with `WaitTimeSeconds`. It is re-checked on the live book at every book
+change, at the price the makers are really at, and answers as soon as the
+order fills in full or is no longer at market, or at the deadline with the
+latest ordinary answer (`200`, `partial` or `none`). An order that fills
+already, is not at market, or meets paused settlements answers at once, as
+does any request once 256 are waiting. An order that can never fill in full
+(larger than the pair's liquidity) waits the whole `wait_ms`; send `wait_ms=0`
+for an immediate answer. Set your own request timeout above your wait plus
+about 3 seconds.
 
 | Param | Required | Meaning |
 |---|---|---|
 | `offered_faucet`, `requested_faucet` | yes | hex faucet ids; the order offers the first and requests the second |
 | `offered_amount`, `requested_amount` | yes | the order, in base units |
 | `min_fill_step` | no | the note's smallest partial fill, in requested-token base units; `0` or omitted means none, as in PSWAP. If only part of the order can fill and that part is smaller, `fillStatus` is `none` (reason `liquidity`). Send `requested_amount` for all-or-nothing |
+| `wait_ms` | no | the longest this request may wait for makers, in milliseconds; omitted: the solver's `swap_eta_wait_ms` (default 5000), which is also the maximum; `0`: answer at once |
 
 **200 response** — offering 1 ETH for 2485.0125 USDT (step 2 with 0.5% slippage), with buyers for 3.2 ETH (8000 USDT) in the book:
 
@@ -317,10 +344,10 @@ with a band the batch price can be up to the band away from it.
 | Code | When |
 |---|---|
 | `200` | OK |
-| `400` | `bad_faucet_id`: missing or malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
+| `400` | `bad_faucet_id`: missing or malformed faucet id; `bad_precision`; `batch_too_large`; on the swap endpoints also `bad_request` (the two faucets are equal, or a non-numeric `wait_ms`) and `bad_amount` (missing, zero or non-numeric amount, or too large to price) |
 | `404` | `unknown_faucet`: not registered with the solver |
-| `408` | the request took longer than `price_query_timeout_ms` (empty body) |
-| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `overloaded`: more than `price_query_max_inflight` requests in flight, retry shortly; `not_ready` (`/v2/pairs` only): the solver is still confirming its Binance markets at startup |
+| `408` | the request took longer than `price_query_timeout_ms` plus `swap_eta_wait_ms` (empty body); a `/v2/swap-eta` wait that runs out answers `200` |
+| `503` | `no_market`: no Binance market is configured for the token or pair — nothing to wait for; `no_price`: its market has no valid quote right now (none yet, stale on `/v2/pair-price`, or the newest was crossed, too wide or too thin); `stale` (`/v1/price` only): the quote is at least the quote TTL old (use `?allow_stale=true` to override); `not_ready` (`/v2/pairs` only): the solver is still confirming its Binance markets at startup |
 
 Without a price, both swap-eta endpoints still answer `200`: `/v2` with reason
 `no_market` or `no_price`, `/v1` with `null` market fields.

@@ -303,15 +303,18 @@ pub struct EngineConfig {
     /// publicly — front it with a reverse proxy / rate limiter.
     #[serde(default = "default_price_query_bind")]
     pub price_query_bind: String,
-    /// Max concurrent in-flight requests; excess is shed with `503`. Default 128.
-    #[serde(default = "default_price_query_max_inflight")]
-    pub price_query_max_inflight: usize,
     /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default 50.
     #[serde(default = "default_price_query_max_batch")]
     pub price_query_max_batch: usize,
-    /// Per-request timeout in ms. Default 3000.
+    /// Per-request processing timeout in ms. Default 3000. The server's
+    /// timeout is this plus `swap_eta_wait_ms`.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
+    /// `/v2/swap-eta`: how long an at-market order that cannot fill in full
+    /// may wait for makers (the default and the maximum of its `wait_ms`).
+    /// `0` turns waiting off. Default 5000.
+    #[serde(default = "default_swap_eta_wait_ms")]
+    pub swap_eta_wait_ms: u64,
     /// Decimal places of the returned price NUMBER: `"full"` or `"0"`..`"18"`.
     /// One value applied to the price; distinct from a token's on-chain
     /// decimals. Default `"full"` (exact, up to 18 places). Overridable per request.
@@ -440,8 +443,8 @@ fn default_price_query_port() -> u16 {
 fn default_price_query_bind() -> String {
     "127.0.0.1".to_string()
 }
-fn default_price_query_max_inflight() -> usize {
-    128
+fn default_swap_eta_wait_ms() -> u64 {
+    5000
 }
 fn default_price_query_max_batch() -> usize {
     50

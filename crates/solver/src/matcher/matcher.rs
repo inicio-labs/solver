@@ -19,6 +19,9 @@ use crate::types::*;
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Matching ticks run, including skipped ones; it stops moving if the matcher stalls.
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// When the order matched longest ago and still not settled was first
+/// matched (Unix ms; 0: none). Published at the end of every tick.
+static OLDEST_MATCHED_MS: AtomicU64 = AtomicU64::new(0);
 static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
@@ -42,6 +45,15 @@ enum MidFallback {
 
 pub(crate) fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Seconds since the order matched longest ago, and still not settled, was
+/// first matched, aged at `now_ms`; 0 when there is none.
+pub(crate) fn oldest_matched_order_age_secs(now_ms: u64) -> u64 {
+    match OLDEST_MATCHED_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        since => now_ms.saturating_sub(since) / 1000,
+    }
 }
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
@@ -166,6 +178,7 @@ pub(super) async fn run_worker(
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
                 }
+                OLDEST_MATCHED_MS.store(book.oldest_matched_since().unwrap_or(0), Ordering::Relaxed);
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -242,6 +255,7 @@ pub(super) fn internal_clear(
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
+        book.track_matched(&[], now_millis());
         return Ok(());
     }
     let sent: Vec<_> = combined
@@ -267,6 +281,7 @@ pub(super) fn internal_clear(
     for note_id in sent.iter().chain(&self_trade_cancels) {
         book.deactivate(*note_id);
     }
+    book.track_matched(&sent, now_millis());
     tracing::info!(
         pairs = included_pairs,
         orders = sent.len(),

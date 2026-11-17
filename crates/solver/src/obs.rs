@@ -170,10 +170,13 @@ fn append_settlement_metrics(body: &mut String) {
 }
 
 /// Numbers the ops agent's checks read: ticks (a stalled matcher stops them),
-/// the last chain sync, settlements confirmed and given back, the fee runway,
-/// and which build is running. Read from memory; no database.
+/// the last chain sync, settlements confirmed, given back or failed before
+/// submission, how long the oldest matched order and the executor's oldest
+/// unfinished work have waited, the fee runway, and which build is running.
+/// Read from memory; no database.
 fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
     use crate::executor::metrics as exec;
+    let now_ms = crate::types::now_millis();
     let _ = writeln!(
         body,
         "solver_matcher_ticks_total {}\n\
@@ -188,6 +191,19 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
             "solver_settlements_released_total{{cause=\"{cause}\"}} {count}"
         );
     }
+    for (stage, cause, count) in exec::failed_before_submit() {
+        let _ = writeln!(
+            body,
+            "solver_executor_failed_before_submit_total{{stage=\"{stage}\",cause=\"{cause}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_matcher_oldest_matched_order_age_seconds {}\n\
+         solver_executor_oldest_unfinished_age_seconds {}",
+        crate::matcher::oldest_matched_order_age_secs(now_ms),
+        exec::oldest_unfinished_age_secs(now_ms),
+    );
     if let Some((balance, base_fee, checked_at)) = exec::fee() {
         let _ = writeln!(
             body,
@@ -245,13 +261,13 @@ fn parse_sample(line: &str) -> Result<String, &'static str> {
     let mut series = name.to_string();
     if let Some(labels) = rest.strip_prefix('{') {
         let mut chars = labels.char_indices();
-        let mut closed = None;
+        let closed;
         loop {
             let Some((start, c)) = chars.next() else {
                 return Err("labels not closed");
             };
             if c == '}' {
-                closed = Some(start);
+                closed = start;
                 break;
             }
             if c == ',' {
@@ -283,7 +299,7 @@ fn parse_sample(line: &str) -> Result<String, &'static str> {
                 }
             }
         }
-        let end = closed.unwrap_or(0) + 1;
+        let end = closed + 1;
         series.push('{');
         series.push_str(&labels[..end]);
         rest = &labels[end..];
@@ -683,6 +699,18 @@ mod tests {
                 "{body}"
             );
         }
+        for stage in ["build", "execute", "prove"] {
+            for cause in ["rpc", "other"] {
+                assert!(
+                    body.contains(&format!(
+                        "solver_executor_failed_before_submit_total{{stage=\"{stage}\",cause=\"{cause}\"}} "
+                    )),
+                    "{body}"
+                );
+            }
+        }
+        assert!(body.contains("solver_matcher_oldest_matched_order_age_seconds "));
+        assert!(body.contains("solver_executor_oldest_unfinished_age_seconds "));
     }
 
     #[tokio::test]
@@ -714,6 +742,7 @@ mod tests {
         assert!(body.contains("solver_chain_last_sync_timestamp_seconds "));
         assert!(body.contains("solver_settlements_confirmed_total "));
         assert!(body.contains("solver_settlements_released_total{cause=\"expired\"} "));
+        assert!(body.contains("solver_executor_oldest_unfinished_age_seconds "));
         assert!(body.contains("solver_build_info{version=\""));
         let errors = exposition_errors(&body);
         assert!(

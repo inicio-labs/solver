@@ -26,6 +26,29 @@ static FEE_BASE: AtomicU64 = AtomicU64::new(0);
 static FEE_CHECKED_AT: AtomicU64 = AtomicU64::new(0);
 static CONFLICTS: [AtomicU64; ConflictKind::COUNT] =
     [const { AtomicU64::new(0) }; ConflictKind::COUNT];
+/// Indexed by stage, then by whether a node call failed (1) or not (0).
+static FAILED_BEFORE_SUBMIT: [[AtomicU64; 2]; FailedStage::COUNT] =
+    [const { [const { AtomicU64::new(0) }; 2] }; FailedStage::COUNT];
+/// When the oldest work the executor holds was taken, in Unix milliseconds
+/// (0: none): settlements waiting for their outcome, and batches held while
+/// it verifies that it can settle. Published by the executor loop.
+static OLDEST_HELD_MS: AtomicU64 = AtomicU64::new(0);
+/// When the executor took the batch it is working on now (0: none).
+static IN_HAND_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Where a settlement failed before it was submitted.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum FailedStage {
+    /// Its inputs or its request could not be put together.
+    Build,
+    /// Running the transaction failed.
+    Execute,
+    /// Proving it failed.
+    Prove,
+}
 
 /// Why a submission of ours was refused, by the node's error code.
 #[derive(
@@ -168,7 +191,57 @@ pub(crate) fn conflicts() -> impl Iterator<Item = (&'static str, u64)> {
     })
 }
 
-/// Inputs released by failed settlements, per cause.
+/// A settlement that failed before it was submitted. `rpc`: a node call
+/// failed, and the orders go straight back; otherwise the same composition
+/// would fail the same way again.
+pub(crate) fn record_failed_before_submit(stage: FailedStage, rpc: bool) {
+    FAILED_BEFORE_SUBMIT[stage as usize][usize::from(rpc)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Settlements that failed before submission, per stage and cause (`rpc` or
+/// `other`).
+pub(crate) fn failed_before_submit() -> impl Iterator<Item = (&'static str, &'static str, u64)> {
+    FailedStage::iter().flat_map(|stage| {
+        [("other", 0), ("rpc", 1)]
+            .into_iter()
+            .map(move |(cause, index)| {
+                (
+                    stage.into(),
+                    cause,
+                    FAILED_BEFORE_SUBMIT[stage as usize][index].load(Ordering::Relaxed),
+                )
+            })
+    })
+}
+
+/// When the oldest work the executor holds was taken (Unix ms), or `None`.
+pub(crate) fn publish_oldest_held(since_ms: Option<u64>) {
+    OLDEST_HELD_MS.store(since_ms.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The batch the executor is working on now, from when it took it, or `None`.
+pub(crate) fn set_in_hand(since_ms: Option<u64>) {
+    IN_HAND_MS.store(since_ms.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Seconds since the executor took the oldest work it has not finished, aged
+/// at `now_ms`; 0 when it holds none.
+pub(crate) fn oldest_unfinished_age_secs(now_ms: u64) -> u64 {
+    unfinished_age_secs(
+        OLDEST_HELD_MS.load(Ordering::Relaxed),
+        IN_HAND_MS.load(Ordering::Relaxed),
+        now_ms,
+    )
+}
+
+fn unfinished_age_secs(held_ms: u64, in_hand_ms: u64, now_ms: u64) -> u64 {
+    [held_ms, in_hand_ms]
+        .into_iter()
+        .filter(|since| *since != 0)
+        .min()
+        .map_or(0, |since| now_ms.saturating_sub(since) / 1000)
+}
+
 /// A settlement committed on chain and was confirmed in the database.
 pub(crate) fn record_confirmed() {
     SETTLEMENTS_CONFIRMED.fetch_add(1, Ordering::Relaxed);
@@ -207,6 +280,7 @@ pub(crate) fn fee() -> Option<(u64, u64, u64)> {
     })
 }
 
+/// Inputs released by failed settlements, per cause.
 pub(crate) fn bounced() -> impl Iterator<Item = (&'static str, u64)> {
     ReleaseCause::iter().map(|cause| {
         (
@@ -310,6 +384,32 @@ mod tests {
         for (error, code) in cases {
             assert_eq!(refusal_code(&error), code, "{error:?}");
         }
+    }
+
+    #[test]
+    fn unfinished_age_counts_the_oldest_held_or_in_hand_work() {
+        assert_eq!(unfinished_age_secs(0, 0, 50_000), 0);
+        assert_eq!(unfinished_age_secs(20_000, 0, 50_000), 30);
+        assert_eq!(unfinished_age_secs(0, 41_000, 50_000), 9);
+        assert_eq!(unfinished_age_secs(20_000, 41_000, 50_000), 30);
+        assert_eq!(unfinished_age_secs(41_000, 20_000, 50_000), 30);
+        // A clock that went back never shows a negative age.
+        assert_eq!(unfinished_age_secs(60_000, 0, 50_000), 0);
+    }
+
+    #[test]
+    fn failures_before_submit_name_every_stage_and_cause() {
+        let rows: Vec<_> = failed_before_submit().collect();
+        assert_eq!(rows.len(), FailedStage::COUNT * 2);
+        let count = |stage: &str, cause: &str| {
+            failed_before_submit()
+                .find(|(s, c, _)| *s == stage && *c == cause)
+                .unwrap()
+                .2
+        };
+        let before = count("prove", "rpc");
+        record_failed_before_submit(FailedStage::Prove, true);
+        assert_eq!(count("prove", "rpc"), before + 1);
     }
 
     /// The counters are process-wide. Only this test records a drop of a

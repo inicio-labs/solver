@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::error::{BatchError, ExecResult, ExecutorError};
-use super::metrics::{self, RefusalAttempt, ReleaseCause};
+use super::metrics::{self, FailedStage, RefusalAttempt, ReleaseCause};
 use super::refusal;
 use crate::client_factory::ClientFactory;
 use crate::db::postgres_db::NodeAnswer;
@@ -144,6 +144,10 @@ struct PendingSettlement {
     /// attempt is released as `NodeAnswer::Unclear`.
     answer: Option<NodeAnswer>,
     retry_at: Option<tokio::time::Instant>,
+    /// When this process took it on, in Unix milliseconds: when it was
+    /// prepared, or, after a restart, when it was loaded. Only for the
+    /// oldest-unfinished gauge.
+    taken_at_ms: u64,
 }
 
 impl PendingSettlement {
@@ -181,6 +185,7 @@ impl PendingSettlement {
             cancelled,
             answer: None,
             retry_at: None,
+            taken_at_ms: crate::types::now_millis(),
         })
     }
 
@@ -189,6 +194,7 @@ impl PendingSettlement {
             .read(db::postgres_db::load_unresolved_attempts_tx)
             .await?;
         let mut pending = HashMap::with_capacity(attempts.len());
+        let loaded_at_ms = crate::types::now_millis();
 
         for recovered in attempts {
             let attempt = recovered.attempt;
@@ -215,6 +221,7 @@ impl PendingSettlement {
                     cancelled: Vec::new(),
                     answer: None,
                     retry_at: None,
+                    taken_at_ms: loaded_at_ms,
                 },
             );
         }
@@ -406,6 +413,9 @@ struct Verification {
     retry: VecDeque<ExecutionBatch>,
     /// Orders owed back to the matcher whose return did not commit yet.
     returning: Vec<BookOrder>,
+    /// When this spell of verification began (Unix ms); `None` while not
+    /// verifying. Only for the oldest-unfinished gauge.
+    since_ms: Option<u64>,
 }
 
 impl Verification {
@@ -413,10 +423,12 @@ impl Verification {
     fn pause(&mut self, retry: impl IntoIterator<Item = ExecutionBatch>) {
         self.retry.extend(retry);
         self.active = true;
+        self.since_ms.get_or_insert_with(crate::types::now_millis);
     }
 
     fn resume(&mut self) {
         self.active = false;
+        self.since_ms = None;
     }
 
     /// Held transactions to run before reading new batches; none while paused.
@@ -611,6 +623,7 @@ fn release_answer(cause: ReleaseCause, refused: Option<&NodeAnswer>) -> NodeAnsw
 
 /// Building this composition failed; it would fail the same way again.
 fn build_failed(error: ExecutorError) -> BatchSubmission {
+    metrics::record_failed_before_submit(FailedStage::Build, false);
     tracing::error!(%error, "settlement transaction build failed");
     BatchSubmission::Failed
 }
@@ -618,8 +631,14 @@ fn build_failed(error: ExecutorError) -> BatchSubmission {
 /// Execution or proving failed before anything was reserved. A node RPC
 /// failure is transient and the orders go straight back; any other error
 /// repeats for this composition.
-fn execution_failed(batch: &ExecutionBatch, error: ClientError) -> BatchSubmission {
-    if matches!(error, ClientError::RpcError(_)) {
+fn execution_failed(
+    batch: &ExecutionBatch,
+    stage: FailedStage,
+    error: ClientError,
+) -> BatchSubmission {
+    let rpc = matches!(error, ClientError::RpcError(_));
+    metrics::record_failed_before_submit(stage, rpc);
+    if rpc {
         tracing::warn!(%error, "settlement execution hit an RPC failure; returning its orders");
         BatchSubmission::GiveBack(batch.book_orders())
     } else {
@@ -1009,6 +1028,15 @@ impl Executor {
         let mut verification = Verification::default();
         let mut failed = FailedHolds::default();
         loop {
+            // Every change to what the executor holds comes back here: a
+            // batch handled, a reconciliation round, a verification check.
+            metrics::publish_oldest_held(
+                pending
+                    .values()
+                    .map(|settlement| settlement.taken_at_ms)
+                    .chain(verification.since_ms)
+                    .min(),
+            );
             // Tell the swap API whether batches are taken right now. Every
             // entry into or exit from verification mode comes back here.
             let accepting = !verification.active;
@@ -1067,6 +1095,7 @@ impl Executor {
                 }
             };
 
+            metrics::set_in_hand(Some(crate::types::now_millis()));
             let mut transactions = VecDeque::from(transactions);
             while let Some(batch) = transactions.pop_front() {
                 if self.cancel.is_cancelled() {
@@ -1125,6 +1154,7 @@ impl Executor {
                     }
                 }
             }
+            metrics::set_in_hand(None);
         }
     }
 
@@ -1174,6 +1204,7 @@ impl Executor {
             Ok(parts) => parts,
             Err(e) => {
                 // A batch that cannot be prepared fails the same way on retry.
+                metrics::record_failed_before_submit(FailedStage::Build, false);
                 tracing::error!(error = %e, notes = batch.filled_notes.len(), "batch preparation failed");
                 return Ok(BatchSubmission::Failed);
             }
@@ -1266,7 +1297,7 @@ impl Executor {
             .await;
         let result = match execution {
             Ok(result) => result,
-            Err(error) => return Ok(execution_failed(batch, error)),
+            Err(error) => return Ok(execution_failed(batch, FailedStage::Execute, error)),
         };
         let inputs = match components.settlement_inputs(&result) {
             Ok(inputs) => inputs,
@@ -1274,7 +1305,7 @@ impl Executor {
         };
         let proven = match self.client.lock().await.prove_transaction(&result).await {
             Ok(proven) => proven,
-            Err(error) => return Ok(execution_failed(batch, error)),
+            Err(error) => return Ok(execution_failed(batch, FailedStage::Prove, error)),
         };
         let attempt = SettlementAttemptRow::prepared(&result);
         let pending =
@@ -1601,6 +1632,10 @@ impl Executor {
         let proven = match self.client.lock().await.prove_transaction(&result).await {
             Ok(proven) => proven,
             Err(error) => {
+                metrics::record_failed_before_submit(
+                    FailedStage::Prove,
+                    matches!(error, ClientError::RpcError(_)),
+                );
                 tracing::warn!(tx_id = %result.id(), %error, "recovery proof failed; retrying later");
                 return Ok(());
             }
@@ -2290,6 +2325,7 @@ mod recovery_tests {
                 cancelled: vec![sit_out],
                 answer: None,
                 retry_at: None,
+                taken_at_ms: 0,
             };
             let adapter = chain(&settlement.parent_notes, consumed, fail_lookup);
             let (book_tx, mut book_rx) = mpsc::channel(1);

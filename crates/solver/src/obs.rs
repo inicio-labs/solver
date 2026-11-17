@@ -476,6 +476,13 @@ mod tests {
             .find_map(|line| line.strip_prefix(prefix.as_str()))
             .unwrap();
         assert!(age.parse::<f64>().unwrap() >= 5.0);
+        let mid = format!("solver_price_quote_mid{{symbol=\"{symbol}\"}} ");
+        let mid = body
+            .lines()
+            .find_map(|line| line.strip_prefix(mid.as_str()))
+            .unwrap();
+        assert!(mid.parse::<f64>().unwrap() > 0.0);
+        assert_eq!(exposition_errors(&body), Vec::<String>::new());
     }
 
     /// Every label is rendered, at zero too, so alerts can rely on the series.

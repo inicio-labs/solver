@@ -16,6 +16,14 @@ static REFUSALS: [[AtomicU64; RefusalAttempt::COUNT]; RefusalCode::COUNT] =
 static DROPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BOUNCED: [AtomicU64; ReleaseCause::COUNT] =
     [const { AtomicU64::new(0) }; ReleaseCause::COUNT];
+static SETTLEMENTS_CONFIRMED: AtomicU64 = AtomicU64::new(0);
+static SETTLEMENTS_RELEASED: [AtomicU64; ReleaseCause::COUNT] =
+    [const { AtomicU64::new(0) }; ReleaseCause::COUNT];
+/// The fee balance and base fee at the last headroom check, and when (Unix
+/// seconds; 0 until the first check).
+static FEE_BALANCE: AtomicU64 = AtomicU64::new(0);
+static FEE_BASE: AtomicU64 = AtomicU64::new(0);
+static FEE_CHECKED_AT: AtomicU64 = AtomicU64::new(0);
 static CONFLICTS: [AtomicU64; ConflictKind::COUNT] =
     [const { AtomicU64::new(0) }; ConflictKind::COUNT];
 
@@ -118,6 +126,7 @@ pub(crate) fn record_refusal(code: RefusalCode, attempt: RefusalAttempt) {
 /// order that went live at accept and whose note was not seen yet.
 pub(crate) fn record_release(cause: ReleaseCause, inputs: usize, unconfirmed: bool) {
     BOUNCED[cause as usize].fetch_add(inputs as u64, Ordering::Relaxed);
+    SETTLEMENTS_RELEASED[cause as usize].fetch_add(1, Ordering::Relaxed);
     if cause == ReleaseCause::Dropped {
         DROPPED[usize::from(unconfirmed)].fetch_add(1, Ordering::Relaxed);
     }
@@ -160,6 +169,44 @@ pub(crate) fn conflicts() -> impl Iterator<Item = (&'static str, u64)> {
 }
 
 /// Inputs released by failed settlements, per cause.
+/// A settlement committed on chain and was confirmed in the database.
+pub(crate) fn record_confirmed() {
+    SETTLEMENTS_CONFIRMED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What the last fee headroom check saw.
+pub(crate) fn record_fee(balance: u64, base_fee: u64, now_unix: u64) {
+    FEE_BALANCE.store(balance, Ordering::Relaxed);
+    FEE_BASE.store(base_fee, Ordering::Relaxed);
+    FEE_CHECKED_AT.store(now_unix, Ordering::Relaxed);
+}
+
+pub(crate) fn settlements_confirmed() -> u64 {
+    SETTLEMENTS_CONFIRMED.load(Ordering::Relaxed)
+}
+
+/// Settlements given back, one per settlement, by cause.
+pub(crate) fn settlements_released() -> impl Iterator<Item = (&'static str, u64)> {
+    ReleaseCause::iter().map(|cause| {
+        (
+            cause.into(),
+            SETTLEMENTS_RELEASED[cause as usize].load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// `(balance, base fee, checked at)`, or `None` before the first check.
+pub(crate) fn fee() -> Option<(u64, u64, u64)> {
+    let at = FEE_CHECKED_AT.load(Ordering::Relaxed);
+    (at != 0).then(|| {
+        (
+            FEE_BALANCE.load(Ordering::Relaxed),
+            FEE_BASE.load(Ordering::Relaxed),
+            at,
+        )
+    })
+}
+
 pub(crate) fn bounced() -> impl Iterator<Item = (&'static str, u64)> {
     ReleaseCause::iter().map(|cause| {
         (

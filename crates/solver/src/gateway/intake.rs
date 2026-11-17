@@ -62,9 +62,11 @@ impl IntakeSender {
         header: CommandHeader,
         command: MakerCommand,
     ) -> Result<CommandReply, IntakeError> {
-        let queue = match command {
-            MakerCommand::Submit { .. } => &self.submits_tx,
-            MakerCommand::CancelAll { .. } | MakerCommand::CancelOrder { .. } => &self.cancels_tx,
+        let (queue, which) = match command {
+            MakerCommand::Submit { .. } => (&self.submits_tx, gateway_metrics::Queue::Submit),
+            MakerCommand::CancelAll { .. } | MakerCommand::CancelOrder { .. } => {
+                (&self.cancels_tx, gateway_metrics::Queue::Cancel)
+            }
         };
         let (reply, replied) = oneshot::channel();
         queue
@@ -74,7 +76,10 @@ impl IntakeSender {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => IntakeError::Busy,
+                mpsc::error::TrySendError::Full(_) => {
+                    gateway_metrics::count_intake_full(which);
+                    IntakeError::Busy
+                }
                 mpsc::error::TrySendError::Closed(_) => IntakeError::Stopped,
             })?;
         replied.await.map_err(|_| IntakeError::Stopped)?
@@ -106,6 +111,7 @@ pub async fn run_intake(
             Some(request) = intake.submits_rx.recv() => request,
             else => return,
         };
+        gateway_metrics::record_intake_depth(intake.submits_rx.len(), intake.cancels_rx.len());
         let mut round = Vec::new();
         let mut first_submit = None;
         match first.command {

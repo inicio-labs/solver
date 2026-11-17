@@ -169,6 +169,141 @@ fn append_settlement_metrics(body: &mut String) {
     }
 }
 
+/// Numbers the ops agent's checks read: ticks (a stalled matcher stops them),
+/// the last chain sync, settlements confirmed and given back, the fee runway,
+/// and which build is running. Read from memory; no database.
+fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
+    use crate::executor::metrics as exec;
+    let _ = writeln!(
+        body,
+        "solver_matcher_ticks_total {}\n\
+         solver_chain_last_sync_timestamp_seconds {last_sync_unix_seconds}\n\
+         solver_settlements_confirmed_total {}",
+        crate::matcher::ticks(),
+        exec::settlements_confirmed(),
+    );
+    for (cause, count) in exec::settlements_released() {
+        let _ = writeln!(
+            body,
+            "solver_settlements_released_total{{cause=\"{cause}\"}} {count}"
+        );
+    }
+    if let Some((balance, base_fee, checked_at)) = exec::fee() {
+        let _ = writeln!(
+            body,
+            "solver_fee_balance_base_units {balance}\n\
+             solver_fee_base_fee_base_units {base_fee}\n\
+             solver_fee_checked_timestamp_seconds {checked_at}"
+        );
+    }
+    let commit: String = option_env!("SOLVER_GIT_COMMIT")
+        .unwrap_or("unknown")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(40)
+        .collect();
+    let _ = writeln!(
+        body,
+        "solver_build_info{{version=\"{}\",commit=\"{commit}\"}} 1",
+        env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Lines of a metrics page that Prometheus' text format would refuse, and
+/// repeated series. Empty when the page parses: one bad line fails a whole scrape.
+#[cfg(test)]
+pub(crate) fn exposition_errors(body: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (number, line) in body.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_sample(line) {
+            Ok(series) => {
+                if !seen.insert(series.clone()) {
+                    errors.push(format!("line {}: repeated series {series}", number + 1));
+                }
+            }
+            Err(why) => errors.push(format!("line {}: {why}: {line}", number + 1)),
+        }
+    }
+    errors
+}
+
+/// `name{labels} value [timestamp]` -> the series (name and labels).
+#[cfg(test)]
+fn parse_sample(line: &str) -> Result<String, &'static str> {
+    let name_end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(line.len());
+    let name = &line[..name_end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err("bad metric name");
+    }
+    let mut rest = &line[name_end..];
+    let mut series = name.to_string();
+    if let Some(labels) = rest.strip_prefix('{') {
+        let mut chars = labels.char_indices();
+        let mut closed = None;
+        loop {
+            let Some((start, c)) = chars.next() else {
+                return Err("labels not closed");
+            };
+            if c == '}' {
+                closed = Some(start);
+                break;
+            }
+            if c == ',' {
+                continue;
+            }
+            if !(c.is_ascii_alphabetic() || c == '_') {
+                return Err("bad label name");
+            }
+            loop {
+                match chars.next() {
+                    Some((_, c)) if c.is_ascii_alphanumeric() || c == '_' => {}
+                    Some((_, '=')) => break,
+                    _ => return Err("bad label name"),
+                }
+            }
+            if !matches!(chars.next(), Some((_, '"'))) {
+                return Err("label value not quoted");
+            }
+            loop {
+                match chars.next() {
+                    Some((_, '\\')) => {
+                        if !matches!(chars.next(), Some((_, '\\' | '"' | 'n'))) {
+                            return Err("bad escape in label value");
+                        }
+                    }
+                    Some((_, '"')) => break,
+                    Some((_, '\n')) | None => return Err("label value not closed"),
+                    Some(_) => {}
+                }
+            }
+        }
+        let end = closed.unwrap_or(0) + 1;
+        series.push('{');
+        series.push_str(&labels[..end]);
+        rest = &labels[end..];
+    }
+    let mut fields = rest
+        .strip_prefix(' ')
+        .ok_or("no space before the value")?
+        .split(' ');
+    let value = fields.next().unwrap_or("");
+    if !matches!(value, "NaN" | "+Inf" | "-Inf") && value.parse::<f64>().is_err() {
+        return Err("bad value");
+    }
+    if let Some(timestamp) = fields.next() {
+        if timestamp.parse::<i64>().is_err() || fields.next().is_some() {
+            return Err("bad timestamp");
+        }
+    }
+    Ok(series)
+}
+
 /// What the maker-note watcher last saw. It publishes these after each
 /// successful round, so a scrape reads no database. Absent when the maker
 /// gateway is disabled.
@@ -247,6 +382,10 @@ async fn metrics(
     let snapshot = state.prices.borrow().clone();
     append_price_metrics(&mut body, &state.feed_metrics, &snapshot);
     append_settlement_metrics(&mut body);
+    append_health_metrics(
+        &mut body,
+        state.last_sync_unix_seconds.load(Ordering::Relaxed),
+    );
     append_maker_metrics(&mut body, crate::gateway::watcher_gauges());
     crate::gateway::metrics::render(&mut body);
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
@@ -499,6 +638,46 @@ mod tests {
         fresh.assert_status_ok();
     }
 
+    #[test]
+    fn exposition_check_finds_lines_prometheus_would_refuse() {
+        let good = "# a comment\n\
+                    solver_up 1\n\
+                    solver_x_total{a=\"1\",b=\"q\\\"u\\\\o\\nte\"} 2.5\n\
+                    solver_y{a=\"1\",} +Inf 1700000000000\n\
+                    solver_z NaN\n";
+        assert_eq!(exposition_errors(good), Vec::<String>::new());
+        for bad in [
+            "solver_x",
+            "solver_x  1",
+            "solver_x one",
+            "1solver 1",
+            "solver_x{a=1} 1",
+            "solver_x{a=\"1} 1",
+            "solver_x{a=\"\\q\"} 1",
+            "solver_x{a-b=\"1\"} 1",
+            "solver_x 1 now",
+        ] {
+            assert_eq!(exposition_errors(bad).len(), 1, "{bad:?} passed");
+        }
+        assert_eq!(exposition_errors("solver_x 1\nsolver_x 2\n").len(), 1);
+    }
+
+    #[test]
+    fn health_metrics_parse_and_name_every_release_cause() {
+        let mut body = String::new();
+        append_health_metrics(&mut body, 1_700_000_000);
+        assert_eq!(exposition_errors(&body), Vec::<String>::new());
+        assert!(body.contains("solver_chain_last_sync_timestamp_seconds 1700000000\n"));
+        for cause in ["refused", "dropped", "expired"] {
+            assert!(
+                body.contains(&format!(
+                    "solver_settlements_released_total{{cause=\"{cause}\"}}"
+                )),
+                "{body}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn metrics_exposes_pool_and_channel_capacity() {
@@ -524,6 +703,16 @@ mod tests {
         assert!(body.contains("solver_matcher_book_channel_remaining 3"));
         assert!(body.contains("solver_matcher_executor_channel_remaining 2"));
         assert!(body.contains("solver_executor_settlements_dropped_total"));
+        assert!(body.contains("solver_matcher_ticks_total "));
+        assert!(body.contains("solver_chain_last_sync_timestamp_seconds "));
+        assert!(body.contains("solver_settlements_confirmed_total "));
+        assert!(body.contains("solver_settlements_released_total{cause=\"expired\"} "));
+        assert!(body.contains("solver_build_info{version=\""));
+        let errors = exposition_errors(&body);
+        assert!(
+            errors.is_empty(),
+            "the metrics page would not parse: {errors:?}"
+        );
         db.pool.fatal_token().cancel();
         let failed = server.get("/metrics").await;
         assert!(failed

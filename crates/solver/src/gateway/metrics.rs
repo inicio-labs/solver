@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::db::maker_db::AcceptFallback;
@@ -25,6 +26,66 @@ const UNCONFIRMED_ACTIVATIONS: &str = "solver_maker_unconfirmed_activations_tota
 type Key = (&'static str, MakerId, &'static str, &'static str);
 
 static COUNTS: LazyLock<Mutex<BTreeMap<Key, u64>>> = LazyLock::new(Mutex::default);
+
+/// Service-wide gateway numbers (no maker label): a reconnect herd shows as a
+/// full intake queue, intake-full replies and a jump in open streams.
+static INTAKE_DEPTH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static INTAKE_FULL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static OPEN_STREAMS: AtomicU64 = AtomicU64::new(0);
+
+/// The two intake queues.
+#[derive(Clone, Copy)]
+pub(crate) enum Queue {
+    Submit = 0,
+    Cancel = 1,
+}
+
+const QUEUE_NAMES: [&str; 2] = ["submit", "cancel"];
+
+/// Commands waiting in each intake queue, as the intake writer last saw them.
+pub(crate) fn record_intake_depth(submits: usize, cancels: usize) {
+    INTAKE_DEPTH[Queue::Submit as usize].store(submits as u64, Ordering::Relaxed);
+    INTAKE_DEPTH[Queue::Cancel as usize].store(cancels as u64, Ordering::Relaxed);
+}
+
+/// A command refused at once because its intake queue was full (the maker
+/// gets UNAVAILABLE "intake is full").
+pub(crate) fn count_intake_full(queue: Queue) {
+    INTAKE_FULL[queue as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Held by each running event stream; counts it open until dropped.
+pub(crate) struct OpenStream(());
+
+impl OpenStream {
+    pub(crate) fn open() -> Self {
+        OPEN_STREAMS.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        OPEN_STREAMS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn render_service_wide(body: &mut String) {
+    for (index, queue) in QUEUE_NAMES.iter().enumerate() {
+        let _ = writeln!(
+            body,
+            "solver_maker_intake_queue_depth{{queue=\"{queue}\"}} {}\n\
+             solver_maker_intake_full_total{{queue=\"{queue}\"}} {}",
+            INTAKE_DEPTH[index].load(Ordering::Relaxed),
+            INTAKE_FULL[index].load(Ordering::Relaxed),
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_maker_open_streams {}",
+        OPEN_STREAMS.load(Ordering::Relaxed)
+    );
+}
 
 fn add(metric: &'static str, maker_id: MakerId, label: (&'static str, &'static str)) {
     *COUNTS
@@ -50,6 +111,7 @@ pub(crate) fn count_activation(maker_id: MakerId, via: &'static str) {
 }
 
 pub(crate) fn render(body: &mut String) {
+    render_service_wide(body);
     let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     for ((metric, maker_id, label, value), count) in counts.iter() {
         let _ = if label.is_empty() {
@@ -66,6 +128,40 @@ pub(crate) fn render(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_wide_numbers_parse_and_move() {
+        let open = OpenStream::open();
+        count_intake_full(Queue::Submit);
+        record_intake_depth(7, 1);
+        let mut body = String::new();
+        render_service_wide(&mut body);
+        assert_eq!(crate::obs::exposition_errors(&body), Vec::<String>::new());
+        assert!(
+            body.contains("solver_maker_intake_queue_depth{queue=\"submit\"} 7\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("solver_maker_intake_queue_depth{queue=\"cancel\"} 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("solver_maker_intake_full_total{queue=\"submit\"} "),
+            "{body}"
+        );
+        let streams = |body: &str| -> u64 {
+            body.lines()
+                .find_map(|l| l.strip_prefix("solver_maker_open_streams "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let with = streams(&body);
+        drop(open);
+        let mut after = String::new();
+        render_service_wide(&mut after);
+        assert_eq!(streams(&after) + 1, with);
+    }
 
     #[test]
     fn counters_render_per_maker_and_label() {

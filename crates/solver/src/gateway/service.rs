@@ -158,6 +158,7 @@ impl MakerGateway for MakerGatewayService {
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
             let _slot = slot;
+            let _open = super::metrics::OpenStream::open();
             feed(pool, events, stream, subscriber, tx, cancel).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))

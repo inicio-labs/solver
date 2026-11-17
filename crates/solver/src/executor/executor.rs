@@ -1392,6 +1392,10 @@ impl Executor {
             .get_balance(fee_faucet)
             .await?
             .as_u64();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        metrics::record_fee(have, u64::from(base_fee), now);
         if have < need {
             return Err(ExecutorError::InsufficientFee {
                 have,
@@ -1576,6 +1580,7 @@ impl Executor {
                 Ok((update, confirmed.activated_makers))
             })
             .await?;
+        metrics::record_confirmed();
         for maker_id in activated {
             gateway_metrics::count_activation(maker_id, "settlement");
         }

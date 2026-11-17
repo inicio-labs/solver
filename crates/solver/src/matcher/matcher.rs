@@ -17,6 +17,8 @@ use crate::swap_eta::DepthChange;
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Matching ticks run, including skipped ones; it stops moving if the matcher stalls.
+static TICKS: AtomicU64 = AtomicU64::new(0);
 static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
@@ -36,6 +38,10 @@ enum MidFallback {
     NothingAtPrice,
     /// The walk failed, e.g. an arithmetic overflow.
     WalkError,
+}
+
+pub(crate) fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
 }
 
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
@@ -141,6 +147,7 @@ pub(super) async fn run_worker(
         tokio::select! {
             biased;
             _ = interval.tick() => {
+                TICKS.fetch_add(1, Ordering::Relaxed);
                 let now = now_millis();
                 ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
                 book.apply_pending(&mut book_rx);

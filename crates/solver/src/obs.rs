@@ -191,10 +191,10 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
             "solver_settlements_released_total{{cause=\"{cause}\"}} {count}"
         );
     }
-    for (stage, cause, count) in exec::failed_before_submit() {
+    for (step, cause, count) in exec::failed_before_submit() {
         let _ = writeln!(
             body,
-            "solver_executor_failed_before_submit_total{{stage=\"{stage}\",cause=\"{cause}\"}} {count}"
+            "solver_executor_failed_before_submit_total{{step=\"{step}\",cause=\"{cause}\"}} {count}"
         );
     }
     let _ = writeln!(
@@ -699,11 +699,11 @@ mod tests {
                 "{body}"
             );
         }
-        for stage in ["build", "execute", "prove"] {
+        for step in ["build", "execute", "prove"] {
             for cause in ["rpc", "other"] {
                 assert!(
                     body.contains(&format!(
-                        "solver_executor_failed_before_submit_total{{stage=\"{stage}\",cause=\"{cause}\"}} "
+                        "solver_executor_failed_before_submit_total{{step=\"{step}\",cause=\"{cause}\"}} "
                     )),
                     "{body}"
                 );

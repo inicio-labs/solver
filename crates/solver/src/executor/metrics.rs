@@ -268,7 +268,8 @@ pub(crate) fn settlements_released() -> impl Iterator<Item = (&'static str, u64)
     })
 }
 
-/// `(balance, base fee, checked at)`, or `None` before the first check.
+/// `(balance, base fee, checked at)`, or `None` before the first check. A
+/// chain that charges no fee never records one: the check stops early.
 pub(crate) fn fee() -> Option<(u64, u64, u64)> {
     let at = FEE_CHECKED_AT.load(Ordering::Relaxed);
     (at != 0).then(|| {

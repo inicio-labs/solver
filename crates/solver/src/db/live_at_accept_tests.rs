@@ -865,7 +865,7 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
         .values(&NewOrderRow::parsed(&slow, 1)?)
         .execute(conn)?;
     // No row is `waiting` yet, so only the guard can refuse the rollback.
-    let refused = postgres_migrations::revert_last(conn).expect_err("the guard refuses");
+    let refused = revert_live_at_accept(conn)?.expect_err("the guard refuses");
     assert!(
         refused.to_string().contains("run the escape hatch first"),
         "{refused}"
@@ -878,7 +878,7 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     assert_eq!((stats.unconfirmed, stats.waiting), (2, 1));
 
     // The rollback refuses while they exist.
-    let refused = postgres_migrations::revert_last(conn);
+    let refused = revert_live_at_accept(conn)?;
     assert!(refused.is_err(), "{refused:?}");
 
     let report = postgres_migrations::cancel_unconfirmed(conn)?;
@@ -905,8 +905,20 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
         postgres_migrations::cancel_unconfirmed(conn)?,
         maker_db::HatchReport::default()
     );
-    postgres_migrations::revert_last(conn)?;
+    revert_live_at_accept(conn)??;
     Ok(())
+}
+
+/// Try to revert the live-at-accept migration: later migrations go first.
+/// If its guard refuses, they are applied again, so the solver's schema
+/// check passes for the rest of the test.
+fn revert_live_at_accept(conn: &mut PgConnection) -> Result<Result<String, DbError>> {
+    postgres_test::revert_after(conn, "20261114000001")?;
+    let reverted = postgres_migrations::revert_last(conn);
+    if reverted.is_err() {
+        postgres_migrations::migrate(conn)?;
+    }
+    Ok(reverted)
 }
 
 /// The startup guard and the gauge count the same orders: those that went
@@ -994,6 +1006,56 @@ fn a_remainder_of_a_closed_lineage_is_still_watched() -> Result<()> {
         "the closed lineage keeps it out of the book"
     );
     assert_eq!(maker_db::watched_maker_orders_tx(conn)?, [remainder]);
+    Ok(())
+}
+
+/// The watcher's read reaches its orders through `orders_live_status_idx`,
+/// the partial index over Active and Stopped orders, instead of scanning
+/// every order ever stored (issue #84). This runs the statement Diesel sends,
+/// statuses bound as one array parameter, against a table that is mostly
+/// history.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_watched_orders_read_uses_the_live_status_index() -> Result<()> {
+    #[derive(QueryableByName)]
+    struct IndexScans {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        scans: i64,
+    }
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let order = note(1);
+    command(conn, alpha, 1, MakerCommand::submit(order.clone())?)?;
+    diesel::sql_query(
+        "INSERT INTO orders (note_id, raw_data, arrival_unix, status, lineage_id)
+         VALUES ($1, $2, 1, 'active', $3)",
+    )
+    .bind::<diesel::sql_types::Bytea, _>(id(&order))
+    .bind::<diesel::sql_types::Bytea, _>(order.to_bytes())
+    .bind::<diesel::sql_types::Bytea, _>(OrderKeys::from_note(&order)?.lineage_id)
+    .execute(conn)?;
+    conn.batch_execute(
+        "INSERT INTO orders (note_id, raw_data, arrival_unix, status)
+         SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), '\\x00', 1, 'onchain_nullified'
+         FROM generate_series(1, 5000) i;
+         ANALYZE orders;
+         ANALYZE maker_lineages;",
+    )?;
+    let (watched, scans) = conn.transaction::<_, DbError, _>(|conn| {
+        let watched = maker_db::watched_maker_orders_tx(conn)?;
+        let scans = diesel::sql_query(
+            "SELECT pg_stat_get_xact_numscans('orders_live_status_idx'::regclass) AS scans",
+        )
+        .get_result::<IndexScans>(conn)?
+        .scans;
+        Ok((watched, scans))
+    })?;
+    assert_eq!(watched, [id(&order)]);
+    assert!(
+        scans > 0,
+        "the watcher's read did not use orders_live_status_idx"
+    );
     Ok(())
 }
 

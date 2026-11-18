@@ -208,20 +208,31 @@ change.
 
 `orders` only grows: executed and consumed orders stay as history, and every
 order changes status two or three times, leaving dead row versions behind.
-Watch `n_dead_tup`, `last_autovacuum` and `last_autoanalyze` for `orders` in
-`pg_stat_user_tables`. Once the table holds a few hundred thousand rows, lower
-its autovacuum thresholds so cleanup keeps pace:
+With Postgres's default trigger (20% of the table dead) a large `orders` table
+would wait about a day between vacuums, and dead entries would pile up in its
+partial indexes meanwhile. The `2026-11-19-000001_watcher_live_index`
+migration sets `orders` to vacuum at 1% + 1000 dead rows and to log every
+autovacuum run (`log_autovacuum_min_duration = 0`), so the server log shows
+each run's duration and pages. Check that it keeps pace:
 
 ```sql
-ALTER TABLE orders SET (
-  autovacuum_vacuum_scale_factor = 0.02,
-  autovacuum_analyze_scale_factor = 0.01
-);
+SELECT n_live_tup, n_dead_tup, last_autovacuum, autovacuum_count, last_autoanalyze
+FROM pg_stat_user_tables WHERE relname = 'orders';
+
+SELECT indexrelname, pg_relation_size(indexrelid) / 8192 AS pages, idx_scan
+FROM pg_stat_user_indexes
+WHERE relname = 'orders' AND indexrelname LIKE 'orders\_%\_idx';
 ```
 
-Active-book hydration reads only the partial index on active orders, so query
-speed does not degrade with history; storage and backup size do (roughly
-800 bytes per order). A retention policy for retired orders needs its own
+`n_dead_tup` should drop back every hour or two under steady load, and
+`orders_live_status_idx` should stay a few pages. To change the trigger, use
+`ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = …)`; reverting the
+migration resets these settings to the server defaults.
+
+Active-book hydration reads only the partial index on active orders, and the
+maker watcher reads only `orders_live_status_idx` (Active and Stopped maker
+orders), so query speed does not degrade with history; storage and backup size
+do (roughly 800 bytes per order). A retention policy for retired orders needs its own
 design, because startup recovery uses stored note IDs to recognise notes it
 has already ingested.
 

@@ -39,6 +39,10 @@ pub(crate) struct ClearingBook {
     /// not choose it (for whatever reason: price, window, no counterparty).
     /// In memory only: a restart starts it again.
     matched_since: HashMap<NoteId, u64>,
+    /// Orders kept but off the matchable index: in a settlement, sat out
+    /// awaiting their cancel, or routed. Small, so counting live maker orders
+    /// costs the makers and these, not the whole book.
+    inactive: HashSet<NoteId>,
 }
 
 impl ClearingBook {
@@ -163,6 +167,7 @@ impl ClearingBook {
             .get_mut(&id)
             .ok_or(ClearingError::InternalInvariant("missing indexed order"))?
             .activate();
+        self.inactive.remove(&id);
         Ok(())
     }
 
@@ -172,6 +177,7 @@ impl ClearingBook {
             // The order record remains for recovery, but the active index must
             // no longer expose it to matching or RFQ.
             order.deactivate();
+            self.inactive.insert(id);
             self.remove_from_index(pair, key, id);
         }
     }
@@ -257,6 +263,7 @@ impl ClearingBook {
     pub fn remove(&mut self, id: NoteId) {
         self.makers.forget(id);
         self.matched_since.remove(&id);
+        self.inactive.remove(&id);
         if let Some(order) = self.orders.remove(&id) {
             let (pair, key) = order.index_key();
             self.remove_from_index(pair, key, id);
@@ -283,6 +290,32 @@ impl ClearingBook {
     /// matched (Unix ms).
     pub(super) fn oldest_matched_since(&self) -> Option<u64> {
         self.matched_since.values().copied().min()
+    }
+
+    /// Each maker's orders the matcher can choose now: its entries less those
+    /// off the index. Costs the makers plus the inactive orders, not the book.
+    pub(super) fn live_orders_per_maker(&self) -> BTreeMap<MakerId, u64> {
+        let mut live: BTreeMap<MakerId, u64> = self.makers.entry_counts().collect();
+        for id in &self.inactive {
+            if let Some(count) = self
+                .makers
+                .tag(id)
+                .and_then(|tag| live.get_mut(&tag.maker_id))
+            {
+                *count = count.saturating_sub(1);
+            }
+        }
+        live
+    }
+
+    /// Matchable orders on a pair outside `configured`, which must list both
+    /// token orders of each pair: users' orders this solver never clears.
+    pub(super) fn orders_outside(&self, configured: &HashSet<(TokenId, TokenId)>) -> u64 {
+        self.pairs
+            .iter()
+            .filter(|(pair, _)| !configured.contains(pair))
+            .map(|(_, index)| index.len() as u64)
+            .sum()
     }
 
     fn admit<'a>(
@@ -737,6 +770,47 @@ mod tests {
         routing.release_expired(&mut book, 111).unwrap();
         assert!(book.orders.is_empty());
         assert!(book.levels().is_empty());
+    }
+
+    /// Live = matchable now: off the index (sent to the executor, or a
+    /// sit-out awaiting its cancel) is not live; a give-back is again.
+    #[test]
+    fn live_orders_per_maker_and_orders_outside_the_plan() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut book = ClearingBook::default();
+        let a1 = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        let a2 = tagged(fixture(false, 10, 19, 2, &mut rng), 7, 2);
+        let b1 = tagged(fixture(true, 30, 10, 3, &mut rng), 8, 1);
+        let user = fixture(true, 30, 11, 4, &mut rng);
+        for order in [&a1, &a2, &b1, &user] {
+            book.insert_or_skip(order);
+        }
+        let live = |book: &ClearingBook| book.live_orders_per_maker();
+        assert_eq!(live(&book), BTreeMap::from([(7, 2), (8, 1)]));
+
+        book.deactivate(a1.id());
+        book.track_matched(&[a1.id()], 1);
+        assert_eq!(live(&book), BTreeMap::from([(7, 1), (8, 1)]));
+        // A sit-out leaves the index without being matched.
+        book.deactivate(a2.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 0), (8, 1)]));
+        book.reactivate(a1.id()).unwrap();
+        book.reactivate(a2.id()).unwrap();
+        assert_eq!(live(&book), BTreeMap::from([(7, 2), (8, 1)]));
+        book.remove(b1.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 2)]));
+        book.deactivate(a1.id());
+        book.remove(a1.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 1)]));
+        assert!(book.inactive.is_empty());
+
+        let a: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+        let b: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        assert_eq!(book.orders_outside(&HashSet::from([(a, b), (b, a)])), 0);
+        // Not configured: every matchable order on it counts, both sides.
+        assert_eq!(book.orders_outside(&HashSet::new()), 2);
+        book.deactivate(user.id());
+        assert_eq!(book.orders_outside(&HashSet::new()), 1);
     }
 
     pub(super) fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {

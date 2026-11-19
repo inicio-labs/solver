@@ -225,6 +225,23 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
     );
 }
 
+/// Each maker's orders the matcher can choose, and matchable orders on pairs
+/// this solver does not clear, as the matcher last counted them (at most a
+/// second ago).
+fn append_book_metrics(body: &mut String) {
+    for (maker_id, live) in crate::matcher::maker_live_orders() {
+        let _ = writeln!(
+            body,
+            "solver_maker_live_orders{{maker_id=\"{maker_id}\"}} {live}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_matcher_orders_on_unconfigured_pairs {}",
+        crate::matcher::orders_on_unconfigured_pairs()
+    );
+}
+
 /// Lines of a metrics page that Prometheus' text format would refuse, and
 /// repeated series. Empty when the page parses: one bad line fails a whole scrape.
 #[cfg(test)]
@@ -403,6 +420,7 @@ async fn metrics(
         state.last_sync_unix_seconds.load(Ordering::Relaxed),
     );
     append_maker_metrics(&mut body, crate::gateway::watcher_gauges());
+    append_book_metrics(&mut body);
     crate::gateway::metrics::render(&mut body);
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

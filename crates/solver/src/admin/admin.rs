@@ -1,3 +1,9 @@
+//! The admin HTTP API: tokens, makers and their API keys.
+//!
+//! Every change that commits logs one `info` line, "admin change", with its
+//! action; reads log nothing. The ops agent counts `info` lines from
+//! `solver::admin` as admin changes, so nothing else here may log at `info`.
+
 use axum::extract::{Path, Request, State};
 use axum::http::{header::AUTHORIZATION, header::CACHE_CONTROL, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -187,6 +193,7 @@ async fn add_token(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if inserted {
+        tracing::info!(action = "add_token", %token, "admin change");
         Ok((StatusCode::CREATED, "registered"))
     } else {
         Ok((StatusCode::OK, "already registered"))
@@ -203,6 +210,9 @@ async fn remove_token(
         .write(move |conn| db::postgres_db::unregister_token_tx(conn, token))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if deleted {
+        tracing::info!(action = "remove_token", %token, "admin change");
+    }
     Ok(if deleted {
         StatusCode::OK
     } else {
@@ -222,12 +232,14 @@ async fn create_maker(
     if name.is_empty() || name.len() > MAX_MAKER_NAME_LEN {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let stored = name.clone();
     let created = state
         .pool
-        .write(move |conn| db::maker_db::create_maker_tx(conn, &name))
+        .write(move |conn| db::maker_db::create_maker_tx(conn, &stored))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let maker_id = created.ok_or(StatusCode::CONFLICT)?;
+    tracing::info!(action = "create_maker", maker_id, %name, "admin change");
     Ok((StatusCode::CREATED, Json(MakerResponse { maker_id })))
 }
 
@@ -252,6 +264,8 @@ async fn issue_api_key(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    // The key itself is never logged.
+    tracing::info!(action = "issue_api_key", maker_id, key_id, "admin change");
     Ok((
         StatusCode::CREATED,
         [(CACHE_CONTROL, "no-store")],
@@ -269,6 +283,9 @@ async fn revoke_api_key(
         .write(move |conn| db::maker_db::revoke_api_key_tx(conn, key_id))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if revoked {
+        tracing::info!(action = "revoke_api_key", key_id, "admin change");
+    }
     Ok(if revoked {
         StatusCode::NO_CONTENT
     } else {
@@ -404,6 +421,134 @@ mod tests {
             .await
             .assert_status(StatusCode::NOT_FOUND);
         assert_eq!(authenticate(hash).await.unwrap(), None);
+    }
+
+    /// Log lines written while the guard lives, on this thread.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        /// `info` lines from this module.
+        fn admin_info_lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(" INFO ") && line.contains("solver::admin"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// The ops agent counts `info` lines from `solver::admin` as admin
+    /// changes: each committed change writes exactly one, and a read, a
+    /// refused change or a change that found nothing writes none.
+    ///
+    /// Run alone (CI has its own step): tracing caches per callsite whether
+    /// anyone listens, process-wide, so another test meeting these callsites
+    /// on a thread without this subscriber can hide lines from it.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL; run alone"]
+    async fn each_admin_change_logs_one_info_line_and_nothing_else_does() {
+        let captured = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let (server, _db, _subscriptions) = test_server().await;
+        let lines = || captured.admin_info_lines();
+
+        server.get("/admin/tokens").await.assert_status_ok();
+        server
+            .post("/admin/makers")
+            .json(&json!({"name": "  "}))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+        server
+            .delete("/admin/keys/999")
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(lines(), Vec::<String>::new());
+
+        let token = json!({ "token_id": token_hex(test_token_a()) });
+        server
+            .post("/admin/tokens")
+            .json(&token)
+            .await
+            .assert_status(StatusCode::CREATED);
+        server
+            .post("/admin/tokens")
+            .json(&token)
+            .await
+            .assert_status_ok();
+        let maker_id = server
+            .post("/admin/makers")
+            .json(&json!({"name": "alpha"}))
+            .await
+            .json::<MakerResponse>()
+            .maker_id;
+        let issued = server.post(&format!("/admin/makers/{maker_id}/keys")).await;
+        let ApiKeyResponse { key_id, api_key } = issued.json();
+        server
+            .delete(&format!("/admin/keys/{key_id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .delete("/admin/tokens")
+            .json(&token)
+            .await
+            .assert_status_ok();
+
+        let lines = lines();
+        let actions: Vec<&str> = lines
+            .iter()
+            .map(|line| {
+                [
+                    "add_token",
+                    "create_maker",
+                    "issue_api_key",
+                    "revoke_api_key",
+                    "remove_token",
+                ]
+                .into_iter()
+                .find(|action| line.contains(&format!("action=\"{action}\"")))
+                .unwrap_or_else(|| panic!("not an admin change: {line}"))
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "add_token",
+                "create_maker",
+                "issue_api_key",
+                "revoke_api_key",
+                "remove_token"
+            ]
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains(&api_key)),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]

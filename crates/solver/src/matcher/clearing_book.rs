@@ -2184,4 +2184,6 @@ mod tests {
 }
 
 #[cfg(test)]
+mod metrics_cost;
+#[cfg(test)]
 mod stp_scale;

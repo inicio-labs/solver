@@ -222,15 +222,15 @@ pub(super) fn internal_clear(
             .markets()
             .pair(base, quote)
             .map_or(0, |pair| pair.rules.band_bps);
-        let execution = if band_bps == 0 {
+        let cleared = if band_bps == 0 {
             clear_pair_or_log(book, base, quote, price, &runtime.config)
         } else {
             clear_pair_bounded(book, base, quote, price, band_bps, &runtime.config)
         };
-        let Some(execution) = execution else {
+        let Some(cleared) = cleared else {
             continue;
         };
-        combined.filled_notes.extend(execution.filled_notes);
+        combined.filled_notes.extend(cleared.execution.filled_notes);
         combined.group_ends.push(combined.filled_notes.len());
         included_pairs += 1;
     }
@@ -272,8 +272,15 @@ pub(super) fn internal_clear(
 /// A pair's accepted plan: its execution batch with the sit-outs to cancel
 /// attached, and what the fills release on each side.
 struct Cleared {
+    #[cfg(test)]
+    price: BatchPrice,
     execution: ExecutionBatch,
     released: PairAmounts,
+}
+
+enum ClearRoute {
+    DistinctWalk,
+    TerminalMid,
 }
 
 /// A step of clearing one pair that failed, and the message to log it under.
@@ -297,13 +304,37 @@ fn clear_pair_at(
     quote: TokenId,
     price: BatchPrice,
     config: &ClearingConfig,
+    route: ClearRoute,
 ) -> Result<Option<Cleared>, Box<ClearFailure>> {
     let (batch, self_trade) = book
         .build_pair_batch(base, quote, price, config)
         .map_err(ClearFailure::at("clearing admission failed"))?;
-    let plan = match PairMatcher::new(&batch, config).clear() {
-        Ok(ClearingOutcome::Accepted(plan)) => plan,
-        Ok(ClearingOutcome::Skipped(reason)) => {
+    let prepared = PairMatcher::new(&batch, config)
+        .prepare()
+        .map_err(ClearFailure::at("pair clearing failed"))?;
+    let legacy_execution = match &prepared.legacy {
+        ClearingOutcome::Accepted(plan) => {
+            let execution = plan.to_execution_batch(&batch).map_err(ClearFailure::at(
+                "clearing execution batch construction failed",
+            ))?;
+            Some((plan.as_ref(), execution))
+        }
+        ClearingOutcome::Skipped(_) => None,
+    };
+    // A distinct walk only owns the route after legacy produces an
+    // executable batch. The terminal mid may also repair a legacy skip.
+    let repaired = if matches!(route, ClearRoute::TerminalMid) || legacy_execution.is_some() {
+        prepared.repair()
+    } else {
+        None
+    };
+    let upgraded = repaired.as_ref().and_then(|plan| {
+        plan.to_execution_batch(&batch)
+            .ok()
+            .map(|batch| (plan, batch))
+    });
+    let Some((plan, mut execution)) = upgraded.or(legacy_execution) else {
+        if let ClearingOutcome::Skipped(reason) = &prepared.legacy {
             match reason {
                 SkipReason::ResourceLimit => {
                     tracing::warn!(%base, %quote, "pair clearing resource limit exceeded");
@@ -317,13 +348,9 @@ fn clear_pair_at(
                 }
                 other => tracing::debug!(%base, %quote, ?other, "pair did not clear"),
             }
-            return Ok(None);
         }
-        Err(error) => return Err(ClearFailure::at("pair clearing failed")(error)),
+        return Ok(None);
     };
-    let mut execution = plan.to_execution_batch(&batch).map_err(ClearFailure::at(
-        "clearing execution batch construction failed",
-    ))?;
     book.attach_self_trade_cancels(self_trade, &mut execution);
     tracing::info!(
         %base,
@@ -336,8 +363,10 @@ fn clear_pair_at(
         "clearing pair included in combined batch"
     );
     Ok(Some(Cleared {
+        #[cfg(test)]
+        price,
         execution,
-        released: plan.candidate.released,
+        released: plan.candidate.released.clone(),
     }))
 }
 
@@ -348,9 +377,9 @@ fn clear_pair_or_log(
     quote: TokenId,
     price: BatchPrice,
     config: &ClearingConfig,
-) -> Option<ExecutionBatch> {
-    match clear_pair_at(book, base, quote, price, config) {
-        Ok(cleared) => cleared.map(|cleared| cleared.execution),
+) -> Option<Cleared> {
+    match clear_pair_at(book, base, quote, price, config, ClearRoute::TerminalMid) {
+        Ok(cleared) => cleared,
         Err(failure) => {
             tracing::error!(%base, %quote, error = %failure.error, "{}", failure.message);
             None
@@ -358,8 +387,8 @@ fn clear_pair_or_log(
     }
 }
 
-/// A pair with a band (ADR 0007): the walk's price when anything trades
-/// there, otherwise the mid, exactly as without a band.
+/// A pair with a band (ADR 0007): the walk's price when legacy trades there,
+/// otherwise the terminal mid.
 fn clear_pair_bounded(
     book: &ClearingBook,
     base: TokenId,
@@ -367,7 +396,7 @@ fn clear_pair_bounded(
     mid: BatchPrice,
     band_bps: u16,
     config: &ClearingConfig,
-) -> Option<ExecutionBatch> {
+) -> Option<Cleared> {
     let fallback = |reason: MidFallback| {
         BOUNDED_FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
         clear_pair_or_log(book, base, quote, mid, config)
@@ -397,7 +426,14 @@ fn clear_pair_bounded(
     }
     // A step that fails at the bounded price is only a warning: the mid is
     // tried next, and a persistent failure there is the error.
-    let cleared = match clear_pair_at(book, base, quote, walk.price, config) {
+    let cleared = match clear_pair_at(
+        book,
+        base,
+        quote,
+        walk.price,
+        config,
+        ClearRoute::DistinctWalk,
+    ) {
         Ok(Some(cleared)) => cleared,
         Ok(None) => {
             tracing::debug!(%base, %quote, price = ?walk.price, "nothing traded at the bounded price; clearing at the mid");
@@ -424,7 +460,7 @@ fn clear_pair_bounded(
         .count();
     WALK_BENCHED_FILLED.fetch_add(benched_filled as u64, Ordering::Relaxed);
     log_bounded_price(base, quote, mid, &walk, &cleared, benched_filled);
-    Some(cleared.execution)
+    Some(cleared)
 }
 
 fn log_bounded_price(
@@ -460,6 +496,9 @@ fn bps_from(price: BatchPrice, mid: BatchPrice) -> f64 {
     let ratio = |p: BatchPrice| f64::from(p.quote_units) / f64::from(p.base_units);
     (ratio(price) / ratio(mid) - 1.0) * 10_000.0
 }
+
+#[cfg(test)]
+mod repair_route_tests;
 
 #[cfg(test)]
 mod tests {

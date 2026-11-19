@@ -326,6 +326,7 @@ pub async fn start(
         prices: channels.prices_rx.clone(),
         config: crate::clearing::ClearingConfig {
             protocol_fee_ppm: config.engine.clearing_fee_ppm,
+            integer_completion_repair: config.engine.clearing_integer_completion_repair,
             self_trade_prevention: config.engine.maker_self_trade_prevention,
             ..crate::clearing::ClearingConfig::default()
         },

@@ -30,6 +30,7 @@ use super::config::{GatewayConfig, StreamConfig};
 use super::error::IntakeError;
 use super::events::{feed, unix_ms, Subscriber};
 use super::intake::{run_intake, IntakeSender};
+use super::metrics::{Calls, CALLS};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
 use super::watcher::{run_watcher, SdkTracker, SyncedHeight, Watcher};
@@ -66,6 +67,9 @@ pub struct MakerGatewayService {
     event_slots: Arc<Semaphore>,
     /// Ends every event stream at shutdown, so the server can stop.
     cancel: CancellationToken,
+    /// Where answered calls are counted: the process's [`CALLS`] (a test
+    /// gives its gateway its own).
+    calls: &'static Calls,
 }
 
 impl MakerGatewayService {
@@ -87,6 +91,7 @@ impl MakerGatewayService {
             settlement_buffer,
             event_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
             cancel,
+            calls: &CALLS,
         }
     }
 
@@ -116,6 +121,22 @@ impl MakerGatewayService {
         Ok((maker_id, key_hash))
     }
 
+    /// Count one answered call: by method, its gRPC code, and `caller`, the
+    /// maker once its API key was accepted.
+    fn counted<T>(
+        &self,
+        method: &'static str,
+        caller: Option<MakerId>,
+        result: Result<Response<T>, Status>,
+    ) -> Result<Response<T>, Status> {
+        let code = match &result {
+            Ok(_) => tonic::Code::Ok,
+            Err(status) => status.code(),
+        };
+        self.calls.add(method, code, caller);
+        result
+    }
+
     async fn execute(
         &self,
         header: CommandHeader,
@@ -140,170 +161,213 @@ impl MakerGateway for MakerGatewayService {
         &self,
         request: Request<proto::StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        let (maker_id, key_hash) = self.authenticate(&request).await?;
-        let subscriber = Subscriber {
-            maker_id,
-            key_hash,
-            cursor: request.into_inner().after_seq,
-        };
-        let slot = self
-            .event_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many event subscriptions"))?;
-        let (tx, rx) = mpsc::channel(self.stream.buffer.max(2));
-        let pool = self.pool.clone();
-        let events = self.events.clone();
-        let stream = self.stream;
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let _open = super::metrics::OpenStream::open();
-            feed(pool, events, stream, subscriber, tx, cancel).await;
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let mut caller = None;
+        let result = async {
+            let (maker_id, key_hash) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let subscriber = Subscriber {
+                maker_id,
+                key_hash,
+                cursor: request.into_inner().after_seq,
+            };
+            let slot = self
+                .event_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Status::resource_exhausted("too many event subscriptions"))?;
+            let (tx, rx) = mpsc::channel(self.stream.buffer.max(2));
+            let pool = self.pool.clone();
+            let events = self.events.clone();
+            let stream = self.stream;
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _open = super::metrics::OpenStream::open();
+                feed(pool, events, stream, subscriber, tx, cancel).await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+        .await;
+        self.counted("stream_events", caller, result)
     }
 
     async fn submit_order(
         &self,
         request: Request<proto::SubmitOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let header = header(maker_id, request.header)?;
-        let note = Note::read_from_bytes(&request.note)
-            .ok()
-            .filter(|note| note.to_bytes() == request.note)
-            .ok_or_else(|| Status::invalid_argument("note is not a canonical miden note"))?;
-        if request
-            .expires_at_unix_ms
-            .is_some_and(|expiry| expiry == 0 || expiry > i64::MAX as u64)
-        {
-            return Err(Status::invalid_argument(
-                "expiry must be a positive Unix millisecond timestamp within i64",
-            ));
-        }
-        let mut command = MakerCommand::submit(note).map_err(|error| {
-            Status::invalid_argument(format!("note is not a valid PSWAP order: {error}"))
-        })?;
-        if let MakerCommand::Submit {
-            expires_at_unix_ms, ..
-        } = &mut command
-        {
-            *expires_at_unix_ms = request.expires_at_unix_ms;
-        }
-        if let MakerCommand::Submit { keys, .. } = &command {
-            if !self.markets.contains(&keys.market) {
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let request = request.into_inner();
+            let header = header(maker_id, request.header)?;
+            let note = Note::read_from_bytes(&request.note)
+                .ok()
+                .filter(|note| note.to_bytes() == request.note)
+                .ok_or_else(|| Status::invalid_argument("note is not a canonical miden note"))?;
+            if request
+                .expires_at_unix_ms
+                .is_some_and(|expiry| expiry == 0 || expiry > i64::MAX as u64)
+            {
                 return Err(Status::invalid_argument(
-                    "this solver does not trade that pair",
+                    "expiry must be a positive Unix millisecond timestamp within i64",
                 ));
             }
+            let mut command = MakerCommand::submit(note).map_err(|error| {
+                Status::invalid_argument(format!("note is not a valid PSWAP order: {error}"))
+            })?;
+            if let MakerCommand::Submit {
+                expires_at_unix_ms, ..
+            } = &mut command
+            {
+                *expires_at_unix_ms = request.expires_at_unix_ms;
+            }
+            if let MakerCommand::Submit { keys, .. } = &command {
+                if !self.markets.contains(&keys.market) {
+                    return Err(Status::invalid_argument(
+                        "this solver does not trade that pair",
+                    ));
+                }
+            }
+            self.execute(header, command).await
         }
-        self.execute(header, command).await
+        .await;
+        self.counted("submit_order", caller, result)
     }
 
     async fn cancel_all(
         &self,
         request: Request<proto::CancelAllRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let (header, scope) = request.into_inner().verify(maker_id)?;
-        self.execute(header, MakerCommand::CancelAll { scope })
-            .await
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let (header, scope) = request.into_inner().verify(maker_id)?;
+            self.execute(header, MakerCommand::CancelAll { scope })
+                .await
+        }
+        .await;
+        self.counted("cancel_all", caller, result)
     }
 
     async fn cancel_order(
         &self,
         request: Request<proto::CancelOrderRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let (header, lineage_id) = request.into_inner().verify(maker_id)?;
-        self.execute(header, MakerCommand::CancelOrder { lineage_id })
-            .await
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let (header, lineage_id) = request.into_inner().verify(maker_id)?;
+            self.execute(header, MakerCommand::CancelOrder { lineage_id })
+                .await
+        }
+        .await;
+        self.counted("cancel_order", caller, result)
     }
 
     async fn heartbeat(
         &self,
         request: Request<proto::HeartbeatRequest>,
     ) -> Result<Response<proto::HeartbeatReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let latest_seq = self
-            .pool
-            .read_public(move |conn| maker_db::latest_event_seq_tx(conn, maker_id))
-            .await
-            .map_err(|_| Status::unavailable("cannot read the event feed now; retry"))?;
-        let received = request.into_inner().received_through_seq;
-        tracing::debug!(
-            maker_id,
-            received,
-            lag = latest_seq.saturating_sub(received),
-            "maker heartbeat"
-        );
-        Ok(Response::new(proto::HeartbeatReply {
-            server_time_unix_ms: unix_ms(),
-            latest_seq,
-        }))
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let latest_seq = self
+                .pool
+                .read_public(move |conn| maker_db::latest_event_seq_tx(conn, maker_id))
+                .await
+                .map_err(|_| Status::unavailable("cannot read the event feed now; retry"))?;
+            let received = request.into_inner().received_through_seq;
+            tracing::debug!(
+                maker_id,
+                received,
+                lag = latest_seq.saturating_sub(received),
+                "maker heartbeat"
+            );
+            Ok(Response::new(proto::HeartbeatReply {
+                server_time_unix_ms: unix_ms(),
+                latest_seq,
+            }))
+        }
+        .await;
+        self.counted("heartbeat", caller, result)
     }
 
     async fn list_active_maker_orders(
         &self,
         request: Request<proto::ListActiveMakerOrdersRequest>,
     ) -> Result<Response<proto::ListActiveMakerOrdersReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let request = request.into_inner();
-        let after = request.page_token;
-        if !after.is_empty() && after.len() != 32 {
-            return Err(Status::invalid_argument("invalid page token"));
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let request = request.into_inner();
+            let after = request.page_token;
+            if !after.is_empty() && after.len() != 32 {
+                return Err(Status::invalid_argument("invalid page token"));
+            }
+            let size = match request.page_size {
+                0 => DEFAULT_ORDER_PAGE,
+                size => size.min(MAX_ORDER_PAGE),
+            };
+            // The matcher drops an order `settlement_buffer` before its expiry
+            // (`MakerIndex::expired`); list only what it can still fill.
+            let cutoff = unix_ms().saturating_add(
+                i64::try_from(self.settlement_buffer.as_millis()).unwrap_or(i64::MAX),
+            );
+            let page = self
+                .pool
+                .read_public(move |conn| {
+                    maker_db::active_maker_orders_page_tx(
+                        conn,
+                        maker_id,
+                        &after,
+                        i64::from(size),
+                        cutoff,
+                    )
+                })
+                .await
+                .map_err(|_| Status::unavailable("cannot read active orders now; retry"))?;
+            let next_page_token = match page.last() {
+                Some(last) if page.len() == size as usize => last.note_id.clone(),
+                _ => Vec::new(),
+            };
+            Ok(Response::new(proto::ListActiveMakerOrdersReply {
+                orders: page
+                    .into_iter()
+                    .map(active_maker_order)
+                    .collect::<Result<_, _>>()?,
+                next_page_token,
+            }))
         }
-        let size = match request.page_size {
-            0 => DEFAULT_ORDER_PAGE,
-            size => size.min(MAX_ORDER_PAGE),
-        };
-        // The matcher drops an order `settlement_buffer` before its expiry
-        // (`MakerIndex::expired`); list only what it can still fill.
-        let cutoff = unix_ms()
-            .saturating_add(i64::try_from(self.settlement_buffer.as_millis()).unwrap_or(i64::MAX));
-        let page = self
-            .pool
-            .read_public(move |conn| {
-                maker_db::active_maker_orders_page_tx(
-                    conn,
-                    maker_id,
-                    &after,
-                    i64::from(size),
-                    cutoff,
-                )
-            })
-            .await
-            .map_err(|_| Status::unavailable("cannot read active orders now; retry"))?;
-        let next_page_token = match page.last() {
-            Some(last) if page.len() == size as usize => last.note_id.clone(),
-            _ => Vec::new(),
-        };
-        Ok(Response::new(proto::ListActiveMakerOrdersReply {
-            orders: page
-                .into_iter()
-                .map(active_maker_order)
-                .collect::<Result<_, _>>()?,
-            next_page_token,
-        }))
+        .await;
+        self.counted("list_active_maker_orders", caller, result)
     }
 
     async fn get_command(
         &self,
         request: Request<proto::GetCommandRequest>,
     ) -> Result<Response<proto::CommandReply>, Status> {
-        let (maker_id, _) = self.authenticate(&request).await?;
-        let request_id = request.into_inner().request_id;
-        let stored = self
-            .pool
-            .read_public(move |conn| maker_db::stored_result_tx(conn, maker_id, &request_id))
-            .await
-            .map_err(|_| Status::unavailable("cannot read command status now; retry"))?;
-        match stored {
-            Some(result) => Ok(Response::new(reply(result, true))),
-            None => Err(Status::not_found("no command with this request ID")),
+        let mut caller = None;
+        let result = async {
+            let (maker_id, _) = self.authenticate(&request).await?;
+            caller = Some(maker_id);
+            let request_id = request.into_inner().request_id;
+            let stored = self
+                .pool
+                .read_public(move |conn| maker_db::stored_result_tx(conn, maker_id, &request_id))
+                .await
+                .map_err(|_| Status::unavailable("cannot read command status now; retry"))?;
+            match stored {
+                Some(result) => Ok(Response::new(reply(result, true))),
+                None => Err(Status::not_found("no command with this request ID")),
+            }
         }
+        .await;
+        self.counted("get_command", caller, result)
     }
 }
 
@@ -606,6 +670,8 @@ mod tests {
         events: EventWake,
         db: TestDb,
         stop: CancellationToken,
+        /// This gateway's own call counts (the process's are shared by tests).
+        calls: &'static Calls,
     }
 
     const TEST_STREAM: StreamConfig = StreamConfig {
@@ -657,6 +723,8 @@ mod tests {
             stop.clone(),
         );
         service.event_slots = Arc::new(Semaphore::new(stream_limit));
+        let calls: &'static Calls = Box::leak(Box::default());
+        service.calls = calls;
         let service = service.into_server();
         let shutdown = stop.clone();
         tokio::spawn(
@@ -680,6 +748,7 @@ mod tests {
             events,
             db,
             stop,
+            calls,
         }
     }
 
@@ -731,6 +800,81 @@ mod tests {
 
     fn code<T: std::fmt::Debug>(result: Result<Response<T>, Status>) -> Code {
         result.unwrap_err().code()
+    }
+
+    /// Every answered call is counted once: by method, gRPC code, and maker
+    /// once the key is accepted (`None` before).
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn every_call_is_counted_once_by_method_code_and_maker() {
+        let Gateway {
+            mut client,
+            key,
+            maker_id,
+            // Kept alive: the schema and the matcher's end of the intake.
+            db: _db,
+            facts: _facts,
+            stop,
+            calls,
+            ..
+        } = gateway().await;
+        let order = pswap_note(1);
+        let maker = Some(maker_id);
+        assert_eq!(
+            code(
+                client
+                    .submit_order(signed("mmk_wrong", submit("s1", 1, &order)))
+                    .await
+            ),
+            Code::Unauthenticated
+        );
+        client
+            .submit_order(signed(&key, submit("s1", 1, &order)))
+            .await
+            .unwrap();
+        // An exact retry answers again, as a call that went through.
+        client
+            .submit_order(signed(&key, submit("s1", 1, &order)))
+            .await
+            .unwrap();
+        assert_eq!(
+            code(
+                client
+                    .submit_order(signed(&key, submit("s1", 1, &pswap_note(2))))
+                    .await
+            ),
+            Code::AlreadyExists
+        );
+        let mut garbled = submit("s2", 2, &order);
+        garbled.note = vec![0];
+        assert_eq!(
+            code(client.submit_order(signed(&key, garbled)).await),
+            Code::InvalidArgument
+        );
+        client
+            .heartbeat(signed(
+                &key,
+                proto::HeartbeatRequest {
+                    received_through_seq: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        let _stream = client
+            .stream_events(signed(&key, proto::StreamEventsRequest { after_seq: 0 }))
+            .await
+            .unwrap();
+
+        assert_eq!(calls.get("submit_order", Code::Unauthenticated, None), 1);
+        assert_eq!(calls.get("submit_order", Code::Ok, maker), 2);
+        assert_eq!(calls.get("submit_order", Code::AlreadyExists, maker), 1);
+        assert_eq!(calls.get("submit_order", Code::InvalidArgument, maker), 1);
+        assert_eq!(calls.get("heartbeat", Code::Ok, maker), 1);
+        assert_eq!(calls.get("stream_events", Code::Ok, maker), 1);
+        let mut body = String::new();
+        calls.render(&mut body);
+        assert_eq!(body.lines().count(), 6, "{body}");
+        stop.cancel();
     }
 
     #[tokio::test]

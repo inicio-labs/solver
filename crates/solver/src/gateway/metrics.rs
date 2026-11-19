@@ -70,6 +70,82 @@ impl Drop for OpenStream {
     }
 }
 
+/// Gateway calls, each counted once when its handler answers: by method, by
+/// gRPC code and by maker (`unknown` until an API key is accepted). One short
+/// lock per call on the gateway's own thread, beside a database round trip.
+#[derive(Default)]
+pub(crate) struct Calls(Mutex<BTreeMap<CallKey, u64>>);
+
+/// Method, gRPC code, and the maker if its key was accepted.
+type CallKey = (&'static str, &'static str, Option<MakerId>);
+
+/// The process's gateway calls, as `/metrics` shows them.
+pub(crate) static CALLS: LazyLock<Calls> = LazyLock::new(Calls::default);
+
+impl Calls {
+    pub(crate) fn add(&self, method: &'static str, code: tonic::Code, maker_id: Option<MakerId>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((method, code_name(code), maker_id))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn render(&self, body: &mut String) {
+        let calls = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for ((method, code, maker_id), count) in calls.iter() {
+            let _ = match maker_id {
+                Some(maker_id) => writeln!(
+                    body,
+                    "solver_gateway_requests_total{{method=\"{method}\",code=\"{code}\",maker_id=\"{maker_id}\"}} {count}"
+                ),
+                None => writeln!(
+                    body,
+                    "solver_gateway_requests_total{{method=\"{method}\",code=\"{code}\",maker_id=\"unknown\"}} {count}"
+                ),
+            };
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(
+        &self,
+        method: &'static str,
+        code: tonic::Code,
+        maker_id: Option<MakerId>,
+    ) -> u64 {
+        let calls = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        calls
+            .get(&(method, code_name(code), maker_id))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+fn code_name(code: tonic::Code) -> &'static str {
+    use tonic::Code;
+    match code {
+        Code::Ok => "ok",
+        Code::Cancelled => "cancelled",
+        Code::Unknown => "unknown",
+        Code::InvalidArgument => "invalid_argument",
+        Code::DeadlineExceeded => "deadline_exceeded",
+        Code::NotFound => "not_found",
+        Code::AlreadyExists => "already_exists",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::Aborted => "aborted",
+        Code::OutOfRange => "out_of_range",
+        Code::Unimplemented => "unimplemented",
+        Code::Internal => "internal",
+        Code::Unavailable => "unavailable",
+        Code::DataLoss => "data_loss",
+        Code::Unauthenticated => "unauthenticated",
+    }
+}
+
 fn render_service_wide(body: &mut String) {
     for (index, queue) in QUEUE_NAMES.iter().enumerate() {
         let _ = writeln!(
@@ -112,6 +188,7 @@ pub(crate) fn count_activation(maker_id: MakerId, via: &'static str) {
 
 pub(crate) fn render(body: &mut String) {
     render_service_wide(body);
+    CALLS.render(body);
     let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     for ((metric, maker_id, label, value), count) in counts.iter() {
         let _ = if label.is_empty() {
@@ -161,6 +238,25 @@ mod tests {
         let mut after = String::new();
         render_service_wide(&mut after);
         assert_eq!(streams(&after) + 1, with);
+    }
+
+    #[test]
+    fn calls_render_by_method_code_and_maker() {
+        let calls = Calls::default();
+        calls.add("submit_order", tonic::Code::Ok, Some(7));
+        calls.add("submit_order", tonic::Code::Ok, Some(7));
+        calls.add("submit_order", tonic::Code::InvalidArgument, Some(7));
+        calls.add("heartbeat", tonic::Code::Unauthenticated, None);
+        let mut body = String::new();
+        calls.render(&mut body);
+        assert_eq!(crate::obs::exposition_errors(&body), Vec::<String>::new());
+        assert_eq!(
+            body,
+            "solver_gateway_requests_total{method=\"heartbeat\",code=\"unauthenticated\",maker_id=\"unknown\"} 1\n\
+             solver_gateway_requests_total{method=\"submit_order\",code=\"invalid_argument\",maker_id=\"7\"} 1\n\
+             solver_gateway_requests_total{method=\"submit_order\",code=\"ok\",maker_id=\"7\"} 2\n"
+        );
+        assert_eq!(calls.get("submit_order", tonic::Code::Ok, Some(7)), 2);
     }
 
     #[test]

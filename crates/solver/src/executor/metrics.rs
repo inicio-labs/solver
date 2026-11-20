@@ -242,9 +242,59 @@ fn unfinished_age_secs(held_ms: u64, in_hand_ms: u64, now_ms: u64) -> u64 {
         .map_or(0, |since| now_ms.saturating_sub(since) / 1000)
 }
 
-/// A settlement committed on chain and was confirmed in the database.
-pub(crate) fn record_confirmed() {
+/// Upper bounds, in seconds, of the settlement time histogram.
+pub(crate) const SETTLEMENT_SECONDS: [u64; 10] = [5, 10, 20, 30, 45, 60, 90, 120, 300, 600];
+
+/// How long settlements took, from when the executor prepared each one to its
+/// confirmation: a Prometheus histogram's cumulative buckets and sum.
+pub(crate) struct SettlementTimes {
+    buckets: [AtomicU64; SETTLEMENT_SECONDS.len()],
+    sum_ms: AtomicU64,
+}
+
+impl SettlementTimes {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; SETTLEMENT_SECONDS.len()],
+            sum_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, millis: u64) {
+        self.sum_ms.fetch_add(millis, Ordering::Relaxed);
+        for (bucket, bound) in self.buckets.iter().zip(SETTLEMENT_SECONDS) {
+            if millis <= bound * 1000 {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Each bound with the settlements that took at most that long, and the
+    /// sum in seconds.
+    fn read(&self) -> (Vec<(u64, u64)>, f64) {
+        let buckets = SETTLEMENT_SECONDS
+            .iter()
+            .zip(&self.buckets)
+            .map(|(bound, count)| (*bound, count.load(Ordering::Relaxed)))
+            .collect();
+        (buckets, self.sum_ms.load(Ordering::Relaxed) as f64 / 1000.0)
+    }
+}
+
+static SETTLEMENT_TIMES: SettlementTimes = SettlementTimes::new();
+
+/// A settlement committed on chain and was confirmed in the database;
+/// `taken_at_ms` is when the executor prepared it (after a restart, when it
+/// loaded it again, so a recovered settlement counts from the restart).
+pub(crate) fn record_confirmed(taken_at_ms: u64, now_ms: u64) {
+    SETTLEMENT_TIMES.record(now_ms.saturating_sub(taken_at_ms));
     SETTLEMENTS_CONFIRMED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The settlement time histogram's buckets and sum. Read before
+/// [`settlements_confirmed`], its count, so no bucket exceeds the count.
+pub(crate) fn settlement_times() -> (Vec<(u64, u64)>, f64) {
+    SETTLEMENT_TIMES.read()
 }
 
 /// What the last fee headroom check saw.
@@ -424,5 +474,30 @@ mod tests {
         record_release(ReleaseCause::Dropped, 0, true);
         record_release(ReleaseCause::Refused, 0, true);
         assert_eq!(count("true"), before + 1);
+    }
+
+    #[test]
+    fn settlement_times_fill_cumulative_buckets() {
+        let times = SettlementTimes::new();
+        for seconds in [3, 59, 61, 700] {
+            times.record(seconds * 1000);
+        }
+        let (buckets, sum) = times.read();
+        assert_eq!(
+            buckets,
+            vec![
+                (5, 1),
+                (10, 1),
+                (20, 1),
+                (30, 1),
+                (45, 1),
+                (60, 2),
+                (90, 3),
+                (120, 3),
+                (300, 3),
+                (600, 3)
+            ]
+        );
+        assert_eq!(sum, 823.0);
     }
 }

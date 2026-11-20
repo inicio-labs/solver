@@ -1611,7 +1611,7 @@ impl Executor {
                 Ok((update, confirmed.activated_makers))
             })
             .await?;
-        metrics::record_confirmed();
+        metrics::record_confirmed(settlement.taken_at_ms, crate::types::now_millis());
         for maker_id in activated {
             gateway_metrics::count_activation(maker_id, "settlement");
         }

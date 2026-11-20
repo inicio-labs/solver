@@ -177,13 +177,28 @@ fn append_settlement_metrics(body: &mut String) {
 fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
     use crate::executor::metrics as exec;
     let now_ms = crate::types::now_millis();
+    // The histogram's buckets first, then the count: a confirmation between
+    // the two reads raises the count, never a bucket above it.
+    let (buckets, sum_seconds) = exec::settlement_times();
+    let confirmed = exec::settlements_confirmed();
     let _ = writeln!(
         body,
         "solver_matcher_ticks_total {}\n\
          solver_chain_last_sync_timestamp_seconds {last_sync_unix_seconds}\n\
-         solver_settlements_confirmed_total {}",
+         solver_settlements_confirmed_total {confirmed}",
         crate::matcher::ticks(),
-        exec::settlements_confirmed(),
+    );
+    for (bound, count) in buckets {
+        let _ = writeln!(
+            body,
+            "solver_settlement_duration_seconds_bucket{{le=\"{bound}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_settlement_duration_seconds_bucket{{le=\"+Inf\"}} {confirmed}\n\
+         solver_settlement_duration_seconds_sum {sum_seconds}\n\
+         solver_settlement_duration_seconds_count {confirmed}"
     );
     for (cause, count) in exec::settlements_released() {
         let _ = writeln!(

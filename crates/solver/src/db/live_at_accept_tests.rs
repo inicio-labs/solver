@@ -1013,7 +1013,9 @@ fn a_remainder_of_a_closed_lineage_is_still_watched() -> Result<()> {
 /// the partial index over Active and Stopped orders, instead of scanning
 /// every order ever stored (issue #84). This runs the statement Diesel sends,
 /// statuses bound as one array parameter, against a table that is mostly
-/// history.
+/// maker history. It runs eight times on one connection: Diesel reuses the
+/// prepared statement, and from the sixth run PostgreSQL may switch to a
+/// generic plan, which cannot prove the index's condition.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 fn the_watched_orders_read_uses_the_live_status_index() -> Result<()> {
@@ -1021,6 +1023,17 @@ fn the_watched_orders_read_uses_the_live_status_index() -> Result<()> {
     struct IndexScans {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         scans: i64,
+    }
+    // The session's scans of the index not yet sent to the statistics
+    // collector, earlier transactions included. They are sent only while the
+    // session is idle outside a transaction, so a difference taken inside one
+    // transaction counts that transaction's scans.
+    fn index_scans(conn: &mut PgConnection) -> Result<i64, DbError> {
+        Ok(diesel::sql_query(
+            "SELECT pg_stat_get_xact_numscans('orders_live_status_idx'::regclass) AS scans",
+        )
+        .get_result::<IndexScans>(conn)?
+        .scans)
     }
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
@@ -1035,27 +1048,34 @@ fn the_watched_orders_read_uses_the_live_status_index() -> Result<()> {
     .bind::<diesel::sql_types::Bytea, _>(order.to_bytes())
     .bind::<diesel::sql_types::Bytea, _>(OrderKeys::from_note(&order)?.lineage_id)
     .execute(conn)?;
+    // Finished maker orders, each with its own lineage, as on mainnet.
     conn.batch_execute(
-        "INSERT INTO orders (note_id, raw_data, arrival_unix, status)
-         SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), '\\x00', 1, 'onchain_nullified'
+        "INSERT INTO maker_commands (maker_id, request_id, seq, kind, payload, result)
+         SELECT m.maker_id, 'h' || i, 1000 + i, 'submit', '\\x00', 'accepted'
+         FROM makers m, generate_series(1, 5000) i WHERE m.name = 'alpha';
+         INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id, state)
+         SELECT decode('ab' || lpad(to_hex(i), 62, '0'), 'hex'), m.maker_id, 'h' || i,
+                1000 + i, decode(lpad(to_hex(i), 64, '0'), 'hex'), 'activated'
+         FROM makers m, generate_series(1, 5000) i WHERE m.name = 'alpha';
+         INSERT INTO orders (note_id, raw_data, arrival_unix, status, lineage_id)
+         SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), '\\x00', 1, 'onchain_nullified',
+                decode('ab' || lpad(to_hex(i), 62, '0'), 'hex')
          FROM generate_series(1, 5000) i;
          ANALYZE orders;
          ANALYZE maker_lineages;",
     )?;
-    let (watched, scans) = conn.transaction::<_, DbError, _>(|conn| {
-        let watched = maker_db::watched_maker_orders_tx(conn)?;
-        let scans = diesel::sql_query(
-            "SELECT pg_stat_get_xact_numscans('orders_live_status_idx'::regclass) AS scans",
-        )
-        .get_result::<IndexScans>(conn)?
-        .scans;
-        Ok((watched, scans))
-    })?;
-    assert_eq!(watched, [id(&order)]);
-    assert!(
-        scans > 0,
-        "the watcher's read did not use orders_live_status_idx"
-    );
+    for run in 1..=8 {
+        let (watched, scans) = conn.transaction::<_, DbError, _>(|conn| {
+            let before = index_scans(conn)?;
+            let watched = maker_db::watched_maker_orders_tx(conn)?;
+            Ok((watched, index_scans(conn)? - before))
+        })?;
+        assert_eq!(watched, [id(&order)], "run {run}");
+        assert!(
+            scans > 0,
+            "run {run} of the watcher's read did not use orders_live_status_idx"
+        );
+    }
     Ok(())
 }
 

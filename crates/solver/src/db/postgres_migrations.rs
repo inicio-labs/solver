@@ -210,7 +210,8 @@ mod tests {
     }
 
     /// The watcher-index migration adds the partial index and the `orders`
-    /// autovacuum settings, and its revert removes both.
+    /// vacuum settings. Its revert removes both and leaves any other
+    /// per-table setting, such as one an operator set by hand, as it is.
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
     fn the_watcher_index_migration_reverts_cleanly() -> Result<()> {
@@ -237,13 +238,17 @@ mod tests {
             migrated.options.as_deref(),
             Some(
                 "{autovacuum_vacuum_scale_factor=0.01,autovacuum_vacuum_threshold=1000,\
-                 log_autovacuum_min_duration=0}"
+                 vacuum_index_cleanup=on,log_autovacuum_min_duration=0}"
             )
         );
+        conn.batch_execute("ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.01)")?;
         assert_eq!(revert_last(conn)?, "20261119000001");
         let reverted = shape(conn)?;
         assert!(!reverted.indexed);
-        assert_eq!(reverted.options, None);
+        assert_eq!(
+            reverted.options.as_deref(),
+            Some("{autovacuum_analyze_scale_factor=0.01}")
+        );
         Ok(())
     }
 

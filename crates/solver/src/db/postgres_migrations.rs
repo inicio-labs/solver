@@ -203,8 +203,52 @@ mod tests {
             Ok(acl.contains("\"=r/") || acl.contains(",=r/") || acl.contains("{=r/"))
         };
         assert!(public_reads(conn)?);
+        assert_eq!(revert_last(conn)?, "20261119000001");
         assert_eq!(revert_last(conn)?, "20261114000001");
         assert!(public_reads(conn)?, "the revert dropped the grant");
+        Ok(())
+    }
+
+    /// The watcher-index migration adds the partial index and the `orders`
+    /// vacuum settings. Its revert removes both and leaves any other
+    /// per-table setting, such as one an operator set by hand, as it is.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn the_watcher_index_migration_reverts_cleanly() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        #[derive(QueryableByName)]
+        struct Shape {
+            #[diesel(sql_type = diesel::sql_types::Bool)]
+            indexed: bool,
+            #[diesel(sql_type = Nullable<Text>)]
+            options: Option<String>,
+        }
+        let shape = |conn: &mut PgConnection| -> Result<Shape> {
+            Ok(diesel::sql_query(format!(
+                "SELECT to_regclass('{schema}.orders_live_status_idx') IS NOT NULL AS indexed,
+                        reloptions::text AS options
+                 FROM pg_class WHERE oid = '{schema}.orders'::regclass"
+            ))
+            .get_result(conn)?)
+        };
+        let migrated = shape(conn)?;
+        assert!(migrated.indexed);
+        assert_eq!(
+            migrated.options.as_deref(),
+            Some(
+                "{autovacuum_vacuum_scale_factor=0.01,autovacuum_vacuum_threshold=1000,\
+                 vacuum_index_cleanup=on,log_autovacuum_min_duration=0}"
+            )
+        );
+        conn.batch_execute("ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.01)")?;
+        assert_eq!(revert_last(conn)?, "20261119000001");
+        let reverted = shape(conn)?;
+        assert!(!reverted.indexed);
+        assert_eq!(
+            reverted.options.as_deref(),
+            Some("{autovacuum_analyze_scale_factor=0.01}")
+        );
         Ok(())
     }
 

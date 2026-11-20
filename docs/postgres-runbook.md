@@ -208,20 +208,53 @@ change.
 
 `orders` only grows: executed and consumed orders stay as history, and every
 order changes status two or three times, leaving dead row versions behind.
-Watch `n_dead_tup`, `last_autovacuum` and `last_autoanalyze` for `orders` in
-`pg_stat_user_tables`. Once the table holds a few hundred thousand rows, lower
-its autovacuum thresholds so cleanup keeps pace:
+With Postgres's default trigger (20% of the table dead) a large `orders` table
+would wait about a day between vacuums, and dead entries would pile up in its
+partial indexes meanwhile. The `2026-11-19-000001_watcher_live_index`
+migration sets these per-table settings on `orders`:
+
+- `autovacuum_vacuum_scale_factor = 0.01`, `autovacuum_vacuum_threshold = 1000`:
+  vacuum at 1% of the rows + 1000 dead rows. The trigger grows with the
+  table, so the time between runs does too (about 3,400 dead rows at 240k
+  rows, 11,000 at 1M).
+- `vacuum_index_cleanup = on`: since PostgreSQL 14, vacuum skips the index
+  pass when under 2% of the table's pages hold dead rows (the log line says
+  `index scan bypassed`), and a 1% trigger usually is under that. Without
+  this setting the dead index entries would stay until a larger run. Each
+  run now reads every `orders` index in full.
+- `log_autovacuum_min_duration = 0`: the server log shows every autovacuum
+  and auto-analyze run on `orders`, with its duration and pages.
+
+Before deploying the migration, check what is already set; it overrides
+these four and keeps any other:
 
 ```sql
-ALTER TABLE orders SET (
-  autovacuum_vacuum_scale_factor = 0.02,
-  autovacuum_analyze_scale_factor = 0.01
-);
+SELECT reloptions FROM pg_class WHERE oid = 'orders'::regclass;
 ```
 
-Active-book hydration reads only the partial index on active orders, so query
-speed does not degrade with history; storage and backup size do (roughly
-800 bytes per order). A retention policy for retired orders needs its own
+Check that cleanup keeps pace:
+
+```sql
+SELECT n_live_tup, n_dead_tup, last_autovacuum, autovacuum_count, last_autoanalyze
+FROM pg_stat_user_tables WHERE relname = 'orders';
+
+SELECT indexrelname,
+       pg_relation_size(indexrelid) / current_setting('block_size')::int AS pages,
+       idx_scan
+FROM pg_stat_user_indexes WHERE relname = 'orders';
+```
+
+`n_dead_tup` should drop back after each run. An index file never shrinks
+(vacuum frees pages inside it), so `orders_live_status_idx` settles at tens
+of pages and should not grow day over day; `orders_pkey` and
+`orders_lineage_idx` grow with the table. To change a setting, use
+`ALTER TABLE orders SET (...)`. Reverting the migration resets only these
+four settings to the server defaults; any other per-table setting stays.
+
+Active-book hydration reads only the partial index on active orders, and the
+maker watcher reads only `orders_live_status_idx` (Active and Stopped maker
+orders), so query speed does not degrade with history; storage and backup size
+do (roughly 800 bytes per order). A retention policy for retired orders needs its own
 design, because startup recovery uses stored note IDs to recognise notes it
 has already ingested.
 

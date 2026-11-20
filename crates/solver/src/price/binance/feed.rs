@@ -322,12 +322,17 @@ impl FeedMetrics {
         );
         let now = Instant::now();
         for (symbol, quote) in snapshot.quotes() {
-            let (valid, fresh, age) = match quote {
+            let (valid, fresh, age, mid) = match quote {
                 SymbolQuote::Valid(quote) => {
                     let age = now.saturating_duration_since(quote.received_at);
-                    (1, u8::from(age < snapshot.ttl()), Some(age.as_secs_f64()))
+                    (
+                        1,
+                        u8::from(age < snapshot.ttl()),
+                        Some(age.as_secs_f64()),
+                        Some(quote.mid),
+                    )
                 }
-                SymbolQuote::Missing | SymbolQuote::Invalid { .. } => (0, 0, None),
+                SymbolQuote::Missing | SymbolQuote::Invalid { .. } => (0, 0, None, None),
             };
             let _ = writeln!(
                 body,
@@ -342,6 +347,11 @@ impl FeedMetrics {
                     body,
                     "solver_price_quote_age_seconds{{symbol=\"{symbol}\"}} {age}"
                 );
+            }
+            // The mid the matcher clears at, in Binance's own units, so an outside
+            // venue can be compared with what we actually use.
+            if let Some(mid) = mid {
+                let _ = writeln!(body, "solver_price_quote_mid{{symbol=\"{symbol}\"}} {mid}");
             }
         }
     }

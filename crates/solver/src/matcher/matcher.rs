@@ -1,5 +1,6 @@
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use strum::{EnumCount, IntoEnumIterator};
 use tokio::sync::mpsc::error::TrySendError;
@@ -12,11 +13,17 @@ use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, ClearingOutcome, PairAmounts, PairMatcher,
     SkipReason,
 };
+use crate::maker::MakerId;
 use crate::price::{PriceSnapshot, PriceUnavailable};
 use crate::swap_eta::DepthChange;
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Matching ticks run, including skipped ones; it stops moving if the matcher stalls.
+static TICKS: AtomicU64 = AtomicU64::new(0);
+/// When the order matched longest ago and still not settled was first
+/// matched (Unix ms; 0: none). Published at the end of every tick.
+static OLDEST_MATCHED_MS: AtomicU64 = AtomicU64::new(0);
 static ORDERED_UPDATE_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
     [const { AtomicU64::new(0) }; PriceUnavailable::COUNT];
@@ -25,6 +32,13 @@ static BOUNDED_FALLBACKS: [AtomicU64; MidFallback::COUNT] =
     [const { AtomicU64::new(0) }; MidFallback::COUNT];
 static WALK_SIT_OUTS: AtomicU64 = AtomicU64::new(0);
 static WALK_BENCHED_FILLED: AtomicU64 = AtomicU64::new(0);
+/// Each maker's live orders, published every [`BOOK_GAUGES_EVERY`]. A maker
+/// seen since start stays listed, at 0 once it has none.
+static MAKER_LIVE_ORDERS: LazyLock<Mutex<BTreeMap<MakerId, u64>>> = LazyLock::new(Mutex::default);
+static ORDERS_ON_UNCONFIGURED_PAIRS: AtomicU64 = AtomicU64::new(0);
+/// How often the book's gauges are counted: they need not move every tick,
+/// and counting them less often keeps their cost off the matching path.
+const BOOK_GAUGES_EVERY: Duration = Duration::from_secs(1);
 
 /// Why a pair with a band cleared at the mid after all (ADR 0007).
 #[derive(Clone, Copy, Debug, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter)]
@@ -38,6 +52,19 @@ enum MidFallback {
     WalkError,
 }
 
+pub(crate) fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Seconds since the order matched longest ago, and still not settled, was
+/// first matched, aged at `now_ms`; 0 when there is none.
+pub(crate) fn oldest_matched_order_age_secs(now_ms: u64) -> u64 {
+    match OLDEST_MATCHED_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        since => now_ms.saturating_sub(since) / 1000,
+    }
+}
+
 pub(crate) fn skipped_executor_full_ticks() -> u64 {
     SKIPPED_EXECUTOR_FULL_TICKS.load(Ordering::Relaxed)
 }
@@ -45,6 +72,43 @@ pub(crate) fn skipped_executor_full_ticks() -> u64 {
 /// Backlog on the ordered book/maker update stream at the last tick.
 pub(crate) fn ordered_update_backlog() -> u64 {
     ORDERED_UPDATE_BACKLOG.load(Ordering::Relaxed)
+}
+
+/// Each maker's orders the matcher could choose at the last count.
+pub(crate) fn maker_live_orders() -> Vec<(MakerId, u64)> {
+    let live = MAKER_LIVE_ORDERS.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter()
+        .map(|(maker_id, count)| (*maker_id, *count))
+        .collect()
+}
+
+/// Matchable orders on pairs this solver does not clear, at the last count.
+pub(crate) fn orders_on_unconfigured_pairs() -> u64 {
+    ORDERS_ON_UNCONFIGURED_PAIRS.load(Ordering::Relaxed)
+}
+
+/// Count the book's gauges: orders on pairs outside the clearing plan, and
+/// each maker's live orders.
+fn publish_book_gauges(book: &ClearingBook, prices: &PriceSnapshot) {
+    let configured: HashSet<(TokenId, TokenId)> = prices
+        .markets()
+        .clearing_pairs()
+        .flat_map(|(a, b)| [(a, b), (b, a)])
+        .collect();
+    ORDERS_ON_UNCONFIGURED_PAIRS.store(book.orders_outside(&configured), Ordering::Relaxed);
+    let live = book.live_orders_per_maker();
+    merge_live_orders(
+        &mut MAKER_LIVE_ORDERS.lock().unwrap_or_else(|e| e.into_inner()),
+        live,
+    );
+}
+
+/// The new count replaces the old; a maker missing from it drops to 0.
+fn merge_live_orders(published: &mut BTreeMap<MakerId, u64>, live: BTreeMap<MakerId, u64>) {
+    for count in published.values_mut() {
+        *count = 0;
+    }
+    published.extend(live);
 }
 
 /// Pairs skipped for want of a usable price, per reason.
@@ -134,6 +198,7 @@ pub(super) async fn run_worker(
         book.insert_or_skip(order);
     }
     let mut interval = tokio::time::interval(match_interval);
+    let mut book_gauges_at: Option<Instant> = None;
     loop {
         // Update the book immediately; run matching only on the batch timer.
         // The timer precedes new receives so a busy producer cannot postpone
@@ -141,6 +206,7 @@ pub(super) async fn run_worker(
         tokio::select! {
             biased;
             _ = interval.tick() => {
+                TICKS.fetch_add(1, Ordering::Relaxed);
                 let now = now_millis();
                 ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
                 book.apply_pending(&mut book_rx);
@@ -158,6 +224,11 @@ pub(super) async fn run_worker(
                     if let Some(routing) = runtime.routing.as_mut() {
                         routing.dispatch(&mut book, now_millis()).map_err(MatcherError::Routing)?;
                     }
+                }
+                OLDEST_MATCHED_MS.store(book.oldest_matched_since().unwrap_or(0), Ordering::Relaxed);
+                if book_gauges_at.is_none_or(|at| at.elapsed() >= BOOK_GAUGES_EVERY) {
+                    publish_book_gauges(&book, &runtime.prices.borrow());
+                    book_gauges_at = Some(Instant::now());
                 }
             }
             update = book_rx.recv() => {
@@ -235,6 +306,7 @@ pub(super) fn internal_clear(
         included_pairs += 1;
     }
     if combined.filled_notes.is_empty() {
+        book.track_matched(&[], now_millis());
         return Ok(());
     }
     let sent: Vec<_> = combined
@@ -260,6 +332,7 @@ pub(super) fn internal_clear(
     for note_id in sent.iter().chain(&self_trade_cancels) {
         book.deactivate(*note_id);
     }
+    book.track_matched(&sent, now_millis());
     tracing::info!(
         pairs = included_pairs,
         orders = sent.len(),
@@ -1086,5 +1159,13 @@ mod tests {
             assert!(book.tick(30, false).contains(&x_ask));
             assert!(walk_benched_filled() > before);
         }
+    }
+
+    #[test]
+    fn a_maker_with_no_live_orders_stays_listed_at_zero() {
+        let mut published = BTreeMap::new();
+        merge_live_orders(&mut published, BTreeMap::from([(7, 2), (8, 1)]));
+        merge_live_orders(&mut published, BTreeMap::from([(7, 3)]));
+        assert_eq!(published, BTreeMap::from([(7, 3), (8, 0)]));
     }
 }

@@ -82,6 +82,13 @@ impl MakerIndex {
         self.entries.get(id).and_then(|entry| entry.tag)
     }
 
+    /// How many book entries each maker has (live or not).
+    pub(super) fn entry_counts(&self) -> impl Iterator<Item = (MakerId, u64)> + '_ {
+        self.by_maker
+            .iter()
+            .map(|(maker_id, ids)| (*maker_id, ids.len() as u64))
+    }
+
     pub(super) fn raise_cutoff(&mut self, maker_id: MakerId, scope: CutoffScope, cutoff: u64) {
         if scope.market.is_empty() && scope.direction.is_empty() {
             let barrier = self.global_cutoffs.entry(maker_id).or_default();

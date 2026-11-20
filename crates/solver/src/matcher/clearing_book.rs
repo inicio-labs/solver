@@ -1,4 +1,4 @@
-use std::collections::{btree_map, BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
 
 use miden_protocol::note::NoteId;
 use tokio::sync::mpsc;
@@ -33,6 +33,16 @@ pub(crate) struct ClearingBook {
     /// Where index changes go for the price API's depth mirror. Sending never
     /// blocks; a closed receiver is ignored.
     depth_tx: Option<mpsc::UnboundedSender<DepthChange>>,
+    /// When each order was first matched (Unix ms), kept while the matcher
+    /// keeps choosing it: in flight, or back and chosen again. Forgotten when
+    /// the order leaves the book, or when it is back and a clearing tick does
+    /// not choose it (for whatever reason: price, window, no counterparty).
+    /// In memory only: a restart starts it again.
+    matched_since: HashMap<NoteId, u64>,
+    /// Orders kept but off the matchable index: in a settlement, sat out
+    /// awaiting their cancel, or routed. Small, so counting live maker orders
+    /// costs the makers and these, not the whole book.
+    inactive: HashSet<NoteId>,
 }
 
 impl ClearingBook {
@@ -157,6 +167,7 @@ impl ClearingBook {
             .get_mut(&id)
             .ok_or(ClearingError::InternalInvariant("missing indexed order"))?
             .activate();
+        self.inactive.remove(&id);
         Ok(())
     }
 
@@ -166,6 +177,7 @@ impl ClearingBook {
             // The order record remains for recovery, but the active index must
             // no longer expose it to matching or RFQ.
             order.deactivate();
+            self.inactive.insert(id);
             self.remove_from_index(pair, key, id);
         }
     }
@@ -250,10 +262,60 @@ impl ClearingBook {
 
     pub fn remove(&mut self, id: NoteId) {
         self.makers.forget(id);
+        self.matched_since.remove(&id);
+        self.inactive.remove(&id);
         if let Some(order) = self.orders.remove(&id) {
             let (pair, key) = order.index_key();
             self.remove_from_index(pair, key, id);
         }
+    }
+
+    /// After a clearing tick that sent `sent`: start the clock of each order
+    /// matched for the first time, and stop it for any order back in the
+    /// book that the tick did not choose.
+    pub(super) fn track_matched(&mut self, sent: &[NoteId], now_ms: u64) {
+        let sent: HashSet<NoteId> = sent.iter().copied().collect();
+        let orders = &self.orders;
+        self.matched_since.retain(|id, _| {
+            orders
+                .get(id)
+                .is_some_and(|order| !order.is_active() || sent.contains(id))
+        });
+        for id in sent {
+            self.matched_since.entry(id).or_insert(now_ms);
+        }
+    }
+
+    /// When the order matched longest ago and still not settled was first
+    /// matched (Unix ms).
+    pub(super) fn oldest_matched_since(&self) -> Option<u64> {
+        self.matched_since.values().copied().min()
+    }
+
+    /// Each maker's orders the matcher can choose now: its entries less those
+    /// off the index. Costs the makers plus the inactive orders, not the book.
+    pub(super) fn live_orders_per_maker(&self) -> BTreeMap<MakerId, u64> {
+        let mut live: BTreeMap<MakerId, u64> = self.makers.entry_counts().collect();
+        for id in &self.inactive {
+            if let Some(count) = self
+                .makers
+                .tag(id)
+                .and_then(|tag| live.get_mut(&tag.maker_id))
+            {
+                *count = count.saturating_sub(1);
+            }
+        }
+        live
+    }
+
+    /// Matchable orders on a pair outside `configured`, which must list both
+    /// token orders of each pair: users' orders this solver never clears.
+    pub(super) fn orders_outside(&self, configured: &HashSet<(TokenId, TokenId)>) -> u64 {
+        self.pairs
+            .iter()
+            .filter(|(pair, _)| !configured.contains(pair))
+            .map(|(_, index)| index.len() as u64)
+            .sum()
     }
 
     fn admit<'a>(
@@ -708,6 +770,47 @@ mod tests {
         routing.release_expired(&mut book, 111).unwrap();
         assert!(book.orders.is_empty());
         assert!(book.levels().is_empty());
+    }
+
+    /// Live = matchable now: off the index (sent to the executor, or a
+    /// sit-out awaiting its cancel) is not live; a give-back is again.
+    #[test]
+    fn live_orders_per_maker_and_orders_outside_the_plan() {
+        let mut rng = RandomCoin::new(Word::default());
+        let mut book = ClearingBook::default();
+        let a1 = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
+        let a2 = tagged(fixture(false, 10, 19, 2, &mut rng), 7, 2);
+        let b1 = tagged(fixture(true, 30, 10, 3, &mut rng), 8, 1);
+        let user = fixture(true, 30, 11, 4, &mut rng);
+        for order in [&a1, &a2, &b1, &user] {
+            book.insert_or_skip(order);
+        }
+        let live = |book: &ClearingBook| book.live_orders_per_maker();
+        assert_eq!(live(&book), BTreeMap::from([(7, 2), (8, 1)]));
+
+        book.deactivate(a1.id());
+        book.track_matched(&[a1.id()], 1);
+        assert_eq!(live(&book), BTreeMap::from([(7, 1), (8, 1)]));
+        // A sit-out leaves the index without being matched.
+        book.deactivate(a2.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 0), (8, 1)]));
+        book.reactivate(a1.id()).unwrap();
+        book.reactivate(a2.id()).unwrap();
+        assert_eq!(live(&book), BTreeMap::from([(7, 2), (8, 1)]));
+        book.remove(b1.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 2)]));
+        book.deactivate(a1.id());
+        book.remove(a1.id());
+        assert_eq!(live(&book), BTreeMap::from([(7, 1)]));
+        assert!(book.inactive.is_empty());
+
+        let a: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+        let b: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        assert_eq!(book.orders_outside(&HashSet::from([(a, b), (b, a)])), 0);
+        // Not configured: every matchable order on it counts, both sides.
+        assert_eq!(book.orders_outside(&HashSet::new()), 2);
+        book.deactivate(user.id());
+        assert_eq!(book.orders_outside(&HashSet::new()), 1);
     }
 
     pub(super) fn tagged(mut order: BookOrder, maker_id: MakerId, root_seq: u64) -> BookOrder {
@@ -1714,6 +1817,83 @@ mod tests {
     }
 
     #[test]
+    fn the_matched_clock_runs_until_the_order_settles_or_is_passed_over() {
+        use crate::matcher::matcher::internal_clear;
+        use crate::price::PriceSnapshot;
+        let mut rng = RandomCoin::new(Word::default());
+        let seller = eligible(false, 1, &mut rng);
+        let buyer = eligible(true, 2, &mut rng);
+        let (base, quote) = Order::from_book_order(&seller).unwrap().index_key().0;
+        let quote_at_two = [(base, quote, "2", std::time::Instant::now())];
+        let runtime = |priced: bool| ClearingRuntime {
+            bootstrap: tokio::sync::oneshot::channel().1,
+            prices: watch::channel(Arc::new(PriceSnapshot::for_tests(
+                if priced { &quote_at_two[..] } else { &[] },
+                &[],
+                Duration::from_secs(3_600),
+            )))
+            .1,
+            config: ClearingConfig::default(),
+            maker_settlement_buffer_ms: 0,
+            routing: None,
+        };
+        let (priced, unpriced) = (runtime(true), runtime(false));
+        let (exec_tx, mut exec_rx) = mpsc::channel(1);
+        let mut book = ClearingBook::default();
+        book.insert_or_skip(&seller);
+        book.insert_or_skip(&buyer);
+        let back = |book: &mut ClearingBook, orders: Vec<BookOrder>| {
+            book.apply(BookUpdate {
+                removed: Vec::new(),
+                active: orders,
+                maker_updates: Vec::new(),
+            })
+        };
+        assert_eq!(book.oldest_matched_since(), None);
+
+        // Matched: the clock starts.
+        internal_clear(&mut book, &priced, &exec_tx).unwrap();
+        exec_rx.try_recv().expect("the two orders cross");
+        let first = book.oldest_matched_since().expect("the clock started");
+
+        // Released and matched again: the clock keeps its start.
+        back(&mut book, vec![seller.clone(), buyer.clone()]);
+        internal_clear(&mut book, &priced, &exec_tx).unwrap();
+        exec_rx.try_recv().expect("matched again");
+        assert_eq!(book.oldest_matched_since(), Some(first));
+
+        // Back again, and a tick without a price for the pair does not
+        // choose them: the clock stops (the price has its own alert).
+        back(&mut book, vec![seller.clone(), buyer.clone()]);
+        internal_clear(&mut book, &unpriced, &exec_tx).unwrap();
+        assert!(exec_rx.try_recv().is_err());
+        assert_eq!(book.oldest_matched_since(), None);
+
+        // Matched again, back, and the buyer is gone: a priced tick passes
+        // the seller over, and its clock stops.
+        internal_clear(&mut book, &priced, &exec_tx).unwrap();
+        exec_rx.try_recv().expect("matched again");
+        assert!(book.oldest_matched_since().unwrap() >= first);
+        book.remove(buyer.id());
+        back(&mut book, vec![seller.clone()]);
+        internal_clear(&mut book, &priced, &exec_tx).unwrap();
+        assert!(exec_rx.try_recv().is_err());
+        assert_eq!(book.oldest_matched_since(), None);
+
+        // Matched and settled: the order leaves the book, and its clock too.
+        book.insert_or_skip(&buyer);
+        internal_clear(&mut book, &priced, &exec_tx).unwrap();
+        exec_rx.try_recv().expect("the two orders cross");
+        assert!(book.oldest_matched_since().is_some());
+        book.apply(BookUpdate {
+            removed: vec![seller.id(), buyer.id()],
+            active: Vec::new(),
+            maker_updates: Vec::new(),
+        });
+        assert_eq!(book.oldest_matched_since(), None);
+    }
+
+    #[test]
     fn a_kept_fill_carries_the_sit_outs_until_the_executor_answers() {
         use crate::matcher::matcher::internal_clear;
         use crate::price::PriceSnapshot;
@@ -2003,5 +2183,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod metrics_cost;
 #[cfg(test)]
 mod stp_scale;

@@ -4,7 +4,9 @@ use super::config::ClearingConfig;
 use super::envelope::ReachableFillMap;
 use super::order::MatchOrder;
 use super::settlement::PairLedger;
-use super::types::{BatchPrice, ClearingError, ClearingOutcome, SkipReason};
+use super::types::{
+    BatchPrice, CandidatePlan, ClearingError, ClearingOutcome, SettlementPlan, SkipReason,
+};
 use ruint::aliases::U256;
 
 const PRIORITY_RETRY_PARTS: usize = 5;
@@ -137,8 +139,9 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
         }
         // Payments round up and protocol payouts round down, and at one clearing
         // price the batch has no spread to absorb that, so the maximum-volume
-        // plan can come out a few units short. Shave the matched volume and plan
-        // again: every accepted plan still passes the same exact solvency check.
+        // plan can come out a few units short. Cover that by raising one partial
+        // order (`cover_rounding`); if that cannot, shave the matched volume and
+        // plan again. Every accepted plan passes the same exact solvency check.
         let price = self.batch.clearing_price;
         let mut buyer_cap = U256::MAX;
         let mut shortfall = None;
@@ -149,32 +152,40 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
                 break;
             };
 
+            let fee_ppm = self.config.protocol_fee_ppm;
             let seller_allocations =
                 seller_fills.allocate_by_priority(sell_orders, seller_quote_target)?;
             let buyer_allocations =
                 buyer_fills.allocate_by_priority(buy_orders, buyer_base_target)?;
-            let mut executions = Vec::new();
-            let mut ledger = PairLedger::default();
-            for (orders, allocations) in [
-                (sell_orders, &seller_allocations),
-                (buy_orders, &buyer_allocations),
-            ] {
-                for (order, &comparison_fill) in orders.iter().zip(allocations.iter()) {
-                    if let Some(execution) =
-                        order.execution(comparison_fill, self.config.protocol_fee_ppm)?
-                    {
-                        ledger.record(order.side(), &execution)?;
-                        executions.push(execution);
-                    }
-                }
-            }
-            match ledger.into_plan(executions).finalize() {
+            let plan = Self::plan(
+                sell_orders,
+                &seller_allocations,
+                buy_orders,
+                &buyer_allocations,
+                fee_ppm,
+            )?;
+            // A plan short by rounding is first covered by raising one order;
+            // if that cannot make it solvent, it is shaved as before, by the
+            // original plan's shortfall.
+            let finalized = match plan.finalize() {
+                Err(insolvent @ SkipReason::Insolvent { .. }) => Self::cover_rounding(
+                    sell_orders,
+                    &seller_allocations,
+                    buy_orders,
+                    &buyer_allocations,
+                    fee_ppm,
+                )?
+                .ok_or(insolvent),
+                finalized => finalized,
+            };
+            match finalized {
                 Ok(plan) => {
                     if attempt > 0 {
                         tracing::info!(
                             attempt,
                             %buyer_base_target,
-                            "clearing rounding shortfall resolved by shaving the matched volume"
+                            "clearing rounding shortfall could not be covered by raising one order; \
+                             resolved by shaving the matched volume"
                         );
                     }
                     return Ok(ClearingOutcome::Accepted(Box::new(plan)));
@@ -202,10 +213,135 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
             shortfall.unwrap_or(SkipReason::NoPositiveCross),
         ))
     }
+
+    fn plan(
+        sell_orders: &[MatchOrder<'_>],
+        seller_allocations: &[U256],
+        buy_orders: &[MatchOrder<'_>],
+        buyer_allocations: &[U256],
+        fee_ppm: u32,
+    ) -> Result<CandidatePlan, ClearingError> {
+        let mut executions = Vec::new();
+        let mut ledger = PairLedger::default();
+        for (orders, allocations) in [
+            (sell_orders, seller_allocations),
+            (buy_orders, buyer_allocations),
+        ] {
+            for (order, &comparison_fill) in orders.iter().zip(allocations) {
+                if let Some(execution) = order.execution(comparison_fill, fee_ppm)? {
+                    ledger.record(order.side(), &execution)?;
+                    executions.push(execution);
+                }
+            }
+        }
+        Ok(ledger.into_plan(executions))
+    }
+
+    /// PSWAP rounds each note's payout down, so the side that gives can come
+    /// out a unit or two short of what the other side is paid. Cover that
+    /// without shaving: raise the sellers' first partial order just enough to
+    /// give out the missing base, then the buyers' for the missing quote (a
+    /// raised seller is paid more quote, which the buyers give). In price-time
+    /// priority the first partial order is the last order with any fill.
+    ///
+    /// A raised order whose note would then give out everything it offers is
+    /// tried as a full fill first, so it is paid at the batch price rather
+    /// than at its own limit; if that plan is not solvent, the smallest fill
+    /// is used. `None` when neither gives a solvent plan.
+    fn cover_rounding(
+        sell_orders: &[MatchOrder<'_>],
+        seller_allocations: &[U256],
+        buy_orders: &[MatchOrder<'_>],
+        buyer_allocations: &[U256],
+        fee_ppm: u32,
+    ) -> Result<Option<SettlementPlan>, ClearingError> {
+        for whole_note_as_full_fill in [true, false] {
+            let mut sellers = seller_allocations.to_vec();
+            let mut buyers = buyer_allocations.to_vec();
+            let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
+            let mut raised_whole_note = Self::raise_first_partial(
+                sell_orders,
+                &mut sellers,
+                plan.shortfall().base,
+                fee_ppm,
+                whole_note_as_full_fill,
+            )?;
+            let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
+            raised_whole_note |= Self::raise_first_partial(
+                buy_orders,
+                &mut buyers,
+                plan.shortfall().quote,
+                fee_ppm,
+                whole_note_as_full_fill,
+            )?;
+            let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
+            if let Ok(plan) = plan.finalize() {
+                return Ok(Some(plan));
+            }
+            if !raised_whole_note {
+                // The second try would raise the same fills again.
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Raise the first partially filled order on one side so its note gives
+    /// out `short` more. Unfilled and fully filled orders are skipped. Returns
+    /// whether the raise jumped a whole note to a full fill.
+    fn raise_first_partial(
+        orders: &[MatchOrder<'_>],
+        allocations: &mut [U256],
+        short: u128,
+        fee_ppm: u32,
+        whole_note_as_full_fill: bool,
+    ) -> Result<bool, ClearingError> {
+        let Ok(short) = u64::try_from(short) else {
+            return Ok(false);
+        };
+        if short == 0 {
+            return Ok(false);
+        }
+        for (order, fill) in orders.iter().zip(allocations.iter_mut()) {
+            let maximum = order.fill_interval().maximum;
+            if *fill == maximum {
+                continue;
+            }
+            let Some(execution) = order.execution(*fill, fee_ppm)? else {
+                continue;
+            };
+            let Some(needed) = execution.release.amount().as_u64().checked_add(short) else {
+                return Ok(false);
+            };
+            let Some(raised) = order.fill_releasing(*fill, needed, fee_ppm)? else {
+                continue;
+            };
+            let whole_note = order
+                .execution(raised, fee_ppm)?
+                .is_some_and(|raised| raised.release.amount() == order.offered_amount());
+            let raised = if whole_note && whole_note_as_full_fill {
+                maximum
+            } else {
+                raised
+            };
+            tracing::debug!(
+                order_id = %order.order().id(),
+                from = %fill,
+                to = %raised,
+                short,
+                "clearing rounding shortfall covered by raising one partial order"
+            );
+            *fill = raised;
+            return Ok(whole_note && whole_note_as_full_fill);
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    mod rounding_props;
+
     use super::super::order::{Order, OrderSide};
     use super::*;
     use miden_protocol::account::AccountId;
@@ -818,9 +954,11 @@ mod tests {
     /// external mid and the mirror counters each with the full quote for 0.3%
     /// less base. Payment and payout rounding left the maximum-volume plan a few
     /// base units short, so the pair was skipped on every tick until the price
-    /// moved. A shaved re-plan must settle it at every price all orders accept.
+    /// moved. It must now settle at every price all orders accept (today by
+    /// raising one partial order; see `shave_still_runs_when_no_seller_can_be_raised`
+    /// for the shave).
     #[test]
-    fn rounding_shortfall_is_resolved_by_shaving_volume() {
+    fn rounding_shortfall_settles_at_every_eligible_price() {
         let (base, quote) = assets();
         let mut rng = RandomCoin::new(Word::default());
         let users = [(24_323_175u64, 733_570u64), (46_258_599, 1_395_300)];

@@ -353,6 +353,47 @@ impl MatchOrder<'_> {
         self.comparison_fills
     }
 
+    /// The smallest comparison fill, at least `current`, at which this note
+    /// gives out at least `release_needed`. `None` if even the whole order
+    /// gives out less.
+    ///
+    /// The note gives out `floor(payment * offered / requested)`, so it needs
+    /// a payment of `T = ceil(release_needed * requested / offered)`. A partial
+    /// fill pays `ceil(fill * payment_units / comparison_units)`, so the
+    /// smallest fill paying at least `T` is
+    /// `floor((T - 1) * comparison_units / payment_units) + 1`. The result is
+    /// checked with `execution`, which also covers the full-fill case.
+    pub(crate) fn fill_releasing(
+        &self,
+        current: U256,
+        release_needed: u64,
+        fee_ppm: u32,
+    ) -> Result<Option<U256>, ClearingError> {
+        let offered = self.order.offered_asset().amount().as_u64();
+        let requested = self.order.requested_asset().amount().as_u64();
+        if release_needed > offered {
+            return Ok(None);
+        }
+        let payment_needed = mul_div_ceil(release_needed, requested, offered)?;
+        let fill = if payment_needed == U256::ZERO {
+            current
+        } else {
+            mul_div_floor(
+                payment_needed - U256::ONE,
+                self.fill_scale.comparison_units,
+                self.fill_scale.payment_units,
+            )? + U256::ONE
+        };
+        let fill = fill
+            .max(current)
+            .max(self.comparison_fills.minimum)
+            .min(self.comparison_fills.maximum);
+        let Some(execution) = self.execution(fill, fee_ppm)? else {
+            return Ok(None);
+        };
+        Ok((execution.release.amount().as_u64() >= release_needed).then_some(fill))
+    }
+
     pub(crate) fn execution(
         &self,
         comparison_fill: U256,

@@ -66,13 +66,20 @@ fn split_residual(released: u128, paid: u128, fee_target: u128) -> (u128, u128) 
 }
 
 impl CandidatePlan {
+    /// How much more each side is paid than the other side's notes give out.
+    pub(crate) fn shortfall(&self) -> PairAmounts {
+        PairAmounts {
+            base: self.paid.base.saturating_sub(self.released.base),
+            quote: self.paid.quote.saturating_sub(self.released.quote),
+        }
+    }
+
     pub(crate) fn finalize(self) -> Result<SettlementPlan, SkipReason> {
-        let base_shortfall = self.paid.base.saturating_sub(self.released.base);
-        let quote_shortfall = self.paid.quote.saturating_sub(self.released.quote);
-        if base_shortfall > 0 || quote_shortfall > 0 {
+        let shortfall = self.shortfall();
+        if shortfall.base > 0 || shortfall.quote > 0 {
             return Err(SkipReason::Insolvent {
-                base_shortfall,
-                quote_shortfall,
+                base_shortfall: shortfall.base,
+                quote_shortfall: shortfall.quote,
             });
         }
         let (fee_base, surplus_base) = split_residual(

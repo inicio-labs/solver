@@ -914,24 +914,31 @@ mod tests {
                 whole: bool,
                 maker: Option<(MakerId, u64)>,
             ) -> NoteId {
-                self.priority += 1;
                 let base_units = 100_000 * lots;
                 let quote_units = 2 * (100_000 + tenths) as u64 * lots;
                 let (offered, requested) = if buy {
-                    (
-                        FungibleAsset::new(iusdt(), quote_units).unwrap(),
-                        FungibleAsset::new(imiden(), base_units).unwrap(),
-                    )
+                    (quote_units, base_units)
                 } else {
-                    (
-                        FungibleAsset::new(imiden(), base_units).unwrap(),
-                        FungibleAsset::new(iusdt(), quote_units).unwrap(),
-                    )
+                    (base_units, quote_units)
                 };
-                let step = if whole {
-                    requested.amount()
+                let minimum = if whole { requested } else { 1 };
+                self.order_in_units(buy, offered, requested, minimum, maker)
+                    .id()
+            }
+
+            fn order_in_units(
+                &mut self,
+                buy: bool,
+                offered: u64,
+                requested: u64,
+                minimum: u64,
+                maker: Option<(MakerId, u64)>,
+            ) -> BookOrder {
+                self.priority += 1;
+                let (from, to) = if buy {
+                    (iusdt(), imiden())
                 } else {
-                    AssetAmount::new(1).unwrap()
+                    (imiden(), iusdt())
                 };
                 let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
                     .try_into()
@@ -940,14 +947,14 @@ mod tests {
                     .sender(creator)
                     .storage(
                         PswapNoteStorage::builder()
-                            .min_requested_asset(requested)
-                            .min_fill_step(step)
+                            .min_requested_asset(FungibleAsset::new(to, requested).unwrap())
+                            .min_fill_step(AssetAmount::new(minimum).unwrap())
                             .creator_account_id(creator)
                             .build(),
                     )
                     .serial_number(self.rng.draw_word())
                     .note_type(NoteType::Public)
-                    .offered_asset(offered)
+                    .offered_asset(FungibleAsset::new(from, offered).unwrap())
                     .build()
                     .unwrap()
                     .into();
@@ -962,7 +969,7 @@ mod tests {
                     }),
                 };
                 self.book.insert_or_skip(&order);
-                order.id()
+                order
             }
 
             /// One tick with the pair's band at `band_bps`, priced by a
@@ -975,6 +982,22 @@ mod tests {
                 } else {
                     PriceSnapshot::for_tests(&pairs, &[], ttl)
                 };
+                let batch = self.dispatch(snapshot, band_bps, ClearingConfig::default());
+                sorted(
+                    batch
+                        .into_iter()
+                        .flat_map(|b| b.filled_notes)
+                        .map(|f| f.note_id)
+                        .collect(),
+                )
+            }
+
+            fn dispatch(
+                &mut self,
+                snapshot: PriceSnapshot,
+                band_bps: u16,
+                config: ClearingConfig,
+            ) -> Option<ExecutionBatch> {
                 let rules = PairRules {
                     band_bps,
                     quote_ttl: None,
@@ -984,17 +1007,17 @@ mod tests {
                 let runtime = ClearingRuntime {
                     bootstrap: oneshot::channel().1,
                     prices: watch::channel(Arc::new(snapshot)).1,
-                    config: ClearingConfig::default(),
+                    config,
                     maker_settlement_buffer_ms: 0,
                     routing: None,
                 };
-                let (exec_tx, mut exec_rx) = mpsc::channel(1);
+                let (exec_tx, mut exec_rx) = mpsc::channel(2);
                 internal_clear(&mut self.book, &runtime, &exec_tx).unwrap();
-                let mut sent: Vec<_> = exec_rx
-                    .try_recv()
-                    .map(|batch| batch.filled_notes.iter().map(|f| f.note_id).collect())
-                    .unwrap_or_default();
-                sent.sort_unstable();
+                let sent = exec_rx.try_recv().ok();
+                assert!(matches!(
+                    exec_rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
                 sent
             }
 
@@ -1003,6 +1026,194 @@ mod tests {
                 self.book
                     .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100, true)
                     .unwrap()
+            }
+        }
+
+        // Each row is (side, units offered, units requested, minimum fill).
+        type Terms = (bool, u64, u64, u64);
+        const MID_303_ORDERS: [Terms; 4] = [
+            (SELL, 6, 17, 17),
+            (SELL, 17, 52, 16),
+            (BUY, 19, 6, 6),
+            (BUY, 29, 9, 0),
+        ];
+        const MID_12_ORDERS: [Terms; 4] = [
+            (SELL, 6, 71, 0),
+            (SELL, 20, 242, 0),
+            (BUY, 88, 7, 7),
+            (BUY, 144, 12, 0),
+        ];
+        const BAND_BPS: u16 = 100;
+
+        fn witness_book(
+            terms: [Terms; 4],
+            makers: [Option<(MakerId, u64)>; 4],
+        ) -> (Book, [BookOrder; 4]) {
+            let mut book = Book::new();
+            let orders = std::array::from_fn(|i| {
+                let (buy, offered, requested, minimum) = terms[i];
+                book.order_in_units(buy, offered, requested, minimum, makers[i])
+            });
+            (book, orders)
+        }
+
+        fn quote(mid: &str, received_at: Instant) -> PriceSnapshot {
+            PriceSnapshot::for_tests(
+                &[(imiden(), iusdt(), mid, received_at)],
+                &[],
+                Duration::from_secs(30),
+            )
+        }
+
+        fn proposal(book: &Book, snapshot: &PriceSnapshot) -> BoundedPrice {
+            let mid = snapshot
+                .pair_price(imiden(), iusdt(), Instant::now())
+                .unwrap();
+            let config = ClearingConfig::default();
+            book.book
+                .bounded_price(
+                    imiden(),
+                    iusdt(),
+                    mid,
+                    BAND_BPS,
+                    config.protocol_fee_ppm,
+                    config.max_orders_per_side,
+                    config.self_trade_prevention,
+                )
+                .unwrap()
+                .unwrap()
+        }
+
+        fn assert_payments(batch: &ExecutionBatch, expected: &[(NoteId, u64)]) {
+            assert_eq!(batch.group_ends, [expected.len()]);
+            assert_eq!(batch.filled_notes.len(), expected.len());
+            let payments: HashMap<_, _> = batch
+                .filled_notes
+                .iter()
+                .map(|fill| (fill.note_id, fill.requested_filled))
+                .collect();
+            assert_eq!(payments, expected.iter().copied().collect());
+        }
+
+        fn assert_mid_execution(
+            terms: [Terms; 4],
+            mid: &str,
+            walk_ratio: (u64, u64),
+            seller_payment: u64,
+        ) {
+            // Confirm the two note payments at the mid, then check which notes
+            // actually reach the executor when the walk proposes a different price.
+            for band in [0, BAND_BPS] {
+                let (mut book, [seller, _, _, buyer]) = witness_book(terms, [None; 4]);
+                let snapshot = quote(mid, Instant::now());
+                if band != 0 {
+                    let walk = BatchPrice::from_ratio(walk_ratio.0, walk_ratio.1).unwrap();
+                    assert_eq!(proposal(&book, &snapshot).price, walk);
+                }
+                let batch = book
+                    .dispatch(snapshot, band, ClearingConfig::default())
+                    .unwrap();
+                assert_payments(&batch, &[(seller.id(), seller_payment), (buyer.id(), 6)]);
+                assert!(batch.self_trade_cancels().is_empty());
+            }
+        }
+
+        #[test]
+        fn bounded_tick_preserves_the_303_mid_payments() {
+            assert_mid_execution(MID_303_ORDERS, "3.03", (52, 17), 18);
+        }
+
+        #[test]
+        fn bounded_tick_preserves_the_buyer_at_the_12_mid() {
+            assert_mid_execution(MID_12_ORDERS, "12", (121, 10), 72);
+        }
+
+        #[test]
+        fn fallback_cancels_only_the_sit_out_of_the_filled_maker() {
+            let (mut book, [seller, other_seller, other_buyer, buyer]) =
+                witness_book(MID_12_ORDERS, [Some((7, 2)), Some((8, 2)), None, None]);
+            let mid_sit_out = book.order_in_units(BUY, 12, 1, 1, Some((7, 1)));
+            let walk_sit_out = book.order_in_units(BUY, 121, 10, 10, Some((8, 1)));
+
+            let snapshot = quote("12", Instant::now());
+            let walk = proposal(&book, &snapshot);
+            assert_eq!(walk.price, BatchPrice::from_ratio(121, 10).unwrap());
+            assert!(walk.sit_outs.contains(&walk_sit_out.id()));
+
+            let batch = book
+                .dispatch(snapshot, BAND_BPS, ClearingConfig::default())
+                .unwrap();
+            assert_payments(&batch, &[(seller.id(), 72), (buyer.id(), 6)]);
+            for fill in batch.filled_notes {
+                let cancels: Vec<_> = fill.cancel_on_reserve.iter().map(BookOrder::id).collect();
+                if fill.note_id == seller.id() {
+                    assert_eq!(cancels, [mid_sit_out.id()]);
+                } else {
+                    assert!(cancels.is_empty());
+                }
+            }
+            let mut remaining = ClearingBook::default();
+            for order in [&other_seller, &other_buyer, &walk_sit_out] {
+                remaining.insert(order).unwrap();
+            }
+            assert_eq!(book.book.levels(), remaining.levels());
+        }
+
+        #[test]
+        fn orders_skipped_on_a_stale_quote_trade_on_a_fresh_quote() {
+            let mut book = Book::new();
+            let seller = book.order_in_units(SELL, 10, 15, 0, None);
+            let buyer = book.order_in_units(BUY, 15, 10, 0, None);
+            let levels = book.book.levels();
+            let config = ClearingConfig::default();
+
+            let stale = quote("1.51", Instant::now() - Duration::from_secs(31));
+            assert!(book.dispatch(stale, BAND_BPS, config).is_none());
+            assert_eq!(book.book.levels(), levels);
+
+            let fresh = quote("1.51", Instant::now());
+            let batch = book.dispatch(fresh, BAND_BPS, config).unwrap();
+            assert_payments(&batch, &[(seller.id(), 15), (buyer.id(), 10)]);
+        }
+
+        mod integer_completion_goals {
+            use super::*;
+
+            #[test]
+            #[ignore = "bounded-price clearing leaves a funded three-base buyer partially filled"]
+            fn bounded_tick_completes_the_original_three_base_buyer() {
+                let mut book = Book::new();
+                let seller = book.order_in_units(SELL, 10, 14, 0, None);
+                let buyer = book.order_in_units(BUY, 5, 3, 0, None);
+                book.order_in_units(BUY, 300, 200, 200, None);
+
+                // Paying five quote releases the seller's three base. Those three base
+                // complete the original buyer and release all five quote to the seller.
+                let snapshot = quote("1.51", Instant::now());
+                let batch = book
+                    .dispatch(snapshot, BAND_BPS, ClearingConfig::default())
+                    .expect("the bounded tick should dispatch the funded trade");
+                assert_payments(&batch, &[(seller.id(), 5), (buyer.id(), 3)]);
+            }
+        }
+
+        #[test]
+        fn crossing_prices_with_incompatible_minimums_dispatch_nothing() {
+            let mut book = Book::new();
+            book.order_in_units(SELL, 8, 11, 11, None);
+            book.order_in_units(BUY, 2, 1, 0, None);
+            book.order_in_units(BUY, 300, 200, 200, None);
+            let snapshot = quote("1.51", Instant::now());
+            assert_eq!(
+                proposal(&book, &snapshot).price,
+                BatchPrice::from_ratio(3, 2).unwrap()
+            );
+            let levels = book.book.levels();
+            for band in [0, BAND_BPS] {
+                assert!(book
+                    .dispatch(snapshot.clone(), band, ClearingConfig::default())
+                    .is_none());
+                assert_eq!(book.book.levels(), levels);
             }
         }
 

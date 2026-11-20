@@ -206,6 +206,8 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
 
 #[cfg(test)]
 mod tests {
+    mod integer_settlement_outcomes;
+
     use super::super::order::{Order, OrderSide};
     use super::*;
     use miden_protocol::account::AccountId;
@@ -260,6 +262,10 @@ mod tests {
     }
 
     fn batch<'a>(price: BatchPrice, orders: &'a [Order]) -> PairBatch<'a> {
+        batch_with_fee(price, orders, 0)
+    }
+
+    fn batch_with_fee(price: BatchPrice, orders: &[Order], fee_ppm: u32) -> PairBatch<'_> {
         let (base, _quote) = assets();
         let (mut sell_orders, mut buy_orders): (Vec<_>, Vec<_>) = orders
             .iter()
@@ -279,7 +285,7 @@ mod tests {
             .into_iter()
             .map(|order| {
                 order
-                    .prepare_if_eligible(OrderSide::SellBase, price, 0)
+                    .prepare_if_eligible(OrderSide::SellBase, price, fee_ppm)
                     .unwrap()
                     .unwrap()
             })
@@ -288,7 +294,7 @@ mod tests {
             .into_iter()
             .map(|order| {
                 order
-                    .prepare_if_eligible(OrderSide::BuyBase, price, 0)
+                    .prepare_if_eligible(OrderSide::BuyBase, price, fee_ppm)
                     .unwrap()
                     .unwrap()
             })

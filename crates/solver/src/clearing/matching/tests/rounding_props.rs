@@ -153,7 +153,8 @@ fn the_first_partial_is_raised_to_the_smallest_covering_fill() {
     let sellers = prepared(&orders);
     let full = sellers[0].fill_interval().maximum;
     let raise = |allocations: &mut Vec<U256>, short| {
-        PairMatcher::raise_first_partial(&sellers, allocations, short, 0, true).unwrap()
+        PairMatcher::raise_first_partial(&sellers, allocations, short, 0, WholeNote::AsFullFill)
+            .unwrap()
     };
 
     // One base short: 5 -> 6 (gives 7). Fill 5 gives only 5.
@@ -192,12 +193,21 @@ fn a_raise_that_spends_the_whole_note_can_be_a_full_fill() {
     let full = sellers[0].fill_interval().maximum;
 
     let mut allocations = fills(&[5]);
-    let whole = PairMatcher::raise_first_partial(&sellers, &mut allocations, 5, 0, true).unwrap();
+    let whole =
+        PairMatcher::raise_first_partial(&sellers, &mut allocations, 5, 0, WholeNote::AsFullFill)
+            .unwrap();
     assert!(whole);
     assert_eq!(allocations, vec![full]);
 
     let mut allocations = fills(&[5]);
-    let whole = PairMatcher::raise_first_partial(&sellers, &mut allocations, 5, 0, false).unwrap();
+    let whole = PairMatcher::raise_first_partial(
+        &sellers,
+        &mut allocations,
+        5,
+        0,
+        WholeNote::AsSmallestFill,
+    )
+    .unwrap();
     assert!(!whole);
     assert_eq!(
         allocations,
@@ -563,4 +573,22 @@ fn random_books_settle_with_valid_plans() {
             }
         }
     }
+}
+
+/// `min_fill_step` can leave two partial orders on a side: priority gives the
+/// first one less so the second reaches its minimum. The raise goes to the
+/// first in priority, not to the last order with a fill.
+#[test]
+fn the_raise_goes_to_the_first_of_two_partials() {
+    let orders = sellers_10_for_7(&[0, 5]);
+    let sellers = prepared(&orders);
+    let map = ReachableFillMap::build(&sellers, 1_000, 1_000_000).unwrap();
+    let mut allocations = map
+        .allocate_by_priority(&sellers, U256::from(12u64))
+        .unwrap();
+    assert_eq!(allocations, fills(&[5, 7]), "both orders partial");
+
+    PairMatcher::raise_first_partial(&sellers, &mut allocations, 1, 0, WholeNote::AsFullFill)
+        .unwrap();
+    assert_eq!(allocations, fills(&[6, 7]));
 }

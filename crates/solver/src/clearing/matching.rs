@@ -168,14 +168,29 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
             // if that cannot make it solvent, it is shaved as before, by the
             // original plan's shortfall.
             let finalized = match plan.finalize() {
-                Err(insolvent @ SkipReason::Insolvent { .. }) => Self::cover_rounding(
-                    sell_orders,
-                    &seller_allocations,
-                    buy_orders,
-                    &buyer_allocations,
-                    fee_ppm,
-                )?
-                .ok_or(insolvent),
+                Err(
+                    insolvent @ SkipReason::Insolvent {
+                        base_shortfall,
+                        quote_shortfall,
+                    },
+                ) => {
+                    let covered = Self::cover_rounding(
+                        sell_orders,
+                        &seller_allocations,
+                        buy_orders,
+                        &buyer_allocations,
+                        fee_ppm,
+                    )?;
+                    if covered.is_some() {
+                        tracing::info!(
+                            attempt,
+                            base_shortfall,
+                            quote_shortfall,
+                            "clearing rounding shortfall covered by raising one partial order"
+                        );
+                    }
+                    covered.ok_or(insolvent)
+                }
                 finalized => finalized,
             };
             match finalized {
@@ -241,13 +256,16 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
     /// out a unit or two short of what the other side is paid. Cover that
     /// without shaving: raise the sellers' first partial order just enough to
     /// give out the missing base, then the buyers' for the missing quote (a
-    /// raised seller is paid more quote, which the buyers give). In price-time
-    /// priority the first partial order is the last order with any fill.
+    /// raised seller is paid more quote, which the buyers give). The first
+    /// partial order is the first in price-time priority with a fill below its
+    /// maximum; unfilled orders are skipped. `min_fill_step` can leave a later
+    /// order partly filled too, and the earlier one is raised.
     ///
     /// A raised order whose note would then give out everything it offers is
-    /// tried as a full fill first, so it is paid at the batch price rather
-    /// than at its own limit; if that plan is not solvent, the smallest fill
-    /// is used. `None` when neither gives a solvent plan.
+    /// tried as a full fill first ([`WholeNote::AsFullFill`]), so it is paid at
+    /// the batch price rather than at its own limit; if that plan is not
+    /// solvent, the smallest fill is used ([`WholeNote::AsSmallestFill`]).
+    /// `None` when neither gives a solvent plan.
     fn cover_rounding(
         sell_orders: &[MatchOrder<'_>],
         seller_allocations: &[U256],
@@ -255,31 +273,32 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
         buyer_allocations: &[U256],
         fee_ppm: u32,
     ) -> Result<Option<SettlementPlan>, ClearingError> {
-        for whole_note_as_full_fill in [true, false] {
+        for whole_note in [WholeNote::AsFullFill, WholeNote::AsSmallestFill] {
             let mut sellers = seller_allocations.to_vec();
             let mut buyers = buyer_allocations.to_vec();
             let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
-            let mut raised_whole_note = Self::raise_first_partial(
+            let mut jumped_to_full_fill = Self::raise_first_partial(
                 sell_orders,
                 &mut sellers,
                 plan.shortfall().base,
                 fee_ppm,
-                whole_note_as_full_fill,
+                whole_note,
             )?;
             let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
-            raised_whole_note |= Self::raise_first_partial(
+            jumped_to_full_fill |= Self::raise_first_partial(
                 buy_orders,
                 &mut buyers,
                 plan.shortfall().quote,
                 fee_ppm,
-                whole_note_as_full_fill,
+                whole_note,
             )?;
             let plan = Self::plan(sell_orders, &sellers, buy_orders, &buyers, fee_ppm)?;
             if let Ok(plan) = plan.finalize() {
                 return Ok(Some(plan));
             }
-            if !raised_whole_note {
-                // The second try would raise the same fills again.
+            if !jumped_to_full_fill {
+                // The two tries differ only where a raise jumped to a full
+                // fill; without one, the smallest-fill try is this same plan.
                 break;
             }
         }
@@ -288,13 +307,14 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
 
     /// Raise the first partially filled order on one side so its note gives
     /// out `short` more. Unfilled and fully filled orders are skipped. Returns
-    /// whether the raise jumped a whole note to a full fill.
+    /// whether the raise jumped to a full fill (only with
+    /// [`WholeNote::AsFullFill`]).
     fn raise_first_partial(
         orders: &[MatchOrder<'_>],
         allocations: &mut [U256],
         short: u128,
         fee_ppm: u32,
-        whole_note_as_full_fill: bool,
+        whole_note: WholeNote,
     ) -> Result<bool, ClearingError> {
         let Ok(short) = u64::try_from(short) else {
             return Ok(false);
@@ -316,26 +336,34 @@ impl<'batch, 'order> PairMatcher<'batch, 'order> {
             let Some(raised) = order.fill_releasing(*fill, needed, fee_ppm)? else {
                 continue;
             };
-            let whole_note = order
+            let spends_whole_note = order
                 .execution(raised, fee_ppm)?
                 .is_some_and(|raised| raised.release.amount() == order.offered_amount());
-            let raised = if whole_note && whole_note_as_full_fill {
-                maximum
-            } else {
-                raised
-            };
+            let jumped_to_full_fill = spends_whole_note && whole_note == WholeNote::AsFullFill;
+            let raised = if jumped_to_full_fill { maximum } else { raised };
             tracing::debug!(
                 order_id = %order.order().id(),
                 from = %fill,
                 to = %raised,
                 short,
-                "clearing rounding shortfall covered by raising one partial order"
+                "raising one partial order to cover a clearing rounding shortfall"
             );
             *fill = raised;
-            return Ok(whole_note && whole_note_as_full_fill);
+            return Ok(jumped_to_full_fill);
         }
         Ok(false)
     }
+}
+
+/// How `cover_rounding` makes a raise whose note would give out everything it
+/// offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WholeNote {
+    /// As a full fill, paid at the batch price.
+    AsFullFill,
+    /// As the smallest fill that covers the shortfall, paid at the order's own
+    /// limit.
+    AsSmallestFill,
 }
 
 #[cfg(test)]

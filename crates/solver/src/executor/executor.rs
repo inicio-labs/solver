@@ -697,6 +697,30 @@ fn split_batch(batch: &mut ExecutionBatch) -> ExecResult<Vec<ExecutionBatch>> {
         .collect())
 }
 
+/// Pure preflight for the optional planner winner. Reuses the exact executor
+/// group, PSWAP, flow and request guards without touching stores/reservations.
+/// Sender is a structural consumer identity only: the executor repeats prepare
+/// with its real account before reservation; output IDs are not cached here.
+pub(crate) fn validate_completion_repair(mut batch: ExecutionBatch) -> ExecResult<()> {
+    let consumer = batch
+        .filled_notes
+        .first()
+        .ok_or(SettlementError::InvalidExecutionGroupBoundary {
+            previous: 0,
+            end: 0,
+            total: 0,
+        })?
+        .note
+        .metadata()
+        .sender();
+    let groups = split_batch(&mut batch)?;
+    for group in groups {
+        let parts = BatchComponents::prepare(&group, consumer)?;
+        parts.request()?;
+    }
+    Ok(())
+}
+
 /// One transaction per pair group of an already split transaction.
 fn pair_groups(batch: ExecutionBatch) -> Vec<ExecutionBatch> {
     let mut notes = batch.filled_notes.into_iter();

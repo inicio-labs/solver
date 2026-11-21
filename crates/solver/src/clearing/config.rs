@@ -7,6 +7,8 @@ pub const DEFAULT_MAX_TOTAL_INTERVALS_PER_SIDE: usize = 50_000;
 #[derive(Clone, Copy, Debug)]
 pub struct ClearingConfig {
     pub protocol_fee_ppm: u32,
+    /// Opt-in, bounded threshold-only completion repair. Default false.
+    pub integer_completion_repair: bool,
     pub max_orders_per_side: usize,
     pub max_total_intervals: usize,
     /// Self-trade prevention for maker orders (ADR 0005).
@@ -29,6 +31,7 @@ impl Default for ClearingConfig {
     fn default() -> Self {
         Self {
             protocol_fee_ppm: 0,
+            integer_completion_repair: false,
             max_orders_per_side: DEFAULT_MAX_ORDERS_PER_SIDE,
             max_total_intervals: DEFAULT_MAX_TOTAL_INTERVALS_PER_SIDE,
             self_trade_prevention: true,

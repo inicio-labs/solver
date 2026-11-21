@@ -67,6 +67,8 @@ fetch_interval_ms = 3000
 # token decimals. A missing or stale price leaves the pair's orders in the live book.
 # Protocol fee and minimum price edge in ppm; zero disables fees.
 clearing_fee_ppm = 0
+# Optional threshold-only integer completion repair; keep off until qualified.
+clearing_integer_completion_repair = false
 # Admin HTTP server port (binds 127.0.0.1 only). Defaults to 3001.
 admin_port = 3001
 # debug_mode is ignored since Miden 0.16 (miden-client removed debug mode); a

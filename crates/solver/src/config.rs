@@ -405,6 +405,9 @@ pub struct EngineConfig {
     /// `true`; `false` matches as before.
     #[serde(default = "default_maker_self_trade_prevention")]
     pub maker_self_trade_prevention: bool,
+    /// Bounded exact-threshold integer completion repair. Default false.
+    #[serde(default)]
+    pub clearing_integer_completion_repair: bool,
     /// Maker orders with a private note go live when the gateway accepts
     /// them, before their note is in a block (ADR 0008). Needs the gateway.
     /// Default `false`: an order goes live once its note is in a block.

@@ -353,6 +353,78 @@ impl MatchOrder<'_> {
         self.comparison_fills
     }
 
+    /// One candidate only: the smallest comparison allocation releasing the
+    /// deficit. Canonical completion must still pay exactly the threshold T;
+    /// a full-price jump above T is outside this policy.
+    pub(crate) fn release_threshold(
+        &self,
+        old_comparison: U256,
+        missing: u128,
+        fee_ppm: u32,
+    ) -> Result<Option<U256>, ClearingError> {
+        let Some(old) = self.execution(old_comparison, fee_ppm)? else {
+            return Ok(None);
+        };
+        let offered = self.offered_amount().as_u64();
+        let requested = self.order.requested_asset().amount().as_u64();
+        let release = u128::from(old.release.amount().as_u64())
+            .checked_add(missing)
+            .ok_or(ClearingError::ArithmeticOverflow)?;
+        if missing == 0 || release > u128::from(offered) {
+            return Ok(None);
+        }
+        let threshold = mul_div_ceil(U256::from(release), requested, offered)?
+            .max(U256::from(
+                self.order
+                    .pswap
+                    .storage()
+                    .min_fill_step()
+                    .as_u64()
+                    .min(requested),
+            ))
+            .max(U256::ONE);
+        let old_payment = U256::from(old.payment.amount().as_u64());
+        if threshold <= old_payment
+            || threshold - old_payment > mul_div_ceil(U256::from(missing), requested, offered)?
+        {
+            return Ok(None);
+        }
+        let interval = self.comparison_fills;
+        let mut comparison = if threshold >= U256::from(requested) {
+            interval.maximum
+        } else {
+            mul_div_floor(
+                threshold - U256::ONE,
+                self.fill_scale.comparison_units,
+                self.fill_scale.payment_units,
+            )?
+            .checked_add(U256::ONE)
+            .ok_or(ClearingError::ArithmeticOverflow)?
+            .max(
+                old_comparison
+                    .checked_add(U256::ONE)
+                    .ok_or(ClearingError::ArithmeticOverflow)?,
+            )
+            .max(interval.minimum)
+        };
+        if comparison > interval.maximum {
+            return Ok(None);
+        }
+        let Some(execution) = self.execution(comparison, fee_ppm)? else {
+            return Ok(None);
+        };
+        if execution.payment.amount().as_u64() >= requested {
+            comparison = interval.maximum;
+        }
+        if comparison <= old_comparison || comparison < interval.minimum {
+            return Ok(None);
+        }
+        let Some(execution) = self.execution(comparison, fee_ppm)? else {
+            return Ok(None);
+        };
+        Ok((U256::from(execution.payment.amount().as_u64()) == threshold).then_some(comparison))
+    }
+
     pub(crate) fn execution(
         &self,
         comparison_fill: U256,

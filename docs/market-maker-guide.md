@@ -106,7 +106,7 @@ sequenceDiagram
 ```
 
 - Steps 1 and 3 can happen in either order. Your note may already be on chain when you submit it, or it may arrive later.
-- After step 2 the order is stored, but it isn't live and isn't filled. On a solver with [live at accept](#13-orders-live-at-accept) on, a private order goes live right after step 2, and you send your transaction first.
+- After step 2 the order is stored, but it isn't live and isn't filled. On a solver with [live at accept](#13-orders-live-at-accept) on, the order goes live right after step 2, and you send your transaction first.
 - Book a fill only at the last step, `SettlementResolved` with `committed = true`.
 - If only part of the order filled, the remainder trades on as the same order (the same lineage) and repeats steps 6 to 9.
 - You can cancel at any point with `CancelOrder` or `CancelAll`.
@@ -267,26 +267,26 @@ For each command in your journal without a reply, either resend it unchanged, or
 
 | Field | Notes |
 |---|---|
-| `note` | The canonical serialization of a Miden `Note`. Not a `NoteFile`, a note ID or a transaction. A PSWAP note for one of our supported pairs; we recommend a private note (see below). |
+| `note` | The canonical serialization of a Miden `Note`. Not a `NoteFile`, a note ID or a transaction. A **private** PSWAP note for one of our supported pairs (see below). |
 | `expires_at_unix_ms` | Optional. Omit it for no expiry. The solver applies it off-chain; the note itself never expires on chain. See [section 11](#11-order-expiry). |
 
 This call doesn't fund or publish your note. You create, fund and commit it on chain with your own wallet. We watch the chain for that exact note, committed and unspent, and then make the order live. The note can already be on chain when you submit, or it can arrive later. Chain or RPC delays can postpone activation.
 
-If the note never commits (for example, your wallet's transaction failed), the order stays accepted, with no event, and isn't listed by `ListActiveMakerOrders`. Your journal is the only record of it. Set an expiry, or cancel it by its lineage if you give up on the note. With [live at accept](#13-orders-live-at-accept) on, a private order is live at once instead, and one whose note never commits is cancelled with `note_not_received`.
+If the note never commits (for example, your wallet's transaction failed), the order stays accepted, with no event, and isn't listed by `ListActiveMakerOrders`. Your journal is the only record of it. Set an expiry, or cancel it by its lineage if you give up on the note. With [live at accept](#13-orders-live-at-accept) on, the order is live at once instead, and one whose note never commits is cancelled with `note_not_received`.
 
 | Reply | What to do |
 |---|---|
-| `accepted` | Stored. The order is **not live and not filled** yet. You get `OrderStatus LIVE` once we see the note on chain (with [live at accept](#13-orders-live-at-accept) on, a private order goes live with this reply), unless a cancel covers it first. |
-| `already_registered` | An earlier submit already registered this order's lineage. If that was yours (for example, the same note under another request ID), nothing changes. If another maker registered it first, the order is theirs: they receive its events and can cancel it. With a private note, that can only happen if someone else has your note's bytes. |
+| `accepted` | Stored. The order is **not live and not filled** yet. You get `OrderStatus LIVE` once we see the note on chain (with [live at accept](#13-orders-live-at-accept) on, it goes live with this reply), unless a cancel covers it first. |
+| `already_registered` | An earlier submit already registered this order's lineage. If that was yours (for example, the same note under another request ID), nothing changes. If another maker registered it first, the order is theirs: they receive its events and can cancel it. That can only happen if someone else has your note's bytes. |
 
 Keep the original `Note` for every order. You need it to rebuild your output notes after a fill ([section 10](#10-settlement-accounting)).
 
-#### Private or public order notes
+#### Order notes are private
 
-We accept both, and we recommend **private** notes for market makers.
+We accept **private** order notes only. A public note is refused with `INVALID_ARGUMENT` ("maker order notes must be private"), and nothing is stored.
 
-- **Private:** your order's terms stay off chain until it fills. Events for each order arrive in a fixed order: `LIVE` first, then the settlement events.
-- **Public:** the terms are visible to everyone. We can match a public note as soon as we see it on chain, which can be before we have verified your submit. So `SettlementPending` can arrive before `LIVE`, and if the order fills before we verify it, you may never receive `LIVE`. Your settlement events are still complete. Send `SubmitOrder` before you commit a public note: until your submit is stored, the note has no maker ID, so [self-trade prevention](#12-self-trade-prevention) cannot group it with your other orders.
+- Your order's terms stay off chain until it fills.
+- Events for each order arrive in a fixed order: `LIVE` first, then the settlement events.
 
 #### Payback note type
 
@@ -426,7 +426,7 @@ This applies to both `CancelOrder` and `CancelAll`.
 
 - **It stops new matches.** Once you have the reply, no new settlement reserves any order the cancel covers.
 - **It doesn't stop a settlement already in flight.** `settling` counts your covered orders that were already reserved and may still fill. It is a count of orders, not a token amount. Their `SettlementPending` events may already be in your feed or still on the way; keep following them to their `SettlementResolved`.
-- **It doesn't touch your note on chain.** Your funds stay in the note until it is consumed or you reclaim it ([section 10](#10-settlement-accounting)). A public note can still be consumed by anyone else; a private note only by someone who has its details. Even `settling = 0` doesn't mean your funds are back.
+- **It doesn't touch your note on chain.** Your funds stay in the note until it is consumed or you reclaim it ([section 10](#10-settlement-accounting)). Only someone who has your note's details can consume it. Even `settling = 0` doesn't mean your funds are back.
 - **It produces no event of its own.** Record the cancel reply and its scope in your own state. An order cancelled before it went live never gets a `LIVE` event. A later `SettlementResolved` can report an order's result as `CANCELLED`.
 
 #### Replacing a cancelled or expired quote
@@ -606,10 +606,10 @@ stateDiagram-v2
 
 | Arrow | What happened |
 |---|---|
-| Accepted → Live | We found your exact note committed and unspent on chain, and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, a private order goes live when we accept it. |
+| Accepted → Live | We found your exact note committed and unspent on chain, and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, an order goes live when we accept it. |
 | Accepted → Never went live | The note was spent before it went live (`UNAVAILABLE`). |
 | Live → Reserved | We matched your order and reserved it for a settlement transaction. |
-| Live → Spent elsewhere | The note was spent outside the solver, for example you reclaimed it, or someone else consumed a public note. |
+| Live → Spent elsewhere | The note was spent outside the solver, for example you reclaimed it. |
 | Reserved → Filled | The transaction committed and nothing is left. |
 | Reserved → Live | The transaction committed a partial fill and your remainder (a new note) is live, or the transaction was voided and your order is back. |
 | Reserved → Cancelled | Your cancel covers the remainder or the returned order. |
@@ -621,7 +621,7 @@ A partial fill doesn't have its own state: it is a committed `SettlementResolved
 
 Cancelled and Spent elsewhere end the order for the solver, but your tokens can still be in a note ([where your funds are](#where-your-funds-are)). An order that reaches its expiry stays as it is, with no event; we just stop matching it ([section 11](#11-order-expiry)).
 
-For a private note, the events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. For a public note, settlement events can come before `LIVE` ([7.1](#private-or-public-order-notes)). An `OrderStatus CANCELLED` is always the order's last event.
+The events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. An `OrderStatus CANCELLED` is always the order's last event.
 
 ### Each event, and when it is sent
 
@@ -634,7 +634,7 @@ flowchart LR
     class e ev
 ```
 
-- **Sent:** once per order, when we verify your submitted note on chain and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, a private order's `LIVE` comes when we accept it, before the note is in a block.
+- **Sent:** once per order, when we verify your submitted note on chain and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, an order's `LIVE` comes when we accept it, before the note is in a block.
 - **Carries:** `note_id`, `depth` (0), `state = LIVE`, and the order's `lineage_id` on the event.
 - **Not sent:** for remainders after a partial fill (`SettlementResolved` reports those), or for an order you cancelled before it went live.
 - **You do:** mark the order live. It can now be matched. Expiry or a later cancel can still stop it.
@@ -656,7 +656,7 @@ flowchart LR
 ```
 
 - **Sent:** when the note is spent by anything other than our settlement. The reason says which case: `note spent before it became live` or `note spent outside this solver`.
-- **Typical causes:** you reclaimed the note, or someone else consumed a public note.
+- **Typical causes:** you reclaimed the note, or someone else who has its details consumed it.
 - **Not sent:** for an order you had already cancelled. Once you cancel, a spend of its note produces no event.
 - **You do:** retire the order. It is not a solver fill, so don't book it as one; check the chain for what happened.
 
@@ -1003,13 +1003,12 @@ A small newer order cancels larger older ones on the other side: the rule follow
 - `OrderStatus CANCELLED` for each cancelled order, after the `SettlementPending` of your order that trades ([section 8](#orderstatus--cancelled)).
 - The cancelled order leaves `ListActiveMakerOrders`.
 - No event while an order only sits out. It ends when your trading order is reserved, when you cancel one side, or when the price moves so that your orders no longer cross.
-- Your tokens stay in the cancelled order's note until you [reclaim it](#taking-your-funds-back). A public note can still be consumed by someone else.
+- Your tokens stay in the cancelled order's note until you [reclaim it](#taking-your-funds-back).
 - Your client must accept the `OrderState` value `ORDER_STATE_CANCELLED` (4).
 
 ### Avoiding it
 
 - Cancel an old quote before you send its replacement, or send the replacement on the same side.
-- Use private notes, or send `SubmitOrder` before you commit a public note. We match a public note as soon as we see it on chain ([7.1](#private-or-public-order-notes)); until your submit for it is stored, it has no maker ID and is not grouped with your other orders.
 
 ### Pairs with a price band
 
@@ -1021,7 +1020,7 @@ Your crossed orders are also checked before the price is chosen: the older of ea
 
 ## 13. Orders live at accept
 
-On a solver running with live at accept (we tell you when it is on), a **private** order goes live as soon as we accept `SubmitOrder`, before its note is in a block. It can trade in the same block as your own transaction. Public orders are unchanged.
+On a solver running with live at accept (we tell you when it is on), an order goes live as soon as we accept `SubmitOrder`, before its note is in a block. It can trade in the same block as your own transaction.
 
 ### Send your transaction first
 
@@ -1068,7 +1067,7 @@ Cancels work as before. A replacement on the **same side** sent before your canc
 
 | gRPC status | Typical cause | What to do |
 |---|---|---|
-| `INVALID_ARGUMENT` | Missing header; request ID empty or longer than 128 bytes; sequence 0 or above 2^63 − 1; note bytes not a canonical Miden note or not a PSWAP order; a pair we don't trade; bad expiry; lineage ID not 47 bytes; bad faucet ID; market and direction naming different pairs; bad page token. | Fix the request. Don't retry it unchanged. Nothing was stored, so you may keep the same request ID and sequence. |
+| `INVALID_ARGUMENT` | Missing header; request ID empty or longer than 128 bytes; sequence 0 or above 2^63 − 1; note bytes not a canonical Miden note or not a PSWAP order; a public note; a pair we don't trade; bad expiry; lineage ID not 47 bytes; bad faucet ID; market and direction naming different pairs; bad page token. | Fix the request. Don't retry it unchanged. Nothing was stored, so you may keep the same request ID and sequence. |
 | `UNAUTHENTICATED` | API key missing, unknown or revoked. | Fix the key. Nothing was stored; keep your command identities as they are. |
 | `ALREADY_EXISTS` | The request ID or sequence was used for a different command. | Resolve it from your journal. Never treat it as success. |
 | `UNAVAILABLE`, or your deadline expires | We may or may not have stored the command. | Resend the identical command, or call `GetCommand`. Use backoff. |

@@ -3,7 +3,7 @@
 
 use miden_protocol::crypto::hash::blake::Blake3_256;
 use miden_protocol::crypto::utils::Serializable;
-use miden_protocol::note::Note;
+use miden_protocol::note::{Note, NoteType};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::types::{OrderError, OrderId, OrderKeys, TokenId};
+use crate::types::{OrderError, OrderKeys, TokenId};
 
 /// Database identity of an onboarded maker.
 pub type MakerId = i64;
@@ -126,13 +126,6 @@ pub enum MakerUpdate {
         maker_id: MakerId,
         lineage_id: LineageId,
     },
-    /// A submit claimed existing orders; update their metadata in place.
-    OrdersAttributed {
-        order_ids: Vec<OrderId>,
-        tag: MakerTag,
-        /// A targeted cancellation committed before these orders were claimed.
-        cancelled: bool,
-    },
 }
 
 /// Wakes maker event streams after a commit that appended events. Only a
@@ -244,8 +237,22 @@ pub enum MakerCommand {
     },
 }
 
+/// Why a note can't be submitted as a maker order.
+#[derive(Debug, Error)]
+pub enum SubmitError {
+    #[error("note is not a valid PSWAP order: {0}")]
+    Order(#[from] OrderError),
+    /// Maker orders are private notes, so their order rows are written after
+    /// the claim, by the watcher or at accept.
+    #[error("maker order notes must be private")]
+    PublicNote,
+}
+
 impl MakerCommand {
-    pub fn submit(note: Note) -> Result<Self, OrderError> {
+    pub fn submit(note: Note) -> Result<Self, SubmitError> {
+        if note.metadata().note_type() != NoteType::Private {
+            return Err(SubmitError::PublicNote);
+        }
         crate::types::Order::from_note(&note)?;
         let keys = OrderKeys::from_note(&note)?;
         Ok(Self::Submit {

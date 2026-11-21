@@ -175,7 +175,7 @@ pub(crate) fn count(metric: &'static str, maker_id: MakerId) {
     add(metric, maker_id, ("", ""));
 }
 
-/// A private submit that took the confirmed path although the switch is on.
+/// A submit that took the confirmed path although the switch is on.
 pub(crate) fn count_fallback(maker_id: MakerId, reason: AcceptFallback) {
     add(ACCEPT_FALLBACKS, maker_id, ("reason", reason.into()));
 }

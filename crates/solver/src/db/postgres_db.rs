@@ -168,37 +168,6 @@ pub fn live_book_update_tx(
     Ok(update)
 }
 
-/// Fill the order keys of unfinished rows stored before the maker migration,
-/// so a lineage a maker claims later applies to them too. Run at startup,
-/// before hydration; rows that cannot be parsed keep NULL and are never maker
-/// orders.
-pub fn backfill_order_keys_tx(conn: &mut PgConnection) -> DbResult<usize> {
-    let rows: Vec<(Vec<u8>, Vec<u8>)> = orders::table
-        .filter(orders::lineage_id.is_null())
-        .filter(
-            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-        )
-        .select((orders::note_id, orders::raw_data))
-        .load(conn)?;
-    let mut filled = 0;
-    for (note_id, raw_data) in rows {
-        let keys = Note::read_from(&mut SliceReader::new(&raw_data))
-            .map_err(DbError::from)
-            .and_then(|note| OrderKeyColumns::of(&note));
-        match keys {
-            Ok(keys) => {
-                filled += diesel::update(orders::table.find(&note_id))
-                    .set(&keys)
-                    .execute(conn)?;
-            }
-            Err(error) => {
-                tracing::warn!(note_id = %hex::encode(&note_id), %error, "stored order has no order keys");
-            }
-        }
-    }
-    Ok(filled)
-}
-
 /// Retire orders whose notes are consumed on chain. A consumed note is spent
 /// whoever consumed it, so a parent reserved by an unresolved settlement is
 /// retired too: confirmation still marks it Executed if our transaction was
@@ -291,8 +260,7 @@ fn reserve_inputs_tx(
         return Err(SettlementError::MissingInputOrder.into());
     }
     // Serialize with cancels: lock the control rows of the makers that own
-    // these inputs, found from the locked rows (an attribution can arrive
-    // after the matcher picked a candidate), and of the makers whose
+    // these inputs, found from the locked rows, and of the makers whose
     // sit-outs this reservation cancels, in maker-ID order. A cancel
     // raising a cutoff takes the same lock, so either it sees this
     // reservation as exposure or this check sees its cutoff.

@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::IntakeError;
 use diesel::pg::PgConnection;
-use miden_protocol::note::NoteType;
 
 use super::metrics as gateway_metrics;
 use crate::db::maker_db::{execute_command_tx, AcceptGate, AcceptMode, CommandOutcome};
@@ -208,9 +207,9 @@ pub async fn run_intake(
 }
 
 /// One intake round's writes, in its transaction: with live at accept on and
-/// a private submit in the round, the owner-epoch guard first (see
-/// [`AcceptGate::resolve`]), then the order rows and maker rows the round
-/// may touch, in the reservation's lock order, then every command.
+/// a submit in the round, the owner-epoch guard first (see
+/// [`AcceptGate::resolve`]), then the maker rows the round touches, in ID
+/// order, then every command.
 ///
 /// `commands` must hold the round's cancels before its submits, as
 /// [`run_intake`] orders them: the matcher applies a round's cancels before
@@ -221,19 +220,16 @@ pub(crate) fn intake_round_tx(
     commands: &[(CommandHeader, MakerCommand)],
     gate: Option<&AcceptGate>,
 ) -> DbResult<Vec<(MakerId, CommandOutcome)>> {
-    let private_submit = commands.iter().any(|(_, command)| {
-        matches!(command, MakerCommand::Submit { note, .. }
-            if note.metadata().note_type() == NoteType::Private)
-    });
+    let has_submit = commands
+        .iter()
+        .any(|(_, command)| matches!(command, MakerCommand::Submit { .. }));
     let accept = match gate {
-        None => AcceptMode::Off,
         // The round's first statement, before any other lock.
-        Some(gate) if private_submit => gate.resolve(conn)?,
+        Some(gate) if has_submit => gate.resolve(conn)?,
         // Nothing here can go live at accept, so no block is read and no
-        // lock taken; a public submit still reports its fallback.
-        Some(_) => AcceptMode::Stale,
+        // lock taken.
+        _ => AcceptMode::Off,
     };
-    crate::db::maker_db::prelock_submission_orders_tx(conn, commands)?;
     crate::db::maker_db::prelock_command_makers_tx(conn, commands)?;
     commands
         .iter()
@@ -261,6 +257,10 @@ pub(crate) mod tests {
     use miden_standards::note::{PswapNote, PswapNoteStorage};
 
     pub(crate) fn pswap_note(serial: u32) -> Note {
+        pswap_note_of_type(serial, NoteType::Private)
+    }
+
+    pub(crate) fn pswap_note_of_type(serial: u32, note_type: NoteType) -> Note {
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
             .try_into()
             .unwrap();
@@ -276,7 +276,7 @@ pub(crate) mod tests {
                     .build(),
             )
             .serial_number(Word::from([serial, 0, 0, 0]))
-            .note_type(NoteType::Private)
+            .note_type(note_type)
             .offered_asset(FungibleAsset::new(offered, 50).unwrap())
             .build()
             .unwrap()
@@ -325,7 +325,12 @@ pub(crate) mod tests {
         }
         let stop = CancellationToken::new();
         let writer = tokio::spawn({
-            let session = db.pool.intake_session();
+            // Live at accept, so the order of the round's writes shows in
+            // what goes live.
+            let session = db
+                .pool
+                .intake_session()
+                .with_live_at_accept(|| Some(miden_protocol::block::BlockNumber::from(7)));
             let queues = std::mem::replace(&mut queues, IntakeSender::new(1, 1).1);
             run_intake(session, queues, updates_tx, 500, stop.clone())
         });
@@ -337,12 +342,11 @@ pub(crate) mod tests {
                 settling: 0
             })
         );
-        // The cancel was written first, and its update is queued before any
-        // handler hears back.
+        // The round's update is queued before any handler hears back.
         let committed = updates.try_recv().unwrap();
         assert!(matches!(
-            committed.maker_updates.first(),
-            Some(MakerUpdate::CutoffRaised { cutoff: 2, .. })
+            committed.maker_updates.as_slice(),
+            [MakerUpdate::CutoffRaised { cutoff: 2, .. }]
         ));
         for submit in [first, last] {
             assert_eq!(
@@ -350,10 +354,10 @@ pub(crate) mod tests {
                 CommandReply::Committed(CommandResult::Accepted)
             );
         }
-        assert!(matches!(
-            committed.maker_updates.get(1),
-            Some(MakerUpdate::OrdersAttributed { .. })
-        ));
+        // The cancel was written first: s1 (seq 1) is below its cutoff and
+        // does not go live, s3 does.
+        let live: Vec<_> = committed.active.iter().map(|order| order.id()).collect();
+        assert_eq!(live, [pswap_note(3).id()]);
         stop.cancel();
         writer.await.unwrap();
     }
@@ -539,9 +543,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// With live at accept on, a fresh private submit is in the round's one
-    /// matcher update, tagged, next to its attribution, and the event
-    /// streams wake for its LIVE. A stale watcher sends it the confirmed way.
+    /// With live at accept on, a fresh submit is in the round's one matcher
+    /// update, tagged, and the event streams wake for its LIVE. A stale
+    /// watcher sends it the confirmed way.
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_live_at_accept_round_publishes_the_order_and_wakes_streams() {
@@ -584,10 +588,7 @@ pub(crate) mod tests {
         assert_eq!(update.active.len(), 1);
         assert_eq!(update.active[0].id(), order.id());
         assert_eq!(update.active[0].maker.map(|tag| tag.maker_id), Some(alpha));
-        assert!(matches!(
-            update.maker_updates.as_slice(),
-            [MakerUpdate::OrdersAttributed { .. }]
-        ));
+        assert!(update.maker_updates.is_empty());
         // The wake follows the reply.
         tokio::time::timeout(std::time::Duration::from_secs(5), woken.changed())
             .await
@@ -602,11 +603,9 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let update = book_rx.recv().await.unwrap();
-        assert!(
-            update.active.is_empty(),
-            "a stale watcher: the confirmed path"
-        );
+        // The update would be queued before the reply: a stale watcher takes
+        // the confirmed path, which sends the matcher nothing yet.
+        assert!(book_rx.try_recv().is_err());
         stop.cancel();
         writer.await.unwrap();
     }
@@ -770,15 +769,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn a_lost_commit_reply_stops_intake_until_hydration_restores_attribution() {
+    async fn a_lost_commit_reply_stops_intake_and_the_stored_submit_replays() {
         let db = TestDb::new().await.unwrap();
         let alpha = maker(&db).await;
         let order = pswap_note(66);
-        let row = crate::db::postgres_models::NewOrderRow::ingested(&order, 1).unwrap();
-        db.pool
-            .write(move |conn| crate::db::postgres_db::insert_orders_batch_tx(conn, &[row], 1))
-            .await
-            .unwrap();
         let mut session = db.pool.intake_session();
         session.simulate_lost_commit_reply();
         let (intake, queues) = IntakeSender::new(2, 2);
@@ -808,27 +802,23 @@ pub(crate) mod tests {
             "no matcher update was published"
         );
 
-        // The stored command is replayable, but a replay has no update of
-        // its own. Recovery must hydrate the matcher before accepting it.
+        // The stored command is replayable, and a replay has no update of
+        // its own. Recovery hydrates the matcher before accepting it.
         let request_id = String::from("s1");
         let retry_header = header(alpha, "s1", 1);
         let retry_command = MakerCommand::submit(order.clone()).unwrap();
         let url = db.url().to_owned();
-        let (stored, live, replay) = tokio::task::spawn_blocking(move || -> DbResult<_> {
+        let (stored, replay) = tokio::task::spawn_blocking(move || -> DbResult<_> {
             let mut conn = crate::db::postgres_migrations::connect(&url)?;
             let stored = maker_db::stored_result_tx(&mut conn, alpha, &request_id)?;
-            let live = crate::db::postgres_db::load_live_orders_tx(&mut conn)?;
             let replay =
                 maker_db::execute_command_confirmed_tx(&mut conn, &retry_header, &retry_command)?;
-            Ok((stored, live, replay))
+            Ok((stored, replay))
         })
         .await
         .unwrap()
         .unwrap();
         assert_eq!(stored, Some(CommandResult::Accepted));
-        let hydrated = live.iter().find(|entry| entry.id() == order.id()).unwrap();
-        assert_eq!(hydrated.maker.unwrap().maker_id, alpha);
-        assert_eq!(hydrated.maker.unwrap().root_seq, 1);
         assert_eq!(
             replay,
             (CommandReply::Replayed(CommandResult::Accepted), None)

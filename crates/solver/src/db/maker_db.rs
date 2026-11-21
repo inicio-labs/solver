@@ -10,13 +10,13 @@
 use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Binary, Text};
+use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 use std::collections::{HashMap, HashSet};
 
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::{Note, NoteType};
+use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 
 use super::error::{DbError, DbResult};
@@ -28,7 +28,7 @@ use super::postgres_schema::{
 use crate::gateway::{self, proto};
 use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, EventWake, LineageId, MakerCommand,
-    MakerId, MakerTag, MakerUpdate,
+    MakerId, MakerUpdate,
 };
 use crate::types::{now_unix, BookOrder, BookUpdate, OrderId, OrderKeys, OrderStatus};
 
@@ -96,35 +96,6 @@ fn lock_maker(conn: &mut PgConnection, maker_id: MakerId) -> DbResult<Option<Mak
         .select(makers::maker_id)
         .first(conn)
         .optional()?)
-}
-
-/// Intake locks all existing submission orders before any command in its
-/// group acquires a maker row. This preserves reservation's order-row → maker
-/// lock order even when the group contains cancels before submits.
-pub fn prelock_submission_orders_tx(
-    conn: &mut PgConnection,
-    commands: &[(CommandHeader, MakerCommand)],
-) -> DbResult<()> {
-    let lineages: Vec<&Vec<u8>> = commands
-        .iter()
-        .filter_map(|(_, command)| match command {
-            MakerCommand::Submit { keys, .. } => Some(&keys.lineage_id),
-            _ => None,
-        })
-        .collect();
-    if !lineages.is_empty() {
-        orders::table
-            .filter(orders::lineage_id.eq_any(lineages))
-            .filter(
-                orders::status
-                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-            )
-            .order(orders::note_id.asc())
-            .for_update()
-            .select(orders::note_id)
-            .load::<Vec<u8>>(conn)?;
-    }
-    Ok(())
 }
 
 /// Reserve every maker control row for a group-commit round in the same
@@ -212,13 +183,9 @@ pub fn execute_command_confirmed_tx(
 pub enum AcceptFallback {
     /// The watcher's latest block was not read recently enough.
     WatcherStale,
-    /// The note already has an order row.
-    Conflict,
-    /// Only private notes go live at accept.
-    Public,
 }
 
-/// Whether a private submit goes live at accept in one intake round (ADR
+/// Whether a submit goes live at accept in one intake round (ADR
 /// 0008), decided once for the round by [`AcceptGate::resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptMode {
@@ -250,7 +217,7 @@ impl AcceptGate {
         }
     }
 
-    /// Decide the mode for a round that holds a private submit. It guards a
+    /// Decide the mode for a round that holds a submit. It guards a
     /// writer takeover: it share-locks the owner epoch, so a new owner's
     /// claim waits for this commit, and it fails if a new owner claimed it
     /// already. The freshness is read after that lock.
@@ -295,7 +262,7 @@ pub struct CommandOutcome {
 /// changes nothing and has no update: a change lost to a crash is restored
 /// by the matcher's startup hydration.
 ///
-/// Unless `accept` is off, a newly claimed private note goes live in this
+/// Unless `accept` is off, a newly claimed note goes live in this
 /// transaction (ADR 0008) if the round's watcher block is fresh and the
 /// order is not cancelled already; otherwise it takes the confirmed path.
 pub fn execute_command_tx(
@@ -310,21 +277,6 @@ pub fn execute_command_tx(
         live: None,
         fallback: None,
     };
-    if let MakerCommand::Submit { keys, .. } = command {
-        // Reservation locks order rows before maker rows. Claim in the same
-        // order, so a late claim cannot slip between reservation's ownership
-        // lookup and its liveness check or deadlock with that reservation.
-        orders::table
-            .filter(orders::lineage_id.eq(&keys.lineage_id))
-            .filter(
-                orders::status
-                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-            )
-            .order(orders::note_id.asc())
-            .for_update()
-            .select(orders::note_id)
-            .load::<Vec<u8>>(conn)?;
-    }
     if lock_maker(conn, header.maker_id)?.is_none() {
         return Err(DbError::Corrupt("authenticated maker is missing"));
     }
@@ -340,57 +292,22 @@ pub fn execute_command_tx(
             keys,
             expires_at_unix_ms,
         } => {
-            let claimed = diesel::insert_into(maker_lineages::table)
-                .values((
-                    maker_lineages::lineage_id.eq(&keys.lineage_id),
-                    maker_lineages::maker_id.eq(maker_id),
-                    maker_lineages::request_id.eq(&header.request_id),
-                    maker_lineages::root_seq.eq(seq_column(header.seq)?),
-                    maker_lineages::note_id.eq(note.id().to_bytes().to_vec()),
-                    maker_lineages::market.eq(&keys.market),
-                    maker_lineages::direction.eq(&keys.direction),
-                    maker_lineages::expires_at_unix_ms
-                        .eq(expires_at_unix_ms.map(i64::try_from).transpose()?),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?
-                == 1;
+            let claimed = claim_lineage_tx(conn, header, note, keys, *expires_at_unix_ms)?;
             if claimed {
-                let cancelled = diesel::select(diesel::dsl::exists(
-                    maker_stops::table
-                        .filter(maker_stops::maker_id.eq(maker_id))
-                        .filter(maker_stops::lineage_id.eq(&keys.lineage_id)),
-                ))
-                .get_result::<bool>(conn)?;
-                let tag = MakerTag {
-                    maker_id,
-                    root_seq: header.seq,
-                    expires_at_unix_ms: *expires_at_unix_ms,
-                };
-                let order_ids = orders::table
-                    .filter(orders::lineage_id.eq(&keys.lineage_id))
-                    .filter(
-                        orders::status
-                            .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-                    )
-                    .select(orders::note_id)
-                    .load::<Vec<u8>>(conn)?
-                    .into_iter()
-                    .map(|bytes| Ok(crate::types::OrderId::read_from_bytes(&bytes)?))
-                    .collect::<DbResult<Vec<_>>>()?;
-                if accept != AcceptMode::Off {
-                    (live, fallback) =
-                        go_live_at_accept_tx(conn, accept, maker_id, &keys.lineage_id, note)?;
+                match accept {
+                    AcceptMode::Off => {}
+                    AcceptMode::Stale => fallback = Some(AcceptFallback::WatcherStale),
+                    AcceptMode::Fresh(block) => {
+                        live = go_live_at_accept_tx(conn, block, maker_id, &keys.lineage_id, note)?;
+                    }
                 }
-                let update = MakerUpdate::OrdersAttributed {
-                    order_ids,
-                    tag,
-                    cancelled,
-                };
-                (CommandResult::Accepted, Some(update))
-            } else {
-                (CommandResult::AlreadyRegistered, None)
             }
+            let result = if claimed {
+                CommandResult::Accepted
+            } else {
+                CommandResult::AlreadyRegistered
+            };
+            (result, None)
         }
         MakerCommand::CancelAll { scope } => {
             let cutoff: i64 = diesel::insert_into(maker_cutoffs::table)
@@ -449,35 +366,56 @@ pub fn execute_command_tx(
     })
 }
 
+/// Claim a submit's lineage for its maker. `false` when the lineage is
+/// claimed already, or when its lineage or its note already has an order
+/// row: a maker order is a private note, and its row is written only after
+/// the claim. The note check matters only for a row with a NULL
+/// `lineage_id`, which is a row stored before the 2026-10-03 migration
+/// (every writer since sets it from the note). Without it, go-live at
+/// accept's plain insert could meet such a row and fail the whole round.
+fn claim_lineage_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    note: &Note,
+    keys: &OrderKeys,
+    expires_at_unix_ms: Option<u64>,
+) -> DbResult<bool> {
+    let claimed = diesel::sql_query(
+        "INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
+                                     market, direction, expires_at_unix_ms)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8
+         WHERE NOT EXISTS (SELECT 1 FROM orders WHERE lineage_id = $1 OR note_id = $5)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind::<Binary, _>(&keys.lineage_id)
+    .bind::<BigInt, _>(header.maker_id)
+    .bind::<Text, _>(&header.request_id)
+    .bind::<BigInt, _>(seq_column(header.seq)?)
+    .bind::<Binary, _>(note.id().to_bytes().to_vec())
+    .bind::<Binary, _>(&keys.market)
+    .bind::<Binary, _>(&keys.direction)
+    .bind::<Nullable<BigInt>, _>(expires_at_unix_ms.map(i64::try_from).transpose()?)
+    .execute(conn)?;
+    Ok(claimed == 1)
+}
+
 /// Put a newly claimed submit's order live now, before its note is in a
 /// block (ADR 0008): store the root row, pass it through the liveness rule,
 /// and only if it is kept, flag the lineage with `accept_block` and report
 /// LIVE. An order cancelled before its submit leaves no row and takes the
-/// confirmed path, as does a note that already has a row.
+/// confirmed path. The claim guaranteed that the note has no row yet.
 fn go_live_at_accept_tx(
     conn: &mut PgConnection,
-    accept: AcceptMode,
+    accept_block: BlockNumber,
     maker_id: MakerId,
     lineage_id: &LineageId,
     note: &Note,
-) -> DbResult<(Option<BookOrder>, Option<AcceptFallback>)> {
-    if note.metadata().note_type() != NoteType::Private {
-        return Ok((None, Some(AcceptFallback::Public)));
-    }
-    let AcceptMode::Fresh(accept_block) = accept else {
-        return Ok((None, Some(AcceptFallback::WatcherStale)));
-    };
+) -> DbResult<Option<BookOrder>> {
     let row = NewOrderRow::parsed(note, now_unix())?;
-    let inserted: Option<OrderRow> = diesel::insert_into(orders::table)
+    let inserted: OrderRow = diesel::insert_into(orders::table)
         .values(&row)
-        .on_conflict(orders::note_id)
-        .do_nothing()
         .returning(OrderRow::as_returning())
-        .get_result(conn)
-        .optional()?;
-    let Some(inserted) = inserted else {
-        return Ok((None, Some(AcceptFallback::Conflict)));
-    };
+        .get_result(conn)?;
     let mut kept = super::postgres_db::live_book_update_tx(
         conn,
         BookUpdate {
@@ -489,14 +427,14 @@ fn go_live_at_accept_tx(
         // Cancelled before it was submitted: the confirmed path, as if this
         // row had never been written.
         diesel::delete(orders::table.find(&row.note_id)).execute(conn)?;
-        return Ok((None, None));
+        return Ok(None);
     };
     diesel::update(maker_lineages::table.find(lineage_id))
         .set(maker_lineages::accept_block.eq(Some(i64::from(accept_block.as_u32()))))
         .execute(conn)?;
     let body = order_status(note, proto::OrderState::Live, "");
     gateway::append_event_tx(conn, maker_id, Some(lineage_id), &body)?;
-    Ok((Some(order), None))
+    Ok(Some(order))
 }
 
 /// Record the command, or return the reply it already has: the stored result
@@ -980,11 +918,11 @@ pub struct WatcherWrites {
 /// confirmed, reporting each once, and return the orders to take out of the
 /// book.
 ///
-/// A public note can trade before its claim is activated. When the note the
-/// watcher found spent was consumed by our own settlement, the settlement
-/// events already told the maker, so the claim is activated without an
-/// event; while that settlement is still in flight, the claim waits for the
-/// next round. The caller holds the order rows (`prelock_watcher_tx`).
+/// A public note claimed before maker intake became private-only can trade
+/// before its claim is activated. When the note the watcher found spent was
+/// consumed by our own settlement, the settlement events already told the
+/// maker, so the claim is activated without an event; while that settlement
+/// is still in flight, the claim waits for the next round. The caller holds the order rows (`prelock_watcher_tx`).
 /// Orders that went live at accept are closed by [`close_unconfirmed_tx`].
 pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResult<Vec<OrderId>> {
     let (unconfirmed, spent): (Vec<_>, Vec<_>) = spent
@@ -1817,14 +1755,15 @@ pub fn append_event_tx(
 mod tests {
     use super::*;
     use crate::db::postgres_db::{
-        backfill_order_keys_tx, confirm_settlement_update_tx, finish_discarded_settlement_tx,
-        insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
-        reserve_settlement_tx, test_consumer, NodeAnswer,
+        confirm_settlement_update_tx, finish_discarded_settlement_tx, insert_orders_batch_tx,
+        live_book_update_tx, load_live_orders_tx, prepare_settlement_tx, reserve_settlement_tx,
+        test_consumer, NodeAnswer,
     };
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
     use crate::db::postgres_schema::live_orders;
     use crate::db::postgres_test::{fill, prepare, revert_after, TestSchema};
+    use crate::maker::MakerTag;
 
     /// The migration that adds the maker tables.
     const MAKER_GATEWAY: &str = "20261003000001";
@@ -2004,20 +1943,10 @@ mod tests {
         let maker_id = maker(conn, "alpha")?;
         let order = note(1);
 
+        // A submit has nothing for the matcher: its order row comes later.
         let (reply, fact) = run(conn, maker_id, "r1", 1, submit(&order))?;
         assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
-        assert_eq!(
-            fact,
-            Some(MakerUpdate::OrdersAttributed {
-                order_ids: Vec::new(),
-                tag: MakerTag {
-                    maker_id,
-                    root_seq: 1,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: false,
-            })
-        );
+        assert_eq!(fact, None);
 
         // The exact retry gets the stored reply and repeats no fact.
         let (reply, fact) = run(conn, maker_id, "r1", 1, submit(&order))?;
@@ -2205,39 +2134,6 @@ mod tests {
             live(conn, &[&before, &after, &kept, &child])?,
             [false, false, true, false]
         );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn a_stop_before_late_claim_carries_cancelled_metadata_for_public_order() -> Result<()> {
-        let mut fixture = TestSchema::migrated()?;
-        let conn = &mut fixture.conn;
-        let alpha = maker(conn, "alpha")?;
-        let quote = note(42);
-        ingest(conn, &[&quote])?;
-        let lineage_id = OrderKeys::from_note(&quote)?.lineage_id;
-        run(
-            conn,
-            alpha,
-            "x1",
-            1,
-            MakerCommand::CancelOrder { lineage_id },
-        )?;
-        let (_, update) = run(conn, alpha, "s2", 2, submit(&quote))?;
-        assert_eq!(
-            update,
-            Some(MakerUpdate::OrdersAttributed {
-                order_ids: vec![quote.id()],
-                tag: MakerTag {
-                    maker_id: alpha,
-                    root_seq: 2,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: true,
-            }),
-        );
-        assert_eq!(live(conn, &[&quote])?, [false]);
         Ok(())
     }
 
@@ -2633,48 +2529,79 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn a_late_claim_waits_for_a_public_reservation_then_reports_exposure() -> Result<()> {
+    fn a_claim_takes_no_order_row_lock_and_refuses_a_reserved_note_at_once() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let alpha = maker(&mut fixture.conn, "alpha")?;
         let quote = note(41);
         ingest(&mut fixture.conn, &[&quote])?;
 
         let held = Arc::new(Barrier::new(2));
+        // Set just before the reservation commits.
+        let committing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut reserver = connect(&fixture)?;
         let reserving = {
-            let (held, quote) = (held.clone(), quote.clone());
+            let (held, quote, committing) = (held.clone(), quote.clone(), committing.clone());
             std::thread::spawn(move || {
                 reserver.transaction::<_, DbError, _>(|conn| {
                     reserve(conn, 41, &quote)?;
                     held.wait();
                     std::thread::sleep(Duration::from_millis(300));
+                    committing.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 })
             })
         };
-        held.wait();
+        // Connected before the reservation's 300 ms window starts.
         let mut claimant = connect(&fixture)?;
-        let started = Instant::now();
+        held.wait();
         let (reply, _) = run(&mut claimant, alpha, "s1", 1, submit(&quote))?;
-        reserving.join().expect("reserver panicked")?;
         assert!(
-            started.elapsed() >= Duration::from_millis(200),
-            "claim waited for the order row"
+            !committing.load(std::sync::atomic::Ordering::SeqCst),
+            "the claim must not wait for the reserved row"
         );
-        assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
+        reserving.join().expect("reserver panicked")?;
         assert_eq!(
-            run(
-                &mut claimant,
-                alpha,
-                "c2",
-                2,
-                cancel_all(CutoffScope::all())
-            )?
-            .0,
-            CommandReply::Committed(CommandResult::Applied {
-                cutoff: 2,
-                settling: 1
-            }),
+            reply,
+            CommandReply::Committed(CommandResult::AlreadyRegistered)
+        );
+        Ok(())
+    }
+
+    /// A submit is refused when any row of its lineage exists (here only a
+    /// remainder), or a row with its note under no lineage.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_claim_is_refused_when_its_lineage_or_its_note_has_a_row() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let (root, remainder, unattributed) = (note(61), note(62), note(63));
+        ingest(conn, &[&remainder, &unattributed])?;
+        let lineage_id = OrderKeys::from_note(&root)?.lineage_id;
+        diesel::update(
+            orders::table.filter(orders::note_id.eq(remainder.id().to_bytes().to_vec())),
+        )
+        .set(orders::lineage_id.eq(Some(&lineage_id)))
+        .execute(conn)?;
+        diesel::update(
+            orders::table.filter(orders::note_id.eq(unattributed.id().to_bytes().to_vec())),
+        )
+        .set(orders::lineage_id.eq(None::<Vec<u8>>))
+        .execute(conn)?;
+        for (seq, order) in [(1, &root), (2, &unattributed)] {
+            let (reply, _) = run(conn, alpha, &format!("s{seq}"), seq, submit(order))?;
+            assert_eq!(
+                reply,
+                CommandReply::Committed(CommandResult::AlreadyRegistered),
+                "seq {seq}"
+            );
+        }
+        let claims: i64 = maker_lineages::table.count().get_result(conn)?;
+        assert_eq!(claims, 0);
+        assert_eq!(
+            live(conn, &[&remainder, &unattributed])?,
+            [true, true],
+            "both stay ordinary orders"
         );
         Ok(())
     }
@@ -2764,34 +2691,6 @@ mod tests {
             .map(|order| (order.id(), order.maker))
             .collect();
         assert_eq!(hydrated, tags);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn order_keys_are_backfilled_for_rows_stored_before_the_migration() -> Result<()> {
-        let mut fixture = TestSchema::migrated()?;
-        let conn = &mut fixture.conn;
-        let (older, finished) = (note(1), note(2));
-        ingest(conn, &[&older, &finished])?;
-        diesel::update(orders::table)
-            .set((
-                orders::lineage_id.eq(None::<Vec<u8>>),
-                orders::depth.eq(None::<i64>),
-                orders::market.eq(None::<Vec<u8>>),
-                orders::direction.eq(None::<Vec<u8>>),
-            ))
-            .execute(conn)?;
-        diesel::update(orders::table.find(finished.id().to_bytes().to_vec()))
-            .set(orders::status.eq(OrderStatus::Executed.as_str()))
-            .execute(conn)?;
-        assert_eq!(backfill_order_keys_tx(conn)?, 1, "only unfinished rows");
-        let lineage: Option<Vec<u8>> = orders::table
-            .find(older.id().to_bytes().to_vec())
-            .select(orders::lineage_id)
-            .first(conn)?;
-        assert_eq!(lineage, Some(OrderKeys::from_note(&older)?.lineage_id));
-        assert_eq!(backfill_order_keys_tx(conn)?, 0);
         Ok(())
     }
 

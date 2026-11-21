@@ -77,7 +77,7 @@ impl MakerIndex {
         }
     }
 
-    /// Maker metadata to copy onto the single order model after admission.
+    /// The maker tag recorded for a book entry.
     pub(super) fn tag(&self, id: &NoteId) -> Option<MakerTag> {
         self.entries.get(id).and_then(|entry| entry.tag)
     }
@@ -141,28 +141,6 @@ impl MakerIndex {
                     .map(|(id, _)| id)
                     .collect();
                 cancelled
-            }
-            MakerUpdate::OrdersAttributed {
-                order_ids,
-                tag,
-                cancelled,
-            } => {
-                let mut cancelled_ids = Vec::new();
-                for id in order_ids {
-                    let Some(entry) = self.entries.get_mut(&id) else {
-                        continue;
-                    };
-                    if entry.tag.is_some() {
-                        continue;
-                    }
-                    entry.tag = Some(tag);
-                    self.by_maker.entry(tag.maker_id).or_default().insert(id);
-                    let entry = &self.entries[&id];
-                    if cancelled || self.below_cutoff(tag, entry.offered, entry.requested) {
-                        cancelled_ids.push(id);
-                    }
-                }
-                cancelled_ids
             }
         }
     }
@@ -362,49 +340,6 @@ mod tests {
         book.forget(quote.id());
         // The ordered update stream delivers earlier activations before this
         // cancellation; later activations have already passed live_orders.
-    }
-
-    #[test]
-    fn an_attribution_tags_entries_that_arrived_first() {
-        let (x, y) = tokens();
-        let mut book = MakerIndex::default();
-        let early = order(1, true, None);
-        assert!(book.admit(&early));
-        assert!(book.tag(&early.id()).is_none());
-        let attribute = |root_seq| MakerUpdate::OrdersAttributed {
-            order_ids: vec![early.id()],
-            tag: MakerTag {
-                maker_id: ALPHA,
-                root_seq,
-                expires_at_unix_ms: None,
-            },
-            cancelled: false,
-        };
-        assert!(book.apply(attribute(5)).is_empty());
-        assert!(book.tag(&early.id()).is_some(), "never routed from now on");
-
-        // A delayed submit below an existing cutoff is dropped at once.
-        let mut other = MakerIndex::default();
-        other.raise_cutoff(ALPHA, CutoffScope::market(x, y), 10);
-        assert!(other.admit(&early));
-        assert_eq!(other.apply(attribute(5)), vec![early.id()]);
-
-        // A cancellation committed before the claim is carried by that
-        // claim, so an already-booked public order is removed at attribution.
-        let mut cancelled = MakerIndex::default();
-        assert!(cancelled.admit(&early));
-        assert_eq!(
-            cancelled.apply(MakerUpdate::OrdersAttributed {
-                order_ids: vec![early.id()],
-                tag: MakerTag {
-                    maker_id: ALPHA,
-                    root_seq: 5,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: true,
-            },),
-            vec![early.id()]
-        );
     }
 
     #[test]

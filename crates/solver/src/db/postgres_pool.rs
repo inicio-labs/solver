@@ -638,7 +638,7 @@ pub struct IntakeSession {
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
     owner_epoch: i64,
-    /// Set when private submits go live at accept (ADR 0008). `None` keeps
+    /// Set when submits go live at accept (ADR 0008). `None` keeps
     /// every submit on the confirmed path.
     gate: Option<Arc<super::maker_db::AcceptGate>>,
     /// Woken after a round that put orders live at accept.
@@ -675,7 +675,7 @@ impl IntakeSession {
         self.drop_next_commit_reply = true;
     }
 
-    /// Let private submits go live at accept (ADR 0008) while `fresh_block`
+    /// Let submits go live at accept (ADR 0008) while `fresh_block`
     /// returns the watcher's latest block.
     pub fn with_live_at_accept(
         mut self,

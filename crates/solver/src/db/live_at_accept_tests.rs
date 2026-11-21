@@ -8,16 +8,9 @@ use anyhow::Result;
 use diesel::connection::SimpleConnection;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
-use miden_protocol::note::{Note, NoteType};
-use miden_protocol::testing::account_id::{
-    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
-    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-};
-use miden_protocol::Word;
-use miden_standards::note::{PswapNote, PswapNoteStorage};
+use miden_protocol::note::Note;
 use prost::Message as _;
 
 use super::maker_db::{
@@ -31,38 +24,12 @@ use super::postgres_models::{NewOrderRow, SettlementInputRow};
 use super::postgres_schema::{maker_lineages, maker_stops, orders, sync_state};
 use super::postgres_test::{self, TestSchema};
 use super::{postgres_migrations, DbError};
+use crate::gateway::intake::tests::pswap_note as note;
 use crate::gateway::proto;
 use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, MakerCommand, MakerId,
 };
 use crate::types::{OrderId, OrderKeys};
-
-fn note_of(serial: u32, note_type: NoteType) -> Note {
-    let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
-        .try_into()
-        .unwrap();
-    let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
-    let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
-    PswapNote::builder()
-        .sender(creator)
-        .storage(
-            PswapNoteStorage::builder()
-                .min_requested_asset(FungibleAsset::new(requested, 100).unwrap())
-                .min_fill_step(AssetAmount::new(1).unwrap())
-                .creator_account_id(creator)
-                .build(),
-        )
-        .serial_number(Word::from([serial, 0, 0, 0]))
-        .note_type(note_type)
-        .offered_asset(FungibleAsset::new(offered, 50).unwrap())
-        .build()
-        .unwrap()
-        .into()
-}
-
-fn note(serial: u32) -> Note {
-    note_of(serial, NoteType::Private)
-}
 
 fn id(note: &Note) -> Vec<u8> {
     note.id().to_bytes().to_vec()
@@ -302,29 +269,11 @@ fn other_submits_take_the_confirmed_path_without_a_trace() -> Result<()> {
         Ok(())
     };
 
-    let public = note_of(1, NoteType::Public);
-    let outcome = accept(conn, alpha, 1, &public)?;
-    assert_eq!(
-        (outcome.live.is_none(), outcome.fallback),
-        (true, Some(AcceptFallback::Public))
-    );
-    assert_eq!(status(conn, &public)?, None);
-    unflagged(conn, &public)?;
-
     let stale = note(2);
     let outcome = accept_with(conn, alpha, 2, &MakerCommand::submit(stale.clone())?, None)?;
     assert_eq!(outcome.fallback, Some(AcceptFallback::WatcherStale));
     assert_eq!(status(conn, &stale)?, None);
     unflagged(conn, &stale)?;
-
-    let stored = note(3);
-    let row = NewOrderRow::parsed(&stored, 1)?;
-    diesel::insert_into(orders::table)
-        .values(&row)
-        .execute(conn)?;
-    let outcome = accept(conn, alpha, 3, &stored)?;
-    assert_eq!(outcome.fallback, Some(AcceptFallback::Conflict));
-    unflagged(conn, &stored)?;
 
     // Cancelled before its submit, by lineage or by a later cutoff: no row,
     // no flag, no LIVE.
@@ -903,8 +852,9 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     for (seq, order) in [(1, &active), (2, &waiting), (3, &confirmed)] {
         accept(conn, alpha, seq, order)?;
     }
-    // On the confirmed path, with the row ingest stores for a public note:
-    // pending, but never unconfirmed.
+    // On the confirmed path, with the row ingest stored for a public note
+    // claimed before maker intake became private-only: pending, but never
+    // unconfirmed.
     let slow = note(4);
     accept_with(conn, alpha, 4, &MakerCommand::submit(slow.clone())?, None)?;
     diesel::insert_into(orders::table)
@@ -1189,11 +1139,11 @@ fn the_hatch_tells_nothing_about_an_order_the_maker_cancelled() -> Result<()> {
     Ok(())
 }
 
-/// A round with only a public submit still reports why it took the
-/// confirmed path, without taking the owner-epoch lock.
+/// A round without a submit never takes the owner-epoch lock: nothing in it
+/// can go live at accept.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn a_public_only_round_reports_its_fallback() -> Result<()> {
+fn a_round_without_a_submit_never_checks_the_owner_epoch() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
@@ -1201,12 +1151,16 @@ fn a_public_only_round_reports_its_fallback() -> Result<()> {
     let gate = AcceptGate::new(epoch(conn)? + 100, || Some(BlockNumber::from(7)));
     let commands = [(
         CommandHeader::new(alpha, "r1".into(), 1).unwrap(),
-        MakerCommand::submit(note_of(1, NoteType::Public))?,
+        MakerCommand::CancelAll {
+            scope: CutoffScope::all(),
+        },
     )];
     let outcomes = conn.transaction::<_, DbError, _>(|conn| {
         crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
     })?;
-    assert_eq!(outcomes[0].1.fallback, Some(AcceptFallback::Public));
-    assert!(outcomes[0].1.live.is_none());
+    assert!(matches!(
+        outcomes[0].1.reply,
+        CommandReply::Committed(CommandResult::Applied { .. })
+    ));
     Ok(())
 }

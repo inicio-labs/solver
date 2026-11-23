@@ -16,8 +16,39 @@ static REFUSALS: [[AtomicU64; RefusalAttempt::COUNT]; RefusalCode::COUNT] =
 static DROPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BOUNCED: [AtomicU64; ReleaseCause::COUNT] =
     [const { AtomicU64::new(0) }; ReleaseCause::COUNT];
+static SETTLEMENTS_CONFIRMED: AtomicU64 = AtomicU64::new(0);
+static SETTLEMENTS_RELEASED: [AtomicU64; ReleaseCause::COUNT] =
+    [const { AtomicU64::new(0) }; ReleaseCause::COUNT];
+/// The fee balance and base fee at the last headroom check, and when (Unix
+/// seconds; 0 until the first check).
+static FEE_BALANCE: AtomicU64 = AtomicU64::new(0);
+static FEE_BASE: AtomicU64 = AtomicU64::new(0);
+static FEE_CHECKED_AT: AtomicU64 = AtomicU64::new(0);
 static CONFLICTS: [AtomicU64; ConflictKind::COUNT] =
     [const { AtomicU64::new(0) }; ConflictKind::COUNT];
+/// Indexed by stage, then by whether a node call failed (1) or not (0).
+static FAILED_BEFORE_SUBMIT: [[AtomicU64; 2]; FailedStage::COUNT] =
+    [const { [const { AtomicU64::new(0) }; 2] }; FailedStage::COUNT];
+/// When the oldest work the executor holds was taken, in Unix milliseconds
+/// (0: none): settlements waiting for their outcome, and batches held while
+/// it verifies that it can settle. Published by the executor loop.
+static OLDEST_HELD_MS: AtomicU64 = AtomicU64::new(0);
+/// When the executor took the batch it is working on now (0: none).
+static IN_HAND_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Where a settlement failed before it was submitted.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum FailedStage {
+    /// Its inputs or its request could not be put together.
+    Build,
+    /// Running the transaction failed.
+    Execute,
+    /// Proving it failed.
+    Prove,
+}
 
 /// Why a submission of ours was refused, by the node's error code.
 #[derive(
@@ -118,6 +149,7 @@ pub(crate) fn record_refusal(code: RefusalCode, attempt: RefusalAttempt) {
 /// order that went live at accept and whose note was not seen yet.
 pub(crate) fn record_release(cause: ReleaseCause, inputs: usize, unconfirmed: bool) {
     BOUNCED[cause as usize].fetch_add(inputs as u64, Ordering::Relaxed);
+    SETTLEMENTS_RELEASED[cause as usize].fetch_add(1, Ordering::Relaxed);
     if cause == ReleaseCause::Dropped {
         DROPPED[usize::from(unconfirmed)].fetch_add(1, Ordering::Relaxed);
     }
@@ -155,6 +187,146 @@ pub(crate) fn conflicts() -> impl Iterator<Item = (&'static str, u64)> {
         (
             kind.into(),
             CONFLICTS[kind as usize].load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// A settlement that failed before it was submitted. `rpc`: a node call
+/// failed, and the orders go straight back; otherwise the same composition
+/// would fail the same way again.
+pub(crate) fn record_failed_before_submit(stage: FailedStage, rpc: bool) {
+    FAILED_BEFORE_SUBMIT[stage as usize][usize::from(rpc)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Settlements that failed before submission, per stage and cause (`rpc` or
+/// `other`).
+pub(crate) fn failed_before_submit() -> impl Iterator<Item = (&'static str, &'static str, u64)> {
+    FailedStage::iter().flat_map(|stage| {
+        [("other", 0), ("rpc", 1)]
+            .into_iter()
+            .map(move |(cause, index)| {
+                (
+                    stage.into(),
+                    cause,
+                    FAILED_BEFORE_SUBMIT[stage as usize][index].load(Ordering::Relaxed),
+                )
+            })
+    })
+}
+
+/// When the oldest work the executor holds was taken (Unix ms), or `None`.
+pub(crate) fn publish_oldest_held(since_ms: Option<u64>) {
+    OLDEST_HELD_MS.store(since_ms.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The batch the executor is working on now, from when it took it, or `None`.
+pub(crate) fn set_in_hand(since_ms: Option<u64>) {
+    IN_HAND_MS.store(since_ms.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Seconds since the executor took the oldest work it has not finished, aged
+/// at `now_ms`; 0 when it holds none.
+pub(crate) fn oldest_unfinished_age_secs(now_ms: u64) -> u64 {
+    unfinished_age_secs(
+        OLDEST_HELD_MS.load(Ordering::Relaxed),
+        IN_HAND_MS.load(Ordering::Relaxed),
+        now_ms,
+    )
+}
+
+fn unfinished_age_secs(held_ms: u64, in_hand_ms: u64, now_ms: u64) -> u64 {
+    [held_ms, in_hand_ms]
+        .into_iter()
+        .filter(|since| *since != 0)
+        .min()
+        .map_or(0, |since| now_ms.saturating_sub(since) / 1000)
+}
+
+/// Upper bounds, in seconds, of the settlement time histogram.
+pub(crate) const SETTLEMENT_SECONDS: [u64; 10] = [5, 10, 20, 30, 45, 60, 90, 120, 300, 600];
+
+/// How long settlements took, from when the executor prepared each one to its
+/// confirmation: a Prometheus histogram's cumulative buckets and sum.
+pub(crate) struct SettlementTimes {
+    buckets: [AtomicU64; SETTLEMENT_SECONDS.len()],
+    sum_ms: AtomicU64,
+}
+
+impl SettlementTimes {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; SETTLEMENT_SECONDS.len()],
+            sum_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, millis: u64) {
+        self.sum_ms.fetch_add(millis, Ordering::Relaxed);
+        for (bucket, bound) in self.buckets.iter().zip(SETTLEMENT_SECONDS) {
+            if millis <= bound * 1000 {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Each bound with the settlements that took at most that long, and the
+    /// sum in seconds.
+    fn read(&self) -> (Vec<(u64, u64)>, f64) {
+        let buckets = SETTLEMENT_SECONDS
+            .iter()
+            .zip(&self.buckets)
+            .map(|(bound, count)| (*bound, count.load(Ordering::Relaxed)))
+            .collect();
+        (buckets, self.sum_ms.load(Ordering::Relaxed) as f64 / 1000.0)
+    }
+}
+
+static SETTLEMENT_TIMES: SettlementTimes = SettlementTimes::new();
+
+/// A settlement committed on chain and was confirmed in the database;
+/// `taken_at_ms` is when the executor prepared it (after a restart, when it
+/// loaded it again, so a recovered settlement counts from the restart).
+pub(crate) fn record_confirmed(taken_at_ms: u64, now_ms: u64) {
+    SETTLEMENT_TIMES.record(now_ms.saturating_sub(taken_at_ms));
+    SETTLEMENTS_CONFIRMED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The settlement time histogram's buckets and sum. Read before
+/// [`settlements_confirmed`], its count, so no bucket exceeds the count.
+pub(crate) fn settlement_times() -> (Vec<(u64, u64)>, f64) {
+    SETTLEMENT_TIMES.read()
+}
+
+/// What the last fee headroom check saw.
+pub(crate) fn record_fee(balance: u64, base_fee: u64, now_unix: u64) {
+    FEE_BALANCE.store(balance, Ordering::Relaxed);
+    FEE_BASE.store(base_fee, Ordering::Relaxed);
+    FEE_CHECKED_AT.store(now_unix, Ordering::Relaxed);
+}
+
+pub(crate) fn settlements_confirmed() -> u64 {
+    SETTLEMENTS_CONFIRMED.load(Ordering::Relaxed)
+}
+
+/// Settlements given back, one per settlement, by cause.
+pub(crate) fn settlements_released() -> impl Iterator<Item = (&'static str, u64)> {
+    ReleaseCause::iter().map(|cause| {
+        (
+            cause.into(),
+            SETTLEMENTS_RELEASED[cause as usize].load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// `(balance, base fee, checked at)`, or `None` before the first check. A
+/// chain that charges no fee never records one: the check stops early.
+pub(crate) fn fee() -> Option<(u64, u64, u64)> {
+    let at = FEE_CHECKED_AT.load(Ordering::Relaxed);
+    (at != 0).then(|| {
+        (
+            FEE_BALANCE.load(Ordering::Relaxed),
+            FEE_BASE.load(Ordering::Relaxed),
+            at,
         )
     })
 }
@@ -265,6 +437,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unfinished_age_counts_the_oldest_held_or_in_hand_work() {
+        assert_eq!(unfinished_age_secs(0, 0, 50_000), 0);
+        assert_eq!(unfinished_age_secs(20_000, 0, 50_000), 30);
+        assert_eq!(unfinished_age_secs(0, 41_000, 50_000), 9);
+        assert_eq!(unfinished_age_secs(20_000, 41_000, 50_000), 30);
+        assert_eq!(unfinished_age_secs(41_000, 20_000, 50_000), 30);
+        // A clock that went back never shows a negative age.
+        assert_eq!(unfinished_age_secs(60_000, 0, 50_000), 0);
+    }
+
+    #[test]
+    fn failures_before_submit_name_every_stage_and_cause() {
+        let rows: Vec<_> = failed_before_submit().collect();
+        assert_eq!(rows.len(), FailedStage::COUNT * 2);
+        let count = |stage: &str, cause: &str| {
+            failed_before_submit()
+                .find(|(s, c, _)| *s == stage && *c == cause)
+                .unwrap()
+                .2
+        };
+        let before = count("prove", "rpc");
+        record_failed_before_submit(FailedStage::Prove, true);
+        assert_eq!(count("prove", "rpc"), before + 1);
+    }
+
     /// The counters are process-wide. Only this test records a drop of a
     /// settlement with an unconfirmed maker input, and it returns no inputs,
     /// so it moves nothing the executor's release test compares (the
@@ -276,5 +474,30 @@ mod tests {
         record_release(ReleaseCause::Dropped, 0, true);
         record_release(ReleaseCause::Refused, 0, true);
         assert_eq!(count("true"), before + 1);
+    }
+
+    #[test]
+    fn settlement_times_fill_cumulative_buckets() {
+        let times = SettlementTimes::new();
+        for seconds in [3, 59, 61, 700] {
+            times.record(seconds * 1000);
+        }
+        let (buckets, sum) = times.read();
+        assert_eq!(
+            buckets,
+            vec![
+                (5, 1),
+                (10, 1),
+                (20, 1),
+                (30, 1),
+                (45, 1),
+                (60, 2),
+                (90, 3),
+                (120, 3),
+                (300, 3),
+                (600, 3)
+            ]
+        );
+        assert_eq!(sum, 823.0);
     }
 }

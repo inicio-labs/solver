@@ -1249,7 +1249,9 @@ impl Executor {
         if let Some(kind) = conflict {
             metrics::record_conflict(kind);
         }
-        tracing::error!(
+        // A refusal is an expected outcome, counted above by code; `error`
+        // is kept for problems no counter reports.
+        tracing::warn!(
             error = %crate::ingest::client_error_detail(&error),
             code = <&str>::from(code),
             conflict = conflict.map(<&str>::from),

@@ -273,3 +273,61 @@ pub fn submit(
         live,
     )
 }
+
+/// Cancel `note`'s lineage with its maker's `CancelOrder` at `seq`.
+pub fn cancel(conn: &mut PgConnection, maker_id: MakerId, seq: u64, note: &Note) -> Result<()> {
+    let lineage_id = lineage_of(note);
+    run(
+        conn,
+        maker_id,
+        seq,
+        &MakerCommand::CancelOrder { lineage_id },
+        false,
+    )?;
+    Ok(())
+}
+
+/// Reserve `parents` in settlement `tx`, each filled by `amount`.
+pub fn reserve(conn: &mut PgConnection, tx: u8, parents: &[&Note], amount: u64) -> Result<()> {
+    let inputs: Vec<_> = parents
+        .iter()
+        .map(|parent| fill(tx, parent, amount).0)
+        .collect();
+    prepare(conn, tx, &inputs)
+}
+
+/// Every event of `maker_id`, decoded, in feed order.
+pub fn events(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<crate::gateway::proto::event_body::Kind>> {
+    use prost::Message as _;
+    Ok(maker_db::read_events_tx(conn, maker_id, 0, 1000)?
+        .into_iter()
+        .map(|event| {
+            crate::gateway::proto::EventBody::decode(event.payload.as_slice())
+                .unwrap()
+                .kind
+                .unwrap()
+        })
+        .collect())
+}
+
+/// Each SettlementResolved of `maker_id`: (input note, status, reason).
+pub fn resolutions(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<(Vec<u8>, crate::gateway::proto::ResultingStatus, String)>> {
+    use crate::gateway::proto::event_body::Kind;
+    Ok(events(conn, maker_id)?
+        .into_iter()
+        .filter_map(|kind| match kind {
+            Kind::SettlementResolved(resolved) => {
+                let result = resolved.result.unwrap();
+                let status = result.status();
+                Some((result.note_id, status, result.reason))
+            }
+            _ => None,
+        })
+        .collect())
+}

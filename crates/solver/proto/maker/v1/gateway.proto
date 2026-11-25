@@ -277,6 +277,12 @@ message InputResult {
   reserved 2;
   reserved "lineage_id";
   ResultingStatus status = 3;
+  // Set only when `status` is CANCELLED: `maker_cancel` (your CancelOrder or
+  // CancelAll), `self_trade_prevention` (a newer crossing order of yours) or
+  // `note_not_received` (the operator's escape hatch closed an order that
+  // went live at accept). Empty when the cause is unknown, as on results sent
+  // before this field existed. Treat an unknown value like an empty one.
+  string reason = 4;
 }
 
 // A settlement transaction was verified committed, or definitively voided

@@ -20,6 +20,7 @@ use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 
 use super::error::{DbError, DbResult};
+use super::postgres_db::INSERT_CHUNK_ROWS;
 use super::postgres_models::{NewOrderRow, OrderRow, SettlementInputRow};
 use super::postgres_schema::{
     api_keys, eligible_orders, live_orders, maker_commands, maker_cutoffs, maker_events,
@@ -340,13 +341,15 @@ pub fn execute_command_tx(
             (CommandResult::Applied { cutoff, settling }, Some(update))
         }
         MakerCommand::CancelOrder { lineage_id } => {
-            diesel::insert_into(maker_stops::table)
-                .values((
-                    maker_stops::maker_id.eq(maker_id),
-                    maker_stops::lineage_id.eq(lineage_id),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?;
+            stop_lineages_tx(
+                conn,
+                &[Stop {
+                    maker_id,
+                    lineage_id,
+                    source: StopSource::Maker,
+                    caused_by: None,
+                }],
+            )?;
             let settling = settling_in_lineage(conn, maker_id, lineage_id)?;
             let update = MakerUpdate::LineageCancelled {
                 maker_id,
@@ -808,9 +811,19 @@ fn order_ids(note_ids: &[Vec<u8>]) -> DbResult<Vec<OrderId>> {
 
 fn order_status(note: &Note, state: proto::OrderState, reason: &str) -> proto::EventBody {
     let depth = OrderKeys::from_note(note).map_or(0, |keys| keys.depth);
+    status_body(note.id().to_bytes().to_vec(), depth, state, reason)
+}
+
+/// An `OrderStatus` event for the order version `note_id` at `depth`.
+fn status_body(
+    note_id: Vec<u8>,
+    depth: u32,
+    state: proto::OrderState,
+    reason: &str,
+) -> proto::EventBody {
     proto::EventBody {
         kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-            note_id: note.id().to_bytes().to_vec(),
+            note_id,
             depth,
             state: state.into(),
             reason: reason.to_owned(),
@@ -1071,21 +1084,31 @@ pub fn close_unconfirmed_tx<'a>(
             &[OrderStatus::Active, OrderStatus::Waiting],
             OrderStatus::Stopped,
             proto::OrderState::Cancelled,
-            NOTE_NOT_RECEIVED,
+            StopSource::Cap.reason(),
         ),
     };
     let moved = move_orders(conn, &closed_ids, from, to)?;
     let moved_now: HashSet<&Vec<u8>> = moved.iter().collect();
-    let mut told = Vec::new();
     // Only the orders it moved: a spent or stopped root's lineage is closed
     // silently.
-    for submission in closed
+    let closed: Vec<&PendingSubmission> = closed
         .into_iter()
         .filter(|s| moved_now.contains(&s.note_id))
-    {
-        if close == Close::NoteNotReceived {
-            stop_lineage_tx(conn, submission.maker_id, &submission.lineage_id)?;
-        }
+        .collect();
+    if close == Close::NoteNotReceived {
+        let stops: Vec<Stop> = closed
+            .iter()
+            .map(|s| Stop {
+                maker_id: s.maker_id,
+                lineage_id: &s.lineage_id,
+                source: StopSource::Cap,
+                caused_by: None,
+            })
+            .collect();
+        stop_lineages_tx(conn, &stops)?;
+    }
+    let mut told = Vec::new();
+    for submission in closed {
         if shown.contains(&submission.note_id) {
             tell_tx(
                 conn,
@@ -1101,20 +1124,87 @@ pub fn close_unconfirmed_tx<'a>(
     Ok((order_ids(&moved)?, told))
 }
 
-/// A lineage's stop row, as `CancelOrder` writes it.
-fn stop_lineage_tx(
-    conn: &mut PgConnection,
-    maker_id: MakerId,
-    lineage_id: &LineageId,
-) -> DbResult<()> {
-    diesel::insert_into(maker_stops::table)
-        .values((
-            maker_stops::maker_id.eq(maker_id),
-            maker_stops::lineage_id.eq(lineage_id),
-        ))
-        .on_conflict_do_nothing()
-        .execute(conn)?;
-    Ok(())
+/// Who stopped a lineage, stored in `maker_stops.source`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum StopSource {
+    /// The maker's `CancelOrder`.
+    Maker,
+    /// The live-at-accept cap: the note never arrived (ADR 0008).
+    Cap,
+    /// The operator's `cancel-unconfirmed` (ADR 0008).
+    EscapeHatch,
+    /// A reservation that filled the maker's kept order (ADR 0005).
+    StpReservation,
+    /// A crossing submit of the same maker (ADR 0009).
+    StpOnSubmit,
+}
+
+impl StopSource {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// The reason a maker hears for an order stopped this way: every event
+    /// for a stop takes it from here.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Maker => MAKER_CANCEL,
+            Self::Cap | Self::EscapeHatch => NOTE_NOT_RECEIVED,
+            Self::StpReservation | Self::StpOnSubmit => SELF_TRADE_PREVENTION,
+        }
+    }
+}
+
+/// One lineage to stop.
+#[derive(Clone, Copy, Debug)]
+pub struct Stop<'a> {
+    pub maker_id: MakerId,
+    pub lineage_id: &'a LineageId,
+    pub source: StopSource,
+    /// The newer order of the maker that crossed it (ADR 0009).
+    pub caused_by: Option<&'a LineageId>,
+}
+
+/// Write `stops`, one statement per [`INSERT_CHUNK_ROWS`], and return the
+/// lineages this call stopped. A lineage stopped already keeps its first stop
+/// row, and is not returned: whoever stopped it first already did whatever
+/// follows. The lineage ID alone names the stop because every caller that
+/// passes more than one takes each (maker, lineage) pair from a claim, and a
+/// lineage is claimed once.
+///
+/// Every stop row is written here. The caller holds the makers' locks. Only
+/// a self-trade stop at submit names the order that caused it: the table's
+/// check refuses a cause with any other source, even on a row it skips.
+pub fn stop_lineages_tx(conn: &mut PgConnection, stops: &[Stop]) -> DbResult<HashSet<LineageId>> {
+    debug_assert!(
+        stops
+            .iter()
+            .all(|stop| stop.caused_by.is_none() || stop.source == StopSource::StpOnSubmit),
+        "only a self-trade stop at submit names a cause"
+    );
+    let mut stopped = HashSet::new();
+    for chunk in stops.chunks(INSERT_CHUNK_ROWS) {
+        let rows: Vec<_> = chunk
+            .iter()
+            .map(|stop| {
+                (
+                    maker_stops::maker_id.eq(stop.maker_id),
+                    maker_stops::lineage_id.eq(stop.lineage_id),
+                    maker_stops::source.eq(Some(stop.source.as_str())),
+                    maker_stops::caused_by_lineage.eq(stop.caused_by),
+                )
+            })
+            .collect();
+        stopped.extend(
+            diesel::insert_into(maker_stops::table)
+                .values(rows)
+                .on_conflict_do_nothing()
+                .returning(maker_stops::lineage_id)
+                .get_results::<Vec<u8>>(conn)?,
+        );
+    }
+    Ok(stopped)
 }
 
 /// Tell a maker its order `note` is now `state`, for `reason`.
@@ -1238,9 +1328,16 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
                 .filter_map(|(note, maker, lineage)| Some((note, (maker?, lineage?)))),
         )
         .collect();
-    for (maker_id, lineage_id) in closing.values() {
-        stop_lineage_tx(conn, *maker_id, lineage_id)?;
-    }
+    let stops: Vec<Stop> = closing
+        .values()
+        .map(|(maker_id, lineage_id)| Stop {
+            maker_id: *maker_id,
+            lineage_id,
+            source: StopSource::EscapeHatch,
+            caused_by: None,
+        })
+        .collect();
+    stop_lineages_tx(conn, &stops)?;
     let stopped = move_orders(
         conn,
         &rows,
@@ -1267,7 +1364,7 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
             lineage_id,
             &note,
             proto::OrderState::Cancelled,
-            NOTE_NOT_RECEIVED,
+            StopSource::EscapeHatch.reason(),
         )?;
     }
     let mut cancelled: Vec<_> = per_maker.into_iter().collect();
@@ -1280,6 +1377,10 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
 
 /// The maker's reason when the cap cancels an order whose note never arrived.
 pub const NOTE_NOT_RECEIVED: &str = "note_not_received";
+/// The maker's reason when its own crossing order cancelled an order.
+pub const SELF_TRADE_PREVENTION: &str = "self_trade_prevention";
+/// The maker's reason for an order its own cancel stopped.
+pub const MAKER_CANCEL: &str = "maker_cancel";
 
 /// Report Unavailable for the maker orders among `note_ids` that the maker
 /// sees as live (active, or waiting for their note: ADR 0008), which are
@@ -1302,14 +1403,12 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
         ))
         .load(conn)?;
     for (note_id, maker_id, lineage_id, depth) in spent {
-        let body = proto::EventBody {
-            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-                note_id,
-                depth: u32::try_from(depth.unwrap_or(0))?,
-                state: proto::OrderState::Unavailable.into(),
-                reason: "note spent outside this solver".into(),
-            })),
-        };
+        let body = status_body(
+            note_id,
+            u32::try_from(depth.unwrap_or(0))?,
+            proto::OrderState::Unavailable,
+            "note spent outside this solver",
+        );
         gateway::append_event_tx(conn, maker_id, lineage_id.as_deref(), &body)?;
     }
     Ok(())
@@ -1317,7 +1416,7 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
 
 /// Stop the sit-outs of a reservation that fills a crossed maker's kept
 /// order (ADR 0005), in the reservation's transaction: a stop row per lineage,
-/// as `CancelOrder` writes, and one `OrderStatus CANCELLED` per order it
+/// with its own source, and one `OrderStatus CANCELLED` per order it
 /// stopped. Orders no longer live (cancelled by the maker or spent meanwhile)
 /// are skipped. Only `postgres_db::reserve_settlement_tx` may call it: that
 /// function locks every sit-out's maker first, and taking the lock here,
@@ -1326,43 +1425,42 @@ pub(super) fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>
     if note_ids.is_empty() {
         return Ok(());
     }
-    /// Note ID, maker, lineage and depth of a live maker order.
-    type Live = (Vec<u8>, i64, Option<Vec<u8>>, Option<i64>);
+    /// Note ID, maker, lineage and depth of a live maker order. The view
+    /// takes the maker from the lineage's claim, so a maker means a lineage.
+    type Live = (Vec<u8>, i64, Vec<u8>, Option<i64>);
     let live: Vec<Live> = live_orders::table
         .filter(live_orders::note_id.eq_any(note_ids))
         .filter(live_orders::maker_id.is_not_null())
         .select((
             live_orders::note_id,
             live_orders::maker_id.assume_not_null(),
-            live_orders::lineage_id,
+            live_orders::lineage_id.assume_not_null(),
             live_orders::depth,
         ))
         .load(conn)?;
+    let stops: Vec<Stop> = live
+        .iter()
+        .map(|(_, maker_id, lineage_id, _)| Stop {
+            maker_id: *maker_id,
+            lineage_id,
+            source: StopSource::StpReservation,
+            caused_by: None,
+        })
+        .collect();
+    // The makers are locked and the view drops stopped lineages, so every
+    // stop here is new; `remove` only keeps a lineage named twice to one
+    // event.
+    let mut stopped = stop_lineages_tx(conn, &stops)?;
     for (note_id, maker_id, lineage_id, depth) in live {
-        // A claimed order always has its lineage.
-        let Some(lineage_id) = lineage_id else {
-            continue;
-        };
-        // A concurrent `CancelOrder` that stopped it first wins: no event.
-        let stopped = diesel::insert_into(maker_stops::table)
-            .values((
-                maker_stops::maker_id.eq(maker_id),
-                maker_stops::lineage_id.eq(&lineage_id),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?
-            == 1;
-        if !stopped {
+        if !stopped.remove(&lineage_id) {
             continue;
         }
-        let body = proto::EventBody {
-            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-                note_id,
-                depth: u32::try_from(depth.unwrap_or(0))?,
-                state: proto::OrderState::Cancelled.into(),
-                reason: "self_trade_prevention".into(),
-            })),
-        };
+        let body = status_body(
+            note_id,
+            u32::try_from(depth.unwrap_or(0))?,
+            proto::OrderState::Cancelled,
+            StopSource::StpReservation.reason(),
+        );
         gateway::append_event_tx(conn, maker_id, Some(&lineage_id), &body)?;
     }
     Ok(())
@@ -2172,6 +2270,31 @@ mod tests {
             [false, false, true, false]
         );
         Ok(())
+    }
+
+    /// The reason a maker hears for each way a lineage can be stopped.
+    #[test]
+    fn every_stop_source_has_its_reason() {
+        let reasons: Vec<_> = [
+            StopSource::Maker,
+            StopSource::Cap,
+            StopSource::EscapeHatch,
+            StopSource::StpReservation,
+            StopSource::StpOnSubmit,
+        ]
+        .into_iter()
+        .map(|source| (source.as_str(), source.reason()))
+        .collect();
+        assert_eq!(
+            reasons,
+            [
+                ("maker", "maker_cancel"),
+                ("cap", "note_not_received"),
+                ("escape_hatch", "note_not_received"),
+                ("stp_reservation", "self_trade_prevention"),
+                ("stp_on_submit", "self_trade_prevention"),
+            ]
+        );
     }
 
     #[test]

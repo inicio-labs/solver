@@ -707,6 +707,52 @@ fn a_spent_unconfirmed_order_is_decided_by_its_status() -> Result<()> {
     Ok(())
 }
 
+/// An order its maker cancelled before it went live, by `CancelOrder` or by
+/// a covering `CancelAll`, is closed quietly when the watcher first sees its
+/// note already spent (the maker reclaimed it): a cancel produces no event,
+/// and neither does the spend. An order nobody cancelled still hears
+/// UNAVAILABLE.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_cancelled_pending_order_hears_nothing_when_its_note_is_spent() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (stopped, cut_off, kept) = (note(1), note(2), note(3));
+    // The confirmed path: accepted, the notes not seen yet.
+    command(conn, alpha, 1, MakerCommand::submit(stopped.clone())?)?;
+    command(conn, alpha, 2, MakerCommand::submit(cut_off.clone())?)?;
+    command(conn, alpha, 5, MakerCommand::submit(kept.clone())?)?;
+    cancel(conn, alpha, 10, &stopped)?;
+    // Below 3, so it covers seqs 1 and 2, not 5.
+    command(
+        conn,
+        alpha,
+        3,
+        MakerCommand::CancelAll {
+            scope: CutoffScope::all(),
+        },
+    )?;
+    let spent = vec![
+        pending(conn, &stopped)?,
+        pending(conn, &cut_off)?,
+        pending(conn, &kept)?,
+    ];
+    conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &spent))?;
+    for order in [&stopped, &cut_off, &kept] {
+        assert_eq!(lineage(conn, order)?.0, "rejected");
+    }
+    assert_eq!(
+        statuses(conn, alpha)?,
+        [(
+            id(&kept),
+            proto::OrderState::Unavailable,
+            "note spent before it became live".to_owned()
+        )]
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 fn a_spend_seen_elsewhere_first_is_reported_once() -> Result<()> {

@@ -1010,8 +1010,13 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
 
     let lineages: Vec<_> = unusable.iter().map(|s| &s.lineage_id).collect();
     let rejected = settle_lineages(conn, &lineages, LineageState::Rejected)?;
+    // An order its maker cancelled before it went live is closed quietly: a
+    // cancel produces no event, and a spend of a cancelled order's note
+    // (usually the maker's own reclaim) produces none either.
+    let cancelled = cancelled_lineages(conn, &lineages)?;
     for submission in unusable {
-        if rejected.contains(&submission.lineage_id) {
+        if rejected.contains(&submission.lineage_id) && !cancelled.contains(&submission.lineage_id)
+        {
             let body = order_status(
                 &submission.note,
                 proto::OrderState::Unavailable,
@@ -1026,6 +1031,38 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
         }
     }
     Ok(removed)
+}
+
+/// The lineages among `lineages` that their maker cancelled: a stop row, or
+/// a cutoff that covers them (the same test as `eligible_orders`).
+fn cancelled_lineages(
+    conn: &mut PgConnection,
+    lineages: &[&LineageId],
+) -> DbResult<HashSet<LineageId>> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Binary)]
+        lineage_id: Vec<u8>,
+    }
+    if lineages.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(diesel::sql_query(
+        "SELECT l.lineage_id FROM maker_lineages l
+         WHERE l.lineage_id = ANY($1)
+           AND (EXISTS (SELECT 1 FROM maker_stops s
+                        WHERE s.maker_id = l.maker_id AND s.lineage_id = l.lineage_id)
+                OR EXISTS (SELECT 1 FROM maker_cutoffs c
+                           WHERE c.maker_id = l.maker_id
+                             AND l.root_seq < c.cutoff
+                             AND (c.market = '' OR c.market = l.market)
+                             AND (c.direction = '' OR c.direction = l.direction)))",
+    )
+    .bind::<diesel::sql_types::Array<Binary>, _>(lineages)
+    .load::<Row>(conn)?
+    .into_iter()
+    .map(|row| row.lineage_id)
+    .collect())
 }
 
 /// How [`close_unconfirmed_tx`] closes an order that went live at accept.

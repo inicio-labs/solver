@@ -32,6 +32,10 @@ axum = { version = "0.8", features = ["json", "ws"] }
 # (Concurrency-shedding uses a tokio Semaphore middleware; body cap uses axum's
 # DefaultBodyLimit — no extra crates needed for those.)
 tower-http = { version = "0.6", default-features = false, features = ["timeout", "set-header", "cors"] }
+# The price API's own HTTP/1.1-only connection loop (connection cap, header
+# timeout, small per-connection buffer); axum::serve exposes none of these.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 hex = "0.4"
 subtle = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

@@ -7,9 +7,13 @@
 //! ISOLATION (P0): this is a public, unauthenticated surface, so it runs on its
 //! OWN OS thread + multi-thread runtime. It never touches the `!Send` miden
 //! `Client` or the matcher's single-threaded `LocalSet`, so wallet traffic
-//! cannot starve fund settlement. Protections: request timeout, body cap,
-//! batch cap, and a cap on `/v2/swap-eta` requests waiting for liquidity.
-//! No handler blocks a worker: the only await is that wait.
+//! cannot starve fund settlement. Protections: a runtime of
+//! `price_query_workers` threads (default 2, so at most two cores), its own
+//! HTTP/1.1-only connection loop with a connection cap, a header timeout and a
+//! 16 KiB per-connection buffer, request timeout, body cap, batch cap, and a
+//! cap on `/v2/swap-eta` requests waiting for liquidity. No handler blocks a
+//! worker: the only await is that wait. `/livez` and `/readyz` are for a load
+//! balancer's health checks.
 //!
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
@@ -26,6 +30,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,10 +41,15 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use miden_protocol::account::AccountId;
 use serde::Serialize;
 use serde_json::json;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -64,6 +74,13 @@ pub struct PriceApiConfig {
     pub port: u16,
     pub max_batch: usize,
     pub timeout_ms: u64,
+    /// Worker threads of this API's runtime (`engine.price_query_workers`).
+    pub workers: usize,
+    /// Open connections kept at once (`engine.price_query_max_connections`).
+    pub max_connections: usize,
+    /// Time a connection has to send a request's headers, idle kept-alive
+    /// time included (`engine.price_query_header_timeout_ms`).
+    pub header_timeout_ms: u64,
     /// `/v2/swap-eta`: how long a request may wait for liquidity (its
     /// `wait_ms` default and maximum); `0` turns waiting off.
     pub swap_eta_wait_ms: u64,
@@ -566,14 +583,7 @@ fn registered_decimals(
 /// confirmed the markets at startup it answers `503 not_ready`, so a list a
 /// failing startup would reject is never served or cached.
 async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoResponse, ApiError> {
-    let confirmed = state
-        .prices
-        .borrow()
-        .markets()
-        .clearing_pairs()
-        .next()
-        .is_some();
-    if !confirmed && !state.pairs.pairs.is_empty() {
+    if !markets_confirmed(&state) {
         return Err(ApiError::NotReady);
     }
     Ok((
@@ -583,6 +593,40 @@ async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoRespon
         )],
         Json(PairsResponse::clone(&state.pairs)),
     ))
+}
+
+/// Whether the price feed has confirmed the Binance markets at startup (or
+/// no pair is configured, so there is nothing to confirm). Until then
+/// `/v2/pairs` and `/readyz` answer `503 not_ready`.
+fn markets_confirmed(state: &PriceApiState) -> bool {
+    state.pairs.pairs.is_empty()
+        || state
+            .prices
+            .borrow()
+            .markets()
+            .clearing_pairs()
+            .next()
+            .is_some()
+}
+
+/// `GET /livez`: the API thread answers. A load balancer or supervisor that
+/// gets no answer should replace or restart the process.
+async fn get_livez() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        "ok",
+    )
+}
+
+/// `GET /readyz`: quotes can be served (the markets are confirmed), else
+/// `503 not_ready`. For a load balancer's health check.
+async fn get_readyz(State(state): State<PriceApiState>) -> Response {
+    let headers = [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    if markets_confirmed(&state) {
+        (headers, "ready").into_response()
+    } else {
+        (headers, ApiError::NotReady).into_response()
+    }
 }
 
 /// The pair's sells and buys in `book`, best first, for an order offering
@@ -963,6 +1007,7 @@ async fn mirror_depth(
     let mut remembered = RememberedPrices::new();
     let mut previous = Arc::new(SwapBookSnapshot::default());
     while let Some(change) = changes.recv().await {
+        MIRROR_QUEUE_LENGTH.store(changes.len() as u64 + 1, Ordering::Relaxed);
         let first = change.pair();
         depth.apply(change);
         let mut touched = depth.drain(&mut changes);
@@ -1076,6 +1121,10 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .route("/pairs", get(get_pairs))
         .route("/pair-price", get(get_pair_price))
         .route("/swap-eta", get(get_swap_eta))
+        .with_state(state.clone());
+    let health = Router::new()
+        .route("/livez", get(get_livez))
+        .route("/readyz", get(get_readyz))
         .with_state(state);
 
     // Public read-only price data → permissive CORS so browser wallets /
@@ -1088,6 +1137,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     Router::new()
         .nest("/v1", v1)
         .nest("/v2", v2)
+        .merge(health)
         // Outer protections (applied to all routes):
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -1122,6 +1172,9 @@ pub fn spawn_price_api_thread(
         .name("price-api".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cfg.workers)
+                .max_blocking_threads(cfg.workers)
+                .thread_name("price-api-worker")
                 .enable_all()
                 .build()
             {
@@ -1168,18 +1221,142 @@ pub fn spawn_price_api_thread(
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
-                tracing::info!(%addr, "price-query API listening");
-                let shutdown = async move { cancel.cancelled().await };
-                if let Err(e) = axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-                {
-                    tracing::error!(error = %e, "price-query API server error");
-                }
+                tracing::info!(
+                    %addr,
+                    workers = cfg.workers,
+                    max_connections = cfg.max_connections,
+                    "price-query API listening"
+                );
+                let limits = ConnectionLimits {
+                    max_connections: cfg.max_connections,
+                    header_timeout: Duration::from_millis(cfg.header_timeout_ms),
+                };
+                serve(listener, app, limits, cancel).await;
             });
         })
         .context("spawn price-api thread")?;
     Ok((handle, ready_rx))
+}
+
+/// Per-connection buffer for reading a request (hyper's floor is 8 KiB): our
+/// requests are a short GET line and a few headers, so this bounds what one
+/// connection can hold.
+const READ_BUFFER_BYTES: usize = 16 * 1024;
+/// How long shutdown waits for open connections to finish their requests.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Connections the API holds open now, and connections closed at accept
+/// because [`ConnectionLimits::max_connections`] were already open.
+static OPEN_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static REFUSED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Changes waiting in the matcher -> mirror channel when the mirror last
+/// drained it: grows only if the mirror falls behind.
+static MIRROR_QUEUE_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+/// `(open, refused since start)` connections, for `/metrics`.
+pub(crate) fn connection_counts() -> (u64, u64) {
+    (
+        OPEN_CONNECTIONS.load(Ordering::Relaxed),
+        REFUSED_CONNECTIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// Changes queued for the depth mirror at its last round, for `/metrics`.
+pub(crate) fn mirror_queue_length() -> u64 {
+    MIRROR_QUEUE_LENGTH.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    max_connections: usize,
+    header_timeout: Duration,
+}
+
+/// One open connection, counted while it lives.
+struct OpenConnection;
+
+impl OpenConnection {
+    fn new() -> Self {
+        OPEN_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        OPEN_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Accept connections and serve `app` on each, HTTP/1.1 only, until `cancel`;
+/// then let open requests finish for at most [`SHUTDOWN_GRACE`]. A
+/// connection over `limits.max_connections` is closed at once and counted,
+/// so a flood of connections costs a file handle each, briefly, not a task.
+async fn serve(
+    listener: TcpListener,
+    app: Router,
+    limits: ConnectionLimits,
+    cancel: CancellationToken,
+) {
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let mut connections = JoinSet::new();
+    loop {
+        let stream = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => stream,
+                Err(error) => {
+                    // Out of file handles, for example: back off briefly
+                    // instead of spinning on the same error.
+                    tracing::warn!(%error, "price-query API accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            REFUSED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let service = TowerToHyperService::new(app.clone());
+        let cancel = cancel.clone();
+        connections.spawn(async move {
+            let _slot = slot;
+            let _open = OpenConnection::new();
+            let connection = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_timeout)
+                .max_buf_size(READ_BUFFER_BYTES)
+                .serve_connection(TokioIo::new(stream), service);
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                result = connection.as_mut() => result,
+                () = cancel.cancelled() => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "price-query API connection ended");
+            }
+        });
+        // Reap finished connections so the set holds only live ones.
+        while connections.try_join_next().is_some() {}
+    }
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            open = connections.len(),
+            "price-query API connections still open at shutdown; closing them"
+        );
+        connections.abort_all();
+    }
 }
 
 #[cfg(test)]

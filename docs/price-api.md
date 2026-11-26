@@ -339,6 +339,14 @@ differ from what the solver does; `/v2/swap-eta` follows the solver's own
 rule. Its `marketPrice` and `offMarket` refer to the Binance mid: on a pair
 with a band the batch price can be up to the band away from it.
 
+### `GET /livez`, `GET /readyz` — health checks
+
+For a load balancer, not for wallets. `/livez` answers `200 ok` while the API
+thread runs. `/readyz` answers `200 ready` once the solver has confirmed its
+Binance markets at startup, and `503` `not_ready` before that (the same rule as
+`/v2/pairs`). Both are `Cache-Control: no-store`. See [Behind a load
+balancer](#behind-a-load-balancer) for the settings that go with them.
+
 ### Status codes
 
 | Code | When |
@@ -406,7 +414,32 @@ const usdt = quoteValue(ibtc, 250000000); // 2.5 IBTC -> 25
 
 ## Notes
 
-- **Read-only, public, cached** (`Cache-Control: max-age=1`; both `swap-eta` versions are `no-store`). Concurrency-limited; excess → `503`.
+- **Read-only, public, cached** (`Cache-Control: max-age=1`; both `swap-eta` versions are `no-store`).
+- **HTTP/1.1 only.** The API runs on its own thread with `engine.price_query_workers`
+  worker threads (default 2), holds at most `engine.price_query_max_connections`
+  open connections (default 1024; more are closed at accept), and closes a
+  connection that takes longer than `engine.price_query_header_timeout_ms`
+  (default 75 s) to send a request's headers, idle kept-alive time included.
 - `price` is per **whole token** (not per base unit) — combine with `decimals` as shown.
 - Prices come from Binance Spot `bookTicker` midpoints. On devnet the faucet tokens are priced by a mock Binance server, so the values in the table above are fixed test prices.
 - Endpoint accepts the **hex** faucet id today. (Bech32 `mdev…` acceptance can be added on request.)
+
+## Behind a load balancer
+
+To serve wallets through a team hostname -> CloudFront (+ WAF) -> an AWS
+Application Load Balancer -> this API, with the API's port open only to the
+load balancer, use these settings:
+
+| Setting | Value | Why |
+|---|---|---|
+| `engine.price_query_bind` | the host's private address, or `0.0.0.0` with the security group below | the ALB must reach it |
+| Security group on the solver host | the API port open **only** to the ALB's security group | nobody on the internet reaches the key-holding host directly |
+| ALB target health check | `GET /readyz`, every 5 s, unhealthy after 2 failures, healthy after 2 | stops traffic while the markets are unconfirmed |
+| ALB idle timeout | 60 s (default) | must stay **below** `price_query_header_timeout_ms` (75 s), or the ALB can send a request on a connection this API is closing (a 502) |
+| ALB to target | HTTP/1.1 | the API speaks nothing else |
+| CloudFront | caching as the API's `Cache-Control` says; origin read timeout ~10 s | |
+| CloudFront custom error responses | 502, 503, 504 -> the JSON `{"error":"not_ready",...}` with status 503, plus a response-headers policy adding `Access-Control-Allow-Origin: *` | when no healthy target answers, wallets get the documented error, not an HTML page they cannot read |
+| WAF | a rate-based rule per client IP | floods stop at the edge |
+
+An ALB sends traffic to every target when all of them fail their health checks
+(it fails open), so the API's own answers, not the ALB, decide `not_ready`.

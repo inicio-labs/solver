@@ -194,6 +194,27 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
             "solver_settlement_duration_seconds_bucket{{le=\"{bound}\"}} {count}"
         );
     }
+    let (tick_buckets, tick_sum, ticks_timed) = crate::matcher::tick_times();
+    for (bound, count) in tick_buckets {
+        let _ = writeln!(
+            body,
+            "solver_matcher_tick_duration_seconds_bucket{{le=\"{bound}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_matcher_tick_duration_seconds_bucket{{le=\"+Inf\"}} {ticks_timed}\n\
+         solver_matcher_tick_duration_seconds_sum {tick_sum}\n\
+         solver_matcher_tick_duration_seconds_count {ticks_timed}"
+    );
+    let (open, refused) = crate::price_api::connection_counts();
+    let _ = writeln!(
+        body,
+        "solver_price_api_open_connections {open}\n\
+         solver_price_api_refused_connections_total {refused}\n\
+         solver_price_mirror_queue_length {}",
+        crate::price_api::mirror_queue_length()
+    );
     let _ = writeln!(
         body,
         "solver_settlement_duration_seconds_bucket{{le=\"+Inf\"}} {confirmed}\n\
@@ -590,6 +611,40 @@ mod tests {
         append_settlement_metrics(&mut after);
         assert_eq!(value(&after, refused), value(&before, refused) + 1);
         assert_eq!(value(&after, bounced), value(&before, bounced) + 3);
+    }
+
+    /// The tick histogram and the price API's connection numbers render as
+    /// valid series: cumulative buckets, `+Inf` equal to the count.
+    #[test]
+    fn health_metrics_include_tick_times_and_price_api_connections() {
+        let mut body = String::new();
+        append_health_metrics(&mut body, 0);
+        assert_eq!(exposition_errors(&body), Vec::<String>::new());
+        let value = |prefix: &str| -> f64 {
+            body.lines()
+                .find_map(|line| line.strip_prefix(prefix)?.trim().parse().ok())
+                .unwrap_or_else(|| panic!("missing {prefix:?} in:\n{body}"))
+        };
+        let buckets: Vec<f64> = body
+            .lines()
+            .filter(|line| line.starts_with("solver_matcher_tick_duration_seconds_bucket"))
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(buckets.len(), 13, "twelve bounds and +Inf");
+        assert!(buckets.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            value("solver_matcher_tick_duration_seconds_bucket{le=\"+Inf\"}"),
+            value("solver_matcher_tick_duration_seconds_count")
+        );
+        assert!(body.contains("solver_matcher_tick_duration_seconds_bucket{le=\"0.001\"} "));
+        assert!(body.contains("solver_matcher_tick_duration_seconds_bucket{le=\"5\"} "));
+        for name in [
+            "solver_price_api_open_connections ",
+            "solver_price_api_refused_connections_total ",
+            "solver_price_mirror_queue_length ",
+        ] {
+            value(name);
+        }
     }
 
     #[test]

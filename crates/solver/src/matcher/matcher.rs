@@ -56,6 +56,50 @@ pub(crate) fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Upper bounds, in milliseconds, of the tick duration histogram.
+const TICK_MILLIS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+
+/// How long each matching tick took, from the timer firing to the end of the
+/// tick (applying queued updates, expiry, clearing, routing, gauges): a
+/// Prometheus histogram's cumulative buckets, sum and count. The quote split's
+/// solver-safety test compares it with the quote side loaded and idle.
+struct TickTimes {
+    buckets: [AtomicU64; TICK_MILLIS.len()],
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+static TICK_TIMES: TickTimes = TickTimes {
+    buckets: [const { AtomicU64::new(0) }; TICK_MILLIS.len()],
+    sum_us: AtomicU64::new(0),
+    count: AtomicU64::new(0),
+};
+
+fn record_tick(elapsed: Duration) {
+    let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    // The count first: a scrape reads the buckets first, so no bucket it
+    // reads can exceed the count it reads after.
+    TICK_TIMES.count.fetch_add(1, Ordering::Relaxed);
+    TICK_TIMES.sum_us.fetch_add(micros, Ordering::Relaxed);
+    for (bucket, bound) in TICK_TIMES.buckets.iter().zip(TICK_MILLIS) {
+        if micros <= bound * 1000 {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The tick duration histogram: each bound in seconds with the ticks that
+/// took at most that long, the sum in seconds, and the count (read last).
+pub(crate) fn tick_times() -> (Vec<(f64, u64)>, f64, u64) {
+    let buckets = TICK_MILLIS
+        .iter()
+        .zip(&TICK_TIMES.buckets)
+        .map(|(bound, count)| (*bound as f64 / 1000.0, count.load(Ordering::Relaxed)))
+        .collect();
+    let sum = TICK_TIMES.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    (buckets, sum, TICK_TIMES.count.load(Ordering::Relaxed))
+}
+
 /// Seconds since the order matched longest ago, and still not settled, was
 /// first matched, aged at `now_ms`; 0 when there is none.
 pub(crate) fn oldest_matched_order_age_secs(now_ms: u64) -> u64 {
@@ -206,6 +250,7 @@ pub(super) async fn run_worker(
         tokio::select! {
             biased;
             _ = interval.tick() => {
+                let started = Instant::now();
                 TICKS.fetch_add(1, Ordering::Relaxed);
                 let now = now_millis();
                 ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
@@ -230,6 +275,7 @@ pub(super) async fn run_worker(
                     publish_book_gauges(&book, &runtime.prices.borrow());
                     book_gauges_at = Some(Instant::now());
                 }
+                record_tick(started.elapsed());
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -550,6 +596,31 @@ mod tests {
 
     fn imiden() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
+    }
+
+    /// A 3 ms tick lands in every bucket from 5 ms up. The histogram is
+    /// process-wide and other tests tick too, so compare
+    /// against the values before recording.
+    #[test]
+    fn a_tick_is_counted_in_every_bucket_at_or_above_its_duration() {
+        let bucket = |bound: f64| -> u64 {
+            tick_times()
+                .0
+                .into_iter()
+                .find(|(b, _)| *b == bound)
+                .unwrap()
+                .1
+        };
+        let (before_5ms, before_5s) = (bucket(0.005), bucket(5.0));
+        let before_count = tick_times().2;
+        record_tick(Duration::from_millis(3));
+        assert!(bucket(0.005) > before_5ms);
+        assert!(bucket(5.0) > before_5s);
+        assert!(tick_times().2 > before_count);
+        let (buckets, sum, count) = tick_times();
+        assert!(buckets.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+        assert!(buckets.last().unwrap().1 <= count);
+        assert!(sum >= 0.003);
     }
     fn iusdt() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()

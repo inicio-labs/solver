@@ -5394,6 +5394,8 @@ dependencies = [
  "diesel_migrations",
  "futures-util",
  "hex",
+ "hyper",
+ "hyper-util",
  "miden-client",
  "miden-client-sqlite-store",
  "miden-core",

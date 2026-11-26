@@ -7,10 +7,11 @@ syntax = "proto3";
 package solver.maker.v1;
 
 service MakerGateway {
-  // Durably accept a PSWAP note, private or public. Accepted does not mean
-  // Live: the note becomes Live once it is verified on chain. On a solver
-  // with live at accept on, a private note goes Live when it is accepted,
-  // before it is in a block: send the transaction that creates it first.
+  // Durably accept a private PSWAP note; a public one is refused with
+  // INVALID_ARGUMENT. Accepted does not mean Live: the note becomes Live once
+  // it is verified on chain. On a solver with live at accept on, it goes Live
+  // when it is accepted, before it is in a block: send the transaction that
+  // creates it first.
   rpc SubmitOrder(SubmitOrderRequest) returns (CommandReply);
   // Stop every order of this maker in the scope whose submit sequence is
   // below this command's sequence, including submits that arrive later.

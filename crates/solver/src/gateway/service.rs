@@ -213,9 +213,8 @@ impl MakerGateway for MakerGatewayService {
                     "expiry must be a positive Unix millisecond timestamp within i64",
                 ));
             }
-            let mut command = MakerCommand::submit(note).map_err(|error| {
-                Status::invalid_argument(format!("note is not a valid PSWAP order: {error}"))
-            })?;
+            let mut command = MakerCommand::submit(note)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             if let MakerCommand::Submit {
                 expires_at_unix_ms, ..
             } = &mut command
@@ -648,7 +647,7 @@ async fn supervise_gateway<S, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::intake::tests::pswap_note;
+    use super::super::intake::tests::{pswap_note, pswap_note_of_type};
     use super::super::proto::maker_gateway_client::MakerGatewayClient;
     use super::*;
     use crate::db::postgres_test::TestDb;
@@ -912,10 +911,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(accepted, reply(CommandResult::Accepted, false));
-        assert!(matches!(
-            facts.recv().await.unwrap().maker_updates.first(),
-            Some(MakerUpdate::OrdersAttributed { .. })
-        ));
+        // Nothing for the matcher until the note's order row exists.
+        assert!(facts.try_recv().is_err());
         let retried = client
             .submit_order(signed(&key, submit("s1", 1, &order)))
             .await
@@ -965,6 +962,19 @@ mod tests {
             ),
             Code::InvalidArgument
         );
+        let public = client
+            .submit_order(signed(
+                &key,
+                submit(
+                    "s7",
+                    7,
+                    &pswap_note_of_type(7, miden_protocol::note::NoteType::Public),
+                ),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(public.code(), Code::InvalidArgument);
+        assert_eq!(public.message(), "maker order notes must be private");
         let mut garbage = submit("s9", 9, &order);
         garbage.note.push(0);
         assert_eq!(

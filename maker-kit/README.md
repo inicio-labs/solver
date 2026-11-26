@@ -69,7 +69,7 @@ maker events            # replays your feed, shows OrderStatus LIVE
 maker orders            # what the solver can match now
 ```
 
-`quote` creates the order note on chain (private, public paybacks), records it in `wallet/journal.json`, and submits it. Add `--public` for a public order note.
+`quote` creates the order note on chain (private, public paybacks), records it in `wallet/journal.json`, and submits it. The gateway accepts private order notes only.
 
 **4. Cancel and take the tokens back.**
 

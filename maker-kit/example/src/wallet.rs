@@ -162,20 +162,18 @@ pub async fn claim(client: &mut MidenClient, id: AccountId) -> Result<(usize, us
 }
 
 /// Create an order: a PSWAP note offering `offered` for `requested`, created
-/// and committed by the maker's own account. Private by default (its terms
-/// stay off chain until it fills); paybacks public, so the wallet finds them
-/// by syncing. Returns the note to submit to the gateway.
+/// and committed by the maker's own account. Private, as the gateway requires
+/// (its terms stay off chain until it fills); paybacks public, so the wallet
+/// finds them by syncing. Returns the note to submit to the gateway.
 pub async fn create_order(
     client: &mut MidenClient,
     id: AccountId,
     offered: FungibleAsset,
     requested: FungibleAsset,
-    public_note: bool,
 ) -> Result<Note> {
     client.sync_state().await.context("sync")?;
-    let note_type = if public_note { NoteType::Public } else { NoteType::Private };
     let request = TransactionRequestBuilder::new()
-        .build_pswap_create(&PswapTransactionData::new(id, offered, requested), note_type, NoteType::Public, None, client.rng())
+        .build_pswap_create(&PswapTransactionData::new(id, offered, requested), NoteType::Private, NoteType::Public, None, client.rng())
         .map_err(|e| anyhow!(e).context("build the PSWAP note"))?;
     let note = request
         .expected_output_own_notes()

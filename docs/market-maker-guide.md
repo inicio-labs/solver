@@ -713,7 +713,7 @@ flowchart LR
 
 - **Sent:** once for each of your orders in the transaction, when we know it will never commit (for example, its validity window passed before it was included in a block).
 - **Carries:** `tx_id`, `committed = false` and `result`. There is no `fill`: nothing was filled.
-- **You do:** release the exposure. `result` says whether your order is back (`LIVE`), cancelled (`CANCELLED`) or was spent elsewhere (`SPENT_ELSEWHERE`).
+- **You do:** release the exposure. `result` says whether your order is back (`LIVE`), cancelled (`CANCELLED`, with its `reason`) or was spent elsewhere (`SPENT_ELSEWHERE`).
 
 ### What never produces an event
 
@@ -922,6 +922,17 @@ If you reclaim while a settlement is still pending, only one of the two transact
 | `LIVE` | The remainder is live and can be matched again. | Your order is back and can be matched again. |
 | `CANCELLED` | The remainder is cancelled; we won't match it. | Your order is cancelled; we won't match it. |
 | `SPENT_ELSEWHERE` | The remainder was consumed outside the solver. | Your note was consumed outside the solver. |
+
+A `CANCELLED` result says why in `result.reason`:
+
+| `result.reason` | Why |
+|---|---|
+| `maker_cancel` | Your `CancelOrder`, or a `CancelAll` that covers the order. |
+| `self_trade_prevention` | A crossing order of yours on the other side of the pair ([section 12](#12-self-trade-prevention)). |
+| `note_not_received` | The operator closed your orders that went live at accept and were not confirmed (the escape hatch, [section 13](#13-orders-live-at-accept)). If the settlement still committed, your note did arrive: take the fill and reclaim the remainder as usual. |
+| empty | Unknown: the order was stopped before the solver recorded why. |
+
+`result.reason` is empty for every other status. More reasons may be added: treat a value you don't know like an empty one. Results sent before this field existed have none, so a replay of an old cursor shows them empty.
 
 A `LIVE` order is still subject to its expiry. After a partial fill, use the rebuilt remainder as the original note for the next fill. The lineage, root submit sequence and expiry stay the same.
 

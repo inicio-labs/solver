@@ -501,3 +501,136 @@ fn stops_past_one_chunk_are_all_written_once() -> Result<()> {
     assert_eq!(stop_rows(conn)?.len(), INSERT_CHUNK_ROWS + 1);
     Ok(())
 }
+
+/// Resolve settlement `tx`: committed, or voided because the node never
+/// received it, with `consumed` spent elsewhere meanwhile.
+fn resolve(conn: &mut PgConnection, tx: u8, commit: bool, consumed: &[&Note]) -> Result<()> {
+    use super::postgres_db::{finish_discarded_settlement_tx, live_book_update_tx, NodeAnswer};
+    let consumed: HashSet<_> = consumed.iter().map(|note| note.id()).collect();
+    conn.transaction::<_, DbError, _>(|conn| {
+        if commit {
+            confirm_settlement_tx(
+                conn,
+                &[tx; 32],
+                &consumed,
+                BlockNumber::from(8),
+                test_consumer(),
+                None,
+            )?;
+        } else {
+            let released =
+                finish_discarded_settlement_tx(conn, &[tx; 32], &consumed, &NodeAnswer::NotSent)?;
+            live_book_update_tx(conn, released.update)?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// A settlement result that says CANCELLED gives the reason the order was
+/// stopped while the settlement held it: the maker's own cancel or cutoff,
+/// a newer crossing order, or the escape hatch; a stop wins over a cutoff.
+/// Other results give none.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_cancelled_settlement_result_says_why() -> Result<()> {
+    use super::maker_db::{Stop, StopSource};
+    use super::postgres_schema::maker_stops;
+    use crate::gateway::proto::ResultingStatus::{Cancelled, FullyFilled, Live, SpentElsewhere};
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let notes: Vec<Note> = (1..=9).map(|s| order(s, Side::Sell, 50, 100)).collect();
+    // Seqs 10, 20, ..., 90, each in its own settlement; 7 fills whole.
+    for (index, note) in notes.iter().enumerate() {
+        submit(conn, alpha, 10 * (1 + index as u64), note, true)?;
+        let amount = if index == 7 { 100 } else { 40 };
+        postgres_test::reserve(conn, 10 + index as u8, &[note], amount)?;
+    }
+    // 0, 7 and 8: their maker's CancelOrder.
+    for (seq, index) in [(100, 0), (110, 7), (120, 8)] {
+        postgres_test::cancel(conn, alpha, seq, &notes[index])?;
+    }
+    // The maker's cutoff on sells below 55 covers 0 to 4; 1 has nothing
+    // else.
+    run(
+        conn,
+        alpha,
+        55,
+        &MakerCommand::CancelAll {
+            scope: CutoffScope {
+                market: OrderKeys::from_note(&notes[1])?.market,
+                direction: OrderKeys::from_note(&notes[1])?.direction,
+            },
+        },
+        false,
+    )?;
+    // 2: a newer crossing order; 3: the escape hatch's stop; 4: a stop
+    // from before stops recorded their source. 5: not stopped. 6 is the
+    // newer order, still settling.
+    let (two, newer) = (lineage_of(&notes[2]), lineage_of(&notes[6]));
+    conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::stop_lineages_tx(
+            conn,
+            &[
+                Stop {
+                    maker_id: alpha,
+                    lineage_id: &two,
+                    source: StopSource::StpOnSubmit,
+                    caused_by: Some(&newer),
+                },
+                Stop {
+                    maker_id: alpha,
+                    lineage_id: &lineage_of(&notes[3]),
+                    source: StopSource::EscapeHatch,
+                    caused_by: None,
+                },
+                Stop {
+                    maker_id: alpha,
+                    lineage_id: &lineage_of(&notes[4]),
+                    source: StopSource::Maker,
+                    caused_by: None,
+                },
+            ],
+        )
+    })?;
+    diesel::update(maker_stops::table.filter(maker_stops::lineage_id.eq(lineage_of(&notes[4]))))
+        .set(maker_stops::source.eq(None::<String>))
+        .execute(conn)?;
+    for (index, commit, consumed) in [
+        (0, true, None),
+        (1, false, None),
+        (2, true, None),
+        (3, false, None),
+        (4, true, None),
+        (5, true, None),
+        (7, true, None),
+        (8, false, Some(&notes[8])),
+    ] {
+        let consumed: Vec<&Note> = consumed.into_iter().collect();
+        resolve(conn, 10 + index as u8, commit, &consumed)?;
+    }
+    let reasons: Vec<_> = postgres_test::resolutions(conn, alpha)?
+        .into_iter()
+        .map(|(note, status, reason)| {
+            let index = notes.iter().position(|n| id(n) == note).unwrap();
+            (index, status, reason)
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (0, Cancelled, "maker_cancel".to_owned()),
+            (1, Cancelled, "maker_cancel".to_owned()),
+            (2, Cancelled, "self_trade_prevention".to_owned()),
+            (3, Cancelled, "note_not_received".to_owned()),
+            (4, Cancelled, String::new()),
+            (5, Live, String::new()),
+            (7, FullyFilled, String::new()),
+            (8, SpentElsewhere, String::new()),
+        ]
+    );
+    // A lineage neither stopped nor cut off has no reason at all.
+    assert!(maker_db::cancelled_lineages(conn, &[&lineage_of(&notes[5])])?.is_empty());
+    Ok(())
+}

@@ -973,7 +973,8 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
     // (usually the maker's own reclaim) produces none either.
     let cancelled = cancelled_lineages(conn, &lineages)?;
     for submission in unusable {
-        if rejected.contains(&submission.lineage_id) && !cancelled.contains(&submission.lineage_id)
+        if rejected.contains(&submission.lineage_id)
+            && !cancelled.contains_key(&submission.lineage_id)
         {
             let body = order_status(
                 &submission.note,
@@ -989,38 +990,6 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
         }
     }
     Ok(removed)
-}
-
-/// The lineages among `lineages` that their maker cancelled: a stop row, or
-/// a cutoff that covers them (the same test as `eligible_orders`).
-fn cancelled_lineages(
-    conn: &mut PgConnection,
-    lineages: &[&LineageId],
-) -> DbResult<HashSet<LineageId>> {
-    #[derive(QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = Binary)]
-        lineage_id: Vec<u8>,
-    }
-    if lineages.is_empty() {
-        return Ok(HashSet::new());
-    }
-    Ok(diesel::sql_query(
-        "SELECT l.lineage_id FROM maker_lineages l
-         WHERE l.lineage_id = ANY($1)
-           AND (EXISTS (SELECT 1 FROM maker_stops s
-                        WHERE s.maker_id = l.maker_id AND s.lineage_id = l.lineage_id)
-                OR EXISTS (SELECT 1 FROM maker_cutoffs c
-                           WHERE c.maker_id = l.maker_id
-                             AND l.root_seq < c.cutoff
-                             AND (c.market = '' OR c.market = l.market)
-                             AND (c.direction = '' OR c.direction = l.direction)))",
-    )
-    .bind::<diesel::sql_types::Array<Binary>, _>(lineages)
-    .load::<Row>(conn)?
-    .into_iter()
-    .map(|row| row.lineage_id)
-    .collect())
 }
 
 /// How [`close_unconfirmed_tx`] closes an order that went live at accept.
@@ -1125,7 +1094,7 @@ pub fn close_unconfirmed_tx<'a>(
 }
 
 /// Who stopped a lineage, stored in `maker_stops.source`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum StopSource {
     /// The maker's `CancelOrder`.
@@ -1569,6 +1538,52 @@ fn resulting_status(
     }
 }
 
+/// The lineages among `lineages` that their maker cancelled (not admitted by
+/// `eligible_lineages`: a stop row or a cutoff covers them), each with the
+/// reason a maker hears: the source of its stop row, else `maker_cancel` for
+/// a cutoff. A stop wins over a cutoff. A stop written before stops recorded
+/// their source has an empty reason; a lineage not cancelled is absent.
+pub(super) fn cancelled_lineages(
+    conn: &mut PgConnection,
+    lineages: &[&LineageId],
+) -> DbResult<HashMap<LineageId, &'static str>> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Binary)]
+        lineage_id: Vec<u8>,
+        #[diesel(sql_type = Nullable<Text>)]
+        source: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        stopped: bool,
+    }
+    if lineages.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT l.lineage_id, s.source, s.lineage_id IS NOT NULL AS stopped
+         FROM maker_lineages l
+         LEFT JOIN maker_stops s ON s.maker_id = l.maker_id AND s.lineage_id = l.lineage_id
+         WHERE l.lineage_id = ANY($1)
+           AND NOT EXISTS (SELECT 1 FROM eligible_lineages e WHERE e.lineage_id = l.lineage_id)",
+    )
+    .bind::<diesel::sql_types::Array<Binary>, _>(lineages)
+    .load(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let reason = if row.stopped {
+                row.source
+                    .as_deref()
+                    .and_then(|source| source.parse::<StopSource>().ok())
+                    .map_or("", StopSource::reason)
+            } else {
+                MAKER_CANCEL
+            };
+            (row.lineage_id, reason)
+        })
+        .collect())
+}
+
 /// Immutable fill details computed once from the executor's original notes and
 /// predicted remainders, or rebuilt from durable inputs during startup.
 pub type SettlementFills = HashMap<Vec<u8>, proto::InputFill>;
@@ -1642,6 +1657,12 @@ pub fn report_settlement_tx(
             .collect();
         (live, statuses)
     };
+    let reasons = if matches!(phase, SettlementPhase::Pending) {
+        HashMap::new()
+    } else {
+        let lineages: Vec<&LineageId> = owners.values().map(|(_, lineage)| lineage).collect();
+        cancelled_lineages(conn, &lineages)?
+    };
     // Stable per-maker ordering makes replay independent of SQL plan order.
     let mut ordered: Vec<_> = inputs
         .iter()
@@ -1692,6 +1713,14 @@ pub fn report_settlement_tx(
                 } else {
                     resulting_status(&subject(input), &live, &statuses)
                 };
+                // A CANCELLED result for a lineage neither stopped nor cut
+                // off gets an empty reason. No known flow reaches it; this is
+                // the only place an unknown reason comes from.
+                let reason = if status == proto::ResultingStatus::Cancelled {
+                    reasons.get(lineage_id).copied().unwrap_or_default()
+                } else {
+                    ""
+                };
                 proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
                     tx_id: tx_id.to_vec(),
                     committed,
@@ -1701,6 +1730,7 @@ pub fn report_settlement_tx(
                     result: Some(proto::InputResult {
                         note_id: input.parent_note_id.clone(),
                         status: status.into(),
+                        reason: reason.to_owned(),
                     }),
                 })
             }
@@ -3202,9 +3232,10 @@ mod tests {
         let report = resolved(events.last().unwrap());
         assert!(report.committed);
         assert!(report.fill.is_some(), "the fill is reported");
+        let result = report.result.as_ref().unwrap();
         assert_eq!(
-            report.result.as_ref().unwrap().status(),
-            proto::ResultingStatus::Cancelled
+            (result.status(), result.reason.as_str()),
+            (proto::ResultingStatus::Cancelled, MAKER_CANCEL)
         );
         Ok(())
     }
@@ -3244,22 +3275,25 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| !report.committed && report.fill.is_none()));
-        let statuses: HashMap<Vec<u8>, proto::ResultingStatus> = reports
+        let statuses: HashMap<Vec<u8>, (proto::ResultingStatus, &str)> = reports
             .iter()
             .map(|report| report.result.as_ref().unwrap())
-            .map(|result| (result.note_id.clone(), result.status()))
+            .map(|result| {
+                let outcome = (result.status(), result.reason.as_str());
+                (result.note_id.clone(), outcome)
+            })
             .collect();
         assert_eq!(
             statuses[&returned.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Live
+            (proto::ResultingStatus::Live, "")
         );
         assert_eq!(
             statuses[&spent.id().to_bytes().to_vec()],
-            proto::ResultingStatus::SpentElsewhere
+            (proto::ResultingStatus::SpentElsewhere, "")
         );
         assert_eq!(
             statuses[&stopped.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Cancelled
+            (proto::ResultingStatus::Cancelled, MAKER_CANCEL)
         );
         Ok(())
     }

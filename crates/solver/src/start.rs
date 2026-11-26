@@ -241,11 +241,24 @@ pub async fn start(
                     unseen.lineages_without_amounts,
                     unseen.orders_without_maker,
                 );
-                tracing::info!(
-                    lineages_without_amounts = unseen.lineages_without_amounts,
-                    orders_without_maker = unseen.orders_without_maker,
-                    "maker orders self-trade prevention at submit cannot see"
-                );
+                let (without_amounts, without_maker) =
+                    (unseen.lineages_without_amounts, unseen.orders_without_maker);
+                if config.engine.maker_cancel_crossing_on_submit
+                    && without_amounts + without_maker > 0
+                {
+                    tracing::warn!(
+                        lineages_without_amounts = without_amounts,
+                        orders_without_maker = without_maker,
+                        "maker orders self-trade prevention at submit cannot see, with the \
+                         check on: they are never compared with any order (see the runbook)"
+                    );
+                } else {
+                    tracing::info!(
+                        lineages_without_amounts = without_amounts,
+                        orders_without_maker = without_maker,
+                        "maker orders self-trade prevention at submit cannot see"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "could not count the maker orders self-trade prevention at submit cannot see");
@@ -594,6 +607,7 @@ pub async fn start(
             },
             settlement_buffer: Duration::from_millis(config.engine.maker_settlement_buffer_ms),
             live_at_accept: config.engine.maker_live_at_accept,
+            cancel_crossing_on_submit: config.engine.maker_cancel_crossing_on_submit,
             unconfirmed_cap: crate::gateway::UnconfirmedCap {
                 secs: config.engine.maker_unconfirmed_cancel_after_secs,
                 blocks: config.engine.maker_unconfirmed_cancel_after_blocks,

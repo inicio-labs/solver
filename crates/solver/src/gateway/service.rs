@@ -30,7 +30,7 @@ use super::config::{GatewayConfig, StreamConfig};
 use super::error::IntakeError;
 use super::events::{feed, unix_ms, Subscriber};
 use super::intake::{run_intake, IntakeSender};
-use super::metrics::{Calls, CALLS};
+use super::metrics::{self, Calls, CALLS};
 use super::proto::maker_gateway_server::{MakerGateway, MakerGatewayServer};
 use super::proto::{self, command_reply};
 use super::watcher::{run_watcher, SdkTracker, SyncedHeight, Watcher};
@@ -143,8 +143,8 @@ impl MakerGatewayService {
         command: MakerCommand,
     ) -> Result<Response<proto::CommandReply>, Status> {
         match self.intake.execute(header, command).await {
-            Ok(CommandReply::Committed(result)) => Ok(Response::new(reply(result, false))),
-            Ok(CommandReply::Replayed(result)) => Ok(Response::new(reply(result, true))),
+            Ok(CommandReply::Committed(result)) => answer(result, false),
+            Ok(CommandReply::Replayed(result)) => answer(result, true),
             Ok(CommandReply::Conflict) => Err(Status::already_exists(
                 "request ID or sequence already used for a different command",
             )),
@@ -228,7 +228,20 @@ impl MakerGateway for MakerGatewayService {
                     ));
                 }
             }
-            self.execute(header, command).await
+            let expiry = request.expires_at_unix_ms;
+            let reply = self.execute(header, command).await?;
+            // Accepted now, with less than the settlement buffer left: the
+            // matcher never chooses it. Counted to tell the maker.
+            let buffer = u64::try_from(self.settlement_buffer.as_millis()).unwrap_or(u64::MAX);
+            if reply.get_ref().result == Some(command_reply::Result::Accepted(proto::Accepted {}))
+                && !reply.get_ref().replayed
+                && expiry.is_some_and(|expiry| {
+                    expiry < crate::types::now_millis().saturating_add(buffer)
+                })
+            {
+                metrics::count(metrics::SUBMITS_NEAR_EXPIRY, maker_id);
+            }
+            Ok(reply)
         }
         .await;
         self.counted("submit_order", caller, result)
@@ -361,7 +374,7 @@ impl MakerGateway for MakerGatewayService {
                 .await
                 .map_err(|_| Status::unavailable("cannot read command status now; retry"))?;
             match stored {
-                Some(result) => Ok(Response::new(reply(result, true))),
+                Some(result) => answer(result, true),
                 None => Err(Status::not_found("no command with this request ID")),
             }
         }
@@ -470,7 +483,20 @@ fn active_maker_order(
     })
 }
 
-fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
+/// A stored command result as the gateway answers it: a reply, or for a
+/// refused submit an error, the same on every retry.
+fn answer(result: CommandResult, replayed: bool) -> Result<Response<proto::CommandReply>, Status> {
+    reply(result, replayed).map(Response::new).ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "sequence is below more than {} of your later orders on this pair: \
+             take every sequence from one rising counter",
+            crate::db::maker_db::MAX_NEWER_LINEAGES
+        ))
+    })
+}
+
+/// The reply for `result`; `None` for a refused submit.
+fn reply(result: CommandResult, replayed: bool) -> Option<proto::CommandReply> {
     let result = match result {
         CommandResult::Accepted => command_reply::Result::Accepted(proto::Accepted {}),
         CommandResult::AlreadyRegistered => {
@@ -482,11 +508,12 @@ fn reply(result: CommandResult, replayed: bool) -> proto::CommandReply {
         CommandResult::Stopped { settling } => {
             command_reply::Result::Stopped(proto::Stopped { settling })
         }
+        CommandResult::SeqBelowHistory => return None,
     };
-    proto::CommandReply {
+    Some(proto::CommandReply {
         replayed,
         result: Some(result),
-    }
+    })
 }
 
 fn intake_status(error: &IntakeError) -> Status {
@@ -561,6 +588,9 @@ pub fn spawn_gateway_thread(
                 )
                 .with_cap(cfg.unconfirmed_cap);
                 let mut session = pool.intake_session();
+                if cfg.cancel_crossing_on_submit {
+                    session = session.with_self_trade_check();
+                }
                 if cfg.live_at_accept {
                     let height = watcher.synced_height();
                     session =
@@ -683,6 +713,12 @@ mod tests {
     }
 
     async fn gateway_with_stream_limit(stream_limit: usize) -> Gateway {
+        gateway_with(stream_limit, false).await
+    }
+
+    /// A gateway whose intake runs self-trade prevention at submit when
+    /// `self_trade` is set.
+    async fn gateway_with(stream_limit: usize, self_trade: bool) -> Gateway {
         let db = TestDb::new().await.unwrap();
         let key = crate::maker::new_api_key();
         let hash = api_key_hash(&key);
@@ -700,13 +736,11 @@ mod tests {
         let (intake, queues) = IntakeSender::new(16, 16);
         let (facts_tx, facts) = mpsc::channel(16);
         let stop = CancellationToken::new();
-        tokio::spawn(run_intake(
-            db.pool.intake_session(),
-            queues,
-            facts_tx,
-            500,
-            stop.clone(),
-        ));
+        let mut session = db.pool.intake_session();
+        if self_trade {
+            session = session.with_self_trade_check();
+        }
+        tokio::spawn(run_intake(session, queues, facts_tx, 500, stop.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let events = EventWake::default();
@@ -910,7 +944,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(accepted, reply(CommandResult::Accepted, false));
+        assert_eq!(Some(accepted), reply(CommandResult::Accepted, false));
         // Nothing for the matcher until the note's order row exists.
         assert!(facts.try_recv().is_err());
         let retried = client
@@ -918,7 +952,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(retried, reply(CommandResult::Accepted, true));
+        assert_eq!(Some(retried), reply(CommandResult::Accepted, true));
         assert_eq!(
             code(
                 client
@@ -1040,6 +1074,7 @@ mod tests {
                 },
                 false
             )
+            .unwrap()
         );
         assert_eq!(
             facts.recv().await.unwrap().maker_updates.first().cloned(),
@@ -1080,7 +1115,7 @@ mod tests {
             .into_inner();
         assert_eq!(
             stopped,
-            reply(CommandResult::Stopped { settling: 0 }, false)
+            reply(CommandResult::Stopped { settling: 0 }, false).unwrap()
         );
 
         // Pending and cancelled orders are absent from the active list.
@@ -1152,6 +1187,7 @@ mod tests {
                 },
                 true
             )
+            .unwrap()
         );
         assert_eq!(
             code(
@@ -1201,6 +1237,7 @@ mod tests {
             stream: TEST_STREAM,
             settlement_buffer: Duration::ZERO,
             live_at_accept: false,
+            cancel_crossing_on_submit: false,
             unconfirmed_cap: Default::default(),
         };
         // No node answers here: watcher rounds fail and are retried.
@@ -1412,6 +1449,7 @@ mod tests {
             mut client,
             facts: _facts,
             key,
+            maker_id,
             db,
             stop,
             ..
@@ -1425,6 +1463,8 @@ mod tests {
             );
         }
         request.expires_at_unix_ms = Some(1);
+        let near_expiry = || metrics::counted(metrics::SUBMITS_NEAR_EXPIRY, maker_id, ("", ""));
+        let before = near_expiry();
         assert!(
             !client
                 .submit_order(signed(&key, request.clone()))
@@ -1433,6 +1473,8 @@ mod tests {
                 .into_inner()
                 .replayed
         );
+        // Accepted with its expiry already past: counted, once.
+        assert_eq!(near_expiry(), before + 1);
         assert!(
             client
                 .submit_order(signed(&key, request.clone()))
@@ -1441,6 +1483,7 @@ mod tests {
                 .into_inner()
                 .replayed
         );
+        assert_eq!(near_expiry(), before + 1, "a replay is not counted again");
         request.expires_at_unix_ms = Some(2);
         assert_eq!(
             code(client.submit_order(signed(&key, request)).await),
@@ -1448,5 +1491,74 @@ mod tests {
         );
         assert!(!db.pool.fatal_token().is_cancelled());
         stop.cancel();
+    }
+
+    /// With the check on, a submit far below its maker's history on the pair
+    /// is refused with FAILED_PRECONDITION: on a retry and by GetCommand too,
+    /// and counted under that code.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_submit_far_below_its_makers_history_is_refused_over_grpc() {
+        let Gateway {
+            mut client,
+            key,
+            maker_id,
+            db,
+            facts: _facts,
+            stop,
+            calls,
+            ..
+        } = gateway_with(MAX_EVENT_STREAMS, true).await;
+        let order = pswap_note(1);
+        let keys = crate::types::OrderKeys::from_note(&order).unwrap();
+        db.pool
+            .write(move |conn| {
+                crate::db::postgres_test::history(
+                    conn,
+                    maker_id,
+                    &keys.market,
+                    &keys.direction,
+                    1_002,
+                    maker_db::MAX_NEWER_LINEAGES + 1,
+                )
+                .map_err(|_| crate::db::DbError::Corrupt("history"))
+            })
+            .await
+            .unwrap();
+        let request = submit("deep", 1, &order);
+        for _ in 0..2 {
+            assert_eq!(
+                code(client.submit_order(signed(&key, request.clone())).await),
+                Code::FailedPrecondition
+            );
+        }
+        assert_eq!(
+            code(
+                client
+                    .get_command(signed(
+                        &key,
+                        proto::GetCommandRequest {
+                            request_id: "deep".into(),
+                        },
+                    ))
+                    .await
+            ),
+            Code::FailedPrecondition
+        );
+        let maker = Some(maker_id);
+        assert_eq!(
+            calls.get("submit_order", Code::FailedPrecondition, maker),
+            2
+        );
+        stop.cancel();
+    }
+
+    #[test]
+    fn a_submit_below_its_makers_history_is_refused_on_every_retry() {
+        for replayed in [false, true] {
+            let status = answer(CommandResult::SeqBelowHistory, replayed).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        }
+        assert!(answer(CommandResult::Accepted, false).is_ok());
     }
 }

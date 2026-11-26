@@ -15,10 +15,10 @@ use super::postgres_db::{confirm_settlement_tx, insert_orders_batch_tx, test_con
 use super::postgres_models::NewOrderRow;
 use super::postgres_schema::{eligible_lineages, eligible_orders, maker_lineages};
 use super::postgres_test::{
-    self, id, lineage_of, maker, order, order_of, run, submit, Side, TestSchema,
+    self, ask, bid, history, id, lineage_of, maker, order, order_of, run, submit, Side, TestSchema,
 };
 use super::DbError;
-use crate::maker::{CutoffScope, MakerCommand};
+use crate::maker::{CutoffScope, MakerCommand, MakerId};
 use crate::types::OrderKeys;
 
 /// The maker copied onto `note`'s order row.
@@ -509,7 +509,8 @@ fn resolve(conn: &mut PgConnection, tx: u8, commit: bool, consumed: &[&Note]) ->
     let consumed: HashSet<_> = consumed.iter().map(|note| note.id()).collect();
     conn.transaction::<_, DbError, _>(|conn| {
         if commit {
-            confirm_settlement_tx(
+            // As the executor writes it: the update passes the liveness rule.
+            let confirmed = confirm_settlement_tx(
                 conn,
                 &[tx; 32],
                 &consumed,
@@ -517,6 +518,7 @@ fn resolve(conn: &mut PgConnection, tx: u8, commit: bool, consumed: &[&Note]) ->
                 test_consumer(),
                 None,
             )?;
+            live_book_update_tx(conn, confirmed.update)?;
         } else {
             let released =
                 finish_discarded_settlement_tx(conn, &[tx; 32], &consumed, &NodeAnswer::NotSent)?;
@@ -632,5 +634,1029 @@ fn a_cancelled_settlement_result_says_why() -> Result<()> {
     );
     // A lineage neither stopped nor cut off has no reason at all.
     assert!(maker_db::cancelled_lineages(conn, &[&lineage_of(&notes[5])])?.is_empty());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The check at submit (ADR 0009): intake rounds with the switch on.
+
+use super::maker_db::{AcceptGate, StpCancel};
+use crate::gateway::intake::{intake_round_tx, IntakeRound};
+use crate::gateway::proto::OrderState;
+use crate::maker::{CommandHeader as Header, MakerUpdate};
+
+fn sub(maker_id: MakerId, seq: u64, note: &Note) -> (Header, MakerCommand) {
+    (
+        Header::new(maker_id, format!("r{seq}"), seq).unwrap(),
+        MakerCommand::submit(note.clone()).unwrap(),
+    )
+}
+
+/// A submit of `note` that expires at `at` (Unix ms).
+fn sub_expiring(maker_id: MakerId, seq: u64, note: &Note, at: u64) -> (Header, MakerCommand) {
+    let mut command = sub(maker_id, seq, note);
+    if let MakerCommand::Submit {
+        expires_at_unix_ms, ..
+    } = &mut command.1
+    {
+        *expires_at_unix_ms = Some(at);
+    }
+    command
+}
+
+fn cancel_cmd(maker_id: MakerId, seq: u64, note: &Note) -> (Header, MakerCommand) {
+    (
+        Header::new(maker_id, format!("r{seq}"), seq).unwrap(),
+        MakerCommand::CancelOrder {
+            lineage_id: lineage_of(note),
+        },
+    )
+}
+
+/// One intake round with the check on: live at accept on (a fresh watcher
+/// block) or off. Cancels must come first, as intake orders them.
+fn stp_round(
+    conn: &mut PgConnection,
+    commands: &[(Header, MakerCommand)],
+    live: bool,
+) -> Result<IntakeRound> {
+    round(conn, commands, live, true)
+}
+
+/// One intake round, with the check on or off.
+fn round(
+    conn: &mut PgConnection,
+    commands: &[(Header, MakerCommand)],
+    live: bool,
+    check: bool,
+) -> Result<IntakeRound> {
+    let epoch = postgres_test::epoch(conn)?;
+    let gate = if live {
+        AcceptGate::new(epoch, || Some(BlockNumber::from(7)))
+    } else {
+        AcceptGate::epoch_only(epoch)
+    };
+    Ok(conn
+        .transaction::<_, DbError, _>(|conn| intake_round_tx(conn, commands, Some(&gate), check))?)
+}
+
+fn cancelled(note: &Note) -> (Vec<u8>, OrderState, String) {
+    (
+        id(note),
+        OrderState::Cancelled,
+        "self_trade_prevention".into(),
+    )
+}
+
+fn went_live(note: &Note) -> (Vec<u8>, OrderState, String) {
+    (id(note), OrderState::Live, String::new())
+}
+
+fn lineage_state(conn: &mut PgConnection, note: &Note) -> Result<String> {
+    Ok(maker_lineages::table
+        .find(lineage_of(note))
+        .select(maker_lineages::state)
+        .first(conn)?)
+}
+
+/// The source and cause of `note`'s stop, if it has one.
+fn stop_of(conn: &mut PgConnection, note: &Note) -> Result<Option<(String, Option<Vec<u8>>)>> {
+    use super::postgres_schema::maker_stops;
+    Ok(maker_stops::table
+        .filter(maker_stops::lineage_id.eq(lineage_of(note)))
+        .select((
+            maker_stops::source.assume_not_null(),
+            maker_stops::caused_by_lineage,
+        ))
+        .first(conn)
+        .optional()?)
+}
+
+fn in_book(conn: &mut PgConnection, note: &Note) -> Result<bool> {
+    Ok(super::postgres_db::load_live_orders_tx(conn)?
+        .iter()
+        .any(|order| order.id() == note.id()))
+}
+
+/// A new order cancels the maker's older crossing orders in every state
+/// they can be open in, each as the table in ADR 0009 says: pending or
+/// waiting for its note (CANCELLED, lineage closed if pending), live
+/// (CANCELLED), in a settlement (no event now). It goes live itself, and
+/// the matcher learns of every loser.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_new_order_cancels_older_crossing_orders_in_every_open_state() -> Result<()> {
+    use super::postgres_db::mark_orders_onchain_nullified_tx;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    // Serials run against seqs, so lineage IDs sort the other way round from
+    // seqs: the events must still come in seq order.
+    let (pending, live, waiting, settling, retired) = (
+        ask(60, 100),
+        ask(50, 99),
+        ask(40, 98),
+        ask(30, 97),
+        ask(20, 96),
+    );
+    let (filled, same_side, above) = (ask(10, 95), bid(5, 90), ask(6, 120));
+    // Pending: accepted, its note not in a block yet (live at accept off).
+    stp_round(conn, &[sub(alpha, 1, &pending)], false)?;
+    stp_round(conn, &[sub(alpha, 2, &live)], true)?;
+    stp_round(conn, &[sub(alpha, 3, &waiting)], true)?;
+    postgres_test::set_status(conn, &waiting, "waiting")?;
+    stp_round(conn, &[sub(alpha, 4, &settling)], true)?;
+    postgres_test::reserve(conn, 9, &[&settling], 40)?;
+    // Retired by the watcher while its settlement is unresolved (decision N).
+    stp_round(conn, &[sub(alpha, 5, &retired)], true)?;
+    postgres_test::reserve(conn, 8, &[&retired], 40)?;
+    conn.transaction::<_, DbError, _>(|conn| {
+        mark_orders_onchain_nullified_tx(conn, &[id(&retired)])
+    })?;
+    // Filled on the confirmed path: not open, so never cancelled.
+    stp_round(conn, &[sub(alpha, 6, &filled)], false)?;
+    let landed = maker_db::pending_submissions_tx(conn)?
+        .into_iter()
+        .find(|s| s.note.id() == filled.id())
+        .unwrap();
+    conn.transaction::<_, DbError, _>(|conn| maker_db::activate_tx(conn, &[landed], 1))?;
+    let (input, _, rest) = postgres_test::fill(7, &filled, 95);
+    assert!(rest.is_none(), "a full fill");
+    postgres_test::prepare(conn, 7, &[input])?;
+    resolve(conn, 7, true, &[])?;
+    stp_round(
+        conn,
+        &[sub(alpha, 7, &same_side), sub(alpha, 8, &above)],
+        true,
+    )?;
+    let before = postgres_test::statuses(conn, alpha)?.len();
+
+    let new = bid(7, 100);
+    let round = stp_round(conn, &[sub(alpha, 10, &new)], true)?;
+    assert!(
+        round.outcomes[0].1.live.is_some(),
+        "the new order goes live"
+    );
+    let mut cancelled_lineages: Vec<Vec<u8>> = round
+        .self_trade
+        .updates
+        .iter()
+        .map(|update| match update {
+            MakerUpdate::LineageCancelled { lineage_id, .. } => lineage_id.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    cancelled_lineages.sort();
+    let losers = [&pending, &live, &waiting, &settling, &retired];
+    let mut expected: Vec<Vec<u8>> = losers.iter().map(|note| lineage_of(note)).collect();
+    expected.sort();
+    assert_eq!(cancelled_lineages, expected);
+    assert!(round.self_trade.appended);
+    // CANCELLED for the pending, live and waiting ones, in seq order; then
+    // LIVE. Nothing for the settling one and the retired parent.
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?[before..],
+        [
+            cancelled(&pending),
+            cancelled(&live),
+            cancelled(&waiting),
+            went_live(&new),
+        ]
+    );
+    assert_eq!(lineage_state(conn, &pending)?, "rejected");
+    for note in losers {
+        let (source, caused_by) = stop_of(conn, note)?.expect("stopped");
+        assert_eq!(source, "stp_on_submit");
+        assert_eq!(caused_by, Some(lineage_of(&new)));
+        assert!(!in_book(conn, note)?);
+    }
+    assert_eq!(stop_of(conn, &filled)?, None);
+    for note in [&same_side, &above] {
+        assert_eq!(stop_of(conn, note)?, None);
+        assert!(in_book(conn, note)?);
+    }
+    assert_eq!(
+        round.self_trade.cancels,
+        [StpCancel {
+            maker_id: alpha,
+            entering: false
+        }; 5]
+    );
+    // The settling one and the retired parent: their settlements commit
+    // partial fills; the remainders never enter the book, and the results
+    // say why.
+    resolve(conn, 9, true, &[])?;
+    resolve(conn, 8, true, &[])?;
+    for parent in [&settling, &retired] {
+        let (_, _, remainder) = postgres_test::fill(0, parent, 40);
+        let remainder = remainder.unwrap();
+        assert_eq!(
+            postgres_test::status(conn, &remainder)?.as_deref(),
+            Some("stopped")
+        );
+        assert!(!in_book(conn, &remainder)?);
+    }
+    let reasons: Vec<_> = postgres_test::resolutions(conn, alpha)?
+        .into_iter()
+        .filter(|(note, ..)| *note != id(&filled))
+        .collect();
+    let cancelled_result = |note: &Note| {
+        (
+            id(note),
+            crate::gateway::proto::ResultingStatus::Cancelled,
+            "self_trade_prevention".to_owned(),
+        )
+    };
+    assert_eq!(
+        reasons,
+        [cancelled_result(&settling), cancelled_result(&retired)]
+    );
+    Ok(())
+}
+
+/// Resolve settlement `tx` holding `parent`: voided, with `parent` spent
+/// outside the solver.
+fn void_spent(conn: &mut PgConnection, tx: u8, parent: &Note) -> Result<()> {
+    use super::postgres_db::{finish_discarded_settlement_tx, live_book_update_tx, NodeAnswer};
+    conn.transaction::<_, DbError, _>(|conn| {
+        let consumed: HashSet<_> = [parent.id()].into_iter().collect();
+        let released =
+            finish_discarded_settlement_tx(conn, &[tx; 32], &consumed, &NodeAnswer::NotSent)?;
+        live_book_update_tx(conn, released.update)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// A submit that reaches us after a newer crossing order of its maker gets
+/// CANCELLED and never LIVE, whatever happened to the newer one since:
+/// pending, live, settling, cancelled, filled, lost to an even newer order,
+/// or past its expiry. Its lineage is closed, so nothing follows when its
+/// note is spent, and it still cancels its own older crossing orders.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_late_order_loses_to_a_newer_crossing_order_in_any_state() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let states = [
+        "pending",
+        "live",
+        "settling",
+        "cancelled",
+        "filled",
+        "lost",
+        "expired",
+    ];
+    for (index, state) in states.iter().enumerate() {
+        let maker_id = maker(conn, state)?;
+        let serial = 100 * (index as u32 + 1);
+        // An older bid of its own, a newer bid that crosses the late ask.
+        let (oldest, late, newer) = (bid(serial, 100), ask(serial + 1, 100), bid(serial + 2, 101));
+        stp_round(conn, &[sub(maker_id, 1, &oldest)], true)?;
+        let newer_submit = if *state == "expired" {
+            sub_expiring(maker_id, 10, &newer, 1)
+        } else {
+            sub(maker_id, 10, &newer)
+        };
+        stp_round(conn, &[newer_submit], *state != "pending")?;
+        match *state {
+            "settling" => postgres_test::reserve(conn, serial as u8, &[&newer], 40)?,
+            "cancelled" => {
+                stp_round(conn, &[cancel_cmd(maker_id, 11, &newer)], true)?;
+            }
+            "filled" => {
+                let (input, _, remainder) = postgres_test::fill(serial as u8, &newer, 100);
+                assert!(remainder.is_none(), "a full fill");
+                postgres_test::prepare(conn, serial as u8, &[input])?;
+                resolve(conn, serial as u8, true, &[])?;
+            }
+            "lost" => {
+                // An ask at 1.005: it crosses the newer bid (1.01), not the
+                // oldest (1.00).
+                let newest = order(serial + 3, Side::Sell, 200, 201);
+                stp_round(conn, &[sub(maker_id, 20, &newest)], true)?;
+                assert!(stop_of(conn, &newer)?.is_some());
+            }
+            _ => {}
+        }
+        let before = postgres_test::statuses(conn, maker_id)?.len();
+        let round = stp_round(conn, &[sub(maker_id, 5, &late)], true)?;
+        assert!(round.outcomes[0].1.live.is_none(), "{state}");
+        assert_eq!(
+            round.outcomes[0].1.reply,
+            crate::maker::CommandReply::Committed(crate::maker::CommandResult::Accepted),
+            "{state}: the reply stays Accepted"
+        );
+        assert_eq!(
+            postgres_test::statuses(conn, maker_id)?[before..],
+            [cancelled(&oldest), cancelled(&late)],
+            "{state}"
+        );
+        assert_eq!(
+            stop_of(conn, &late)?.unwrap(),
+            ("stp_on_submit".to_owned(), Some(lineage_of(&newer))),
+            "{state}"
+        );
+        assert_eq!(lineage_state(conn, &late)?, "rejected", "{state}");
+        assert_eq!(postgres_test::status(conn, &late)?, None, "{state}");
+        assert_eq!(
+            round.self_trade.cancels,
+            [
+                StpCancel {
+                    maker_id,
+                    entering: false
+                },
+                StpCancel {
+                    maker_id,
+                    entering: true
+                }
+            ],
+            "{state}"
+        );
+        // Its note is never watched: nothing follows when it is spent.
+        assert!(maker_db::pending_submissions_tx(conn)?
+            .iter()
+            .all(|s| s.note.id() != late.id()));
+    }
+    Ok(())
+}
+
+/// A submit its maker cancelled first, or a cutoff covers, still cancels
+/// its older crossing orders, never goes live and gets no event of its own,
+/// even when a newer crossing order would have beaten it. It is counted.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_cancelled_or_cut_off_submit_still_cancels_its_older_crossing_orders() -> Result<()> {
+    use super::maker_db::DeadCause;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (older, dead, newer) = (ask(1, 100), bid(2, 101), ask(3, 101));
+    stp_round(conn, &[sub(alpha, 5, &older)], true)?;
+    stp_round(conn, &[sub(alpha, 20, &newer)], true)?;
+    // The cancel of `dead` (seq 11) comes before its submit (seq 10).
+    stp_round(conn, &[cancel_cmd(alpha, 11, &dead)], true)?;
+    let before = postgres_test::statuses(conn, alpha)?.len();
+    let round = stp_round(conn, &[sub(alpha, 10, &dead)], true)?;
+    assert!(round.outcomes[0].1.live.is_none());
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?[before..],
+        [cancelled(&older)]
+    );
+    assert_eq!(
+        round.self_trade.dead_on_arrival,
+        [(alpha, DeadCause::Cancelled)]
+    );
+    // Closed: the watcher never tells of it, even if its note is spent.
+    assert_eq!(lineage_state(conn, &dead)?, "rejected");
+    assert_eq!(
+        round.self_trade.cancels,
+        [StpCancel {
+            maker_id: alpha,
+            entering: false
+        }]
+    );
+    assert!(in_book(conn, &newer)?);
+    assert_eq!(stop_of(conn, &dead)?.unwrap().0, "maker");
+
+    // Under a cutoff on bids only, so the older ask is open.
+    let beta = maker(conn, "beta")?;
+    let (older, cut) = (ask(11, 100), bid(12, 101));
+    stp_round(conn, &[sub(beta, 5, &older)], true)?;
+    let keys = OrderKeys::from_note(&cut)?;
+    stp_round(
+        conn,
+        &[(
+            Header::new(beta, "c".into(), 12).unwrap(),
+            MakerCommand::CancelAll {
+                scope: CutoffScope {
+                    market: keys.market,
+                    direction: keys.direction,
+                },
+            },
+        )],
+        true,
+    )?;
+    let before = postgres_test::statuses(conn, beta)?.len();
+    let round = stp_round(conn, &[sub(beta, 10, &cut)], true)?;
+    assert!(round.outcomes[0].1.live.is_none());
+    assert_eq!(
+        postgres_test::statuses(conn, beta)?[before..],
+        [cancelled(&older)]
+    );
+    assert_eq!(
+        round.self_trade.dead_on_arrival,
+        [(beta, DeadCause::CutOff)]
+    );
+    Ok(())
+}
+
+/// Two crossing submits in one round, in either order, with live at accept
+/// on or off: only the newer one can go live; the older one gets CANCELLED
+/// and never LIVE.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn of_two_crossing_submits_in_one_round_only_the_newer_goes_live() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let mut serial = 0;
+    for live in [true, false] {
+        for newer_first in [true, false] {
+            let maker_id = maker(conn, &format!("m{live}{newer_first}"))?;
+            serial += 10;
+            let (old, new) = (ask(serial, 100), bid(serial + 1, 100));
+            let mut round = vec![sub(maker_id, 1, &old), sub(maker_id, 2, &new)];
+            if newer_first {
+                round.reverse();
+            }
+            let result = stp_round(conn, &round, live)?;
+            let live_ids: Vec<_> = result
+                .outcomes
+                .iter()
+                .filter_map(|(_, outcome)| outcome.live.as_ref().map(|order| order.id()))
+                .collect();
+            let expected_live = if live { vec![new.id()] } else { Vec::new() };
+            assert_eq!(live_ids, expected_live);
+            let mut events = vec![cancelled(&old)];
+            if live {
+                events.push(went_live(&new));
+            }
+            assert_eq!(postgres_test::statuses(conn, maker_id)?, events);
+            assert_eq!(
+                result.self_trade.updates,
+                [MakerUpdate::LineageCancelled {
+                    maker_id,
+                    lineage_id: lineage_of(&old)
+                }]
+            );
+            assert_eq!(lineage_state(conn, &old)?, "rejected");
+        }
+    }
+    Ok(())
+}
+
+/// The check ignores expiry: an old order past its expiry is cancelled
+/// like any other, and a submit with less than the settlement buffer left
+/// still takes part. An order the matcher chose before a newer
+/// crossing order arrived fails its reservation, and that is counted.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn expiry_plays_no_part_and_a_chosen_order_fails_its_reservation() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let expiring = |seq: u64, note: &Note, at: u64| sub_expiring(alpha, seq, note, at);
+    let (expired, chosen) = (ask(1, 100), ask(2, 99));
+    stp_round(conn, &[expiring(1, &expired, 1)], true)?;
+    stp_round(conn, &[sub(alpha, 2, &chosen)], true)?;
+    let soon = crate::types::now_millis() + 10_000;
+    let new = bid(3, 100);
+    // Less than the settlement buffer left: it still takes part.
+    stp_round(conn, &[expiring(3, &new, soon)], true)?;
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?[2..4],
+        [cancelled(&expired), cancelled(&chosen)]
+    );
+    // The matcher had chosen `chosen` before the bid arrived: its
+    // reservation is refused, and counted because the input has a stop.
+    // The counter is process-wide and only grows.
+    let before = crate::executor::metrics::reservation_stopped_inputs();
+    assert!(postgres_test::reserve(conn, 9, &[&chosen], 40).is_err());
+    assert!(crate::executor::metrics::reservation_stopped_inputs() > before);
+    assert!(super::postgres_db::has_stopped_input_tx(
+        conn,
+        &[id(&chosen)]
+    )?);
+    assert!(!super::postgres_db::has_stopped_input_tx(
+        conn,
+        &[id(&new)]
+    )?);
+    Ok(())
+}
+
+/// A loser held by a settlement hears nothing until that settlement
+/// resolves; then its result says FULLY_FILLED, CANCELLED (the input, or the
+/// remainder, stored stopped) or SPENT_ELSEWHERE.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_settling_loser_is_reported_by_its_settlement() -> Result<()> {
+    use crate::gateway::proto::ResultingStatus::{Cancelled, FullyFilled, SpentElsewhere};
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (full, voided, spent) = (ask(1, 100), ask(2, 99), ask(3, 98));
+    for (seq, note) in [(1, &full), (2, &voided), (3, &spent)] {
+        stp_round(conn, &[sub(alpha, seq, note)], true)?;
+    }
+    let (input, _, _) = postgres_test::fill(1, &full, 100);
+    postgres_test::prepare(conn, 1, &[input])?;
+    postgres_test::reserve(conn, 2, &[&voided], 40)?;
+    postgres_test::reserve(conn, 3, &[&spent], 40)?;
+    let new = bid(4, 100);
+    let round = stp_round(conn, &[sub(alpha, 10, &new)], true)?;
+    assert_eq!(round.self_trade.updates.len(), 3);
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?[3..],
+        [went_live(&new)],
+        "nothing yet"
+    );
+
+    resolve(conn, 1, true, &[])?;
+    resolve(conn, 2, false, &[])?;
+    void_spent(conn, 3, &spent)?;
+    assert_eq!(
+        postgres_test::resolutions(conn, alpha)?,
+        [
+            (id(&full), FullyFilled, String::new()),
+            (id(&voided), Cancelled, "self_trade_prevention".to_owned()),
+            (id(&spent), SpentElsewhere, String::new()),
+        ]
+    );
+    assert_eq!(
+        postgres_test::status(conn, &voided)?.as_deref(),
+        Some("stopped")
+    );
+    assert!(!in_book(conn, &voided)?);
+    Ok(())
+}
+
+/// A round whose only loser is in a settlement appends no event (live at
+/// accept off: its winner waits for its note), so it wakes no stream.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_round_whose_only_loser_is_settling_appends_nothing() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let old = ask(1, 100);
+    stp_round(conn, &[sub(alpha, 1, &old)], true)?;
+    postgres_test::reserve(conn, 1, &[&old], 40)?;
+    let events = postgres_test::events(conn, alpha)?.len();
+    let round = stp_round(conn, &[sub(alpha, 2, &bid(2, 100))], false)?;
+    assert_eq!(round.self_trade.updates.len(), 1);
+    assert!(!round.self_trade.appended);
+    assert_eq!(postgres_test::events(conn, alpha)?.len(), events);
+    Ok(())
+}
+
+/// The newer read covers only lineages above the round's lowest claim: an
+/// exact retry claims nothing and reads nothing, and a late submit reads
+/// only the lineages after it.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_newer_read_starts_at_the_rounds_lowest_claim() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    // Asks at seqs 10..=19, none crossing another.
+    for seq in 10..20 {
+        stp_round(conn, &[sub(alpha, seq, &ask(seq as u32, 100))], true)?;
+    }
+    let retry = stp_round(conn, &[sub(alpha, 12, &ask(12, 100))], true)?;
+    assert!(retry.self_trade.newer_rows.is_empty());
+    let late = stp_round(conn, &[sub(alpha, 15, &ask(99, 100))], true)?;
+    // A conflict on seq 15: not claimed, nothing read.
+    assert!(late.self_trade.newer_rows.is_empty());
+    let late = stp_round(conn, &[sub(alpha, 165, &ask(98, 100))], true)?;
+    assert!(late.self_trade.newer_rows.is_empty(), "165 is the newest");
+    let late = stp_round(conn, &[sub(alpha, 1, &ask(97, 100))], true)?;
+    assert_eq!(late.self_trade.newer_rows, [(alpha, 11)]);
+    Ok(())
+}
+
+/// A round makes two reads per (maker, market) and a fixed number of
+/// writes for its losers: its statements grow only with its own commands.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_rounds_cost_does_not_grow_with_its_losers() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let statements = Arc::new(AtomicUsize::new(0));
+    let counted = statements.clone();
+    conn.set_instrumentation(move |event: diesel::connection::InstrumentationEvent<'_>| {
+        if matches!(
+            event,
+            diesel::connection::InstrumentationEvent::StartQuery { .. }
+        ) {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let cost = |conn: &mut PgConnection, round: &[(Header, MakerCommand)]| -> Result<usize> {
+        let start = statements.load(Ordering::Relaxed);
+        stp_round(conn, round, false)?;
+        Ok(statements.load(Ordering::Relaxed) - start)
+    };
+    // One loser, then fifty, each lost to one ask.
+    let (alpha, beta) = (maker(conn, "alpha")?, maker(conn, "beta")?);
+    cost(conn, &[sub(alpha, 1, &bid(1, 200))])?;
+    for seq in 1..=50 {
+        cost(conn, &[sub(beta, seq, &bid(100 + seq as u32, 200))])?;
+    }
+    let one = cost(conn, &[sub(alpha, 100, &ask(2, 100))])?;
+    let fifty = cost(conn, &[sub(beta, 100, &ask(3, 100))])?;
+    assert_eq!(one, fifty, "losers cost the same in any number");
+    // One submit, then two, then fifty, none crossing.
+    let gamma = maker(conn, "gamma")?;
+    let asks = |from: u64, count: u64| -> Vec<(Header, MakerCommand)> {
+        (from..from + count)
+            .map(|seq| sub(gamma, seq, &ask(1000 + seq as u32, 100)))
+            .collect()
+    };
+    let one = cost(conn, &asks(1, 1))?;
+    let two = cost(conn, &asks(10, 2))?;
+    let fifty = cost(conn, &asks(100, 50))?;
+    assert_eq!(fifty - one, 49 * (two - one));
+    Ok(())
+}
+
+/// Equal prices cross. The same side, another maker and a user's order are
+/// never touched.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn only_the_makers_own_opposite_crossing_orders_are_touched() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let (alpha, beta) = (maker(conn, "alpha")?, maker(conn, "beta")?);
+    // The new order is a bid at 1.00. An older bid of the maker is on its
+    // side; another maker's ask and a user's ask would cross it.
+    let (equal, same_side, others) = (ask(1, 100), bid(2, 90), ask(3, 50));
+    let user = order_of(4, Side::Sell, 100, 50, NoteType::Public);
+    stp_round(conn, &[sub(alpha, 1, &equal)], true)?;
+    stp_round(conn, &[sub(alpha, 2, &same_side)], true)?;
+    stp_round(conn, &[sub(beta, 1, &others)], true)?;
+    conn.transaction::<_, DbError, _>(|conn| {
+        insert_orders_batch_tx(conn, &[NewOrderRow::parsed(&user, 1)?], 1)
+    })?;
+    let round = stp_round(conn, &[sub(alpha, 3, &bid(5, 100))], true)?;
+    assert_eq!(
+        round.self_trade.updates,
+        [MakerUpdate::LineageCancelled {
+            maker_id: alpha,
+            lineage_id: lineage_of(&equal)
+        }]
+    );
+    for note in [&same_side, &others, &user] {
+        assert!(in_book(conn, note)?);
+    }
+    Ok(())
+}
+
+/// A maker's own cancel and a crossing submit racing for one order give one
+/// stop and at most one event. A pending order stopped while a watcher
+/// round that already read it is in flight is stored stopped, with no event.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn races_with_the_makers_cancel_and_the_watcher_stop_once() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    // The maker's cancel first: the submit finds the order stopped.
+    let (first, second) = (ask(1, 100), ask(2, 100));
+    stp_round(conn, &[sub(alpha, 1, &first)], true)?;
+    stp_round(conn, &[cancel_cmd(alpha, 3, &first)], true)?;
+    let round = stp_round(conn, &[sub(alpha, 4, &bid(3, 100))], true)?;
+    assert!(round.self_trade.cancels.is_empty());
+    assert_eq!(stop_of(conn, &first)?.unwrap().0, "maker");
+    // The stop first: the maker's later cancel adds nothing.
+    stp_round(conn, &[sub(alpha, 5, &second)], true)?;
+    stp_round(conn, &[sub(alpha, 6, &bid(4, 100))], true)?;
+    let events = postgres_test::statuses(conn, alpha)?.len();
+    stp_round(conn, &[cancel_cmd(alpha, 7, &second)], true)?;
+    assert_eq!(postgres_test::statuses(conn, alpha)?.len(), events);
+    assert_eq!(stop_of(conn, &second)?.unwrap().0, "stp_on_submit");
+    let cancels_of = |conn: &mut PgConnection, note: &Note| -> Result<usize> {
+        Ok(postgres_test::statuses(conn, alpha)?
+            .iter()
+            .filter(|(id_, state, _)| *id_ == id(note) && *state == OrderState::Cancelled)
+            .count())
+    };
+    assert_eq!(cancels_of(conn, &first)?, 0);
+    assert_eq!(cancels_of(conn, &second)?, 1);
+
+    // The watcher read a pending order, then a crossing submit stopped it.
+    let beta = maker(conn, "beta")?;
+    let pending = ask(10, 100);
+    stp_round(conn, &[sub(beta, 1, &pending)], false)?;
+    let read = maker_db::pending_submissions_tx(conn)?
+        .into_iter()
+        .find(|s| s.note.id() == pending.id())
+        .unwrap();
+    stp_round(conn, &[sub(beta, 2, &bid(11, 100))], false)?;
+    let events = postgres_test::statuses(conn, beta)?.len();
+    conn.transaction::<_, DbError, _>(|conn| {
+        let activated = maker_db::activate_tx(conn, &[read], 1)?;
+        super::postgres_db::live_book_update_tx(conn, activated.update)?;
+        Ok(())
+    })?;
+    assert_eq!(
+        postgres_test::status(conn, &pending)?.as_deref(),
+        Some("stopped")
+    );
+    assert_eq!(postgres_test::statuses(conn, beta)?.len(), events);
+    Ok(())
+}
+
+/// A watcher round that read an order before a crossing submit stopped it
+/// adds nothing: the cap closing an order that went live at accept, and a
+/// pending order whose note it found spent, both stay at the one CANCELLED.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_stale_watcher_read_adds_nothing_after_a_stop() -> Result<()> {
+    use super::maker_db::Close;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let read = |conn: &mut PgConnection, note: &Note| -> Result<_> {
+        Ok(maker_db::pending_submissions_tx(conn)?
+            .into_iter()
+            .find(|s| s.note.id() == note.id())
+            .unwrap())
+    };
+
+    // The cap.
+    let alpha = maker(conn, "alpha")?;
+    let unconfirmed = ask(1, 100);
+    stp_round(conn, &[sub(alpha, 1, &unconfirmed)], true)?;
+    let stale = read(conn, &unconfirmed)?;
+    stp_round(conn, &[sub(alpha, 2, &bid(2, 100))], true)?;
+    let events = postgres_test::statuses(conn, alpha)?;
+    conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::close_unconfirmed_tx(conn, [&stale], Close::NoteNotReceived)
+    })?;
+    assert_eq!(postgres_test::statuses(conn, alpha)?, events);
+    assert_eq!(stop_of(conn, &unconfirmed)?.unwrap().0, "stp_on_submit");
+
+    // The note found spent.
+    let beta = maker(conn, "beta")?;
+    let pending = ask(3, 100);
+    stp_round(conn, &[sub(beta, 1, &pending)], false)?;
+    let stale = read(conn, &pending)?;
+    stp_round(conn, &[sub(beta, 2, &bid(4, 100))], false)?;
+    let events = postgres_test::statuses(conn, beta)?;
+    assert!(events.contains(&cancelled(&pending)));
+    conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &[stale]))?;
+    assert_eq!(postgres_test::statuses(conn, beta)?, events);
+    assert_eq!(lineage_state(conn, &pending)?, "rejected");
+    Ok(())
+}
+
+/// The owner-epoch guard is taken with the check on and live at accept off.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_check_takes_the_owner_epoch_guard() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let gate = AcceptGate::epoch_only(postgres_test::epoch(conn)? + 1);
+    let refused = conn.transaction::<_, DbError, _>(|conn| {
+        intake_round_tx(conn, &[sub(alpha, 1, &ask(1, 100))], Some(&gate), true)
+    });
+    assert!(
+        matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// With the check off, crossing orders stay as before.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn with_the_check_off_nothing_changes() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (old, new) = (ask(1, 100), bid(2, 100));
+    for (seq, note) in [(1, &old), (2, &new)] {
+        let round = round(conn, &[sub(alpha, seq, note)], true, false)?;
+        assert!(round.self_trade.updates.is_empty());
+    }
+    assert!(in_book(conn, &old)? && in_book(conn, &new)?);
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?,
+        [went_live(&old), went_live(&new)]
+    );
+    Ok(())
+}
+
+/// Wait until session `pid` waits on a lock.
+fn wait_for_lock_wait(url: &str, pid: i32) -> Result<()> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+    let mut watch = super::postgres_migrations::connect(url)?;
+    let started = std::time::Instant::now();
+    while !diesel::select(sql::<Bool>(&format!(
+        "EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {pid} AND wait_event_type = 'Lock')"
+    )))
+    .get_result::<bool>(&mut watch)?
+    {
+        anyhow::ensure!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "session {pid} never waited on a lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// A crossing submit and a reservation of the order it cancels serialize on
+/// the maker's lock and never deadlock, in either order. Each order is run
+/// on purpose: the first session writes, and commits only once the second
+/// waits on its lock. Reservation first: the order settles and hears
+/// nothing now. Submit first: the order gets CANCELLED and the reservation
+/// fails.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_crossing_submit_and_a_reservation_of_its_loser_serialize() -> Result<()> {
+    use super::postgres_migrations::connect;
+    use super::postgres_models::SettlementAttemptRow;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Integer;
+    let mut fixture = TestSchema::migrated()?;
+    let alpha = maker(&mut fixture.conn, "alpha")?;
+    let epoch = postgres_test::epoch(&mut fixture.conn)?;
+    for (k, reservation_first) in [(0_u8, true), (1, false), (2, true), (3, false)] {
+        let (quote, crossing) = (ask(10 + u32::from(k), 100), bid(1000 + u32::from(k), 100));
+        let seq = 10 * u64::from(k);
+        stp_round(&mut fixture.conn, &[sub(alpha, seq + 1, &quote)], true)?;
+        let (input, _, _) = postgres_test::fill(k, &quote, 40);
+        let attempt = SettlementAttemptRow {
+            tx_id: vec![k; 32],
+            tx_result: vec![k],
+            status: "prepared".into(),
+        };
+        let commands = [sub(alpha, seq + 2, &crossing)];
+        let reserve = |conn: &mut PgConnection| {
+            super::postgres_db::prepare_settlement_tx(
+                conn,
+                &attempt,
+                std::slice::from_ref(&input),
+                None,
+            )
+        };
+        let submit = |conn: &mut PgConnection| {
+            let gate = AcceptGate::new(epoch, || Some(BlockNumber::from(7)));
+            intake_round_tx(conn, &commands, Some(&gate), true).map(|_| ())
+        };
+        let (mut leader, mut follower) = (connect(&fixture.url)?, connect(&fixture.url)?);
+        let follower_pid: i32 =
+            diesel::select(sql::<Integer>("pg_backend_pid()")).get_result(&mut follower)?;
+        let url = fixture.url.clone();
+        let (wrote, written) = std::sync::mpsc::channel();
+        let second = std::thread::scope(|scope| -> Result<Result<(), DbError>> {
+            let first = scope.spawn(|| {
+                leader.transaction::<_, DbError, _>(|conn| {
+                    if reservation_first {
+                        reserve(conn)?;
+                    } else {
+                        submit(conn)?;
+                    }
+                    wrote.send(()).expect("the test waits");
+                    wait_for_lock_wait(&url, follower_pid)
+                        .map_err(|_| DbError::Corrupt("the second session never waited"))
+                })
+            });
+            written.recv()?;
+            let second = follower.transaction::<_, DbError, _>(|conn| {
+                if reservation_first {
+                    submit(conn)
+                } else {
+                    reserve(conn)
+                }
+            });
+            first.join().expect("first session panicked")?;
+            Ok(second)
+        })?;
+        let conn = &mut fixture.conn;
+        let told = postgres_test::statuses(conn, alpha)?.contains(&cancelled(&quote));
+        assert_eq!(
+            stop_of(conn, &quote)?.unwrap().0,
+            "stp_on_submit",
+            "round {k}"
+        );
+        if reservation_first {
+            second?;
+            assert!(!told, "round {k}: a settling loser hears nothing now");
+            assert_eq!(
+                postgres_test::status(conn, &quote)?.as_deref(),
+                Some("settling")
+            );
+        } else {
+            assert!(
+                matches!(
+                    second,
+                    Err(DbError::Settlement(
+                        crate::types::SettlementError::InputOrderNotActive
+                    ))
+                ),
+                "round {k}: {second:?}"
+            );
+            assert!(told, "round {k}: a live loser hears CANCELLED");
+        }
+    }
+    Ok(())
+}
+
+/// The newer read starts at the round's lowest claim, not its highest: a
+/// late submit is compared with a newer order even when the same round
+/// also claims a higher seq.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_late_submit_beside_a_higher_one_still_sees_the_newer_order() -> Result<()> {
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let (newer, late, unrelated) = (ask(1, 100), bid(2, 101), bid(3, 50));
+    stp_round(conn, &[sub(alpha, 7, &newer)], true)?;
+    stp_round(conn, &[cancel_cmd(alpha, 8, &newer)], true)?;
+    let round = stp_round(
+        conn,
+        &[sub(alpha, 5, &late), sub(alpha, 9, &unrelated)],
+        true,
+    )?;
+    assert!(round.outcomes[0].1.live.is_none(), "the late bid lost");
+    assert!(round.outcomes[1].1.live.is_some());
+    assert_eq!(
+        postgres_test::statuses(conn, alpha)?.last(),
+        Some(&went_live(&unrelated))
+    );
+    assert!(postgres_test::statuses(conn, alpha)?.contains(&cancelled(&late)));
+    // Newer than 5: the cancelled ask (7); the round's own 9 is not counted.
+    assert_eq!(round.self_trade.newer_rows, [(alpha, 1)]);
+    Ok(())
+}
+
+/// With the check on, a submit with more than 1,000 of its maker's orders
+/// on the pair above its seq is refused before it is claimed, the same on
+/// every retry; 1,000 is fine, another pair's history does not count, an
+/// earlier accepted submit still replays, and with the check off nothing is
+/// refused.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn a_submit_far_below_its_makers_history_is_refused() -> Result<()> {
+    use crate::maker::{CommandReply, CommandResult};
+    use maker_db::MAX_NEWER_LINEAGES;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let keys = OrderKeys::from_note(&ask(1, 100))?;
+    let reply = |round: IntakeRound| round.outcomes.into_iter().next().unwrap().1.reply;
+
+    let early = ask(1, 100);
+    assert_eq!(
+        reply(stp_round(conn, &[sub(alpha, 1, &early)], false)?),
+        CommandReply::Committed(CommandResult::Accepted)
+    );
+    // Another pair's history does not count.
+    history(
+        conn,
+        alpha,
+        b"other pair",
+        &keys.direction,
+        2_002,
+        MAX_NEWER_LINEAGES + 1,
+    )?;
+    let elsewhere = ask(2, 100);
+    assert_eq!(
+        reply(stp_round(conn, &[sub(alpha, 3, &elsewhere)], false)?),
+        CommandReply::Committed(CommandResult::Accepted)
+    );
+
+    // 1,001 orders on this pair at seqs 10,002..12,002.
+    history(
+        conn,
+        alpha,
+        &keys.market,
+        &keys.direction,
+        10_002,
+        MAX_NEWER_LINEAGES + 1,
+    )?;
+    let (refused, kept) = (ask(3, 100), ask(4, 100));
+    // Stored: the retry replays the refusal, never recomputes it.
+    for expected in [
+        CommandReply::Committed(CommandResult::SeqBelowHistory),
+        CommandReply::Replayed(CommandResult::SeqBelowHistory),
+    ] {
+        let outcome = stp_round(conn, &[sub(alpha, 10_001, &refused)], false)?;
+        assert_eq!(reply(outcome), expected);
+    }
+    let claims: i64 = maker_lineages::table
+        .find(lineage_of(&refused))
+        .count()
+        .get_result(conn)?;
+    assert_eq!(claims, 0, "a refused submit claims nothing");
+    // Exactly 1,000 above: claimed.
+    assert_eq!(
+        reply(stp_round(conn, &[sub(alpha, 10_003, &kept)], false)?),
+        CommandReply::Committed(CommandResult::Accepted)
+    );
+    // An exact retry of the early submit still gets its stored reply.
+    assert_eq!(
+        reply(stp_round(conn, &[sub(alpha, 1, &early)], false)?),
+        CommandReply::Replayed(CommandResult::Accepted)
+    );
+    // With the check off, nothing is refused.
+    let off = round(conn, &[sub(alpha, 9_999, &ask(5, 100))], false, false)?;
+    assert_eq!(reply(off), CommandReply::Committed(CommandResult::Accepted));
     Ok(())
 }

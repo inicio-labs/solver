@@ -18,7 +18,7 @@ use super::postgres_models::{
     RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
-    eligible_orders, live_orders, maker_lineages, makers, orders, registered_tokens,
+    eligible_orders, live_orders, maker_lineages, maker_stops, makers, orders, registered_tokens,
     settlement_attempts, settlement_inputs, sync_state,
 };
 use crate::maker::MakerTag;
@@ -209,6 +209,28 @@ pub fn prepare_settlement_tx(
     reserve_inputs_tx(conn, attempt, inputs, cached_fills, &[])
 }
 
+/// Whether any of `note_ids` belongs to a lineage its maker's stop row
+/// covers.
+pub(crate) fn has_stopped_input_tx(
+    conn: &mut PgConnection,
+    note_ids: &[Vec<u8>],
+) -> DbResult<bool> {
+    Ok(diesel::select(diesel::dsl::exists(
+        orders::table
+            .inner_join(
+                maker_lineages::table
+                    .on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+            )
+            .inner_join(
+                maker_stops::table.on(maker_stops::maker_id
+                    .eq(maker_lineages::maker_id)
+                    .and(maker_stops::lineage_id.eq(maker_lineages::lineage_id))),
+            )
+            .filter(orders::note_id.eq_any(note_ids)),
+    ))
+    .get_result(conn)?)
+}
+
 /// The executor's reservation: reserve the inputs and, in the same commit,
 /// cancel the sit-outs of the crossed makers they fill (ADR 0005). The
 /// sit-outs' makers are locked with the inputs' owners, in one maker-ID
@@ -286,6 +308,11 @@ fn reserve_inputs_tx(
         .count()
         .get_result(conn)?;
     if usize::try_from(live)? != parent_ids.len() {
+        // A stop between the matcher's choice and this reservation: counted,
+        // since self-trade prevention at submit can cause it (ADR 0009).
+        if has_stopped_input_tx(conn, &parent_ids)? {
+            crate::executor::metrics::record_reservation_stopped_input();
+        }
         return Err(SettlementError::InputOrderNotActive.into());
     }
     let parents: HashMap<&[u8], &OrderRow> = locked

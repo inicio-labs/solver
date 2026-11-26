@@ -359,6 +359,8 @@ erDiagram
     bigint maker_id PK, FK
     bytea lineage_id PK "targeted cancel"
     timestamptz created_at
+    text source "who stopped it, ADR 0009"
+    bytea caused_by_lineage "self-trade stops only"
   }
   maker_events {
     bigint maker_id PK, FK

@@ -8,6 +8,7 @@ mod error;
 mod events;
 pub(crate) mod intake;
 pub(crate) mod metrics;
+pub mod self_trade;
 mod service;
 mod watcher;
 

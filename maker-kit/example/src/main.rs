@@ -14,7 +14,8 @@
 //!   maker cancel-all [--market IETH,IUSDT]
 //!                                   cancel every older order, or those in one market
 //!   maker reclaim <lineage-hex>     take back an unfilled order's tokens (after your cancel,
-//!                                   or after the solver's OrderStatus CANCELLED)
+//!                                   the solver's OrderStatus CANCELLED, or a SettlementResolved
+//!                                   whose result is CANCELLED)
 //!   maker heartbeat                 server time and your newest event sequence
 //!   maker get-command <request-id>  the stored reply of a command you sent
 //!
@@ -258,9 +259,13 @@ fn print_event(cfg: &Config, event: &pb::MakerEvent) {
                 .and_then(|x| pb::ResultingStatus::try_from(x.status).ok())
                 .map(|s| s.as_str_name())
                 .unwrap_or("?");
+            let reason = r.result.as_ref().map_or("", |x| x.reason.as_str());
             format!(
-                "SettlementResolved committed={} block={} result={status} {}",
-                r.committed, r.commit_block, describe_fill(cfg, r.fill.as_ref())
+                "SettlementResolved committed={} block={} result={status}{} {}",
+                r.committed,
+                r.commit_block,
+                if reason.is_empty() { String::new() } else { format!(" reason={reason:?}") },
+                describe_fill(cfg, r.fill.as_ref())
             )
         }
         None => "event without a body".to_string(),

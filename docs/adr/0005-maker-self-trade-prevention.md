@@ -1,6 +1,6 @@
 # 5. Self-trade prevention for maker orders
 
-- **Status:** Accepted, implemented. Decided with Vaibhav Jindal on 2026-10-23 to 2026-10-25. D1 to D3 are built with their proposed defaults; D6 is Vaibhav's to send.
+- **Status:** Accepted, implemented. Decided with Vaibhav Jindal on 2026-10-23 to 2026-10-25. D1 to D3 are built with their proposed defaults; D6 is Vaibhav's to send. To be replaced by [ADR 0009](0009-self-trade-prevention-at-submit.md) (self-trade prevention at submit) once its soak passes.
 - **Date:** 2026-10-25
 - **Deciders:** Vaibhav Jindal. Maker requirement from Jordy (Pragma), 2026-10-23.
 - **Scope:** PSWAP batch clearing in the 0.17 solver, maker orders only (orders with a maker ID from the gateway).

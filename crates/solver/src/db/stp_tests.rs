@@ -1660,3 +1660,56 @@ fn a_submit_far_below_its_makers_history_is_refused() -> Result<()> {
     assert_eq!(reply(off), CommandReply::Committed(CommandResult::Accepted));
     Ok(())
 }
+
+/// The runbook's soak check 1, run as the runbook prints it: it finds each
+/// crossed pair of a maker's open orders, a parent retired while its
+/// settlement is unresolved included, and none the rule prevented.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn the_runbooks_real_miss_check_finds_crossed_pairs() -> Result<()> {
+    use super::postgres_db::mark_orders_onchain_nullified_tx;
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        misses: i64,
+    }
+    let runbook = include_str!("../../../../docs/postgres-runbook.md");
+    let start = runbook
+        .find("WITH open_lineages AS (")
+        .expect("check 1 in the runbook");
+    let end = start + runbook[start..].find(">= :switch_on;").unwrap() + ">= :switch_on".len();
+    let check = &runbook[start..end];
+    let misses = |conn: &mut PgConnection, switch_on: &str| -> Result<i64> {
+        let check = check.replace(":switch_on", &format!("'{switch_on}'::timestamptz"));
+        Ok(
+            diesel::sql_query(format!("SELECT count(*) AS misses FROM ({check}) found"))
+                .get_result::<Count>(conn)?
+                .misses,
+        )
+    };
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    // With the check off: a crossed pair of live orders.
+    let alpha = maker(conn, "alpha")?;
+    round(conn, &[sub(alpha, 1, &ask(1, 100))], true, false)?;
+    round(conn, &[sub(alpha, 2, &bid(2, 101))], true, false)?;
+    assert_eq!(misses(conn, "-infinity")?, 1);
+    assert_eq!(misses(conn, "infinity")?, 0, "both from before switch-on");
+    // And one whose ask is a parent the watcher retired while its
+    // settlement is unresolved.
+    let beta = maker(conn, "beta")?;
+    let retired = ask(3, 100);
+    round(conn, &[sub(beta, 1, &retired)], true, false)?;
+    postgres_test::reserve(conn, 9, &[&retired], 40)?;
+    conn.transaction::<_, DbError, _>(|conn| {
+        mark_orders_onchain_nullified_tx(conn, &[id(&retired)])
+    })?;
+    round(conn, &[sub(beta, 2, &bid(4, 101))], true, false)?;
+    assert_eq!(misses(conn, "-infinity")?, 2);
+    // With the check on, the rule leaves no crossed pair.
+    let gamma = maker(conn, "gamma")?;
+    stp_round(conn, &[sub(gamma, 1, &ask(5, 100))], true)?;
+    stp_round(conn, &[sub(gamma, 2, &bid(6, 101))], true)?;
+    assert_eq!(misses(conn, "-infinity")?, 2);
+    Ok(())
+}

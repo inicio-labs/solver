@@ -29,7 +29,7 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 | # | Decision |
 |---|---|
 | D1 | Every maker is trusted. One switch, `engine.maker_live_at_accept`, off by default; changing it needs a restart. |
-| D2 | Only private notes go live at accept. Public notes keep the confirmed path (ingest and the watcher). |
+| D2 | Only private notes go live at accept. Since 2026-11-22 the gateway accepts private notes only (ADR 0003), so every submit can. |
 | D3 | When a settlement with unconfirmed parents never commits, what the node said decides where they go (table below). |
 | D4 | A `waiting` order comes back only when its note is in a block. |
 | D5 | The maker sees a `waiting` order as LIVE: in `ListActiveMakerOrders`, and as `LIVE` in a voided `SettlementResolved`. No proto change. A `waiting` order the maker cancels leaves the listing at once; its row stays `waiting`, with no event, until its note lands (it is then stored `stopped`) or the cap closes it silently. A parent the maker cancelled while a settlement held it is stored `stopped` at the release and reported `CANCELLED`. |
@@ -45,13 +45,13 @@ A private maker order goes live when the gateway accepts `SubmitOrder`, before i
 With the switch on, a newly claimed submit of a private note, in intake's transaction:
 1. `SELECT owner_epoch … FOR SHARE`, once per round: a new owner's claim waits for this commit, and a round after a takeover fails (and stops the solver) instead of putting a ghost order in a book nobody reads.
 2. Read the watcher's block (D7). Not fresh: the confirmed path.
-3. Insert the root row `ON CONFLICT (note_id) DO NOTHING RETURNING`. An existing row: the confirmed path.
+3. Insert the root row. The claim already refused a submit whose lineage or note has a row, so the insert always adds one.
 4. Run `live_book_update_tx` on it: the cancel rule every book write applies, which also adds the order's maker tag. Not kept (the maker cancelled it first, or a cutoff covers it): delete the row and take the confirmed path, so nothing differs from today.
 5. Only if kept: set `accept_block` to the block read in step 2, append LIVE.
 6. Publish `BookUpdate { active, maker_updates }` in the round's one update, under the publication guard.
 7. After commit, wake the event streams.
 
-The confirmed path is today's: no row until the watcher sees the note. Accept fallbacks are counted per maker (`watcher_stale`, `conflict`, `public`).
+The confirmed path is today's: no row until the watcher sees the note. Accept fallbacks are counted per maker (`watcher_stale`).
 
 ### Order life
 

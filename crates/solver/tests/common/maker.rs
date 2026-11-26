@@ -160,6 +160,15 @@ impl EventFeed {
     }
 }
 
+impl EventFeed {
+    /// Every event still unread, and every event that arrives within
+    /// `window`, in order.
+    pub async fn drain(&mut self, window: Duration) -> Result<Vec<proto::MakerEvent>> {
+        self.next_match(window, |_| false).await?;
+        Ok(self.unread.drain(..).collect())
+    }
+}
+
 /// Read the feed until an event matches `want`, or fail after `max_wait`.
 /// Every event seen on the way is returned too, in order, for assertions.
 pub async fn wait_for_event<F>(

@@ -4,6 +4,7 @@
 - **Date:** 2026-10-02
 - **Revised:** 2026-10-02 — cancellation by cutoff and the `live_orders` view; maker intake and activation in parallel with ingest and settlement. Builds on PR #34.
 - **Revised:** 2026-10-03 — lineage-keyed maker metadata; public notes accepted through the gateway; RFQ router skips maker orders; makers rebuild payback/remainder notes from fill details; no cancel stream event; events kept and timestamped (expiry later); restore detection deferred.
+- **Revised:** 2026-11-22 — **private notes only.** The gateway refuses a public note, and a lineage whose note already has an order row is not claimed (`already_registered`). So a maker order's row is always written after its claim, by the watcher or at accept (ADR 0008), and the attribution of rows that came first (`OrdersAttributed`, the startup order-key backfill) is gone. Where this ADR describes public maker notes, it is superseded.
 - **Deciders:** Vaibhav Jindal for maker-facing requirements; solver implementation review pending.
 - **Related:** [ADR 0001](0001-external-liquidity-routing.md) for public external routing, [ADR 0002](0002-filler-sdk.md) for the filler interface.
 
@@ -207,10 +208,10 @@ No sweep follows a cancel. Rows below a cutoff keep `status = 'active'` until a 
 Maker and book changes share the bounded `book_tx` stream. The intake and `write_book` hold one publication guard across commit and send, so the matcher sees them in commit order:
 
 - CancelAll and CancelOrder publish a cutoff or lineage cancellation; the maker index locates affected live entries without scanning the whole book.
-- Submit publishes the IDs of existing orders whose lineage it claimed, with their maker tag. The matcher updates those orders in place, preserving inactive RFQ or settlement state. Later book updates already carry the tag from `live_orders`.
+- Submit publishes nothing about existing orders: maker orders are private notes, so a claim always comes before its order row (a submit whose lineage or note already has a row gets `already_registered`), and every book update carries the maker tag from `live_orders`.
 - The matcher drains queued updates before each clearing tick. A cancellation can wait behind earlier book updates and bounded-channel backpressure; the database reservation check remains the final guarantee.
 
-The matcher keeps cutoffs and only the lineage/maker indexes needed to find cancellations. It does not keep a timed cache of cancellations or attributions: an earlier activation cannot arrive after a later cancellation on the same stream, and a later activation passes `live_orders`. A targeted cancellation committed before a claim is included in that claim's metadata update. An aborted book writer still finishes publication in an owned task; an intake timeout or aborted publication stops the solver so startup hydration restores durable state. Reservation still checks `live_orders`.
+The matcher keeps cutoffs and only the lineage/maker indexes needed to find cancellations. It does not keep a timed cache of cancellations: an earlier activation cannot arrive after a later cancellation on the same stream, and a later activation passes `live_orders`. An aborted book writer still finishes publication in an owned task; an intake timeout or aborted publication stops the solver so startup hydration restores durable state. Reservation still checks `live_orders`.
 
 A valid empty scope still installs its barrier for later arrivals. Counts, if returned, describe the as-of view of the cancel commit.
 
@@ -218,7 +219,7 @@ Bulk cancellation may filter by order type, market and direction; provided filte
 
 #### Where cancel meets matching
 
-Reservation happens once, in the executor, after proving and before any possible broadcast: PR #34's `prepare_settlement_tx` commit. That transaction locks the input order rows, then the control rows of the makers that own them (in maker-ID order; read from the locked rows rather than from the candidate, because an attribution can arrive after the matcher picked it), checks every input against `live_orders`, then reserves the whole exact input notes and stores the transaction record. A cancel raises its cutoff under the same row lock, so the two serialize. Both take `FOR NO KEY UPDATE`: reservations come only from the single core writer, so a shared mode would gain nothing, and foreign-key checks (`KEY SHARE`) never wait on it:
+Reservation happens once, in the executor, after proving and before any possible broadcast: PR #34's `prepare_settlement_tx` commit. That transaction locks the input order rows, then the control rows of the makers that own them (in maker-ID order, read from the locked rows), checks every input against `live_orders`, then reserves the whole exact input notes and stores the transaction record. A cancel raises its cutoff under the same row lock, so the two serialize. Both take `FOR NO KEY UPDATE`: reservations come only from the single core writer, so a shared mode would gain nothing, and foreign-key checks (`KEY SHARE`) never wait on it:
 
 - Cancel wins: the reservation fails, nothing is broadcast, and the inputs return to the matcher through the same view, so the stopped ones stay out. The proof is wasted, which is acceptable.
 - Reservation wins: the cancel reply lists that settlement as in-flight exposure; whatever it leaves behind comes back Stopped.
@@ -241,9 +242,9 @@ Maker traffic must not slow public ingest or settlement, and a cancel must never
 
 **Handlers** run concurrently and do only CPU work: authenticate, decode, and validate the note once into domain types. They pass the validated command to the intake writer over bounded channels, with a separate small channel for cancels, and await its reply. A full channel returns UNAVAILABLE ("durable acceptance unavailable") instead of hanging.
 
-**Intake writer (group commit).** One task owns the intake session. Each round it takes every waiting cancel first, then up to N waiting submits (default 500), and writes them in one transaction using statements that cannot fail per command (`INSERT … ON CONFLICT DO NOTHING RETURNING`), so one bad command never aborts the batch. It locks existing submission order rows before maker rows, matching reservation's lock order. It classifies each outcome from the returned rows (Accepted, retry of a stored result, idempotency conflict, note already registered), commits once, sends the committed maker updates on `book_tx`, then replies to every handler. Atomicity remains per command: if the transaction itself fails, none of its commands was acknowledged and each is retryable by request ID. Commands that arrive while a round commits form the next round.
+**Intake writer (group commit).** One task owns the intake session. Each round it takes every waiting cancel first, then up to N waiting submits (default 500), and writes them in one transaction using statements that cannot fail per command (`INSERT … ON CONFLICT DO NOTHING RETURNING`), so one bad command never aborts the batch. It takes no order-row lock: a claim never touches an existing order row. It classifies each outcome from the returned rows (Accepted, retry of a stored result, idempotency conflict, note already registered), commits once, sends the committed maker updates on `book_tx`, then replies to every handler. Atomicity remains per command: if the transaction itself fails, none of its commands was acknowledged and each is retryable by request ID. Commands that arrive while a round commits form the next round.
 
-A separate session is safe because maker commands only append control records and never move orders or settlements; execution authority stays with the core writer. The pool opens the intake session only after it owns the database and closes it when the pool's fatal token fires. Cancel and reservation serialize through the maker control row lock, while a late claim and reservation serialize through the order row lock. Submits and cancels add no work to the core writer.
+A separate session is safe because maker commands only append control records and never move orders or settlements; execution authority stays with the core writer. The pool opens the intake session only after it owns the database and closes it when the pool's fatal token fires. Cancel and reservation serialize through the maker control row lock; a claim touches no order row, so it never waits on a reservation. Submits and cancels add no work to the core writer.
 
 **Maker-note watcher.** One local task on the gateway thread, polling every `maker_watch_interval_ms` (default 1 s), uses a dedicated Miden SDK client and SQLite store:
 
@@ -358,6 +359,8 @@ erDiagram
     bigint maker_id PK, FK
     bytea lineage_id PK "targeted cancel"
     timestamptz created_at
+    text source "who stopped it, ADR 0009"
+    bytea caused_by_lineage "self-trade stops only"
   }
   maker_events {
     bigint maker_id PK, FK

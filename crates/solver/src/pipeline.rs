@@ -387,13 +387,6 @@ async fn reconcile_clearing_book(
     pool: &db::DbPool,
     client: &mut dyn MidenClient,
 ) -> Result<matcher::ClearingBootstrap> {
-    let backfilled = pool.write(db::postgres_db::backfill_order_keys_tx).await?;
-    if backfilled > 0 {
-        tracing::info!(
-            backfilled,
-            "filled order keys of orders stored before maker support"
-        );
-    }
     // Cutoffs only rise, so reading them after the orders can only stop more.
     let (mut orders, cutoffs) = pool
         .read(|conn| {

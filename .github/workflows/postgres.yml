@@ -42,13 +42,13 @@ jobs:
       - name: Migration formatting
         run: |
           rustfmt --check --edition 2021 --config skip_children=true \
-            crates/solver/src/db/postgres_*.rs crates/solver/src/db/maker_db.rs \
-            crates/solver/src/db/{mod,live_at_accept_tests}.rs \
+            crates/solver/src/db/postgres_*.rs crates/solver/src/db/maker_db.rs crates/solver/src/db/maker_db/self_trade.rs \
+            crates/solver/src/db/{mod,live_at_accept_tests,stp_tests}.rs \
             crates/solver/src/maker.rs crates/solver/src/types.rs \
             crates/solver/src/admin/admin.rs crates/solver/src/config.rs \
             crates/solver/src/executor/{executor,metrics,mod,refusal}.rs crates/solver/src/ingest/{ingest,error,mod}.rs \
             crates/solver/src/matcher/clearing_book.rs crates/solver/src/matcher/matcher.rs \
-            crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs \
+            crates/solver/src/matcher/maker_index.rs crates/solver/src/gateway/*.rs crates/solver/src/gateway/self_trade/tests.rs \
             crates/solver/src/matcher/clearing_book/bounded_price.rs \
             crates/solver/src/matcher/clearing_book/bounded_price/tests.rs \
             crates/solver/src/matcher/clearing_book/metrics_cost.rs \

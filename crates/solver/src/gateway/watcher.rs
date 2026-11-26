@@ -1334,6 +1334,19 @@ mod tests {
             self.command(&format!("s{seq}"), seq, command).await;
         }
 
+        /// A public note's claim, as maker intake stored it before it became
+        /// private-only: such lineages remain until they end.
+        async fn legacy_public_submit(&self, seq: u64, note: &Note) {
+            let order = crate::types::Order::from_note(note).unwrap();
+            let command = MakerCommand::Submit {
+                note: Box::new(note.clone()),
+                keys: crate::types::OrderKeys::from_note(note).unwrap(),
+                amounts: (order.offered_amount, order.requested_amount),
+                expires_at_unix_ms: None,
+            };
+            self.command(&format!("s{seq}"), seq, command).await;
+        }
+
         /// The OrderStatus events so far: (note ID, state, reason).
         async fn statuses(&self) -> Vec<(Vec<u8>, proto::OrderState, String)> {
             let maker_id = self.maker_id;
@@ -1473,44 +1486,12 @@ mod tests {
         assert_eq!(f.status(&order).await, "stopped");
     }
 
-    #[tokio::test]
-    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-    async fn a_public_maker_note_ingested_first_becomes_a_maker_order() {
-        let mut f = fixture().await;
-        let order = note(1, NoteType::Public);
-        let row = NewOrderRow::ingested(&order, 1).unwrap();
-        f.db.pool
-            .write(move |conn| {
-                postgres_db::insert_orders_batch_tx(conn, &[row], 1)?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        f.submit(1, &order).await;
-        f.chain.commit(&order, 2);
-        f.watcher.round().await.unwrap();
-
-        // Ingest put the order in the book, and the submit's attribution
-        // tagged it there, so activation sends nothing again.
-        assert!(f.book.try_recv().is_err());
-        assert_eq!(
-            f.statuses().await,
-            [(id(&order), proto::OrderState::Live, String::new())]
-        );
-        assert_eq!(f.status(&order).await, "active");
-        let tagged =
-            f.db.pool
-                .read(postgres_db::load_live_orders_tx)
-                .await
-                .unwrap();
-        assert!(tagged[0].maker.is_some(), "now a maker order");
-    }
-
-    /// A public maker note can trade before the watcher activates its claim:
-    /// ingest stores it and `live_orders` admits it. When our own settlement
-    /// consumes it in that window, the settlement events report the fill, so
-    /// the watcher waits while the settlement is in flight, then activates
-    /// the claim without reporting the note spent.
+    /// A public maker note claimed before maker intake became private-only
+    /// can trade before the watcher activates its claim: ingest stores it and
+    /// `live_orders` admits it. When our own settlement consumes it in that
+    /// window, the settlement events report the fill, so the watcher waits
+    /// while the settlement is in flight, then activates the claim without
+    /// reporting the note spent.
     #[tokio::test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
     async fn a_pending_note_filled_by_our_settlement_is_not_reported_spent() {
@@ -1520,7 +1501,7 @@ mod tests {
 
         let mut f = fixture().await;
         let order = note(1, NoteType::Public);
-        f.submit(1, &order).await;
+        f.legacy_public_submit(1, &order).await;
         let row = NewOrderRow::ingested(&order, 1).unwrap();
         let tx_id = vec![7; 32];
         let attempt = SettlementAttemptRow {

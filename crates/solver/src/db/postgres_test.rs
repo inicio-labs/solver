@@ -6,9 +6,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use diesel::connection::SimpleConnection;
-use diesel::PgConnection;
+use diesel::{Connection, PgConnection};
+use miden_protocol::account::AccountId;
+use miden_protocol::asset::{AssetAmount, FungibleAsset};
+use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::utils::Serializable;
+use miden_protocol::note::{Note, NoteType};
+use miden_protocol::testing::account_id::{
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2, ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+};
+use miden_protocol::Word;
+use miden_standards::note::{PswapNote, PswapNoteStorage};
 
-use super::{postgres_migrations, DbPool};
+use super::maker_db::{self, AcceptMode, CommandOutcome};
+use crate::maker::{CommandHeader, MakerCommand, MakerId};
+use crate::types::OrderKeys;
+
+use super::{postgres_migrations, DbError, DbPool};
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -99,9 +114,6 @@ pub fn fill(
     miden_protocol::note::Note,
     Option<miden_protocol::note::Note>,
 ) {
-    use miden_protocol::crypto::utils::Serializable;
-    use miden_protocol::note::Note;
-
     let pswap = miden_standards::note::PswapNote::try_from(parent).unwrap();
     let requested = pswap.storage().requested_faucet_id();
     let (payback, remainder) = pswap
@@ -128,8 +140,6 @@ pub fn prepare(
     tx: u8,
     inputs: &[super::postgres_models::SettlementInputRow],
 ) -> Result<()> {
-    use diesel::Connection;
-
     let attempt = super::postgres_models::SettlementAttemptRow {
         tx_id: vec![tx; 32],
         tx_result: vec![tx],
@@ -153,4 +163,276 @@ pub fn revert_after(conn: &mut PgConnection, version: &str) -> Result<()> {
         }
         postgres_migrations::revert_last(conn)?;
     }
+}
+
+/// Which way an order trades on the test pair: a sell offers faucet A for
+/// faucet B, a buy offers B for A.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Sell,
+    Buy,
+}
+
+/// A private PSWAP order offering `offered` for `requested`.
+pub fn order(serial: u32, side: Side, offered: u64, requested: u64) -> Note {
+    order_of(serial, side, offered, requested, NoteType::Private)
+}
+
+pub fn order_of(
+    serial: u32,
+    side: Side,
+    offered: u64,
+    requested: u64,
+    note_type: NoteType,
+) -> Note {
+    let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+    let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+    match side {
+        Side::Sell => pswap_order(serial, (a, offered), (b, requested), note_type),
+        Side::Buy => pswap_order(serial, (b, offered), (a, requested), note_type),
+    }
+}
+
+/// An ask offering 100 of A at `price` B per 100, and a bid paying `price`
+/// B for 100 A: a bid crosses an ask at or below its price.
+pub fn ask(serial: u32, price: u64) -> Note {
+    order(serial, Side::Sell, 100, price)
+}
+
+pub fn bid(serial: u32, price: u64) -> Note {
+    order(serial, Side::Buy, price, 100)
+}
+
+/// A private sell on another pair: faucet A for a third faucet.
+pub fn order_on_other_pair(serial: u32, offered: u64, requested: u64) -> Note {
+    let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+    let c = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap();
+    pswap_order(serial, (a, offered), (c, requested), NoteType::Private)
+}
+
+fn pswap_order(
+    serial: u32,
+    (offered_faucet, offered): (AccountId, u64),
+    (requested_faucet, requested): (AccountId, u64),
+    note_type: NoteType,
+) -> Note {
+    let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+        .try_into()
+        .unwrap();
+    PswapNote::builder()
+        .sender(creator)
+        .storage(
+            PswapNoteStorage::builder()
+                .min_requested_asset(FungibleAsset::new(requested_faucet, requested).unwrap())
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build(),
+        )
+        .serial_number(Word::from([serial, 0, 0, 0]))
+        .note_type(note_type)
+        .offered_asset(FungibleAsset::new(offered_faucet, offered).unwrap())
+        .build()
+        .unwrap()
+        .into()
+}
+
+pub fn id(note: &Note) -> Vec<u8> {
+    note.id().to_bytes().to_vec()
+}
+
+pub fn lineage_of(note: &Note) -> Vec<u8> {
+    OrderKeys::from_note(note).unwrap().lineage_id
+}
+
+pub fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
+    Ok(maker_db::create_maker_tx(conn, name)?.unwrap())
+}
+
+/// Run one command in its own transaction, live at accept on with a fresh
+/// watcher block when `live` is set.
+pub fn run(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    seq: u64,
+    command: &MakerCommand,
+    live: bool,
+) -> Result<CommandOutcome> {
+    let accept = if live {
+        AcceptMode::Fresh(BlockNumber::from(7))
+    } else {
+        AcceptMode::Off
+    };
+    let header = CommandHeader::new(maker_id, format!("r{seq}"), seq).unwrap();
+    Ok(conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::execute_command_tx(conn, &header, command, accept)
+    })?)
+}
+
+pub fn submit(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    seq: u64,
+    note: &Note,
+    live: bool,
+) -> Result<CommandOutcome> {
+    run(
+        conn,
+        maker_id,
+        seq,
+        &MakerCommand::submit(note.clone())?,
+        live,
+    )
+}
+
+/// Cancel `note`'s lineage with its maker's `CancelOrder` at `seq`.
+pub fn cancel(conn: &mut PgConnection, maker_id: MakerId, seq: u64, note: &Note) -> Result<()> {
+    let lineage_id = lineage_of(note);
+    run(
+        conn,
+        maker_id,
+        seq,
+        &MakerCommand::CancelOrder { lineage_id },
+        false,
+    )?;
+    Ok(())
+}
+
+/// Reserve `parents` in settlement `tx`, each filled by `amount`.
+pub fn reserve(conn: &mut PgConnection, tx: u8, parents: &[&Note], amount: u64) -> Result<()> {
+    let inputs: Vec<_> = parents
+        .iter()
+        .map(|parent| fill(tx, parent, amount).0)
+        .collect();
+    prepare(conn, tx, &inputs)
+}
+
+/// Every event of `maker_id`, decoded, in feed order.
+pub fn events(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<crate::gateway::proto::event_body::Kind>> {
+    use prost::Message as _;
+    Ok(maker_db::read_events_tx(conn, maker_id, 0, 1000)?
+        .into_iter()
+        .map(|event| {
+            crate::gateway::proto::EventBody::decode(event.payload.as_slice())
+                .unwrap()
+                .kind
+                .unwrap()
+        })
+        .collect())
+}
+
+/// Each SettlementResolved of `maker_id`: (input note, status, reason).
+pub fn resolutions(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<(Vec<u8>, crate::gateway::proto::ResultingStatus, String)>> {
+    use crate::gateway::proto::event_body::Kind;
+    Ok(events(conn, maker_id)?
+        .into_iter()
+        .filter_map(|kind| match kind {
+            Kind::SettlementResolved(resolved) => {
+                let result = resolved.result.unwrap();
+                let status = result.status();
+                Some((result.note_id, status, result.reason))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// The owner epoch in `sync_state`.
+pub fn epoch(conn: &mut PgConnection) -> Result<i64> {
+    use super::postgres_schema::sync_state;
+    use diesel::prelude::*;
+    Ok(sync_state::table
+        .find(1_i16)
+        .select(sync_state::owner_epoch)
+        .first(conn)?)
+}
+
+/// The status of `note`'s order row, if it has one.
+pub fn status(conn: &mut PgConnection, note: &Note) -> Result<Option<String>> {
+    use super::postgres_schema::orders;
+    use diesel::prelude::*;
+    Ok(orders::table
+        .find(id(note))
+        .select(orders::status)
+        .first(conn)
+        .optional()?)
+}
+
+/// Set the status of `note`'s order row.
+pub fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> {
+    use super::postgres_schema::orders;
+    use diesel::prelude::*;
+    diesel::update(orders::table.find(id(note)))
+        .set(orders::status.eq(status))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// The accepted submission of `note` the watcher has yet to see.
+pub fn pending(conn: &mut PgConnection, note: &Note) -> Result<maker_db::PendingSubmission> {
+    Ok(maker_db::pending_submissions_tx(conn)?
+        .into_iter()
+        .find(|s| s.note.id() == note.id())
+        .expect("a pending submission"))
+}
+
+/// The OrderStatus events of `maker_id`: (note, state, reason).
+pub fn statuses(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<(Vec<u8>, crate::gateway::proto::OrderState, String)>> {
+    use crate::gateway::proto::event_body::Kind;
+    Ok(events(conn, maker_id)?
+        .into_iter()
+        .filter_map(|kind| match kind {
+            Kind::OrderStatus(status) => {
+                let state = status.state();
+                Some((status.note_id, state, status.reason))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Add `count` closed lineages of `maker_id` on `market`, at even seqs from
+/// `first`, as a long quoting history.
+pub fn history(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    market: &[u8],
+    direction: &[u8],
+    first: i64,
+    count: i64,
+) -> Result<()> {
+    let last = first + 2 * (count - 1);
+    use diesel::prelude::*;
+    use diesel::sql_types::{BigInt, Binary};
+    diesel::sql_query(
+        "INSERT INTO maker_commands (maker_id, request_id, seq, kind, payload, result)
+         SELECT $1, 'h' || g, g, 'submit', '\\x00', '{\"result\":\"accepted\"}'
+         FROM generate_series($2::bigint, $3::bigint, 2) g",
+    )
+    .bind::<BigInt, _>(maker_id)
+    .bind::<BigInt, _>(first)
+    .bind::<BigInt, _>(last)
+    .execute(conn)?;
+    diesel::sql_query(
+        "INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
+                                     market, direction, state,
+                                     offered_amount, requested_amount)
+         SELECT $4 || int8send(g), $1, 'h' || g, g, int8send(g), $4, $5, 'rejected', 100, 100
+         FROM generate_series($2::bigint, $3::bigint, 2) g",
+    )
+    .bind::<BigInt, _>(maker_id)
+    .bind::<BigInt, _>(first)
+    .bind::<BigInt, _>(last)
+    .bind::<Binary, _>(market)
+    .bind::<Binary, _>(direction)
+    .execute(conn)?;
+    Ok(())
 }

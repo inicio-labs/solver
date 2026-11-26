@@ -18,7 +18,7 @@ use super::postgres_models::{
     RegisteredTokenRow, SettlementAttemptRow, SettlementInputRow, SettlementStatus,
 };
 use super::postgres_schema::{
-    eligible_orders, live_orders, maker_lineages, makers, orders, registered_tokens,
+    eligible_orders, live_orders, maker_lineages, maker_stops, makers, orders, registered_tokens,
     settlement_attempts, settlement_inputs, sync_state,
 };
 use crate::maker::MakerTag;
@@ -28,7 +28,7 @@ use miden_protocol::block::BlockNumber;
 
 /// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
-const INSERT_CHUNK_ROWS: usize = 1_000;
+pub(super) const INSERT_CHUNK_ROWS: usize = 1_000;
 
 pub fn get_last_fetched_block_tx(conn: &mut PgConnection) -> DbResult<u64> {
     let block: i64 = sync_state::table
@@ -168,37 +168,6 @@ pub fn live_book_update_tx(
     Ok(update)
 }
 
-/// Fill the order keys of unfinished rows stored before the maker migration,
-/// so a lineage a maker claims later applies to them too. Run at startup,
-/// before hydration; rows that cannot be parsed keep NULL and are never maker
-/// orders.
-pub fn backfill_order_keys_tx(conn: &mut PgConnection) -> DbResult<usize> {
-    let rows: Vec<(Vec<u8>, Vec<u8>)> = orders::table
-        .filter(orders::lineage_id.is_null())
-        .filter(
-            orders::status.eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-        )
-        .select((orders::note_id, orders::raw_data))
-        .load(conn)?;
-    let mut filled = 0;
-    for (note_id, raw_data) in rows {
-        let keys = Note::read_from(&mut SliceReader::new(&raw_data))
-            .map_err(DbError::from)
-            .and_then(|note| OrderKeyColumns::of(&note));
-        match keys {
-            Ok(keys) => {
-                filled += diesel::update(orders::table.find(&note_id))
-                    .set(&keys)
-                    .execute(conn)?;
-            }
-            Err(error) => {
-                tracing::warn!(note_id = %hex::encode(&note_id), %error, "stored order has no order keys");
-            }
-        }
-    }
-    Ok(filled)
-}
-
 /// Retire orders whose notes are consumed on chain. A consumed note is spent
 /// whoever consumed it, so a parent reserved by an unresolved settlement is
 /// retired too: confirmation still marks it Executed if our transaction was
@@ -238,6 +207,28 @@ pub fn prepare_settlement_tx(
     cached_fills: Option<&maker_db::SettlementFills>,
 ) -> DbResult<()> {
     reserve_inputs_tx(conn, attempt, inputs, cached_fills, &[])
+}
+
+/// Whether any of `note_ids` belongs to a lineage its maker's stop row
+/// covers.
+pub(crate) fn has_stopped_input_tx(
+    conn: &mut PgConnection,
+    note_ids: &[Vec<u8>],
+) -> DbResult<bool> {
+    Ok(diesel::select(diesel::dsl::exists(
+        orders::table
+            .inner_join(
+                maker_lineages::table
+                    .on(maker_lineages::lineage_id.nullable().eq(orders::lineage_id)),
+            )
+            .inner_join(
+                maker_stops::table.on(maker_stops::maker_id
+                    .eq(maker_lineages::maker_id)
+                    .and(maker_stops::lineage_id.eq(maker_lineages::lineage_id))),
+            )
+            .filter(orders::note_id.eq_any(note_ids)),
+    ))
+    .get_result(conn)?)
 }
 
 /// The executor's reservation: reserve the inputs and, in the same commit,
@@ -291,8 +282,7 @@ fn reserve_inputs_tx(
         return Err(SettlementError::MissingInputOrder.into());
     }
     // Serialize with cancels: lock the control rows of the makers that own
-    // these inputs, found from the locked rows (an attribution can arrive
-    // after the matcher picked a candidate), and of the makers whose
+    // these inputs, found from the locked rows, and of the makers whose
     // sit-outs this reservation cancels, in maker-ID order. A cancel
     // raising a cutoff takes the same lock, so either it sees this
     // reservation as exposure or this check sees its cutoff.
@@ -318,6 +308,11 @@ fn reserve_inputs_tx(
         .count()
         .get_result(conn)?;
     if usize::try_from(live)? != parent_ids.len() {
+        // A stop between the matcher's choice and this reservation: counted,
+        // since self-trade prevention at submit can cause it (ADR 0009).
+        if has_stopped_input_tx(conn, &parent_ids)? {
+            crate::executor::metrics::record_reservation_stopped_input();
+        }
         return Err(SettlementError::InputOrderNotActive.into());
     }
     let parents: HashMap<&[u8], &OrderRow> = locked

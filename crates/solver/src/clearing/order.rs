@@ -81,11 +81,6 @@ impl Order {
         self.maker.is_none()
     }
 
-    /// Attribution changes routing only; it must not reactivate an in-flight order.
-    pub(crate) fn set_maker(&mut self, tag: MakerTag) {
-        self.maker = Some(tag);
-    }
-
     /// The maker that claimed this order, and its submit sequence.
     pub(crate) fn maker_tag(&self) -> Option<MakerTag> {
         self.maker

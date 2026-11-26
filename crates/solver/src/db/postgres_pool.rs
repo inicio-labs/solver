@@ -626,10 +626,11 @@ struct Writer {
 /// through the maker control row, which works across sessions.
 ///
 /// With live at accept on (ADR 0008) a round also inserts, stops and deletes
-/// order rows. Such a round first share-locks the owner epoch this session
-/// was opened under and fails if a new owner has claimed it (see
-/// [`AcceptGate::resolve`](super::maker_db::AcceptGate::resolve)), so it
-/// never writes an order into a book another process owns.
+/// order rows, and with self-trade prevention at submit on (ADR 0009) it
+/// stops other orders of the maker. Such a round first share-locks the owner
+/// epoch this session was opened under and fails if a new owner has claimed
+/// it (see [`AcceptGate::resolve`](super::maker_db::AcceptGate::resolve)), so
+/// it never changes a book another process owns.
 pub struct IntakeSession {
     url: String,
     application_name: String,
@@ -638,10 +639,14 @@ pub struct IntakeSession {
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
     owner_epoch: i64,
-    /// Set when private submits go live at accept (ADR 0008). `None` keeps
-    /// every submit on the confirmed path.
+    /// The owner-epoch guard of a round with a submit, with the
+    /// live-at-accept gate when that is on (ADR 0008). `None` when neither
+    /// live at accept nor self-trade prevention at submit is on.
     gate: Option<Arc<super::maker_db::AcceptGate>>,
-    /// Woken after a round that put orders live at accept.
+    /// A submit cancels its maker's older crossing orders (ADR 0009).
+    self_trade: bool,
+    /// Woken after a round that appended events: orders that went live at
+    /// accept, or orders self-trade prevention cancelled.
     wake: crate::maker::EventWake,
     #[cfg(test)]
     drop_next_commit_reply: bool,
@@ -675,7 +680,7 @@ impl IntakeSession {
         self.drop_next_commit_reply = true;
     }
 
-    /// Let private submits go live at accept (ADR 0008) while `fresh_block`
+    /// Let submits go live at accept (ADR 0008) while `fresh_block`
     /// returns the watcher's latest block.
     pub fn with_live_at_accept(
         mut self,
@@ -686,6 +691,24 @@ impl IntakeSession {
             fresh_block,
         )));
         self
+    }
+
+    /// Let each submit cancel its maker's older crossing orders, and lose to
+    /// a newer one (ADR 0009). Its rounds take the owner-epoch guard whether
+    /// or not live at accept is on.
+    pub fn with_self_trade_check(mut self) -> Self {
+        self.self_trade = true;
+        if self.gate.is_none() {
+            self.gate = Some(Arc::new(super::maker_db::AcceptGate::epoch_only(
+                self.owner_epoch,
+            )));
+        }
+        self
+    }
+
+    /// Whether self-trade prevention at submit is on.
+    pub(crate) fn self_trade_check(&self) -> bool {
+        self.self_trade
     }
 
     /// Wake `wake` instead of the process's event streams.
@@ -699,7 +722,9 @@ impl IntakeSession {
         self.wake.clone()
     }
 
-    /// The live-at-accept gate; `None` when it is off.
+    /// The owner-epoch guard, with the live-at-accept gate when that is on;
+    /// `None` when neither live at accept nor self-trade prevention at
+    /// submit is on.
     pub(crate) fn accept_gate(&self) -> Option<Arc<super::maker_db::AcceptGate>> {
         self.gate.clone()
     }
@@ -905,6 +930,7 @@ impl PgPool {
             publish_order: self.publish_order.clone(),
             owner_epoch: self.writer_config.owner_epoch,
             gate: None,
+            self_trade: false,
             wake: crate::maker::EventWake::global().clone(),
             #[cfg(test)]
             drop_next_commit_reply: false,

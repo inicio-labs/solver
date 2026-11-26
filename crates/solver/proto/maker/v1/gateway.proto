@@ -7,10 +7,16 @@ syntax = "proto3";
 package solver.maker.v1;
 
 service MakerGateway {
-  // Durably accept a PSWAP note, private or public. Accepted does not mean
-  // Live: the note becomes Live once it is verified on chain. On a solver
-  // with live at accept on, a private note goes Live when it is accepted,
-  // before it is in a block: send the transaction that creates it first.
+  // Durably accept a private PSWAP note; a public one is refused with
+  // INVALID_ARGUMENT. Accepted does not mean Live: the note becomes Live once
+  // it is verified on chain. On a solver with live at accept on, it goes Live
+  // when it is accepted, before it is in a block: send the transaction that
+  // creates it first. With self-trade prevention at submit on, accepting it
+  // cancels this maker's older orders on the pair that cross it, and it is
+  // itself cancelled, never Live, if a newer crossing order of the maker
+  // exists; the reply is still Accepted (ADR 0009). A submit whose seq is
+  // below more than 1,000 of the maker's later orders on the pair is refused
+  // with FAILED_PRECONDITION; every retry and GetCommand return the same.
   rpc SubmitOrder(SubmitOrderRequest) returns (CommandReply);
   // Stop every order of this maker in the scope whose submit sequence is
   // below this command's sequence, including submits that arrive later.
@@ -19,7 +25,8 @@ service MakerGateway {
   rpc CancelAll(CancelAllRequest) returns (CommandReply);
   // Stop one order by its lineage ID, even before its submit arrives.
   rpc CancelOrder(CancelOrderRequest) returns (CommandReply);
-  // The stored reply of an earlier command, after a lost response.
+  // The stored reply of an earlier command, after a lost response; for a
+  // refused submit, FAILED_PRECONDITION, as its own reply was.
   rpc GetCommand(GetCommandRequest) returns (CommandReply);
   // This maker's events after `after_seq`, a ReplayComplete once caught up,
   // then each new event once it commits, with periodic keep-alives carrying
@@ -211,7 +218,8 @@ enum OrderState {
   ORDER_STATE_UNAVAILABLE = 3;
   // Stopped by the solver; `reason` says why: `self_trade_prevention`, or
   // `note_not_received` for an order that went live at accept whose note
-  // never reached a block.
+  // never reached a block. Always the order's last event; with self-trade
+  // prevention at submit it can also be its first, for an order never Live.
   ORDER_STATE_CANCELLED = 4;
 }
 
@@ -276,6 +284,12 @@ message InputResult {
   reserved 2;
   reserved "lineage_id";
   ResultingStatus status = 3;
+  // Set only when `status` is CANCELLED: `maker_cancel` (your CancelOrder or
+  // CancelAll), `self_trade_prevention` (a newer crossing order of yours) or
+  // `note_not_received` (the operator's escape hatch closed an order that
+  // went live at accept). Empty when the cause is unknown, as on results sent
+  // before this field existed. Treat an unknown value like an empty one.
+  string reason = 4;
 }
 
 // A settlement transaction was verified committed, or definitively voided

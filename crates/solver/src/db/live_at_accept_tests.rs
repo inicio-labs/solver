@@ -8,76 +8,28 @@ use anyhow::Result;
 use diesel::connection::SimpleConnection;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use miden_protocol::asset::{AssetAmount, FungibleAsset};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
-use miden_protocol::note::{Note, NoteType};
-use miden_protocol::testing::account_id::{
-    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
-    ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
-};
-use miden_protocol::Word;
-use miden_standards::note::{PswapNote, PswapNoteStorage};
-use prost::Message as _;
+use miden_protocol::note::Note;
 
-use super::maker_db::{
-    self, AcceptFallback, AcceptGate, AcceptMode, Close, CommandOutcome, PendingSubmission,
-};
+use super::maker_db::{self, AcceptFallback, AcceptGate, AcceptMode, Close, CommandOutcome};
 use super::postgres_db::{
     self, confirm_settlement_tx, finish_discarded_settlement_tx, live_book_update_tx,
     test_consumer, NodeAnswer,
 };
-use super::postgres_models::{NewOrderRow, SettlementInputRow};
-use super::postgres_schema::{maker_lineages, maker_stops, orders, sync_state};
-use super::postgres_test::{self, TestSchema};
+use super::postgres_models::NewOrderRow;
+use super::postgres_schema::{maker_lineages, maker_stops, orders};
+use super::postgres_test::{
+    self, cancel, epoch, id, maker, pending, reserve, resolutions, set_status, status, statuses,
+    TestSchema,
+};
 use super::{postgres_migrations, DbError};
+use crate::gateway::intake::tests::pswap_note as note;
 use crate::gateway::proto;
 use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, MakerCommand, MakerId,
 };
 use crate::types::{OrderId, OrderKeys};
-
-fn note_of(serial: u32, note_type: NoteType) -> Note {
-    let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
-        .try_into()
-        .unwrap();
-    let offered = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
-    let requested = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
-    PswapNote::builder()
-        .sender(creator)
-        .storage(
-            PswapNoteStorage::builder()
-                .min_requested_asset(FungibleAsset::new(requested, 100).unwrap())
-                .min_fill_step(AssetAmount::new(1).unwrap())
-                .creator_account_id(creator)
-                .build(),
-        )
-        .serial_number(Word::from([serial, 0, 0, 0]))
-        .note_type(note_type)
-        .offered_asset(FungibleAsset::new(offered, 50).unwrap())
-        .build()
-        .unwrap()
-        .into()
-}
-
-fn note(serial: u32) -> Note {
-    note_of(serial, NoteType::Private)
-}
-
-fn id(note: &Note) -> Vec<u8> {
-    note.id().to_bytes().to_vec()
-}
-
-fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
-    Ok(maker_db::create_maker_tx(conn, name)?.unwrap())
-}
-
-fn epoch(conn: &mut PgConnection) -> Result<i64> {
-    Ok(sync_state::table
-        .find(1_i16)
-        .select(sync_state::owner_epoch)
-        .first(conn)?)
-}
 
 /// Run `command` through intake's write with live at accept on, the watcher
 /// fresh at `block` (or stale for `None`).
@@ -125,31 +77,6 @@ fn command(
     Ok(())
 }
 
-fn cancel(conn: &mut PgConnection, maker_id: MakerId, seq: u64, note: &Note) -> Result<()> {
-    let lineage_id = OrderKeys::from_note(note)?.lineage_id;
-    command(
-        conn,
-        maker_id,
-        seq,
-        MakerCommand::CancelOrder { lineage_id },
-    )
-}
-
-fn status(conn: &mut PgConnection, note: &Note) -> Result<Option<String>> {
-    Ok(orders::table
-        .find(id(note))
-        .select(orders::status)
-        .first(conn)
-        .optional()?)
-}
-
-fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> {
-    diesel::update(orders::table.find(id(note)))
-        .set(orders::status.eq(status))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// The lineage's state and accept block (set only if it went live at accept).
 fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, Option<i64>)> {
     Ok(maker_lineages::table
@@ -158,72 +85,8 @@ fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, Option<i64>)
         .first(conn)?)
 }
 
-fn pending(conn: &mut PgConnection, note: &Note) -> Result<PendingSubmission> {
-    Ok(maker_db::pending_submissions_tx(conn)?
-        .into_iter()
-        .find(|s| s.note.id() == note.id())
-        .expect("a pending submission"))
-}
-
-/// Every event of `maker_id`, decoded.
-fn events(conn: &mut PgConnection, maker_id: MakerId) -> Result<Vec<proto::event_body::Kind>> {
-    Ok(maker_db::read_events_tx(conn, maker_id, 0, 1000)?
-        .into_iter()
-        .map(|event| {
-            proto::EventBody::decode(event.payload.as_slice())
-                .unwrap()
-                .kind
-                .unwrap()
-        })
-        .collect())
-}
-
-/// The OrderStatus events of `maker_id`: (note, state, reason).
-fn statuses(
-    conn: &mut PgConnection,
-    maker_id: MakerId,
-) -> Result<Vec<(Vec<u8>, proto::OrderState, String)>> {
-    Ok(events(conn, maker_id)?
-        .into_iter()
-        .filter_map(|kind| match kind {
-            proto::event_body::Kind::OrderStatus(status) => {
-                let state = status.state();
-                Some((status.note_id, state, status.reason))
-            }
-            _ => None,
-        })
-        .collect())
-}
-
-/// The status each SettlementResolved reported, per input note.
-fn resolutions(
-    conn: &mut PgConnection,
-    maker_id: MakerId,
-) -> Result<Vec<(Vec<u8>, proto::ResultingStatus)>> {
-    Ok(events(conn, maker_id)?
-        .into_iter()
-        .filter_map(|kind| match kind {
-            proto::event_body::Kind::SettlementResolved(resolved) => {
-                let result = resolved.result.unwrap();
-                let status = result.status();
-                Some((result.note_id, status))
-            }
-            _ => None,
-        })
-        .collect())
-}
-
 fn live(state: proto::OrderState) -> bool {
     state == proto::OrderState::Live
-}
-
-/// Reserve `parents` in settlement `tx`, each filled by 40.
-fn reserve(conn: &mut PgConnection, tx: u8, parents: &[&Note]) -> Result<()> {
-    let inputs: Vec<SettlementInputRow> = parents
-        .iter()
-        .map(|parent| postgres_test::fill(tx, parent, 40).0)
-        .collect();
-    postgres_test::prepare(conn, tx, &inputs)
 }
 
 fn release(
@@ -302,29 +165,11 @@ fn other_submits_take_the_confirmed_path_without_a_trace() -> Result<()> {
         Ok(())
     };
 
-    let public = note_of(1, NoteType::Public);
-    let outcome = accept(conn, alpha, 1, &public)?;
-    assert_eq!(
-        (outcome.live.is_none(), outcome.fallback),
-        (true, Some(AcceptFallback::Public))
-    );
-    assert_eq!(status(conn, &public)?, None);
-    unflagged(conn, &public)?;
-
     let stale = note(2);
     let outcome = accept_with(conn, alpha, 2, &MakerCommand::submit(stale.clone())?, None)?;
     assert_eq!(outcome.fallback, Some(AcceptFallback::WatcherStale));
     assert_eq!(status(conn, &stale)?, None);
     unflagged(conn, &stale)?;
-
-    let stored = note(3);
-    let row = NewOrderRow::parsed(&stored, 1)?;
-    diesel::insert_into(orders::table)
-        .values(&row)
-        .execute(conn)?;
-    let outcome = accept(conn, alpha, 3, &stored)?;
-    assert_eq!(outcome.fallback, Some(AcceptFallback::Conflict));
-    unflagged(conn, &stored)?;
 
     // Cancelled before its submit, by lineage or by a later cutoff: no row,
     // no flag, no LIVE.
@@ -377,8 +222,13 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
         )])
     };
     let first = note(1);
-    let outcomes =
-        crate::gateway::intake::intake_round_tx(&mut intake, &round(1, &first)?, Some(&gate))?;
+    let outcomes = crate::gateway::intake::intake_round_tx(
+        &mut intake,
+        &round(1, &first)?,
+        Some(&gate),
+        false,
+    )?
+    .outcomes;
     assert!(outcomes[0].1.live.is_some());
     conn.batch_execute("SET lock_timeout = '200ms'")?;
     let claim = conn.batch_execute("UPDATE sync_state SET owner_epoch = owner_epoch + 1");
@@ -391,7 +241,7 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     let second = note(2);
     let commands = round(2, &second)?;
     let refused = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
     });
     assert!(
         matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
@@ -427,7 +277,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     )];
     let go_live = |conn: &mut PgConnection| {
         conn.transaction::<_, DbError, _>(|conn| {
-            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate))
+            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate), false)
         })
     };
     conn.batch_execute(
@@ -457,7 +307,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     // The maker's retry of the same command is not a replay: it goes live.
     conn.batch_execute("DROP TRIGGER fail_event ON maker_events")?;
     let outcomes = go_live(conn)?;
-    assert!(outcomes[0].1.live.is_some());
+    assert!(outcomes.outcomes[0].1.live.is_some());
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
     assert_eq!(lineage(conn, &order)?, ("pending".into(), Some(7)));
     assert_eq!(
@@ -532,7 +382,7 @@ fn our_confirmed_settlement_activates_a_root_it_erased() -> Result<()> {
     let alpha = maker(conn, "alpha")?;
     let order = note(1);
     accept(conn, alpha, 1, &order)?;
-    reserve(conn, 9, &[&order])?;
+    reserve(conn, 9, &[&order], 40)?;
     let confirmed = conn.transaction::<_, DbError, _>(|conn| {
         confirm_settlement_tx(
             conn,
@@ -554,7 +404,7 @@ fn our_confirmed_settlement_activates_a_root_it_erased() -> Result<()> {
 type Released = (
     [String; 3],
     postgres_db::DiscardedSettlement,
-    Vec<(Vec<u8>, proto::ResultingStatus)>,
+    Vec<(Vec<u8>, proto::ResultingStatus, String)>,
 );
 
 /// Two unconfirmed maker parents and one ordinary order in one settlement,
@@ -571,7 +421,7 @@ fn released_with(answer: impl FnOnce(&Note, &Note, &Note) -> NodeAnswer) -> Resu
     diesel::insert_into(orders::table)
         .values(&row)
         .execute(conn)?;
-    reserve(conn, 9, &[&a, &b, &user])?;
+    reserve(conn, 9, &[&a, &b, &user], 40)?;
     let released = release(conn, 9, answer(&a, &b, &user))?;
     let statuses = [&a, &b, &user].map(|order| status(conn, order).unwrap().unwrap());
     Ok((statuses, released, resolutions(conn, alpha)?))
@@ -595,7 +445,7 @@ fn a_release_follows_what_the_node_said() -> Result<()> {
     // A waiting order is still live to its maker.
     assert!(reported
         .iter()
-        .all(|(_, status)| *status == proto::ResultingStatus::Live));
+        .all(|(_, status, _)| *status == proto::ResultingStatus::Live));
 
     // Naming only another parent: the node knew both maker notes.
     let (statuses, released, _) = released_with(|_, _, user| named(&[user]))?;
@@ -628,7 +478,7 @@ fn a_release_decides_by_the_rows_as_they_are_now() -> Result<()> {
     let (found, cancelled) = (note(1), note(2));
     accept(conn, alpha, 1, &found)?;
     accept(conn, alpha, 2, &cancelled)?;
-    reserve(conn, 9, &[&found, &cancelled])?;
+    reserve(conn, 9, &[&found, &cancelled], 40)?;
     // While settling: the watcher finds the first note, and the maker
     // cancels the second order.
     let submission = pending(conn, &found)?;
@@ -647,8 +497,12 @@ fn a_release_decides_by_the_rows_as_they_are_now() -> Result<()> {
     assert_eq!(
         reported,
         HashSet::from([
-            (id(&found), proto::ResultingStatus::Live),
-            (id(&cancelled), proto::ResultingStatus::Cancelled),
+            (id(&found), proto::ResultingStatus::Live, String::new()),
+            (
+                id(&cancelled),
+                proto::ResultingStatus::Cancelled,
+                "maker_cancel".to_owned()
+            ),
         ])
     );
 
@@ -676,7 +530,7 @@ fn a_spent_unconfirmed_order_is_decided_by_its_status() -> Result<()> {
         accept(conn, alpha, seq, order)?;
     }
     set_status(conn, &waiting, "waiting")?;
-    reserve(conn, 9, &[&settling])?;
+    reserve(conn, 9, &[&settling], 40)?;
     let rejections = [pending(conn, &waiting)?, pending(conn, &settling)?];
     let removed =
         conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &rejections))?;
@@ -786,7 +640,7 @@ fn a_spent_note_waits_for_its_settlement_then_is_reported_once() -> Result<()> {
     let alpha = maker(conn, "alpha")?;
     let order = note(1);
     accept(conn, alpha, 1, &order)?;
-    reserve(conn, 9, &[&order])?;
+    reserve(conn, 9, &[&order], 40)?;
     let first = pending(conn, &order)?;
     conn.transaction::<_, DbError, _>(|conn| maker_db::reject_tx(conn, &[first]))?;
     assert_eq!(lineage(conn, &order)?.0, "pending");
@@ -830,7 +684,7 @@ fn the_cap_closes_each_lineage_by_its_roots_status() -> Result<()> {
         accept(conn, alpha, seq, order)?;
     }
     set_status(conn, &waiting, "waiting")?;
-    reserve(conn, 9, &[&settling])?;
+    reserve(conn, 9, &[&settling], 40)?;
     // The maker cancelled it; the book write stored it stopped.
     cancel(conn, alpha, 7, &cancelled)?;
     set_status(conn, &cancelled, "stopped")?;
@@ -903,8 +757,9 @@ fn the_hatch_cancels_unconfirmed_orders_and_unblocks_rollback() -> Result<()> {
     for (seq, order) in [(1, &active), (2, &waiting), (3, &confirmed)] {
         accept(conn, alpha, seq, order)?;
     }
-    // On the confirmed path, with the row ingest stores for a public note:
-    // pending, but never unconfirmed.
+    // On the confirmed path, with the row ingest stored for a public note
+    // claimed before maker intake became private-only: pending, but never
+    // unconfirmed.
     let slow = note(4);
     accept_with(conn, alpha, 4, &MakerCommand::submit(slow.clone())?, None)?;
     diesel::insert_into(orders::table)
@@ -1023,7 +878,7 @@ fn a_remainder_of_a_closed_lineage_is_still_watched() -> Result<()> {
     let alpha = maker(conn, "alpha")?;
     let order = note(1);
     accept(conn, alpha, 1, &order)?;
-    reserve(conn, 9, &[&order])?;
+    reserve(conn, 9, &[&order], 40)?;
     // The confirmation deletes the settlement's inputs.
     let remainder = settlement_child(conn, &order)?;
     // Closed, but nothing stopped: a settlement holds the root.
@@ -1189,11 +1044,11 @@ fn the_hatch_tells_nothing_about_an_order_the_maker_cancelled() -> Result<()> {
     Ok(())
 }
 
-/// A round with only a public submit still reports why it took the
-/// confirmed path, without taking the owner-epoch lock.
+/// A round without a submit never takes the owner-epoch lock: nothing in it
+/// can go live at accept.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn a_public_only_round_reports_its_fallback() -> Result<()> {
+fn a_round_without_a_submit_never_checks_the_owner_epoch() -> Result<()> {
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
     let alpha = maker(conn, "alpha")?;
@@ -1201,12 +1056,16 @@ fn a_public_only_round_reports_its_fallback() -> Result<()> {
     let gate = AcceptGate::new(epoch(conn)? + 100, || Some(BlockNumber::from(7)));
     let commands = [(
         CommandHeader::new(alpha, "r1".into(), 1).unwrap(),
-        MakerCommand::submit(note_of(1, NoteType::Public))?,
+        MakerCommand::CancelAll {
+            scope: CutoffScope::all(),
+        },
     )];
     let outcomes = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
     })?;
-    assert_eq!(outcomes[0].1.fallback, Some(AcceptFallback::Public));
-    assert!(outcomes[0].1.live.is_none());
+    assert!(matches!(
+        outcomes.outcomes[0].1.reply,
+        CommandReply::Committed(CommandResult::Applied { .. })
+    ));
     Ok(())
 }

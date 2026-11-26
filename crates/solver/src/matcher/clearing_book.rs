@@ -111,12 +111,6 @@ impl ClearingBook {
             self.remove(order.id());
             tracing::warn!(note_id = %order.id(), %error, "order left out of the live book");
         }
-        if let (Some(tag), Some(stored)) = (
-            self.makers.tag(&order.id()),
-            self.orders.get_mut(&order.id()),
-        ) {
-            stored.set_maker(tag);
-        }
     }
 
     fn remove_from_index(&mut self, pair: (TokenId, TokenId), key: OrderKey, id: NoteId) {
@@ -229,18 +223,7 @@ impl ClearingBook {
 
     /// Apply a committed maker update and remove any orders it cancels.
     pub(super) fn apply_maker_update(&mut self, update: MakerUpdate) {
-        let attribution = match &update {
-            MakerUpdate::OrdersAttributed { order_ids, tag, .. } => Some((order_ids.clone(), *tag)),
-            _ => None,
-        };
         let cancelled = self.makers.apply(update);
-        if let Some((order_ids, tag)) = attribution {
-            for id in order_ids {
-                if let Some(order) = self.orders.get_mut(&id) {
-                    order.set_maker(tag);
-                }
-            }
-        }
         if !cancelled.is_empty() {
             tracing::debug!(
                 cancelled = cancelled.len(),
@@ -607,6 +590,28 @@ mod tests {
         seq: u64,
         rng: &mut RandomCoin,
     ) -> BookOrder {
+        fixture_of_type(buy, offered, requested, seq, rng, NoteType::Public)
+    }
+
+    /// A maker submits private notes only.
+    fn maker_fixture(
+        buy: bool,
+        offered: u64,
+        requested: u64,
+        seq: u64,
+        rng: &mut RandomCoin,
+    ) -> BookOrder {
+        fixture_of_type(buy, offered, requested, seq, rng, NoteType::Private)
+    }
+
+    fn fixture_of_type(
+        buy: bool,
+        offered: u64,
+        requested: u64,
+        seq: u64,
+        rng: &mut RandomCoin,
+        note_type: NoteType,
+    ) -> BookOrder {
         let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
         let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
         let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
@@ -623,7 +628,7 @@ mod tests {
                     .build(),
             )
             .serial_number(rng.draw_word())
-            .note_type(NoteType::Public)
+            .note_type(note_type)
             .offered_asset(FungibleAsset::new(offered_token, offered).unwrap())
             .build()
             .unwrap()
@@ -827,7 +832,6 @@ mod tests {
     fn rfq_never_routes_a_maker_order() {
         let mut rng = RandomCoin::new(Word::default());
         let quote = tagged(fixture(false, 10, 18, 1, &mut rng), 7, 1);
-        let public = fixture(false, 10, 18, 2, &mut rng);
         let mut book = ClearingBook::default();
         book.insert_or_skip(&quote);
         let (mut routing, mut route_rx) = routing_fixture(&quote);
@@ -841,50 +845,6 @@ mod tests {
             1,
             "it still clears internally"
         );
-
-        // A public order becomes a maker order when its maker's submit
-        // arrives after ingest: from then on it is not routed either.
-        book.insert_or_skip(&public);
-        book.apply_maker_update(MakerUpdate::OrdersAttributed {
-            order_ids: vec![public.id()],
-            tag: crate::maker::MakerTag {
-                maker_id: 7,
-                root_seq: 2,
-                expires_at_unix_ms: None,
-            },
-            cancelled: false,
-        });
-        routing.dispatch(&mut book, 101).unwrap();
-        assert!(route_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn late_attribution_preserves_an_inactive_orders_lifecycle() {
-        let mut rng = RandomCoin::new(Word::default());
-        let public = fixture(false, 10, 18, 1, &mut rng);
-        let mut book = ClearingBook::default();
-        book.insert_or_skip(&public);
-        book.deactivate(public.id());
-        book.apply(BookUpdate {
-            removed: Vec::new(),
-            active: Vec::new(),
-            maker_updates: vec![MakerUpdate::OrdersAttributed {
-                order_ids: vec![public.id()],
-                tag: crate::maker::MakerTag {
-                    maker_id: 7,
-                    root_seq: 1,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: false,
-            }],
-        });
-        let stored = &book.orders[&public.id()];
-        assert!(
-            !stored.is_active(),
-            "metadata must not release an in-flight order"
-        );
-        assert!(!stored.can_route_to_rfq());
-        assert!(book.levels().is_empty());
     }
 
     #[test]
@@ -2017,9 +1977,9 @@ mod tests {
             let mut schema = TestSchema::migrated()?;
             let conn = &mut schema.conn;
             let mut rng = RandomCoin::new(Word::from([u32::from(s1_eligible), 0, 0, 0]));
-            let b1 = fixture(true, 22, 10, 1, &mut rng);
-            let s1 = fixture(false, 10, if s1_eligible { 18 } else { 21 }, 2, &mut rng);
-            let s2 = fixture(false, 10, 18, 3, &mut rng);
+            let b1 = maker_fixture(true, 22, 10, 1, &mut rng);
+            let s1 = maker_fixture(false, 10, if s1_eligible { 18 } else { 21 }, 2, &mut rng);
+            let s2 = maker_fixture(false, 10, 18, 3, &mut rng);
             let user = fixture(true, 44, 20, 4, &mut rng);
             let named = [("B1", &b1), ("S1", &s1), ("S2", &s2), ("user", &user)];
             let name = |id: &NoteId| -> &str {

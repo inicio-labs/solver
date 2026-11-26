@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
-use crate::db::maker_db::AcceptFallback;
+use crate::db::maker_db::{AcceptFallback, DeadCause};
 use crate::maker::MakerId;
 
 /// Orders that went live at accept.
@@ -20,6 +20,13 @@ pub(crate) const SENT_TO_WAITING: &str = "solver_maker_sent_to_waiting_total";
 pub(crate) const WAITING_RETURNED: &str = "solver_maker_waiting_returned_total";
 /// Orders the cap cancelled: `note_not_received`.
 pub(crate) const CAP_CANCELS: &str = "solver_maker_cap_cancels_total";
+/// Submits with less than the settlement buffer left before their expiry
+/// (ADR 0009): accepted, but the matcher never chooses them.
+pub(crate) const SUBMITS_NEAR_EXPIRY: &str = "solver_maker_submits_near_expiry_total";
+/// Newer lineages a self-trade read found beyond the round's own claims.
+pub(crate) const STP_NEWER_ROWS: &str = "solver_maker_stp_newer_rows_total";
+pub(crate) const STP_CANCELS: &str = "solver_maker_stp_on_submit_cancels_total";
+pub(crate) const DEAD_ON_ARRIVAL: &str = "solver_maker_submits_dead_on_arrival_total";
 const ACCEPT_FALLBACKS: &str = "solver_maker_accept_fallbacks_total";
 const UNCONFIRMED_ACTIVATIONS: &str = "solver_maker_unconfirmed_activations_total";
 
@@ -32,6 +39,18 @@ static COUNTS: LazyLock<Mutex<BTreeMap<Key, u64>>> = LazyLock::new(Mutex::defaul
 static INTAKE_DEPTH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static INTAKE_FULL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static OPEN_STREAMS: AtomicU64 = AtomicU64::new(0);
+/// What self-trade prevention at submit cannot see, counted once at startup
+/// (`maker_db::stp_readiness_tx`): open lineages without amounts, open maker
+/// orders without their maker. Unset until a count succeeds, so the two
+/// gauges are absent then: a failed or skipped count never reads as
+/// "nothing unseen".
+static STP_READINESS: OnceLock<(i64, i64)> = OnceLock::new();
+
+/// Record the startup count of what self-trade prevention at submit cannot
+/// see (ADR 0009).
+pub(crate) fn record_stp_readiness(lineages_without_amounts: i64, orders_without_maker: i64) {
+    let _ = STP_READINESS.set((lineages_without_amounts, orders_without_maker));
+}
 
 /// The two intake queues.
 #[derive(Clone, Copy)]
@@ -164,23 +183,50 @@ fn render_service_wide(body: &mut String) {
     let _ = writeln!(
         body,
         "solver_maker_open_streams {}",
-        OPEN_STREAMS.load(Ordering::Relaxed)
+        OPEN_STREAMS.load(Ordering::Relaxed),
     );
+    if let Some((lineages, orders)) = STP_READINESS.get() {
+        let _ = writeln!(
+            body,
+            "solver_maker_open_lineages_without_amounts {lineages}\n\
+             solver_maker_open_orders_without_maker_id {orders}",
+        );
+    }
 }
 
 fn add(metric: &'static str, maker_id: MakerId, label: (&'static str, &'static str)) {
+    add_by(metric, maker_id, label, 1);
+}
+
+fn add_by(metric: &'static str, maker_id: MakerId, label: (&'static str, &'static str), by: u64) {
     *COUNTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry((metric, maker_id, label.0, label.1))
-        .or_default() += 1;
+        .or_default() += by;
 }
 
 pub(crate) fn count(metric: &'static str, maker_id: MakerId) {
     add(metric, maker_id, ("", ""));
 }
 
-/// A private submit that took the confirmed path although the switch is on.
+pub(crate) fn count_by(metric: &'static str, maker_id: MakerId, by: u64) {
+    add_by(metric, maker_id, ("", ""), by);
+}
+
+/// An order a crossing submit cancelled (ADR 0009): the submit itself when
+/// it arrived after a newer crossing order (`entering`), else an older one.
+pub(crate) fn count_stp_cancel(maker_id: MakerId, entering: bool) {
+    let loser = if entering { "entering" } else { "older" };
+    add(STP_CANCELS, maker_id, ("loser", loser));
+}
+
+/// A submit its maker had cancelled or cut off before it arrived.
+pub(crate) fn count_dead_on_arrival(maker_id: MakerId, cause: DeadCause) {
+    add(DEAD_ON_ARRIVAL, maker_id, ("reason", cause.into()));
+}
+
+/// A submit that took the confirmed path although the switch is on.
 pub(crate) fn count_fallback(maker_id: MakerId, reason: AcceptFallback) {
     add(ACCEPT_FALLBACKS, maker_id, ("reason", reason.into()));
 }
@@ -189,6 +235,21 @@ pub(crate) fn count_fallback(maker_id: MakerId, reason: AcceptFallback) {
 /// its exact `lookup`, or our own `settlement`.
 pub(crate) fn count_activation(maker_id: MakerId, via: &'static str) {
     add(UNCONFIRMED_ACTIVATIONS, maker_id, ("via", via));
+}
+
+/// The count of `metric` for `maker_id` with `label` (`("", "")` for none).
+#[cfg(test)]
+pub(crate) fn counted(
+    metric: &'static str,
+    maker_id: MakerId,
+    label: (&'static str, &'static str),
+) -> u64 {
+    COUNTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(metric, maker_id, label.0, label.1))
+        .copied()
+        .unwrap_or(0)
 }
 
 pub(crate) fn render(body: &mut String) {
@@ -210,6 +271,55 @@ pub(crate) fn render(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness gauges are absent until a count is recorded, then show
+    /// what it found. The value is process-wide and set once, so this is the
+    /// only test that records it.
+    #[test]
+    fn readiness_gauges_appear_only_after_a_count() {
+        let mut body = String::new();
+        render_service_wide(&mut body);
+        assert!(
+            !body.contains("solver_maker_open_lineages_without_amounts"),
+            "{body}"
+        );
+        record_stp_readiness(3, 0);
+        let mut body = String::new();
+        render_service_wide(&mut body);
+        assert!(
+            body.contains("solver_maker_open_lineages_without_amounts 3\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("solver_maker_open_orders_without_maker_id 0\n"),
+            "{body}"
+        );
+    }
+
+    /// The self-trade counters render with their labels (ADR 0009).
+    #[test]
+    fn self_trade_counters_render_with_their_labels() {
+        // A maker ID no other test uses: the counters are process-wide.
+        let maker_id = 9_000_001;
+        count_stp_cancel(maker_id, true);
+        count_stp_cancel(maker_id, false);
+        count_stp_cancel(maker_id, false);
+        count_dead_on_arrival(maker_id, DeadCause::CutOff);
+        count(SUBMITS_NEAR_EXPIRY, maker_id);
+        count_by(STP_NEWER_ROWS, maker_id, 7);
+        let mut body = String::new();
+        render(&mut body);
+        assert_eq!(crate::obs::exposition_errors(&body), Vec::<String>::new());
+        for line in [
+            "solver_maker_stp_on_submit_cancels_total{maker_id=\"9000001\",loser=\"entering\"} 1\n",
+            "solver_maker_stp_on_submit_cancels_total{maker_id=\"9000001\",loser=\"older\"} 2\n",
+            "solver_maker_submits_dead_on_arrival_total{maker_id=\"9000001\",reason=\"cut_off\"} 1\n",
+            "solver_maker_submits_near_expiry_total{maker_id=\"9000001\"} 1\n",
+            "solver_maker_stp_newer_rows_total{maker_id=\"9000001\"} 7\n",
+        ] {
+            assert!(body.contains(line), "{line} missing from {body}");
+        }
+    }
 
     #[test]
     fn service_wide_numbers_parse_and_move() {

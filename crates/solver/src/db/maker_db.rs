@@ -10,16 +10,17 @@
 use diesel::dsl::{count_star, now, sql};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Binary, Text};
+use diesel::sql_types::{BigInt, Binary, Nullable, Text};
 use std::collections::{HashMap, HashSet};
 
 use miden_protocol::account::AccountId;
 use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::{Deserializable, Serializable};
-use miden_protocol::note::{Note, NoteType};
+use miden_protocol::note::Note;
 use miden_standards::note::PswapNote;
 
 use super::error::{DbError, DbResult};
+use super::postgres_db::INSERT_CHUNK_ROWS;
 use super::postgres_models::{NewOrderRow, OrderRow, SettlementInputRow};
 use super::postgres_schema::{
     api_keys, eligible_orders, live_orders, maker_commands, maker_cutoffs, maker_events,
@@ -28,7 +29,7 @@ use super::postgres_schema::{
 use crate::gateway::{self, proto};
 use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, EventWake, LineageId, MakerCommand,
-    MakerId, MakerTag, MakerUpdate,
+    MakerId, MakerUpdate,
 };
 use crate::types::{now_unix, BookOrder, BookUpdate, OrderId, OrderKeys, OrderStatus};
 
@@ -96,35 +97,6 @@ fn lock_maker(conn: &mut PgConnection, maker_id: MakerId) -> DbResult<Option<Mak
         .select(makers::maker_id)
         .first(conn)
         .optional()?)
-}
-
-/// Intake locks all existing submission orders before any command in its
-/// group acquires a maker row. This preserves reservation's order-row → maker
-/// lock order even when the group contains cancels before submits.
-pub fn prelock_submission_orders_tx(
-    conn: &mut PgConnection,
-    commands: &[(CommandHeader, MakerCommand)],
-) -> DbResult<()> {
-    let lineages: Vec<&Vec<u8>> = commands
-        .iter()
-        .filter_map(|(_, command)| match command {
-            MakerCommand::Submit { keys, .. } => Some(&keys.lineage_id),
-            _ => None,
-        })
-        .collect();
-    if !lineages.is_empty() {
-        orders::table
-            .filter(orders::lineage_id.eq_any(lineages))
-            .filter(
-                orders::status
-                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-            )
-            .order(orders::note_id.asc())
-            .for_update()
-            .select(orders::note_id)
-            .load::<Vec<u8>>(conn)?;
-    }
-    Ok(())
 }
 
 /// Reserve every maker control row for a group-commit round in the same
@@ -212,13 +184,9 @@ pub fn execute_command_confirmed_tx(
 pub enum AcceptFallback {
     /// The watcher's latest block was not read recently enough.
     WatcherStale,
-    /// The note already has an order row.
-    Conflict,
-    /// Only private notes go live at accept.
-    Public,
 }
 
-/// Whether a private submit goes live at accept in one intake round (ADR
+/// Whether a submit goes live at accept in one intake round (ADR
 /// 0008), decided once for the round by [`AcceptGate::resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptMode {
@@ -231,10 +199,12 @@ pub enum AcceptMode {
     Fresh(BlockNumber),
 }
 
-/// Intake's live-at-accept gate (ADR 0008).
+/// Intake's owner-epoch guard, and its live-at-accept gate (ADR 0008).
 pub struct AcceptGate {
     owner_epoch: i64,
-    fresh_block: Box<dyn Fn() -> Option<BlockNumber> + Send + Sync>,
+    /// `None` when live at accept is off: the gate then only guards the
+    /// owner epoch, for self-trade prevention at submit (ADR 0009).
+    fresh_block: Option<Box<dyn Fn() -> Option<BlockNumber> + Send + Sync>>,
 }
 
 impl AcceptGate {
@@ -246,11 +216,19 @@ impl AcceptGate {
     ) -> Self {
         Self {
             owner_epoch,
-            fresh_block: Box::new(fresh_block),
+            fresh_block: Some(Box::new(fresh_block)),
         }
     }
 
-    /// Decide the mode for a round that holds a private submit. It guards a
+    /// Only the owner-epoch guard: every submit takes the confirmed path.
+    pub fn epoch_only(owner_epoch: i64) -> Self {
+        Self {
+            owner_epoch,
+            fresh_block: None,
+        }
+    }
+
+    /// Decide the mode for a round that holds a submit. It guards a
     /// writer takeover: it share-locks the owner epoch, so a new owner's
     /// claim waits for this commit, and it fails if a new owner claimed it
     /// already. The freshness is read after that lock.
@@ -274,7 +252,10 @@ impl AcceptGate {
                 current,
             });
         }
-        Ok((self.fresh_block)().map_or(AcceptMode::Stale, AcceptMode::Fresh))
+        Ok(match &self.fresh_block {
+            None => AcceptMode::Off,
+            Some(fresh_block) => fresh_block().map_or(AcceptMode::Stale, AcceptMode::Fresh),
+        })
     }
 }
 
@@ -295,7 +276,7 @@ pub struct CommandOutcome {
 /// changes nothing and has no update: a change lost to a crash is restored
 /// by the matcher's startup hydration.
 ///
-/// Unless `accept` is off, a newly claimed private note goes live in this
+/// Unless `accept` is off, a newly claimed note goes live in this
 /// transaction (ADR 0008) if the round's watcher block is fresh and the
 /// order is not cancelled already; otherwise it takes the confirmed path.
 pub fn execute_command_tx(
@@ -304,27 +285,35 @@ pub fn execute_command_tx(
     command: &MakerCommand,
     accept: AcceptMode,
 ) -> DbResult<CommandOutcome> {
+    write_command_tx(conn, header, command, accept, false)
+}
+
+/// [`execute_command_tx`] in an intake round with self-trade prevention at
+/// submit on (ADR 0009): a submit is only claimed (the round decides which
+/// claims go live), and one with more than [`MAX_NEWER_LINEAGES`] of its
+/// maker's orders on the pair above its seq is refused before the claim.
+/// An exact retry still gets its stored reply.
+pub fn claim_command_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    command: &MakerCommand,
+) -> DbResult<CommandOutcome> {
+    write_command_tx(conn, header, command, AcceptMode::Off, true)
+}
+
+fn write_command_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    command: &MakerCommand,
+    accept: AcceptMode,
+    refuse_below_history: bool,
+) -> DbResult<CommandOutcome> {
     let replayed = |reply| CommandOutcome {
         reply,
         update: None,
         live: None,
         fallback: None,
     };
-    if let MakerCommand::Submit { keys, .. } = command {
-        // Reservation locks order rows before maker rows. Claim in the same
-        // order, so a late claim cannot slip between reservation's ownership
-        // lookup and its liveness check or deadlock with that reservation.
-        orders::table
-            .filter(orders::lineage_id.eq(&keys.lineage_id))
-            .filter(
-                orders::status
-                    .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-            )
-            .order(orders::note_id.asc())
-            .for_update()
-            .select(orders::note_id)
-            .load::<Vec<u8>>(conn)?;
-    }
     if lock_maker(conn, header.maker_id)?.is_none() {
         return Err(DbError::Corrupt("authenticated maker is missing"));
     }
@@ -338,56 +327,22 @@ pub fn execute_command_tx(
         MakerCommand::Submit {
             note,
             keys,
+            amounts,
             expires_at_unix_ms,
         } => {
-            let claimed = diesel::insert_into(maker_lineages::table)
-                .values((
-                    maker_lineages::lineage_id.eq(&keys.lineage_id),
-                    maker_lineages::maker_id.eq(maker_id),
-                    maker_lineages::request_id.eq(&header.request_id),
-                    maker_lineages::root_seq.eq(seq_column(header.seq)?),
-                    maker_lineages::note_id.eq(note.id().to_bytes().to_vec()),
-                    maker_lineages::market.eq(&keys.market),
-                    maker_lineages::direction.eq(&keys.direction),
-                    maker_lineages::expires_at_unix_ms
-                        .eq(expires_at_unix_ms.map(i64::try_from).transpose()?),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?
-                == 1;
-            if claimed {
-                let cancelled = diesel::select(diesel::dsl::exists(
-                    maker_stops::table
-                        .filter(maker_stops::maker_id.eq(maker_id))
-                        .filter(maker_stops::lineage_id.eq(&keys.lineage_id)),
-                ))
-                .get_result::<bool>(conn)?;
-                let tag = MakerTag {
-                    maker_id,
-                    root_seq: header.seq,
-                    expires_at_unix_ms: *expires_at_unix_ms,
-                };
-                let order_ids = orders::table
-                    .filter(orders::lineage_id.eq(&keys.lineage_id))
-                    .filter(
-                        orders::status
-                            .eq_any([OrderStatus::Active.as_str(), OrderStatus::Settling.as_str()]),
-                    )
-                    .select(orders::note_id)
-                    .load::<Vec<u8>>(conn)?
-                    .into_iter()
-                    .map(|bytes| Ok(crate::types::OrderId::read_from_bytes(&bytes)?))
-                    .collect::<DbResult<Vec<_>>>()?;
-                if accept != AcceptMode::Off {
-                    (live, fallback) =
-                        go_live_at_accept_tx(conn, accept, maker_id, &keys.lineage_id, note)?;
+            if refuse_below_history
+                && self_trade::far_below_history_tx(conn, maker_id, &keys.market, header.seq)?
+            {
+                (CommandResult::SeqBelowHistory, None)
+            } else if claim_lineage_tx(conn, header, note, keys, *amounts, *expires_at_unix_ms)? {
+                match accept {
+                    AcceptMode::Off => {}
+                    AcceptMode::Stale => fallback = Some(AcceptFallback::WatcherStale),
+                    AcceptMode::Fresh(block) => {
+                        live = go_live_at_accept_tx(conn, block, maker_id, &keys.lineage_id, note)?;
+                    }
                 }
-                let update = MakerUpdate::OrdersAttributed {
-                    order_ids,
-                    tag,
-                    cancelled,
-                };
-                (CommandResult::Accepted, Some(update))
+                (CommandResult::Accepted, None)
             } else {
                 (CommandResult::AlreadyRegistered, None)
             }
@@ -421,13 +376,15 @@ pub fn execute_command_tx(
             (CommandResult::Applied { cutoff, settling }, Some(update))
         }
         MakerCommand::CancelOrder { lineage_id } => {
-            diesel::insert_into(maker_stops::table)
-                .values((
-                    maker_stops::maker_id.eq(maker_id),
-                    maker_stops::lineage_id.eq(lineage_id),
-                ))
-                .on_conflict_do_nothing()
-                .execute(conn)?;
+            stop_lineages_tx(
+                conn,
+                &[Stop {
+                    maker_id,
+                    lineage_id,
+                    source: StopSource::Maker,
+                    caused_by: None,
+                }],
+            )?;
             let settling = settling_in_lineage(conn, maker_id, lineage_id)?;
             let update = MakerUpdate::LineageCancelled {
                 maker_id,
@@ -449,35 +406,61 @@ pub fn execute_command_tx(
     })
 }
 
+/// Claim a submit's lineage for its maker, with the amounts it was submitted
+/// at. `false` when the lineage is claimed already, or when its lineage or
+/// its note already has an order row: a maker order is a private note, and
+/// its row is written only after the claim. The note check matters only for
+/// a row with a NULL `lineage_id`, which is a row stored before the
+/// 2026-10-03 migration (every writer since sets it from the note). Without
+/// it, go-live at accept's plain insert could meet such a row and fail the
+/// whole round.
+fn claim_lineage_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    note: &Note,
+    keys: &OrderKeys,
+    (offered, requested): (u64, u64),
+    expires_at_unix_ms: Option<u64>,
+) -> DbResult<bool> {
+    let claimed = diesel::sql_query(
+        "INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
+                                     market, direction, expires_at_unix_ms,
+                                     offered_amount, requested_amount)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+         WHERE NOT EXISTS (SELECT 1 FROM orders WHERE lineage_id = $1 OR note_id = $5)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind::<Binary, _>(&keys.lineage_id)
+    .bind::<BigInt, _>(header.maker_id)
+    .bind::<Text, _>(&header.request_id)
+    .bind::<BigInt, _>(seq_column(header.seq)?)
+    .bind::<Binary, _>(note.id().to_bytes().to_vec())
+    .bind::<Binary, _>(&keys.market)
+    .bind::<Binary, _>(&keys.direction)
+    .bind::<Nullable<BigInt>, _>(expires_at_unix_ms.map(i64::try_from).transpose()?)
+    .bind::<BigInt, _>(i64::try_from(offered)?)
+    .bind::<BigInt, _>(i64::try_from(requested)?)
+    .execute(conn)?;
+    Ok(claimed == 1)
+}
+
 /// Put a newly claimed submit's order live now, before its note is in a
 /// block (ADR 0008): store the root row, pass it through the liveness rule,
 /// and only if it is kept, flag the lineage with `accept_block` and report
 /// LIVE. An order cancelled before its submit leaves no row and takes the
-/// confirmed path, as does a note that already has a row.
-fn go_live_at_accept_tx(
+/// confirmed path. The claim guaranteed that the note has no row yet.
+pub(crate) fn go_live_at_accept_tx(
     conn: &mut PgConnection,
-    accept: AcceptMode,
+    accept_block: BlockNumber,
     maker_id: MakerId,
     lineage_id: &LineageId,
     note: &Note,
-) -> DbResult<(Option<BookOrder>, Option<AcceptFallback>)> {
-    if note.metadata().note_type() != NoteType::Private {
-        return Ok((None, Some(AcceptFallback::Public)));
-    }
-    let AcceptMode::Fresh(accept_block) = accept else {
-        return Ok((None, Some(AcceptFallback::WatcherStale)));
-    };
+) -> DbResult<Option<BookOrder>> {
     let row = NewOrderRow::parsed(note, now_unix())?;
-    let inserted: Option<OrderRow> = diesel::insert_into(orders::table)
+    let inserted: OrderRow = diesel::insert_into(orders::table)
         .values(&row)
-        .on_conflict(orders::note_id)
-        .do_nothing()
         .returning(OrderRow::as_returning())
-        .get_result(conn)
-        .optional()?;
-    let Some(inserted) = inserted else {
-        return Ok((None, Some(AcceptFallback::Conflict)));
-    };
+        .get_result(conn)?;
     let mut kept = super::postgres_db::live_book_update_tx(
         conn,
         BookUpdate {
@@ -489,14 +472,14 @@ fn go_live_at_accept_tx(
         // Cancelled before it was submitted: the confirmed path, as if this
         // row had never been written.
         diesel::delete(orders::table.find(&row.note_id)).execute(conn)?;
-        return Ok((None, None));
+        return Ok(None);
     };
     diesel::update(maker_lineages::table.find(lineage_id))
         .set(maker_lineages::accept_block.eq(Some(i64::from(accept_block.as_u32()))))
         .execute(conn)?;
     let body = order_status(note, proto::OrderState::Live, "");
     gateway::append_event_tx(conn, maker_id, Some(lineage_id), &body)?;
-    Ok((Some(order), None))
+    Ok(Some(order))
 }
 
 /// Record the command, or return the reply it already has: the stored result
@@ -863,9 +846,19 @@ fn order_ids(note_ids: &[Vec<u8>]) -> DbResult<Vec<OrderId>> {
 
 fn order_status(note: &Note, state: proto::OrderState, reason: &str) -> proto::EventBody {
     let depth = OrderKeys::from_note(note).map_or(0, |keys| keys.depth);
+    status_body(note.id().to_bytes().to_vec(), depth, state, reason)
+}
+
+/// An `OrderStatus` event for the order version `note_id` at `depth`.
+fn status_body(
+    note_id: Vec<u8>,
+    depth: u32,
+    state: proto::OrderState,
+    reason: &str,
+) -> proto::EventBody {
     proto::EventBody {
         kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-            note_id: note.id().to_bytes().to_vec(),
+            note_id,
             depth,
             state: state.into(),
             reason: reason.to_owned(),
@@ -980,11 +973,11 @@ pub struct WatcherWrites {
 /// confirmed, reporting each once, and return the orders to take out of the
 /// book.
 ///
-/// A public note can trade before its claim is activated. When the note the
-/// watcher found spent was consumed by our own settlement, the settlement
-/// events already told the maker, so the claim is activated without an
-/// event; while that settlement is still in flight, the claim waits for the
-/// next round. The caller holds the order rows (`prelock_watcher_tx`).
+/// A public note claimed before maker intake became private-only can trade
+/// before its claim is activated. When the note the watcher found spent was
+/// consumed by our own settlement, the settlement events already told the
+/// maker, so the claim is activated without an event; while that settlement
+/// is still in flight, the claim waits for the next round. The caller holds the order rows (`prelock_watcher_tx`).
 /// Orders that went live at accept are closed by [`close_unconfirmed_tx`].
 pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResult<Vec<OrderId>> {
     let (unconfirmed, spent): (Vec<_>, Vec<_>) = spent
@@ -1015,7 +1008,8 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
     // (usually the maker's own reclaim) produces none either.
     let cancelled = cancelled_lineages(conn, &lineages)?;
     for submission in unusable {
-        if rejected.contains(&submission.lineage_id) && !cancelled.contains(&submission.lineage_id)
+        if rejected.contains(&submission.lineage_id)
+            && !cancelled.contains_key(&submission.lineage_id)
         {
             let body = order_status(
                 &submission.note,
@@ -1031,38 +1025,6 @@ pub fn reject_tx(conn: &mut PgConnection, spent: &[PendingSubmission]) -> DbResu
         }
     }
     Ok(removed)
-}
-
-/// The lineages among `lineages` that their maker cancelled: a stop row, or
-/// a cutoff that covers them (the same test as `eligible_orders`).
-fn cancelled_lineages(
-    conn: &mut PgConnection,
-    lineages: &[&LineageId],
-) -> DbResult<HashSet<LineageId>> {
-    #[derive(QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = Binary)]
-        lineage_id: Vec<u8>,
-    }
-    if lineages.is_empty() {
-        return Ok(HashSet::new());
-    }
-    Ok(diesel::sql_query(
-        "SELECT l.lineage_id FROM maker_lineages l
-         WHERE l.lineage_id = ANY($1)
-           AND (EXISTS (SELECT 1 FROM maker_stops s
-                        WHERE s.maker_id = l.maker_id AND s.lineage_id = l.lineage_id)
-                OR EXISTS (SELECT 1 FROM maker_cutoffs c
-                           WHERE c.maker_id = l.maker_id
-                             AND l.root_seq < c.cutoff
-                             AND (c.market = '' OR c.market = l.market)
-                             AND (c.direction = '' OR c.direction = l.direction)))",
-    )
-    .bind::<diesel::sql_types::Array<Binary>, _>(lineages)
-    .load::<Row>(conn)?
-    .into_iter()
-    .map(|row| row.lineage_id)
-    .collect())
 }
 
 /// How [`close_unconfirmed_tx`] closes an order that went live at accept.
@@ -1126,21 +1088,31 @@ pub fn close_unconfirmed_tx<'a>(
             &[OrderStatus::Active, OrderStatus::Waiting],
             OrderStatus::Stopped,
             proto::OrderState::Cancelled,
-            NOTE_NOT_RECEIVED,
+            StopSource::Cap.reason(),
         ),
     };
     let moved = move_orders(conn, &closed_ids, from, to)?;
     let moved_now: HashSet<&Vec<u8>> = moved.iter().collect();
-    let mut told = Vec::new();
     // Only the orders it moved: a spent or stopped root's lineage is closed
     // silently.
-    for submission in closed
+    let closed: Vec<&PendingSubmission> = closed
         .into_iter()
         .filter(|s| moved_now.contains(&s.note_id))
-    {
-        if close == Close::NoteNotReceived {
-            stop_lineage_tx(conn, submission.maker_id, &submission.lineage_id)?;
-        }
+        .collect();
+    if close == Close::NoteNotReceived {
+        let stops: Vec<Stop> = closed
+            .iter()
+            .map(|s| Stop {
+                maker_id: s.maker_id,
+                lineage_id: &s.lineage_id,
+                source: StopSource::Cap,
+                caused_by: None,
+            })
+            .collect();
+        stop_lineages_tx(conn, &stops)?;
+    }
+    let mut told = Vec::new();
+    for submission in closed {
         if shown.contains(&submission.note_id) {
             tell_tx(
                 conn,
@@ -1156,20 +1128,87 @@ pub fn close_unconfirmed_tx<'a>(
     Ok((order_ids(&moved)?, told))
 }
 
-/// A lineage's stop row, as `CancelOrder` writes it.
-fn stop_lineage_tx(
-    conn: &mut PgConnection,
-    maker_id: MakerId,
-    lineage_id: &LineageId,
-) -> DbResult<()> {
-    diesel::insert_into(maker_stops::table)
-        .values((
-            maker_stops::maker_id.eq(maker_id),
-            maker_stops::lineage_id.eq(lineage_id),
-        ))
-        .on_conflict_do_nothing()
-        .execute(conn)?;
-    Ok(())
+/// Who stopped a lineage, stored in `maker_stops.source`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum StopSource {
+    /// The maker's `CancelOrder`.
+    Maker,
+    /// The live-at-accept cap: the note never arrived (ADR 0008).
+    Cap,
+    /// The operator's `cancel-unconfirmed` (ADR 0008).
+    EscapeHatch,
+    /// A reservation that filled the maker's kept order (ADR 0005).
+    StpReservation,
+    /// A crossing submit of the same maker (ADR 0009).
+    StpOnSubmit,
+}
+
+impl StopSource {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// The reason a maker hears for an order stopped this way: every event
+    /// for a stop takes it from here.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Maker => MAKER_CANCEL,
+            Self::Cap | Self::EscapeHatch => NOTE_NOT_RECEIVED,
+            Self::StpReservation | Self::StpOnSubmit => SELF_TRADE_PREVENTION,
+        }
+    }
+}
+
+/// One lineage to stop.
+#[derive(Clone, Copy, Debug)]
+pub struct Stop<'a> {
+    pub maker_id: MakerId,
+    pub lineage_id: &'a LineageId,
+    pub source: StopSource,
+    /// The newer order of the maker that crossed it (ADR 0009).
+    pub caused_by: Option<&'a LineageId>,
+}
+
+/// Write `stops`, one statement per [`INSERT_CHUNK_ROWS`], and return the
+/// lineages this call stopped. A lineage stopped already keeps its first stop
+/// row, and is not returned: whoever stopped it first already did whatever
+/// follows. The lineage ID alone names the stop because every caller that
+/// passes more than one takes each (maker, lineage) pair from a claim, and a
+/// lineage is claimed once.
+///
+/// Every stop row is written here. The caller holds the makers' locks. Only
+/// a self-trade stop at submit names the order that caused it: the table's
+/// check refuses a cause with any other source, even on a row it skips.
+pub fn stop_lineages_tx(conn: &mut PgConnection, stops: &[Stop]) -> DbResult<HashSet<LineageId>> {
+    debug_assert!(
+        stops
+            .iter()
+            .all(|stop| stop.caused_by.is_none() || stop.source == StopSource::StpOnSubmit),
+        "only a self-trade stop at submit names a cause"
+    );
+    let mut stopped = HashSet::new();
+    for chunk in stops.chunks(INSERT_CHUNK_ROWS) {
+        let rows: Vec<_> = chunk
+            .iter()
+            .map(|stop| {
+                (
+                    maker_stops::maker_id.eq(stop.maker_id),
+                    maker_stops::lineage_id.eq(stop.lineage_id),
+                    maker_stops::source.eq(Some(stop.source.as_str())),
+                    maker_stops::caused_by_lineage.eq(stop.caused_by),
+                )
+            })
+            .collect();
+        stopped.extend(
+            diesel::insert_into(maker_stops::table)
+                .values(rows)
+                .on_conflict_do_nothing()
+                .returning(maker_stops::lineage_id)
+                .get_results::<Vec<u8>>(conn)?,
+        );
+    }
+    Ok(stopped)
 }
 
 /// Tell a maker its order `note` is now `state`, for `reason`.
@@ -1293,9 +1332,16 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
                 .filter_map(|(note, maker, lineage)| Some((note, (maker?, lineage?)))),
         )
         .collect();
-    for (maker_id, lineage_id) in closing.values() {
-        stop_lineage_tx(conn, *maker_id, lineage_id)?;
-    }
+    let stops: Vec<Stop> = closing
+        .values()
+        .map(|(maker_id, lineage_id)| Stop {
+            maker_id: *maker_id,
+            lineage_id,
+            source: StopSource::EscapeHatch,
+            caused_by: None,
+        })
+        .collect();
+    stop_lineages_tx(conn, &stops)?;
     let stopped = move_orders(
         conn,
         &rows,
@@ -1322,7 +1368,7 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
             lineage_id,
             &note,
             proto::OrderState::Cancelled,
-            NOTE_NOT_RECEIVED,
+            StopSource::EscapeHatch.reason(),
         )?;
     }
     let mut cancelled: Vec<_> = per_maker.into_iter().collect();
@@ -1335,6 +1381,10 @@ pub fn cancel_unconfirmed_tx(conn: &mut PgConnection) -> DbResult<HatchReport> {
 
 /// The maker's reason when the cap cancels an order whose note never arrived.
 pub const NOTE_NOT_RECEIVED: &str = "note_not_received";
+/// The maker's reason when its own crossing order cancelled an order.
+pub const SELF_TRADE_PREVENTION: &str = "self_trade_prevention";
+/// The maker's reason for an order its own cancel stopped.
+pub const MAKER_CANCEL: &str = "maker_cancel";
 
 /// Report Unavailable for the maker orders among `note_ids` that the maker
 /// sees as live (active, or waiting for their note: ADR 0008), which are
@@ -1357,14 +1407,12 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
         ))
         .load(conn)?;
     for (note_id, maker_id, lineage_id, depth) in spent {
-        let body = proto::EventBody {
-            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-                note_id,
-                depth: u32::try_from(depth.unwrap_or(0))?,
-                state: proto::OrderState::Unavailable.into(),
-                reason: "note spent outside this solver".into(),
-            })),
-        };
+        let body = status_body(
+            note_id,
+            u32::try_from(depth.unwrap_or(0))?,
+            proto::OrderState::Unavailable,
+            "note spent outside this solver",
+        );
         gateway::append_event_tx(conn, maker_id, lineage_id.as_deref(), &body)?;
     }
     Ok(())
@@ -1372,7 +1420,7 @@ pub fn report_spent_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>]) -> DbResul
 
 /// Stop the sit-outs of a reservation that fills a crossed maker's kept
 /// order (ADR 0005), in the reservation's transaction: a stop row per lineage,
-/// as `CancelOrder` writes, and one `OrderStatus CANCELLED` per order it
+/// with its own source, and one `OrderStatus CANCELLED` per order it
 /// stopped. Orders no longer live (cancelled by the maker or spent meanwhile)
 /// are skipped. Only `postgres_db::reserve_settlement_tx` may call it: that
 /// function locks every sit-out's maker first, and taking the lock here,
@@ -1381,43 +1429,42 @@ pub(super) fn cancel_self_trades_tx(conn: &mut PgConnection, note_ids: &[Vec<u8>
     if note_ids.is_empty() {
         return Ok(());
     }
-    /// Note ID, maker, lineage and depth of a live maker order.
-    type Live = (Vec<u8>, i64, Option<Vec<u8>>, Option<i64>);
+    /// Note ID, maker, lineage and depth of a live maker order. The view
+    /// takes the maker from the lineage's claim, so a maker means a lineage.
+    type Live = (Vec<u8>, i64, Vec<u8>, Option<i64>);
     let live: Vec<Live> = live_orders::table
         .filter(live_orders::note_id.eq_any(note_ids))
         .filter(live_orders::maker_id.is_not_null())
         .select((
             live_orders::note_id,
             live_orders::maker_id.assume_not_null(),
-            live_orders::lineage_id,
+            live_orders::lineage_id.assume_not_null(),
             live_orders::depth,
         ))
         .load(conn)?;
+    let stops: Vec<Stop> = live
+        .iter()
+        .map(|(_, maker_id, lineage_id, _)| Stop {
+            maker_id: *maker_id,
+            lineage_id,
+            source: StopSource::StpReservation,
+            caused_by: None,
+        })
+        .collect();
+    // The makers are locked and the view drops stopped lineages, so every
+    // stop here is new; `remove` only keeps a lineage named twice to one
+    // event.
+    let mut stopped = stop_lineages_tx(conn, &stops)?;
     for (note_id, maker_id, lineage_id, depth) in live {
-        // A claimed order always has its lineage.
-        let Some(lineage_id) = lineage_id else {
-            continue;
-        };
-        // A concurrent `CancelOrder` that stopped it first wins: no event.
-        let stopped = diesel::insert_into(maker_stops::table)
-            .values((
-                maker_stops::maker_id.eq(maker_id),
-                maker_stops::lineage_id.eq(&lineage_id),
-            ))
-            .on_conflict_do_nothing()
-            .execute(conn)?
-            == 1;
-        if !stopped {
+        if !stopped.remove(&lineage_id) {
             continue;
         }
-        let body = proto::EventBody {
-            kind: Some(proto::event_body::Kind::OrderStatus(proto::OrderStatus {
-                note_id,
-                depth: u32::try_from(depth.unwrap_or(0))?,
-                state: proto::OrderState::Cancelled.into(),
-                reason: "self_trade_prevention".into(),
-            })),
-        };
+        let body = status_body(
+            note_id,
+            u32::try_from(depth.unwrap_or(0))?,
+            proto::OrderState::Cancelled,
+            StopSource::StpReservation.reason(),
+        );
         gateway::append_event_tx(conn, maker_id, Some(&lineage_id), &body)?;
     }
     Ok(())
@@ -1526,6 +1573,52 @@ fn resulting_status(
     }
 }
 
+/// The lineages among `lineages` that their maker cancelled (not admitted by
+/// `eligible_lineages`: a stop row or a cutoff covers them), each with the
+/// reason a maker hears: the source of its stop row, else `maker_cancel` for
+/// a cutoff. A stop wins over a cutoff. A stop written before stops recorded
+/// their source has an empty reason; a lineage not cancelled is absent.
+pub(super) fn cancelled_lineages(
+    conn: &mut PgConnection,
+    lineages: &[&LineageId],
+) -> DbResult<HashMap<LineageId, &'static str>> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Binary)]
+        lineage_id: Vec<u8>,
+        #[diesel(sql_type = Nullable<Text>)]
+        source: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        stopped: bool,
+    }
+    if lineages.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT l.lineage_id, s.source, s.lineage_id IS NOT NULL AS stopped
+         FROM maker_lineages l
+         LEFT JOIN maker_stops s ON s.maker_id = l.maker_id AND s.lineage_id = l.lineage_id
+         WHERE l.lineage_id = ANY($1)
+           AND NOT EXISTS (SELECT 1 FROM eligible_lineages e WHERE e.lineage_id = l.lineage_id)",
+    )
+    .bind::<diesel::sql_types::Array<Binary>, _>(lineages)
+    .load(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let reason = if row.stopped {
+                row.source
+                    .as_deref()
+                    .and_then(|source| source.parse::<StopSource>().ok())
+                    .map_or("", StopSource::reason)
+            } else {
+                MAKER_CANCEL
+            };
+            (row.lineage_id, reason)
+        })
+        .collect())
+}
+
 /// Immutable fill details computed once from the executor's original notes and
 /// predicted remainders, or rebuilt from durable inputs during startup.
 pub type SettlementFills = HashMap<Vec<u8>, proto::InputFill>;
@@ -1599,6 +1692,12 @@ pub fn report_settlement_tx(
             .collect();
         (live, statuses)
     };
+    let reasons = if matches!(phase, SettlementPhase::Pending) {
+        HashMap::new()
+    } else {
+        let lineages: Vec<&LineageId> = owners.values().map(|(_, lineage)| lineage).collect();
+        cancelled_lineages(conn, &lineages)?
+    };
     // Stable per-maker ordering makes replay independent of SQL plan order.
     let mut ordered: Vec<_> = inputs
         .iter()
@@ -1649,6 +1748,14 @@ pub fn report_settlement_tx(
                 } else {
                     resulting_status(&subject(input), &live, &statuses)
                 };
+                // A CANCELLED result for a lineage neither stopped nor cut
+                // off gets an empty reason. No known flow reaches it; this is
+                // the only place an unknown reason comes from.
+                let reason = if status == proto::ResultingStatus::Cancelled {
+                    reasons.get(lineage_id).copied().unwrap_or_default()
+                } else {
+                    ""
+                };
                 proto::event_body::Kind::SettlementResolved(proto::SettlementResolved {
                     tx_id: tx_id.to_vec(),
                     committed,
@@ -1658,6 +1765,7 @@ pub fn report_settlement_tx(
                     result: Some(proto::InputResult {
                         note_id: input.parent_note_id.clone(),
                         status: status.into(),
+                        reason: reason.to_owned(),
                     }),
                 })
             }
@@ -1710,6 +1818,40 @@ pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLine
          FROM maker_lineages m
          LEFT JOIN eligible_orders o ON o.note_id = m.note_id AND m.accept_block IS NOT NULL
          WHERE m.state = 'pending'",
+    )
+    .get_result(conn)?)
+}
+
+/// What self-trade prevention at submit (ADR 0009) cannot see, counted at
+/// startup: both must be 0 before the check is switched on.
+#[derive(QueryableByName, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StpReadiness {
+    /// Open lineages claimed before their amounts were stored. They never
+    /// cross, so the check cannot cancel them or be cancelled by them.
+    #[diesel(sql_type = BigInt)]
+    pub lineages_without_amounts: i64,
+    /// Open maker order rows without their maker, which the check's read
+    /// cannot find.
+    #[diesel(sql_type = BigInt)]
+    pub orders_without_maker: i64,
+}
+
+/// Count [`StpReadiness`]. A lineage is open while it is pending or one of
+/// its rows is active, settling or waiting, and its maker has not stopped it.
+pub fn stp_readiness_tx(conn: &mut PgConnection) -> DbResult<StpReadiness> {
+    Ok(diesel::sql_query(
+        "SELECT
+            (SELECT count(*) FROM eligible_lineages l
+             WHERE l.offered_amount IS NULL
+               AND (l.state = 'pending' OR EXISTS (
+                    SELECT 1 FROM orders o
+                    WHERE o.lineage_id = l.lineage_id
+                      AND o.status IN ('active', 'settling', 'waiting'))))
+                AS lineages_without_amounts,
+            (SELECT count(*) FROM orders o
+             JOIN maker_lineages l ON l.lineage_id = o.lineage_id
+             WHERE o.status IN ('active', 'settling', 'waiting') AND o.maker_id IS NULL)
+                AS orders_without_maker",
     )
     .get_result(conn)?)
 }
@@ -1783,10 +1925,54 @@ pub enum EventKind {
     SettlementResolved,
 }
 
-/// Append an event to `maker_id`'s feed in the caller's business transaction
-/// and return its sequence. The counter row update serializes appenders, so a
+/// One event to append: its lineage, kind and encoded body.
+type NewEvent<'a> = (Option<&'a [u8]>, EventKind, Vec<u8>);
+
+/// Append `events` to `maker_id`'s feed in order, in the caller's business
+/// transaction, and return the first one's sequence (`None` for no events).
+/// One counter update for all of them, then one insert per
+/// [`INSERT_CHUNK_ROWS`]. The counter row update serializes appenders, so a
 /// maker's committed sequences are contiguous; a rolled-back transaction
 /// returns its numbers with it.
+fn append_events_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    events: &[NewEvent],
+) -> DbResult<Option<u64>> {
+    let count = i64::try_from(events.len())?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let next: i64 = diesel::update(makers::table.find(maker_id))
+        .set(makers::next_event_seq.eq(makers::next_event_seq + count))
+        .returning(makers::next_event_seq)
+        .get_result(conn)?;
+    EventWake::mark_appended();
+    let first = next - count;
+    let numbered: Vec<_> = events.iter().zip(first..).collect();
+    for chunk in numbered.chunks(INSERT_CHUNK_ROWS) {
+        let rows: Vec<_> = chunk
+            .iter()
+            .map(|((lineage_id, kind, payload), event_seq)| {
+                let kind: &'static str = (*kind).into();
+                (
+                    maker_events::maker_id.eq(maker_id),
+                    maker_events::event_seq.eq(*event_seq),
+                    maker_events::kind.eq(kind),
+                    maker_events::lineage_id.eq(*lineage_id),
+                    maker_events::payload.eq(payload),
+                )
+            })
+            .collect();
+        diesel::insert_into(maker_events::table)
+            .values(rows)
+            .execute(conn)?;
+    }
+    Ok(Some(u64::try_from(first)?))
+}
+
+/// Append one event to `maker_id`'s feed (see [`append_events_tx`]) and
+/// return its sequence.
 pub fn append_event_tx(
     conn: &mut PgConnection,
     maker_id: MakerId,
@@ -1794,37 +1980,28 @@ pub fn append_event_tx(
     lineage_id: Option<&[u8]>,
     payload: &[u8],
 ) -> DbResult<u64> {
-    let next: i64 = diesel::update(makers::table.find(maker_id))
-        .set(makers::next_event_seq.eq(makers::next_event_seq + 1))
-        .returning(makers::next_event_seq)
-        .get_result(conn)?;
-    let event_seq = next - 1;
-    EventWake::mark_appended();
-    let kind: &'static str = kind.into();
-    diesel::insert_into(maker_events::table)
-        .values((
-            maker_events::maker_id.eq(maker_id),
-            maker_events::event_seq.eq(event_seq),
-            maker_events::kind.eq(kind),
-            maker_events::lineage_id.eq(lineage_id),
-            maker_events::payload.eq(payload),
-        ))
-        .execute(conn)?;
-    Ok(u64::try_from(event_seq)?)
+    append_events_tx(conn, maker_id, &[(lineage_id, kind, payload.to_vec())])?
+        .ok_or(DbError::Corrupt("one event appended none"))
 }
+
+mod self_trade;
+pub use self_trade::{
+    self_trade_round_tx, DeadCause, SelfTradeRound, StpCancel, Submitted, MAX_NEWER_LINEAGES,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::postgres_db::{
-        backfill_order_keys_tx, confirm_settlement_update_tx, finish_discarded_settlement_tx,
-        insert_orders_batch_tx, live_book_update_tx, load_live_orders_tx, prepare_settlement_tx,
-        reserve_settlement_tx, test_consumer, NodeAnswer,
+        confirm_settlement_update_tx, finish_discarded_settlement_tx, insert_orders_batch_tx,
+        live_book_update_tx, load_live_orders_tx, prepare_settlement_tx, reserve_settlement_tx,
+        test_consumer, NodeAnswer,
     };
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
     use crate::db::postgres_schema::live_orders;
-    use crate::db::postgres_test::{fill, prepare, revert_after, TestSchema};
+    use crate::db::postgres_test::{fill, maker, prepare, revert_after, TestSchema};
+    use crate::maker::MakerTag;
 
     /// The migration that adds the maker tables.
     const MAKER_GATEWAY: &str = "20261003000001";
@@ -1916,10 +2093,6 @@ mod tests {
         MakerCommand::CancelAll { scope }
     }
 
-    fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
-        Ok(create_maker_tx(conn, name)?.unwrap())
-    }
-
     /// Store `notes` as ordinary ingested orders.
     fn ingest(conn: &mut PgConnection, notes: &[&Note]) -> Result<()> {
         let rows: Vec<_> = notes
@@ -2004,20 +2177,10 @@ mod tests {
         let maker_id = maker(conn, "alpha")?;
         let order = note(1);
 
+        // A submit has nothing for the matcher: its order row comes later.
         let (reply, fact) = run(conn, maker_id, "r1", 1, submit(&order))?;
         assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
-        assert_eq!(
-            fact,
-            Some(MakerUpdate::OrdersAttributed {
-                order_ids: Vec::new(),
-                tag: MakerTag {
-                    maker_id,
-                    root_seq: 1,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: false,
-            })
-        );
+        assert_eq!(fact, None);
 
         // The exact retry gets the stored reply and repeats no fact.
         let (reply, fact) = run(conn, maker_id, "r1", 1, submit(&order))?;
@@ -2208,37 +2371,29 @@ mod tests {
         Ok(())
     }
 
+    /// The reason a maker hears for each way a lineage can be stopped.
     #[test]
-    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn a_stop_before_late_claim_carries_cancelled_metadata_for_public_order() -> Result<()> {
-        let mut fixture = TestSchema::migrated()?;
-        let conn = &mut fixture.conn;
-        let alpha = maker(conn, "alpha")?;
-        let quote = note(42);
-        ingest(conn, &[&quote])?;
-        let lineage_id = OrderKeys::from_note(&quote)?.lineage_id;
-        run(
-            conn,
-            alpha,
-            "x1",
-            1,
-            MakerCommand::CancelOrder { lineage_id },
-        )?;
-        let (_, update) = run(conn, alpha, "s2", 2, submit(&quote))?;
+    fn every_stop_source_has_its_reason() {
+        let reasons: Vec<_> = [
+            StopSource::Maker,
+            StopSource::Cap,
+            StopSource::EscapeHatch,
+            StopSource::StpReservation,
+            StopSource::StpOnSubmit,
+        ]
+        .into_iter()
+        .map(|source| (source.as_str(), source.reason()))
+        .collect();
         assert_eq!(
-            update,
-            Some(MakerUpdate::OrdersAttributed {
-                order_ids: vec![quote.id()],
-                tag: MakerTag {
-                    maker_id: alpha,
-                    root_seq: 2,
-                    expires_at_unix_ms: None,
-                },
-                cancelled: true,
-            }),
+            reasons,
+            [
+                ("maker", "maker_cancel"),
+                ("cap", "note_not_received"),
+                ("escape_hatch", "note_not_received"),
+                ("stp_reservation", "self_trade_prevention"),
+                ("stp_on_submit", "self_trade_prevention"),
+            ]
         );
-        assert_eq!(live(conn, &[&quote])?, [false]);
-        Ok(())
     }
 
     #[test]
@@ -2633,48 +2788,79 @@ mod tests {
 
     #[test]
     #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn a_late_claim_waits_for_a_public_reservation_then_reports_exposure() -> Result<()> {
+    fn a_claim_takes_no_order_row_lock_and_refuses_a_reserved_note_at_once() -> Result<()> {
         let mut fixture = TestSchema::migrated()?;
         let alpha = maker(&mut fixture.conn, "alpha")?;
         let quote = note(41);
         ingest(&mut fixture.conn, &[&quote])?;
 
         let held = Arc::new(Barrier::new(2));
+        // Set just before the reservation commits.
+        let committing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut reserver = connect(&fixture)?;
         let reserving = {
-            let (held, quote) = (held.clone(), quote.clone());
+            let (held, quote, committing) = (held.clone(), quote.clone(), committing.clone());
             std::thread::spawn(move || {
                 reserver.transaction::<_, DbError, _>(|conn| {
                     reserve(conn, 41, &quote)?;
                     held.wait();
                     std::thread::sleep(Duration::from_millis(300));
+                    committing.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 })
             })
         };
-        held.wait();
+        // Connected before the reservation's 300 ms window starts.
         let mut claimant = connect(&fixture)?;
-        let started = Instant::now();
+        held.wait();
         let (reply, _) = run(&mut claimant, alpha, "s1", 1, submit(&quote))?;
-        reserving.join().expect("reserver panicked")?;
         assert!(
-            started.elapsed() >= Duration::from_millis(200),
-            "claim waited for the order row"
+            !committing.load(std::sync::atomic::Ordering::SeqCst),
+            "the claim must not wait for the reserved row"
         );
-        assert_eq!(reply, CommandReply::Committed(CommandResult::Accepted));
+        reserving.join().expect("reserver panicked")?;
         assert_eq!(
-            run(
-                &mut claimant,
-                alpha,
-                "c2",
-                2,
-                cancel_all(CutoffScope::all())
-            )?
-            .0,
-            CommandReply::Committed(CommandResult::Applied {
-                cutoff: 2,
-                settling: 1
-            }),
+            reply,
+            CommandReply::Committed(CommandResult::AlreadyRegistered)
+        );
+        Ok(())
+    }
+
+    /// A submit is refused when any row of its lineage exists (here only a
+    /// remainder), or a row with its note under no lineage.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn a_claim_is_refused_when_its_lineage_or_its_note_has_a_row() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let conn = &mut fixture.conn;
+        let alpha = maker(conn, "alpha")?;
+        let (root, remainder, unattributed) = (note(61), note(62), note(63));
+        ingest(conn, &[&remainder, &unattributed])?;
+        let lineage_id = OrderKeys::from_note(&root)?.lineage_id;
+        diesel::update(
+            orders::table.filter(orders::note_id.eq(remainder.id().to_bytes().to_vec())),
+        )
+        .set(orders::lineage_id.eq(Some(&lineage_id)))
+        .execute(conn)?;
+        diesel::update(
+            orders::table.filter(orders::note_id.eq(unattributed.id().to_bytes().to_vec())),
+        )
+        .set(orders::lineage_id.eq(None::<Vec<u8>>))
+        .execute(conn)?;
+        for (seq, order) in [(1, &root), (2, &unattributed)] {
+            let (reply, _) = run(conn, alpha, &format!("s{seq}"), seq, submit(order))?;
+            assert_eq!(
+                reply,
+                CommandReply::Committed(CommandResult::AlreadyRegistered),
+                "seq {seq}"
+            );
+        }
+        let claims: i64 = maker_lineages::table.count().get_result(conn)?;
+        assert_eq!(claims, 0);
+        assert_eq!(
+            live(conn, &[&remainder, &unattributed])?,
+            [true, true],
+            "both stay ordinary orders"
         );
         Ok(())
     }
@@ -2764,34 +2950,6 @@ mod tests {
             .map(|order| (order.id(), order.maker))
             .collect();
         assert_eq!(hydrated, tags);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
-    fn order_keys_are_backfilled_for_rows_stored_before_the_migration() -> Result<()> {
-        let mut fixture = TestSchema::migrated()?;
-        let conn = &mut fixture.conn;
-        let (older, finished) = (note(1), note(2));
-        ingest(conn, &[&older, &finished])?;
-        diesel::update(orders::table)
-            .set((
-                orders::lineage_id.eq(None::<Vec<u8>>),
-                orders::depth.eq(None::<i64>),
-                orders::market.eq(None::<Vec<u8>>),
-                orders::direction.eq(None::<Vec<u8>>),
-            ))
-            .execute(conn)?;
-        diesel::update(orders::table.find(finished.id().to_bytes().to_vec()))
-            .set(orders::status.eq(OrderStatus::Executed.as_str()))
-            .execute(conn)?;
-        assert_eq!(backfill_order_keys_tx(conn)?, 1, "only unfinished rows");
-        let lineage: Option<Vec<u8>> = orders::table
-            .find(older.id().to_bytes().to_vec())
-            .select(orders::lineage_id)
-            .first(conn)?;
-        assert_eq!(lineage, Some(OrderKeys::from_note(&older)?.lineage_id));
-        assert_eq!(backfill_order_keys_tx(conn)?, 0);
         Ok(())
     }
 
@@ -3143,9 +3301,10 @@ mod tests {
         let report = resolved(events.last().unwrap());
         assert!(report.committed);
         assert!(report.fill.is_some(), "the fill is reported");
+        let result = report.result.as_ref().unwrap();
         assert_eq!(
-            report.result.as_ref().unwrap().status(),
-            proto::ResultingStatus::Cancelled
+            (result.status(), result.reason.as_str()),
+            (proto::ResultingStatus::Cancelled, MAKER_CANCEL)
         );
         Ok(())
     }
@@ -3185,22 +3344,25 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| !report.committed && report.fill.is_none()));
-        let statuses: HashMap<Vec<u8>, proto::ResultingStatus> = reports
+        let statuses: HashMap<Vec<u8>, (proto::ResultingStatus, &str)> = reports
             .iter()
             .map(|report| report.result.as_ref().unwrap())
-            .map(|result| (result.note_id.clone(), result.status()))
+            .map(|result| {
+                let outcome = (result.status(), result.reason.as_str());
+                (result.note_id.clone(), outcome)
+            })
             .collect();
         assert_eq!(
             statuses[&returned.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Live
+            (proto::ResultingStatus::Live, "")
         );
         assert_eq!(
             statuses[&spent.id().to_bytes().to_vec()],
-            proto::ResultingStatus::SpentElsewhere
+            (proto::ResultingStatus::SpentElsewhere, "")
         );
         assert_eq!(
             statuses[&stopped.id().to_bytes().to_vec()],
-            proto::ResultingStatus::Cancelled
+            (proto::ResultingStatus::Cancelled, MAKER_CANCEL)
         );
         Ok(())
     }

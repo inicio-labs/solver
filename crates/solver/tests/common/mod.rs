@@ -424,6 +424,7 @@ pub fn engine_config() -> solver::config::EngineConfig {
         maker_settlement_buffer_ms: 30_000,
         maker_self_trade_prevention: true,
         maker_live_at_accept: false,
+        maker_cancel_crossing_on_submit: false,
         maker_unconfirmed_cancel_after_secs: 60,
         maker_unconfirmed_cancel_after_blocks: 20,
     }

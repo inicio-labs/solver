@@ -6,7 +6,7 @@
 //!   maker address                   print the account id and testnet address
 //!   maker claim                     consume incoming notes: faucet mints, USDCx, fill paybacks
 //!   maker balance                   vault balance of every configured token
-//!   maker quote --offer IETH:0.5 --request IUSDT:1250 [--expires-in 600] [--public]
+//!   maker quote --offer IETH:0.5 --request IUSDT:1250 [--expires-in 600]
 //!                                   create a PSWAP order note and submit it to the gateway
 //!   maker orders                    list your orders the solver can match now
 //!   maker events [--follow]         replay your event feed from the saved cursor, then follow it
@@ -14,7 +14,8 @@
 //!   maker cancel-all [--market IETH,IUSDT]
 //!                                   cancel every older order, or those in one market
 //!   maker reclaim <lineage-hex>     take back an unfilled order's tokens (after your cancel,
-//!                                   or after the solver's OrderStatus CANCELLED)
+//!                                   the solver's OrderStatus CANCELLED, or a SettlementResolved
+//!                                   whose result is CANCELLED)
 //!   maker heartbeat                 server time and your newest event sequence
 //!   maker get-command <request-id>  the stored reply of a command you sent
 //!
@@ -174,10 +175,9 @@ async fn quote(cfg: &Config, journal: &mut Journal, args: &[String]) -> Result<(
         .map(|s| s.parse::<u64>().map(|secs| now_ms() + secs * 1000))
         .transpose()
         .context("--expires-in SECONDS")?;
-    let public_note = args.iter().any(|a| a == "--public");
 
     let (mut client, _) = wallet::client(cfg).await?;
-    let note = wallet::create_order(&mut client, id, offered, requested, public_note).await?;
+    let note = wallet::create_order(&mut client, id, offered, requested).await?;
     let lineage = wallet::lineage_id(&note)?;
     let lineage_hex = hex::encode(&lineage);
 
@@ -259,9 +259,13 @@ fn print_event(cfg: &Config, event: &pb::MakerEvent) {
                 .and_then(|x| pb::ResultingStatus::try_from(x.status).ok())
                 .map(|s| s.as_str_name())
                 .unwrap_or("?");
+            let reason = r.result.as_ref().map_or("", |x| x.reason.as_str());
             format!(
-                "SettlementResolved committed={} block={} result={status} {}",
-                r.committed, r.commit_block, describe_fill(cfg, r.fill.as_ref())
+                "SettlementResolved committed={} block={} result={status}{} {}",
+                r.committed,
+                r.commit_block,
+                if reason.is_empty() { String::new() } else { format!(" reason={reason:?}") },
+                describe_fill(cfg, r.fill.as_ref())
             )
         }
         None => "event without a body".to_string(),

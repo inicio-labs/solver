@@ -167,6 +167,11 @@ fn append_settlement_metrics(body: &mut String) {
             "solver_executor_inputs_bounced_total{{reason=\"{reason}\"}} {count}"
         );
     }
+    let _ = writeln!(
+        body,
+        "solver_executor_reservation_stopped_input_total {}",
+        crate::executor::metrics::reservation_stopped_inputs()
+    );
 }
 
 /// Numbers the ops agent's checks read: ticks (a stalled matcher stops them),

@@ -1,5 +1,6 @@
 //! Maker gateway on the mock chain: a maker order end to end, on today's
-//! path and live at accept (ADR 0008).
+//! path and live at accept (ADR 0008), and self-trade prevention at submit
+//! (ADR 0009).
 //!
 //! The solver runs as in the other integration tests, with the maker gateway
 //! enabled and every client behind [`NodeLikeRpc`], a mock node that refuses
@@ -398,28 +399,41 @@ impl Scenario {
         self.solver.is_finished()
     }
 
-    /// The maker's order, not sent yet: sell 1 ETH for 100 USDC as a private
-    /// note.
-    fn maker_order(&mut self) -> Result<(TransactionRequest, Note)> {
+    /// A PSWAP order of `owner`, not sent yet: `offered` for `requested`,
+    /// as a note of `note_type` with public paybacks.
+    fn pswap(
+        &mut self,
+        owner: AccountId,
+        (offered, offered_amount): (AccountId, u64),
+        (requested, requested_amount): (AccountId, u64),
+        note_type: NoteType,
+    ) -> Result<(TransactionRequest, Note)> {
         let request = TransactionRequestBuilder::new()
             .build_pswap_create(
                 &PswapTransactionData::new(
-                    self.maker,
-                    FungibleAsset::new(self.eth, 1)?,
-                    FungibleAsset::new(self.usdc, 100)?,
+                    owner,
+                    FungibleAsset::new(offered, offered_amount)?,
+                    FungibleAsset::new(requested, requested_amount)?,
                 ),
-                NoteType::Private,
+                note_type,
                 NoteType::Public,
                 None,
                 self.users.rng(),
             )
-            .map_err(|e| anyhow!("maker order: {e}"))?;
+            .map_err(|e| anyhow!("order: {e}"))?;
         let order = request
             .expected_output_own_notes()
             .into_iter()
             .next()
-            .context("the maker's request creates no note")?;
+            .context("the request creates no note")?;
         Ok((request, order))
+    }
+
+    /// The maker's order, not sent yet: sell 1 ETH for 100 USDC as a private
+    /// note.
+    fn maker_order(&mut self) -> Result<(TransactionRequest, Note)> {
+        let (maker, eth, usdc) = (self.maker, self.eth, self.usdc);
+        self.pswap(maker, (eth, 1), (usdc, 100), NoteType::Private)
     }
 
     /// Send `account`'s transaction; the node accepts it and it waits for a
@@ -431,26 +445,15 @@ impl Scenario {
         Ok(())
     }
 
-    /// Alice buys 1 ETH for up to 120 USDC, publicly, and her order lands.
-    async fn user_buys(&mut self) -> Result<()> {
-        let order = TransactionRequestBuilder::new()
-            .build_pswap_create(
-                &PswapTransactionData::new(
-                    self.alice,
-                    FungibleAsset::new(self.usdc, 120)?,
-                    FungibleAsset::new(self.eth, 1)?,
-                ),
-                NoteType::Public,
-                NoteType::Public,
-                None,
-                self.users.rng(),
-            )
-            .map_err(|e| anyhow!("user order: {e}"))?;
-        self.send(self.alice, order).await?;
+    /// Alice buys 1 ETH for up to 120 USDC, publicly; returns her order's
+    /// note once ingest has stored it.
+    async fn user_buys(&mut self) -> Result<Note> {
+        let (alice, eth, usdc) = (self.alice, self.eth, self.usdc);
+        let (request, order) = self.pswap(alice, (usdc, 120), (eth, 1), NoteType::Public)?;
+        self.send(self.alice, request).await?;
         self.rpc.prove_block();
-        // Ingest stores it.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while common::count_orders(&self.pg.url, "active").await < 1 {
+        while self.state_of(&order).await?.is_none() {
             ensure!(!self.stopped(), "the solver stopped");
             ensure!(
                 std::time::Instant::now() < deadline,
@@ -458,7 +461,23 @@ impl Scenario {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        Ok(())
+        Ok(order)
+    }
+
+    /// The order row's status, if it exists.
+    async fn state_of(&self, order: &Note) -> Result<Option<String>> {
+        let url = self.pg.url.clone();
+        let note_id = order.id().to_bytes();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            use solver::db::postgres_schema::orders;
+            let mut conn = solver::db::postgres_migrations::connect(&url)?;
+            Ok(orders::table
+                .find(&note_id)
+                .select(orders::status)
+                .get_result(&mut conn)
+                .optional()?)
+        })
+        .await?
     }
 
     async fn submit(&mut self, order: &Note) -> Result<()> {
@@ -473,13 +492,17 @@ impl Scenario {
         Ok(())
     }
 
-    async fn wait_for_live(&mut self, order: &Note, max_wait: Duration) -> Result<()> {
+    /// Wait for `order`'s LIVE; returns every event read on the way.
+    async fn wait_for_live(
+        &mut self,
+        order: &Note,
+        max_wait: Duration,
+    ) -> Result<Vec<proto::MakerEvent>> {
         wait_for_event(&mut self.events, max_wait, |kind| {
             is_order_status(kind, order, proto::OrderState::Live)
         })
         .await
-        .context("the maker order never went LIVE")?;
-        Ok(())
+        .context("the maker order never went LIVE")
     }
 
     /// Wait until a transaction in the mock's mempool spends `note`.
@@ -497,8 +520,9 @@ impl Scenario {
     }
 
     /// Prove blocks until the maker's settlement resolves as committed, well
-    /// inside its 20-block validity window.
-    async fn prove_until_committed(&mut self) -> Result<()> {
+    /// inside its 20-block validity window; returns every event read on the
+    /// way.
+    async fn prove_until_committed(&mut self) -> Result<Vec<proto::MakerEvent>> {
         for _ in 0..10 {
             self.rpc.prove_block();
             let committed = self
@@ -510,8 +534,8 @@ impl Scenario {
                     )
                 })
                 .await?;
-            if committed.is_some() {
-                return Ok(());
+            if let Some(events) = committed {
+                return Ok(events);
             }
         }
         Err(anyhow!(
@@ -818,6 +842,296 @@ async fn an_order_whose_note_never_arrives_is_capped() -> Result<()> {
             },
         ))
         .await
+}
+
+/// Self-trade prevention at submit (ADR 0009): the maker re-quotes across
+/// its own live ask with a bid. The ask is cancelled when the bid is
+/// accepted, before the bid's note is in any block, and never trades. With
+/// live at accept on the bid is LIVE at once; off, both sides are out of the
+/// book until the bid's note lands (the re-quote gap). The maker's feed is
+/// exactly the ask's LIVE and CANCELLED, then the bid's LIVE.
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn a_crossing_requote_cancels_the_older_order_at_submit_with_live_at_accept() -> Result<()> {
+    crossing_requote(true).await
+}
+
+/// The same, with live at accept off.
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn a_crossing_requote_cancels_the_older_order_at_submit_without_live_at_accept() -> Result<()>
+{
+    crossing_requote(false).await
+}
+
+async fn crossing_requote(live_at_accept: bool) -> Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(Scenario::run(
+            move |engine| {
+                engine.maker_cancel_crossing_on_submit = true;
+                engine.maker_live_at_accept = live_at_accept;
+                // The old rule would keep the crossed ask out of the batch on
+                // its own and hide a missing cancel: off, as after the soak.
+                engine.maker_self_trade_prevention = false;
+            },
+            move |s| Box::pin(async move { requote(s, live_at_accept).await }),
+        ))
+        .await
+}
+
+async fn requote(s: &mut Scenario, live_at_accept: bool) -> Result<()> {
+    let mut seen = Vec::new();
+    // The maker also holds USDC, to bid.
+    s.users
+        .mint_and_consume(s.maker, s.usdc, NoteType::Public)
+        .await?;
+    s.rpc.prove_block();
+    s.users.sync_state().await?;
+
+    // Its ask: 1 ETH for 100 USDC, live.
+    let (request, ask) = s.maker_order()?;
+    s.send(s.maker, request).await?;
+    if !live_at_accept {
+        s.rpc.prove_block();
+    }
+    s.submit(&ask).await?;
+    seen.extend(s.wait_for_live(&ask, Duration::from_secs(120)).await?);
+
+    // Its bid: 105 USDC for 1 ETH, above its own ask.
+    let (maker, eth, usdc) = (s.maker, s.eth, s.usdc);
+    let (request, bid) = s.pswap(maker, (usdc, 105), (eth, 1), NoteType::Private)?;
+    s.send(s.maker, request).await?;
+    s.submit(&bid).await?;
+    // The ask goes at once, before any block; the feed check at the end
+    // pins that its CANCELLED comes before the bid's LIVE.
+    if live_at_accept {
+        seen.extend(s.wait_for_live(&bid, Duration::from_secs(10)).await?);
+    } else {
+        seen.extend(
+            wait_for_event(&mut s.events, Duration::from_secs(10), |kind| {
+                is_order_status(kind, &ask, proto::OrderState::Cancelled)
+            })
+            .await
+            .context("the ask was not cancelled at submit")?,
+        );
+        // The re-quote gap: neither side is in the book until the block.
+        expect_no_event(&mut s.events, Duration::from_secs(2), |kind| {
+            is_order_status(kind, &bid, proto::OrderState::Live)
+        })
+        .await
+        .context("the bid went LIVE before its note was in a block")?;
+        s.rpc.prove_block();
+        seen.extend(s.wait_for_live(&bid, Duration::from_secs(120)).await?);
+    }
+    s.grew(
+        "solver_maker_stp_on_submit_cancels_total",
+        "loser=\"older\"",
+        |d| d == 1.0,
+    )
+    .await?;
+
+    // A user's buy can only meet the cancelled ask. Once it is in the book,
+    // the matcher runs several ticks and never chooses anything: the ask left
+    // the book with the bid's submit. The age gauge reads whole seconds, so a
+    // choice shows only after 1 s. A chosen order counts until its settlement
+    // lands, and no block is proved while we watch: 5 s of ticks is enough.
+    let user = s.user_buys().await?;
+    let ticks = |metrics: &str| total(metrics, "solver_matcher_ticks_total", "");
+    let skips = |metrics: &str| total(metrics, "solver_matcher_price_skips_total", "");
+    let before = scrape(s.obs_port).await?;
+    let (start, skipped) = (ticks(&before), skips(&before));
+    let watched = std::time::Instant::now();
+    let deadline = watched + Duration::from_secs(60);
+    let mut metrics;
+    loop {
+        metrics = scrape(s.obs_port).await?;
+        ensure!(
+            total(
+                &metrics,
+                "solver_matcher_oldest_matched_order_age_seconds",
+                ""
+            ) == 0.0,
+            "the matcher chose an order: only the cancelled ask could match the user's {}",
+            user.id()
+        );
+        if ticks(&metrics) >= start + 3.0 && watched.elapsed() >= Duration::from_secs(5) {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the matcher stopped ticking"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The ticks priced the pair, and the matcher's own count of the maker's
+    // orders it can choose holds the bid alone: the ask is out of its book.
+    ensure!(
+        skips(&metrics) == skipped,
+        "the matcher skipped the pair for its price"
+    );
+    ensure!(
+        total(&metrics, "solver_maker_live_orders", "") == 1.0,
+        "the matcher's maker orders: {}",
+        total(&metrics, "solver_maker_live_orders", "")
+    );
+    // Had the matcher still held the ask, its reservation would have failed
+    // on the stop.
+    s.grew("solver_executor_reservation_stopped_input_total", "", |d| {
+        d == 0.0
+    })
+    .await?;
+
+    // The maker's whole feed, with anything still on the way: no settlement
+    // event, and the ask's LIVE and CANCELLED before the bid's LIVE.
+    seen.extend(s.events.drain(Duration::from_secs(2)).await?);
+    let feed = seen
+        .iter()
+        .map(
+            |event| match event.body.as_ref().and_then(|body| body.kind.as_ref()) {
+                Some(proto::event_body::Kind::OrderStatus(status)) => Ok((
+                    status.note_id.clone(),
+                    status.state(),
+                    status.reason.as_str(),
+                )),
+                other => Err(anyhow!("not an order status: {other:?}")),
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let (ask_id, bid_id) = (ask.id().to_bytes(), bid.id().to_bytes());
+    ensure!(
+        feed == [
+            (ask_id.clone(), proto::OrderState::Live, ""),
+            (
+                ask_id,
+                proto::OrderState::Cancelled,
+                "self_trade_prevention"
+            ),
+            (bid_id, proto::OrderState::Live, ""),
+        ],
+        "the maker's feed: {feed:?}"
+    );
+    Ok(())
+}
+
+/// A loser held by a settlement, end to end (ADR 0009): the maker's ask is in
+/// a settlement with a user's buy when its crossing bid arrives. The ask
+/// hears nothing until that settlement commits; then its `SettlementResolved`
+/// keeps the fill and says CANCELLED, reason `self_trade_prevention`: the
+/// remainder is stopped. The bid goes live at once.
+#[tokio::test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+async fn a_settling_loser_hears_of_its_cancel_in_its_settlement_result() -> Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(Scenario::run(
+            |engine| {
+                engine.maker_cancel_crossing_on_submit = true;
+                engine.maker_live_at_accept = true;
+                engine.maker_self_trade_prevention = false;
+            },
+            |s| Box::pin(settling_loser(s)),
+        ))
+        .await
+}
+
+async fn settling_loser(s: &mut Scenario) -> Result<()> {
+    let mut seen = Vec::new();
+    // The maker also holds USDC, to bid.
+    s.users
+        .mint_and_consume(s.maker, s.usdc, NoteType::Public)
+        .await?;
+    s.rpc.prove_block();
+    s.users.sync_state().await?;
+    let user = s.user_buys().await?;
+
+    // Its ask, 2 ETH for 200 USDC, live at once: the user's buy of 1 ETH
+    // fills half of it, in a settlement no block has proved yet.
+    let (maker, eth, usdc) = (s.maker, s.eth, s.usdc);
+    let (request, ask) = s.pswap(maker, (eth, 2), (usdc, 200), NoteType::Private)?;
+    s.send(s.maker, request).await?;
+    s.submit(&ask).await?;
+    seen.extend(s.wait_for_live(&ask, Duration::from_secs(10)).await?);
+    wait_for_submitted_settlement(&s.pg.url, Duration::from_secs(900), || s.stopped()).await?;
+    s.wait_in_mempool(&ask).await?;
+
+    // Its crossing bid, before any block: the settling ask loses.
+    let (request, bid) = s.pswap(maker, (usdc, 105), (eth, 1), NoteType::Private)?;
+    s.send(s.maker, request).await?;
+    s.submit(&bid).await?;
+    seen.extend(s.wait_for_live(&bid, Duration::from_secs(10)).await?);
+    s.grew(
+        "solver_maker_stp_on_submit_cancels_total",
+        "loser=\"older\"",
+        |d| d == 1.0,
+    )
+    .await?;
+    let ask_id = ask.id().to_bytes();
+    expect_no_event(&mut s.events, Duration::from_secs(2), |kind| {
+        matches!(kind, proto::event_body::Kind::OrderStatus(status) if status.note_id == ask_id)
+    })
+    .await
+    .context("the settling ask heard of its cancel before its settlement resolved")?;
+
+    // The settlement commits: the user's buy is filled, the ask's fill
+    // stands and its remainder is stopped.
+    seen.extend(s.prove_until_committed().await?);
+    ensure!(
+        s.state_of(&user).await?.as_deref() == Some("executed"),
+        "the user's order is {:?}",
+        s.state_of(&user).await?
+    );
+    seen.extend(s.events.drain(Duration::from_secs(2)).await?);
+    let feed: Vec<String> = seen
+        .iter()
+        .map(|event| {
+            let name = |id: &[u8]| {
+                if id == ask_id.as_slice() {
+                    "ask"
+                } else if id == bid.id().to_bytes().as_slice() {
+                    "bid"
+                } else {
+                    "other"
+                }
+            };
+            match event.body.as_ref().and_then(|body| body.kind.as_ref()) {
+                Some(proto::event_body::Kind::OrderStatus(status)) => {
+                    format!(
+                        "{} {:?} {:?}",
+                        name(&status.note_id),
+                        status.state(),
+                        status.reason
+                    )
+                }
+                Some(proto::event_body::Kind::SettlementPending(pending)) => {
+                    let fill = pending.fill.as_ref().map_or(&[][..], |f| &f.note_id[..]);
+                    format!("{} pending", name(fill))
+                }
+                Some(proto::event_body::Kind::SettlementResolved(resolved)) => {
+                    let result = resolved.result.clone().unwrap_or_default();
+                    format!(
+                        "{} resolved committed={} fill={} {:?} {:?}",
+                        name(&result.note_id),
+                        resolved.committed,
+                        resolved.fill.is_some(),
+                        result.status(),
+                        result.reason
+                    )
+                }
+                other => format!("{other:?}"),
+            }
+        })
+        .collect();
+    ensure!(
+        feed == [
+            "ask Live \"\"",
+            "ask pending",
+            "bid Live \"\"",
+            "ask resolved committed=true fill=true Cancelled \"self_trade_prevention\"",
+        ],
+        "the maker's feed: {feed:#?}"
+    );
+    Ok(())
 }
 
 /// The solver's `/metrics` text.

@@ -132,7 +132,7 @@ pub fn verify(conn: &mut PgConnection) -> DbResult<()> {
 /// Views a solver session reads directly, so its own role needs `SELECT` on
 /// each. A view reached only through another view is checked against that
 /// view's owner instead.
-const DIRECTLY_READ_VIEWS: [&str; 2] = ["live_orders", "eligible_orders"];
+const DIRECTLY_READ_VIEWS: [&str; 3] = ["live_orders", "eligible_orders", "eligible_lineages"];
 
 /// Check that this session's role can read the views the solver reads
 /// directly. A migration that adds one needs a grant of its own unless the
@@ -203,7 +203,7 @@ mod tests {
             Ok(acl.contains("\"=r/") || acl.contains(",=r/") || acl.contains("{=r/"))
         };
         assert!(public_reads(conn)?);
-        assert_eq!(revert_last(conn)?, "20261119000001");
+        crate::db::postgres_test::revert_after(conn, "20261114000001")?;
         assert_eq!(revert_last(conn)?, "20261114000001");
         assert!(public_reads(conn)?, "the revert dropped the grant");
         Ok(())
@@ -242,6 +242,7 @@ mod tests {
             )
         );
         conn.batch_execute("ALTER TABLE orders SET (autovacuum_analyze_scale_factor = 0.01)")?;
+        crate::db::postgres_test::revert_after(conn, "20261119000001")?;
         assert_eq!(revert_last(conn)?, "20261119000001");
         let reverted = shape(conn)?;
         assert!(!reverted.indexed);
@@ -249,6 +250,95 @@ mod tests {
             reverted.options.as_deref(),
             Some("{autovacuum_analyze_scale_factor=0.01}")
         );
+        Ok(())
+    }
+
+    /// The self-trade storage migration reverts cleanly: the trigger, the
+    /// function, the view, the columns and the indexes go, and orders keep
+    /// being stored.
+    #[test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL and a local PostgreSQL service"]
+    fn the_stp_storage_migration_reverts_cleanly() -> Result<()> {
+        let mut fixture = TestSchema::migrated()?;
+        let (schema, conn) = (fixture.name.clone(), &mut fixture.conn);
+        crate::db::postgres_test::revert_after(conn, "20261125000001")?;
+        #[derive(QueryableByName)]
+        struct Left {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let left = |conn: &mut PgConnection| -> Result<i64> {
+            Ok(diesel::sql_query(format!(
+                "SELECT (SELECT count(*) FROM pg_trigger
+                         WHERE tgrelid = '{schema}.orders'::regclass
+                           AND tgname = 'orders_fill_maker_id')
+                      + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                         WHERE n.nspname = '{schema}' AND p.proname = 'orders_fill_maker_id')
+                      + (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = '{schema}'
+                           AND c.relname IN ('eligible_lineages', 'maker_lineages_seq_idx',
+                                             'maker_lineages_pending_group_idx', 'orders_maker_open_idx'))
+                      + (SELECT count(*) FROM information_schema.columns
+                         WHERE table_schema = '{schema}'
+                           AND (table_name, column_name) IN (
+                               ('orders', 'maker_id'), ('maker_stops', 'source'),
+                               ('maker_stops', 'caused_by_lineage'),
+                               ('maker_lineages', 'offered_amount'),
+                               ('maker_lineages', 'requested_amount'))) AS count"
+            ))
+            .get_result::<Left>(conn)?
+            .count)
+        };
+        assert_eq!(left(conn)?, 1 + 1 + 4 + 5);
+        let lineage_options = |conn: &mut PgConnection| -> Result<Option<String>> {
+            #[derive(QueryableByName)]
+            struct Options {
+                #[diesel(sql_type = Nullable<Text>)]
+                options: Option<String>,
+            }
+            Ok(diesel::sql_query(format!(
+                "SELECT reloptions::text AS options FROM pg_class
+                 WHERE oid = '{schema}.maker_lineages'::regclass"
+            ))
+            .get_result::<Options>(conn)?
+            .options)
+        };
+        assert_eq!(
+            lineage_options(conn)?.as_deref(),
+            Some(
+                "{autovacuum_vacuum_scale_factor=0.01,autovacuum_vacuum_threshold=1000,\
+                 vacuum_index_cleanup=on,log_autovacuum_min_duration=0}"
+            )
+        );
+        // Amounts come in pairs; only a self-trade stop names its cause.
+        conn.batch_execute("BEGIN")?;
+        rejects(
+            conn,
+            "INSERT INTO makers (name) VALUES ('m');
+             INSERT INTO maker_commands (maker_id, request_id, seq, kind, payload, result)
+             SELECT maker_id, 'r', 1, 'submit', '\\x00', '' FROM makers;
+             INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
+                                         offered_amount)
+             SELECT '\\x01', maker_id, 'r', 1, '\\x02', 5 FROM makers",
+        )?;
+        for source in ["'maker'", "NULL"] {
+            rejects(
+                conn,
+                &format!(
+                    "INSERT INTO makers (name) VALUES ('m');
+                     INSERT INTO maker_stops (maker_id, lineage_id, source, caused_by_lineage)
+                     SELECT maker_id, '\\x01', {source}, '\\x02' FROM makers"
+                ),
+            )?;
+        }
+        conn.batch_execute("ROLLBACK")?;
+        assert_eq!(revert_last(conn)?, "20261125000001");
+        assert_eq!(left(conn)?, 0);
+        assert_eq!(lineage_options(conn)?, None);
+        conn.batch_execute(
+            "INSERT INTO orders (note_id, raw_data, arrival_unix, status, priority_seq, lineage_id)
+             VALUES ('\\x01', '\\x01', 1, 'active', 1, '\\x02')",
+        )?;
         Ok(())
     }
 
@@ -290,6 +380,20 @@ mod tests {
         );
         conn.batch_execute(&format!(
             "GRANT SELECT ON {schema}.eligible_orders TO {role}"
+        ))?;
+        let refused = as_role(conn)?.expect_err("eligible_lineages is not granted");
+        assert!(
+            matches!(
+                refused,
+                DbError::Unreadable {
+                    relation: "eligible_lineages",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        conn.batch_execute(&format!(
+            "GRANT SELECT ON {schema}.eligible_lineages TO {role}"
         ))?;
         as_role(conn)??;
         conn.batch_execute("ROLLBACK")?;

@@ -347,3 +347,157 @@ fn no_code_deletes_a_lineage_claim() {
         }
     }
 }
+
+/// A stop row: lineage, source and cause.
+type StopRow = (Vec<u8>, Option<String>, Option<Vec<u8>>);
+
+/// Every stop row: lineage, source and cause.
+fn stop_rows(conn: &mut PgConnection) -> Result<Vec<StopRow>> {
+    use super::postgres_schema::maker_stops;
+    Ok(maker_stops::table
+        .select((
+            maker_stops::lineage_id,
+            maker_stops::source,
+            maker_stops::caused_by_lineage,
+        ))
+        .order(maker_stops::lineage_id)
+        .load(conn)?)
+}
+
+/// Every stop is written with who wrote it, once: a later stop of the same
+/// lineage changes nothing and is not reported as new.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn every_stop_records_its_source_once() -> Result<()> {
+    use super::maker_db::{Close, Stop, StopSource};
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    let notes: Vec<Note> = (1..=4).map(|s| order(s, Side::Sell, 50, 100)).collect();
+    for (index, note) in notes.iter().enumerate() {
+        submit(conn, alpha, 1 + index as u64, note, true)?;
+    }
+    run(
+        conn,
+        alpha,
+        10,
+        &MakerCommand::CancelOrder {
+            lineage_id: lineage_of(&notes[0]),
+        },
+        false,
+    )?;
+    let capped = maker_db::pending_submissions_tx(conn)?
+        .into_iter()
+        .find(|s| s.note.id() == notes[1].id())
+        .unwrap();
+    conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::close_unconfirmed_tx(conn, [&capped], Close::NoteNotReceived)
+    })?;
+    conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::lock_makers_ordered_tx(conn, &[alpha])?;
+        maker_db::cancel_self_trades_tx(conn, &[id(&notes[2]), id(&notes[0])])
+    })?;
+    conn.transaction::<_, DbError, _>(maker_db::cancel_unconfirmed_tx)?;
+    let row = |note: &Note, source: &str| (lineage_of(note), Some(source.to_owned()), None);
+    let mut expected = vec![
+        row(&notes[0], "maker"),
+        row(&notes[1], "cap"),
+        row(&notes[2], "stp_reservation"),
+        row(&notes[3], "escape_hatch"),
+    ];
+    expected.sort();
+    assert_eq!(stop_rows(conn)?, expected);
+
+    // A second stop, by anyone, keeps the first and is not new.
+    let again = conn.transaction::<_, DbError, _>(|conn| {
+        let first = lineage_of(&notes[0]);
+        let other = lineage_of(&notes[3]);
+        maker_db::stop_lineages_tx(
+            conn,
+            &[
+                Stop {
+                    maker_id: alpha,
+                    lineage_id: &first,
+                    source: StopSource::StpOnSubmit,
+                    caused_by: Some(&other),
+                },
+                Stop {
+                    maker_id: alpha,
+                    lineage_id: &first,
+                    source: StopSource::Maker,
+                    caused_by: None,
+                },
+            ],
+        )
+    })?;
+    assert!(again.is_empty());
+    assert_eq!(stop_rows(conn)?, expected);
+
+    // The same new stop twice in one call (the hatch can name a lineage
+    // twice): one row, returned once.
+    let fresh = order(5, Side::Sell, 50, 100);
+    submit(conn, alpha, 20, &fresh, true)?;
+    let lineage = lineage_of(&fresh);
+    let twice = conn.transaction::<_, DbError, _>(|conn| {
+        let stop = Stop {
+            maker_id: alpha,
+            lineage_id: &lineage,
+            source: StopSource::Maker,
+            caused_by: None,
+        };
+        maker_db::stop_lineages_tx(conn, &[stop, stop])
+    })?;
+    assert_eq!(twice, [lineage.clone()].into_iter().collect());
+    expected.push(row(&fresh, "maker"));
+
+    // A self-trade stop at submit records the newer order that caused it.
+    let older = order(6, Side::Sell, 50, 100);
+    submit(conn, alpha, 21, &older, true)?;
+    let (lineage, cause) = (lineage_of(&older), lineage_of(&notes[3]));
+    conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::stop_lineages_tx(
+            conn,
+            &[Stop {
+                maker_id: alpha,
+                lineage_id: &lineage,
+                source: StopSource::StpOnSubmit,
+                caused_by: Some(&cause),
+            }],
+        )
+    })?;
+    expected.push((lineage, Some("stp_on_submit".to_owned()), Some(cause)));
+    expected.sort();
+    assert_eq!(stop_rows(conn)?, expected);
+    Ok(())
+}
+
+/// Stops are written in chunks: every chunk's rows are stored and returned,
+/// and a repeat in a later chunk is not new.
+#[test]
+#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+fn stops_past_one_chunk_are_all_written_once() -> Result<()> {
+    use super::maker_db::{Stop, StopSource};
+    use super::postgres_db::INSERT_CHUNK_ROWS;
+    let mut fixture = TestSchema::migrated()?;
+    let conn = &mut fixture.conn;
+    let alpha = maker(conn, "alpha")?;
+    // No claims needed: a stop row refers to its maker only.
+    let mut lineages: Vec<Vec<u8>> = (0..=INSERT_CHUNK_ROWS as u32)
+        .map(|n| n.to_be_bytes().to_vec())
+        .collect();
+    lineages.push(lineages[0].clone());
+    let stops: Vec<Stop> = lineages
+        .iter()
+        .map(|lineage_id| Stop {
+            maker_id: alpha,
+            lineage_id,
+            source: StopSource::Maker,
+            caused_by: None,
+        })
+        .collect();
+    let stopped =
+        conn.transaction::<_, DbError, _>(|conn| maker_db::stop_lineages_tx(conn, &stops))?;
+    assert_eq!(stopped.len(), INSERT_CHUNK_ROWS + 1);
+    assert_eq!(stop_rows(conn)?.len(), INSERT_CHUNK_ROWS + 1);
+    Ok(())
+}

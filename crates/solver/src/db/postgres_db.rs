@@ -28,7 +28,7 @@ use miden_protocol::block::BlockNumber;
 
 /// Rows per multi-row INSERT. The widest row (a remainder order) binds eight
 /// parameters, far below PostgreSQL's 65,535-parameter statement limit.
-const INSERT_CHUNK_ROWS: usize = 1_000;
+pub(super) const INSERT_CHUNK_ROWS: usize = 1_000;
 
 pub fn get_last_fetched_block_tx(conn: &mut PgConnection) -> DbResult<u64> {
     let block: i64 = sync_state::table

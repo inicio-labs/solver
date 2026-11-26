@@ -48,20 +48,13 @@ Limits are fee-inclusive and exact: a sell offering `X` for `Y` trades at `P ≥
 
 Cost per pair and round: one index seek per side plus at most `2 × max_orders_per_side` steps.
 
-### Self-trade prevention while pricing (rule B)
+### Self-trade prevention while pricing (rule B, removed)
 
-A maker's own crossed orders must not set the price. When the walk first reaches a maker's order, it decides that maker once:
-- take the maker's active orders on the pair that could trade inside the band (bids at or above `L`, asks at or below `H`);
-- for every bid and ask of the maker that clash (bid at or above ask), the **older** order sits out (age = `root_seq`). A newer order counts as newer even when it sits out itself;
-- sit-outs are skipped and take no slot.
-
-At any single price this was ADR 0005's decision; that rule is removed. A maker's orders that cross at their submitted prices are now cancelled at submit ([ADR 0009](0009-self-trade-prevention-at-submit.md)), so rule B meets only the pairs rounding leaves slightly crossed on nearly filled remainders (#93). The maker's normal two-sided quote (bid below ask) clashes with nothing and is never touched.
-
-Without it, a maker could pump the price at no cost: a tiny ask at +25 bps and a tiny bid at +26 bps form a pair the walk would count, and the walk's last pair would set `P` at +25 bps for every buyer. Self-trade prevention at submit cancels the older order of such a pair; rule B keeps any pair that remains from setting the price. With rule B the same book clears at the maker's real ask.
+Rule B sat out the older order of every bid and ask of one maker that clashed inside the band, so a maker's own crossed pair could not set the price (a tiny ask at +25 bps and a tiny bid at +26 bps would otherwise set `P` at +25 bps for every buyer). It is removed: a maker's orders that cross at their submitted prices are cancelled at submit ([ADR 0009](0009-self-trade-prevention-at-submit.md)), so the walk does not look at makers. The one exception is accepted: a pair that rounding leaves slightly crossed on a nearly filled remainder can set the price, as it can already fill itself ([#93](https://github.com/inicio-labs/solver/issues/93)).
 
 ### Admission: unchanged
 
-Admission and matching run at the chosen price exactly as before. Since ADR 0005 was removed, admission does not look at makers: their crossing orders are cancelled at submit (ADR 0009). The walk's sit-outs are not reused (see the consequences).
+Admission and matching run at the chosen price exactly as before. Since ADR 0005 was removed, admission does not look at makers: their crossing orders are cancelled at submit (ADR 0009).
 
 ### Fallback to the mid
 
@@ -73,7 +66,7 @@ admission + matching at P trade nothing
 otherwise                                     → P
 ```
 
-When `P = M` matching runs once. The fallback keeps every pair trading wherever today's rule trades, for example when rule B sits out a maker's stale order that today's rule would still let trade at the mid.
+When `P = M` matching runs once. The fallback keeps every pair trading wherever today's rule trades.
 
 ### Configuration and observability
 
@@ -81,9 +74,9 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 - `[[pairs]] quote_ttl_ms`: the pair's own quote freshness, else `binance.quote_ttl_ms`. Both the matcher and the price API judge a pair by it.
 - `[[pairs]] reference_amount`: the size `/v2/pair-price` quotes at on a pair with a band, in whole `asset_y` tokens; required when `band_bps` is above 0.
 - Startup logs each pair's band, TTL and reference amount.
-- The price API runs the same walk on its mirror of the book's levels, with one probe order added: the reference amount for `/v2/pair-price`, the order being checked for `/v2/swap-eta`, which is then judged at that price. Levels carry no maker identity, so the API's walk has no self-trade prevention, and a level counts as one order toward the cap (issue #64).
-- Metrics: `solver_matcher_bounded_off_mid_total`, `solver_matcher_bounded_fallback_total{reason}` (`walk_found_nothing`, `nothing_at_price`, `walk_error`), `solver_matcher_walk_sit_outs_total`, `solver_matcher_walk_benched_filled_total`.
-- A pair that clears off the mid logs the mid, `P`, the distance in bps, `s*`, `d*`, the walk's volume, its stop reason, the sit-outs and the order that set the price.
+- The price API runs the same walk on its mirror of the book's levels, with one probe order added: the reference amount for `/v2/pair-price`, the order being checked for `/v2/swap-eta`, which is then judged at that price. The matcher's walk does not look at makers either, so both walk the same orders; a level counts as one order toward the cap (issue #64).
+- Metrics: `solver_matcher_bounded_off_mid_total`, `solver_matcher_bounded_fallback_total{reason}` (`walk_found_nothing`, `nothing_at_price`, `walk_error`).
+- A pair that clears off the mid logs the mid, `P`, the distance in bps, `s*`, `d*`, the walk's volume, its stop reason and the order that set the price.
 
 ## Consequences
 
@@ -94,7 +87,6 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 - **Known gaps, deferred to #62:**
   - no collar: with thin makers the batch price can reach the band edge through a small extra ask placed there;
   - an all-or-nothing order can leave the walk on the mid while nothing executes there;
-  - a maker can bench its own ask with a dust bid and still fill it first at the higher price; `solver_matcher_walk_benched_filled_total` counts this, and reusing the walk's sit-outs at admission would close it. Self-trade prevention at submit now cancels the older of such a bid and ask, so only a rounding-crossed remainder (#93) can do it.
 
 ## Alternatives considered
 
@@ -102,12 +94,12 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 - **Midpoint of the max-volume range** (some derivatives venues). Moves the price half-way into the range even when the mid trades the same volume.
 - **Multi-step call-auction tie-breaks** (surplus, then market pressure, then a reference price, as some cash equity auctions do). More rules, and on our simulated books no better for users than "closest to the mid".
 - **Most surplus (CoW style).** The surplus depends on how far orders' limits are from the price, so wide limits pull the price toward them.
-- **No self-trade prevention while pricing.** Simpler, and identical on normal books, but it lets a maker set the price with its own crossed pair (see rule B).
+- **No self-trade prevention while pricing.** Simpler, and identical on normal books, but it let a maker set the price with its own crossed pair. Chosen once self-trade prevention at submit (ADR 0009) cancelled such pairs before they reach the book (see rule B, removed).
 - **Strict fallback (strictly more volume than the mid).** Safer on all-or-nothing books, but more complex; the simple fallback was chosen.
 
 ## Verification
 
 - A Python reference model of this design: hand-written cases for blocking, wrong sit-outs or cancels, and the band's edges, plus property runs on random books. Prices never leave the band, no fill crosses its own limit, no maker fills on both sides, and nothing freezes where today trades.
-- Rust tests: the walk against a brute-force oracle on 2,000 random books (every candidate price, rule B applied pair by pair), the named books from the design review, matcher tests for the band and both fallbacks, and every existing matcher test unchanged with band 0. Four deliberate mutations of the walk each fail several tests.
+- Rust tests: the walk against a brute-force oracle on 2,000 random books (every candidate price), the named books from the design review, matcher tests for the band and both fallbacks, and every existing matcher test unchanged with band 0. Four deliberate mutations of the walk each fail several tests.
 - An integration test on the mock chain (`integration_bounded_price`): a maker's ask 20 bps above the mid never settles without a band and settles at its own limit with one, with exact payback amounts.
 - Scenarios on the mock chain with real orders and the price API (`integration_bounded_price_scenarios`): both band edges, an ask just past the edge, a Binance move into the band, a remainder in the next batch, the fallback to the mid with all-or-nothing orders, a fee, a banded and an unbanded pair, a partial fill at its own limit, and a random book checked for limits, the band and conservation.

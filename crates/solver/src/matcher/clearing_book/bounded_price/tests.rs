@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
 
 use miden_protocol::crypto::rand::RandomCoin;
 use miden_protocol::testing::account_id::{
@@ -11,6 +11,8 @@ use rust_decimal::Decimal;
 
 use super::super::tests::{fixture, tagged};
 use super::*;
+use crate::clearing::bounded::{buy_limit, compare, sell_limit};
+use crate::maker::MakerId;
 
 fn base() -> TokenId {
     ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
@@ -36,7 +38,6 @@ struct Book {
     book: ClearingBook,
     rng: RandomCoin,
     priority: u64,
-    names: HashMap<NoteId, &'static str>,
 }
 
 impl Book {
@@ -45,13 +46,13 @@ impl Book {
             book: ClearingBook::default(),
             rng: RandomCoin::new(Word::default()),
             priority: 0,
-            names: HashMap::new(),
         }
     }
 
+    /// `_name` labels the order for the reader only.
     fn add(
         &mut self,
-        name: &'static str,
+        _name: &'static str,
         buy: bool,
         tenths: i64,
         lots: u64,
@@ -70,7 +71,6 @@ impl Book {
             None => order,
         };
         self.book.insert_or_skip(&order);
-        self.names.insert(order.id(), name);
         order.id()
     }
 
@@ -99,12 +99,6 @@ impl Book {
             .bounded_price(base(), quote(), mid(), band_bps, fee_ppm, cap)
             .unwrap()
     }
-
-    fn named(&self, ids: &[NoteId]) -> Vec<&'static str> {
-        let mut names: Vec<_> = ids.iter().map(|id| self.names[id]).collect();
-        names.sort_unstable();
-        names
-    }
 }
 
 const BUY: bool = true;
@@ -132,10 +126,6 @@ fn more_buyers_clear_at_the_makers_ask() {
     let walk = book.walk(30).unwrap();
     assert_eq!(walk.price, at(65));
     assert_eq!(walk.price_setter, Some(ask));
-    assert!(
-        walk.sit_outs.is_empty(),
-        "a two-sided quote sits nothing out"
-    );
 }
 
 #[test]
@@ -191,110 +181,32 @@ fn the_fee_counts_toward_the_band() {
     assert!(book.walk_with(30, 1_000, usize::MAX).is_none());
 }
 
-/// The example walked through with Vaibhav: maker M's old bid at +12 bps
-/// clashes with its newer ask at +6.5, so the old bid sits out; its new bid
-/// at -6.5 clashes with nothing and stays.
+/// A maker's own crossed pair counts like any other orders: the walk does
+/// not look at makers. Self-trade prevention at submit cancels such a pair
+/// before it reaches the book (ADR 0009), except a pair that rounding leaves
+/// slightly crossed on a nearly filled remainder, which can set the price:
+/// the known limitation in #93.
 #[test]
-fn rule_b_sits_out_the_stale_bid_and_keeps_the_quote() {
-    let mut book = Book::new();
-    book.user("A sells", SELL, -40, 2);
-    let ask = book.maker("M ask #3", 1, 3, SELL, 65, 4);
-    book.user("B buys", BUY, 400, 4);
-    book.maker("M old bid #1", 1, 1, BUY, 120, 3);
-    book.maker("M new bid #2", 1, 2, BUY, -65, 3);
-    let walk = book.walk(30).unwrap();
-    assert_eq!(book.named(&walk.sit_outs), ["M old bid #1"]);
-    assert_eq!(walk.price, at(65));
-    assert_eq!(walk.price_setter, Some(ask));
-    // All of B's 4 lots at its +40 bps limit, in quote units.
-    assert_eq!(walk.volume, U256::from(2 * 100_400 * 4u64));
-    assert_eq!(walk.stop, WalkStop::NoLongerCrossing);
-}
-
-/// Without rule B a maker's own tiny crossed pair (ask +25, bid +26) would
-/// set the price for every buyer at +25. With it, the price stays at the
-/// real ask, +8.
-#[test]
-fn a_makers_own_crossed_pair_cannot_pump_the_price() {
+fn a_makers_crossed_pair_counts_like_any_other_orders() {
     let mut book = Book::new();
     book.maker("Y ask +25 #1", 1, 1, SELL, 250, 1);
     book.maker("Y bid +26 #2", 1, 2, BUY, 260, 1);
     book.maker("Y ask +8 #3", 1, 3, SELL, 80, 3);
     book.user("users", BUY, 400, 3);
     let walk = book.walk(30).unwrap();
-    assert_eq!(walk.price, at(80));
-    assert_eq!(book.named(&walk.sit_outs), ["Y ask +25 #1", "Y bid +26 #2"]);
+    assert_eq!(walk.price, at(250));
 }
 
-/// Pragma's B1 → S1 → B2 → B3, every bid above the ask: B2 and B3 trade,
-/// B1 and S1 sit out.
-#[test]
-fn b1_s1_b2_b3() {
-    let mut book = Book::new();
-    book.maker("B1", 1, 1, BUY, 20, 1);
-    book.maker("S1", 1, 2, SELL, 10, 1);
-    book.maker("B2", 1, 3, BUY, 30, 1);
-    book.maker("B3", 1, 4, BUY, 40, 1);
-    book.user("seller", SELL, -50, 5);
-    let walk = book.walk(30).unwrap();
-    assert_eq!(book.named(&walk.sit_outs), ["B1", "S1"]);
-    // The seller below the mid meets the kept bids above it: the mid.
-    assert_eq!(walk.price, mid());
-}
-
-#[test]
-fn users_and_other_makers_never_sit_out() {
-    let mut book = Book::new();
-    book.maker("X bid", 1, 1, BUY, 20, 1);
-    book.maker("Y ask", 2, 1, SELL, 10, 1);
-    book.user("user bid", BUY, 20, 1);
-    book.user("user ask", SELL, 10, 1);
-    let walk = book.walk(30).unwrap();
-    assert!(walk.sit_outs.is_empty());
-    assert_eq!(walk.volume, U256::from(2 * 2 * LOT));
-}
-
-/// A clash only on paper: the newer ask is above the band, so it can never
-/// trade there, and the older bid above it stays.
-#[test]
-fn a_clash_outside_the_band_benches_nothing() {
-    let mut book = Book::new();
-    book.maker("bid", 1, 1, BUY, 450, 1);
-    book.maker("ask above the band", 1, 2, SELL, 400, 1);
-    book.user("seller", SELL, -50, 1);
-    let walk = book.walk(30).unwrap();
-    assert!(walk.sit_outs.is_empty());
-    assert_eq!(walk.price, mid());
-}
-
-/// Orders in flight are off the index and do not count for rule B either.
+/// Orders in flight are off the index and do not count.
 #[test]
 fn an_order_in_flight_is_ignored() {
     let mut book = Book::new();
-    let stale = book.maker("old bid", 1, 1, BUY, 20, 1);
+    let in_flight = book.user("bid in flight", BUY, 200, 1);
     book.maker("ask", 1, 2, SELL, 10, 1);
     book.user("buyer", BUY, 20, 1);
-    book.book.deactivate(stale);
+    book.book.deactivate(in_flight);
     let walk = book.walk(30).unwrap();
-    assert!(walk.sit_outs.is_empty());
     assert_eq!(walk.price, at(10));
-}
-
-/// Sat-out orders take no slot: with room for two orders a side, five stale
-/// bids do not crowd out the users.
-#[test]
-fn sit_outs_take_no_slot() {
-    let mut book = Book::new();
-    for seq in 1..=5 {
-        book.maker("stale bid", 1, seq, BUY, 20, 1);
-    }
-    book.maker("new ask", 1, 6, SELL, 10, 1);
-    book.user("seller", SELL, -10, 1);
-    book.user("buyer", BUY, 5, 1);
-    let walk = book.walk_with(30, 0, 2).unwrap();
-    assert_eq!(walk.sit_outs.len(), 5);
-    assert_eq!(walk.price, mid());
-    assert_eq!(walk.volume, U256::from(2 * LOT));
 }
 
 #[test]
@@ -307,18 +219,6 @@ fn the_order_cap_stops_the_walk() {
     let walk = book.walk_with(30, 0, 2).unwrap();
     assert_eq!(walk.stop, WalkStop::OrderCap);
     assert_eq!(walk.volume, U256::from(2 * 2 * LOT));
-}
-
-/// A bid and an ask never share a sequence; if they did, the ask counts as
-/// newer.
-#[test]
-fn an_equal_sequence_counts_the_ask_as_newer() {
-    let mut book = Book::new();
-    book.maker("bid", 1, 1, BUY, 20, 1);
-    book.maker("ask", 1, 1, SELL, 10, 1);
-    book.user("buyer", BUY, 50, 1);
-    let walk = book.walk(30).unwrap();
-    assert_eq!(book.named(&walk.sit_outs), ["bid"]);
 }
 
 /// ETH (18 decimals) against USDT (6): one USDT unit buys 4·10^8 wei at
@@ -402,12 +302,11 @@ fn limits_are_the_eligibility_thresholds() {
 }
 
 /// Random books against a brute-force oracle: every candidate price inside
-/// the band, its volume with rule B applied pair by pair, the most volume,
-/// then the price closest to the mid.
+/// the band, its volume, the most volume, then the price closest to the mid.
 #[test]
 fn the_walk_matches_a_brute_force_oracle() {
     let mut rng = StdRng::seed_from_u64(7);
-    let (mut off_mid, mut with_sit_outs) = (0, 0);
+    let mut off_mid = 0;
     for round in 0..2_000 {
         let mut book = Book::new();
         let mut orders = Vec::new();
@@ -447,23 +346,6 @@ fn the_walk_matches_a_brute_force_oracle() {
         let band = 30;
         let (low, high) = (at(-300), at(300));
         let le = |a: BatchPrice, b: BatchPrice| compare(a, b).unwrap() != Ordering::Greater;
-        // Rule B, pair by pair.
-        let mut sat_out = HashSet::new();
-        for bid in &orders {
-            for ask in &orders {
-                let (Some((maker_b, seq_b)), Some((maker_a, seq_a))) = (bid.4, ask.4) else {
-                    continue;
-                };
-                if !(bid.1 && !ask.1 && maker_b == maker_a) {
-                    continue;
-                }
-                let (bid_limit, ask_limit) = (at(bid.2), at(ask.2));
-                let in_play = le(low, bid_limit) && le(ask_limit, high);
-                if in_play && le(ask_limit, bid_limit) {
-                    sat_out.insert(if seq_b > seq_a { ask.0 } else { bid.0 });
-                }
-            }
-        }
         // In quote at the mid: a sell's base times 2, a buy's quote.
         let size = |buy: bool, tenths: i64, lots: u64| {
             if buy {
@@ -476,7 +358,7 @@ fn the_walk_matches_a_brute_force_oracle() {
             let side = |buy: bool| -> u64 {
                 orders
                     .iter()
-                    .filter(|order| order.1 == buy && !sat_out.contains(&order.0))
+                    .filter(|order| order.1 == buy)
                     .filter(|order| {
                         if buy {
                             le(price, at(order.2))
@@ -517,25 +399,16 @@ fn the_walk_matches_a_brute_force_oracle() {
         );
         if let Some(walk) = walk {
             assert_eq!(walk.volume, U256::from(best), "round {round}");
-            assert!(
-                walk.sit_outs.iter().all(|id| sat_out.contains(id)),
-                "round {round}"
-            );
             off_mid += usize::from(walk.price != mid());
-            with_sit_outs += usize::from(!walk.sit_outs.is_empty());
         }
     }
-    // The books exercise what matters: prices off the mid, and rule B.
-    assert!(
-        off_mid > 200 && with_sit_outs > 100,
-        "{off_mid} off the mid, {with_sit_outs} with sit-outs"
-    );
+    // The books exercise what matters: prices off the mid.
+    assert!(off_mid > 200, "{off_mid} off the mid");
 }
 
-/// The price API walks the matcher's book as levels, without rule B. Each
-/// maker order here has its own maker, so rule B has nothing to sit out, and
-/// both find the same price on random books: grouping equal-rate orders into
-/// a level changes nothing.
+/// The price API walks the matcher's book as levels, by the same rules: both
+/// find the same price on random books, makers' crossed orders included.
+/// Grouping equal-rate orders into a level changes nothing.
 #[test]
 fn the_price_api_walk_on_levels_matches_the_matcher() {
     use crate::price::{OrderMarket, PairRules};
@@ -550,7 +423,7 @@ fn the_price_api_walk_on_levels_matches_the_matcher() {
             // A few distinct prices, so equal-rate orders share a level.
             let tenths = 50 * rng.random_range(-8..8);
             if rng.random_bool(0.4) {
-                let maker_id = MakerId::try_from(round * 100 + rounds).unwrap();
+                let maker_id = rng.random_range(1..3);
                 book.maker(
                     "maker",
                     maker_id,

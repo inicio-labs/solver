@@ -81,11 +81,6 @@ impl Order {
         self.maker.is_none()
     }
 
-    /// The maker that claimed this order, and its submit sequence.
-    pub(crate) fn maker_tag(&self) -> Option<MakerTag> {
-        self.maker
-    }
-
     pub fn id(&self) -> NoteId {
         self.note.id()
     }

@@ -2,12 +2,10 @@
 //! ([`crate::clearing::bounded`]) fed with the pair's orders, cheapest sell
 //! and highest buy first, straight from the book's index.
 //!
-//! A maker whose own bid and ask clash has the older order of every clashing
-//! pair sat out while pricing (rule B), so orders that will never trade
-//! cannot set the price. Such pairs are cancelled at submit (ADR 0009); rule
-//! B covers the ones rounding leaves on nearly filled remainders (#93).
+//! A maker's own crossing orders are cancelled at submit (ADR 0009), so the
+//! walk does not look at makers. A pair that rounding leaves slightly crossed
+//! on a nearly filled remainder can set the price: a known limitation (#93).
 
-use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
 
 use miden_protocol::note::NoteId;
@@ -15,9 +13,8 @@ use ruint::aliases::U256;
 
 use super::ClearingBook;
 pub(crate) use crate::clearing::bounded::WalkStop;
-use crate::clearing::bounded::{self, buy_limit, compare, sell_limit, Band, Leg, Legs};
+use crate::clearing::bounded::{self, Band, Leg, Legs};
 use crate::clearing::{BatchPrice, ClearingError, OrderKey, OrderSide};
-use crate::maker::MakerId;
 use crate::types::TokenId;
 
 /// The walk's price and what produced it.
@@ -33,32 +30,24 @@ pub(crate) struct BoundedPrice {
     pub(crate) stop: WalkStop,
     /// The order whose limit is the price; `None` when the price is the mid.
     pub(crate) price_setter: Option<NoteId>,
-    /// Maker orders that rule B sat out while pricing.
-    pub(crate) sit_outs: Vec<NoteId>,
 }
 
 /// One side of the pair's index, best first.
 type Ids<'a> = std::iter::Flatten<std::option::IntoIter<btree_map::Values<'a, OrderKey, NoteId>>>;
 
-/// The pair's orders as the walk's legs, with rule B decided per maker the
-/// first time the walk meets one of its orders.
+/// The pair's orders as the walk's legs, best first.
 struct BookLegs<'a> {
     book: &'a ClearingBook,
     sells: Ids<'a>,
     buys: Ids<'a>,
-    base: TokenId,
-    quote: TokenId,
     band: Band,
     fee_ppm: u32,
-    /// Rule B per maker the walk has met: a pair has a handful of makers.
-    decided: Vec<(MakerId, Vec<NoteId>)>,
 }
 
 impl ClearingBook {
     /// The pair's bounded price at `mid` with a band of `band_bps` each side,
     /// or `None` when nothing crosses inside the band. At most
-    /// `max_orders_per_side` orders count on each side; sat-out orders take no
-    /// slot.
+    /// `max_orders_per_side` orders count on each side.
     pub(in crate::matcher) fn bounded_price(
         &self,
         base: TokenId,
@@ -80,11 +69,8 @@ impl ClearingBook {
             book: self,
             sells: ids((base, quote)),
             buys: ids((quote, base)),
-            base,
-            quote,
             band,
             fee_ppm,
-            decided: Vec::new(),
         };
         let Some(walked) = bounded::walk(&band, max_orders_per_side, &mut legs)? else {
             return Ok(None);
@@ -96,163 +82,32 @@ impl ClearingBook {
             volume: walked.volume,
             stop: walked.stop,
             price_setter: walked.price_setter,
-            sit_outs: legs.decided.into_iter().flat_map(|(_, out)| out).collect(),
         }))
     }
 }
 
 impl Legs<NoteId> for BookLegs<'_> {
     fn next(&mut self, side: OrderSide) -> Result<Option<Leg<NoteId>>, ClearingError> {
-        loop {
-            let ids = match side {
-                OrderSide::SellBase => &mut self.sells,
-                OrderSide::BuyBase => &mut self.buys,
-            };
-            let Some(&id) = ids.next() else {
-                return Ok(None);
-            };
-            let order = self
-                .book
-                .orders
-                .get(&id)
-                .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
-            if let Some(tag) = order.maker_tag() {
-                let at = match self
-                    .decided
-                    .iter()
-                    .position(|(maker_id, _)| *maker_id == tag.maker_id)
-                {
-                    Some(at) => at,
-                    None => {
-                        let out = self.rule_b(tag.maker_id)?;
-                        self.decided.push((tag.maker_id, out));
-                        self.decided.len() - 1
-                    }
-                };
-                // A sit-out takes no slot: the next order in line moves up.
-                if self.decided[at].1.contains(&id) {
-                    continue;
-                }
-            }
-            let offered = order.offered_asset().amount().as_u64();
-            let requested = order.requested_asset().amount().as_u64();
-            let (fee, mid) = (self.fee_ppm, self.band.mid);
-            return Ok(Some(match side {
-                OrderSide::SellBase => Leg::sell(id, offered, requested, offered, fee, mid)?,
-                OrderSide::BuyBase => Leg::buy(id, offered, requested, offered, fee, mid)?,
-            }));
-        }
-    }
-}
-
-impl BookLegs<'_> {
-    /// Rule B for one maker. Among its active orders on the pair that could
-    /// trade inside the band (bids at or above its bottom, asks at or below
-    /// its top), the older order of every bid and ask that clash (bid at or
-    /// above ask) sits out. A newer order counts as newer even when it sits
-    /// out itself.
-    fn rule_b(&self, maker_id: MakerId) -> Result<Vec<NoteId>, ClearingError> {
-        let (mut bids, mut asks) = (Vec::new(), Vec::new());
-        for id in self
+        let ids = match side {
+            OrderSide::SellBase => &mut self.sells,
+            OrderSide::BuyBase => &mut self.buys,
+        };
+        let Some(&id) = ids.next() else {
+            return Ok(None);
+        };
+        let order = self
             .book
-            .makers
-            .orders_on_pair(maker_id, self.base, self.quote)
-        {
-            // Inactive orders are in flight, not in the book.
-            let Some(order) = self.book.orders.get(&id).filter(|order| order.is_active()) else {
-                continue;
-            };
-            let Some(tag) = order.maker_tag() else {
-                continue;
-            };
-            let (offered, requested) = (order.offered_asset(), order.requested_asset());
-            let tokens = (offered.faucet_id(), requested.faucet_id());
-            let amounts = (offered.amount().as_u64(), requested.amount().as_u64());
-            if tokens == (self.base, self.quote) {
-                let limit = sell_limit(amounts.0, amounts.1, self.fee_ppm)?;
-                if compare(limit, self.band.high)? != Ordering::Greater {
-                    asks.push((limit, tag.root_seq, id));
-                }
-            } else if tokens == (self.quote, self.base) {
-                let limit = buy_limit(amounts.0, amounts.1, self.fee_ppm)?;
-                if compare(limit, self.band.low)? != Ordering::Less {
-                    bids.push((limit, tag.root_seq, id));
-                }
-            }
-        }
-        let (Some(top_bid), Some(low_ask)) = (
-            extreme(bids.iter().map(|bid| bid.0), Ordering::Greater)?,
-            extreme(asks.iter().map(|ask| ask.0), Ordering::Less)?,
-        ) else {
-            return Ok(Vec::new());
-        };
-        // The common case: the maker's quotes don't cross, nothing to sort.
-        if compare(top_bid, low_ask)? == Ordering::Less {
-            return Ok(Vec::new());
-        }
-        // Only orders in the clash zone can clash with anything.
-        let mut zone = Vec::new();
-        for (limit, seq, id) in bids {
-            if compare(limit, low_ask)? != Ordering::Less {
-                zone.push((limit, seq, OrderSide::BuyBase, id));
-            }
-        }
-        for (limit, seq, id) in asks {
-            if compare(limit, top_bid)? != Ordering::Greater {
-                zone.push((limit, seq, OrderSide::SellBase, id));
-            }
-        }
-        // Newest first. A bid and an ask never share a sequence (one per
-        // submit); if one ever did, the ask counts as newer.
-        zone.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| (a.2 == OrderSide::BuyBase).cmp(&(b.2 == OrderSide::BuyBase)))
-        });
-        let (mut lowest_newer_ask, mut highest_newer_bid) = (None, None);
-        let mut sit_out = Vec::new();
-        for (limit, _, side, id) in zone {
-            match side {
-                OrderSide::BuyBase => {
-                    if let Some(ask) = lowest_newer_ask {
-                        if compare(limit, ask)? != Ordering::Less {
-                            sit_out.push(id);
-                        }
-                    }
-                    highest_newer_bid = extreme(
-                        [highest_newer_bid, Some(limit)].into_iter().flatten(),
-                        Ordering::Greater,
-                    )?;
-                }
-                OrderSide::SellBase => {
-                    if let Some(bid) = highest_newer_bid {
-                        if compare(limit, bid)? != Ordering::Greater {
-                            sit_out.push(id);
-                        }
-                    }
-                    lowest_newer_ask = extreme(
-                        [lowest_newer_ask, Some(limit)].into_iter().flatten(),
-                        Ordering::Less,
-                    )?;
-                }
-            }
-        }
-        Ok(sit_out)
+            .orders
+            .get(&id)
+            .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
+        let offered = order.offered_asset().amount().as_u64();
+        let requested = order.requested_asset().amount().as_u64();
+        let (fee, mid) = (self.fee_ppm, self.band.mid);
+        Ok(Some(match side {
+            OrderSide::SellBase => Leg::sell(id, offered, requested, offered, fee, mid)?,
+            OrderSide::BuyBase => Leg::buy(id, offered, requested, offered, fee, mid)?,
+        }))
     }
-}
-
-/// The highest (`Ordering::Greater`) or lowest (`Ordering::Less`) of `prices`.
-fn extreme(
-    prices: impl IntoIterator<Item = BatchPrice>,
-    keep: Ordering,
-) -> Result<Option<BatchPrice>, ClearingError> {
-    let mut best: Option<BatchPrice> = None;
-    for price in prices {
-        best = match best {
-            Some(current) if compare(price, current)? != keep => Some(current),
-            _ => Some(price),
-        };
-    }
-    Ok(best)
 }
 
 #[cfg(test)]

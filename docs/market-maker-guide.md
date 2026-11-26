@@ -1038,7 +1038,7 @@ Run the self-trade checks in [section 15](#15-checklist-before-going-live) on a 
 
 On a pair with a price band ([ADR 0007](adr/0007-bounded-clearing-price.md)), the round's price is not always the Binance mid. It is the price inside the band that trades the most volume, and among those the one closest to the mid. When users buy more than they sell, your ask can set the price; when they sell more, your bid can. Every fully filled order in the round trades at that one price.
 
-Your crossed orders are also checked before the price is chosen: the older of each of your bids and asks that clash is left out while pricing, so your own crossed pair can never set the price. Your normal two-sided quote is not affected. Crossed pairs exist only through rounding (above): the rule at submit cancels the rest before they reach the book.
+Your own crossed orders are cancelled at submit, so they never set the price. The one exception is a nearly filled remainder that rounding leaves slightly across your other side (above): it can set the price like any other order.
 
 ---
 

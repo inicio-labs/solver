@@ -30,8 +30,6 @@ static PRICE_SKIPS: [AtomicU64; PriceUnavailable::COUNT] =
 static BOUNDED_OFF_MID: AtomicU64 = AtomicU64::new(0);
 static BOUNDED_FALLBACKS: [AtomicU64; MidFallback::COUNT] =
     [const { AtomicU64::new(0) }; MidFallback::COUNT];
-static WALK_SIT_OUTS: AtomicU64 = AtomicU64::new(0);
-static WALK_BENCHED_FILLED: AtomicU64 = AtomicU64::new(0);
 /// Each maker's live orders, published every [`BOOK_GAUGES_EVERY`]. A maker
 /// seen since start stays listed, at 0 once it has none.
 static MAKER_LIVE_ORDERS: LazyLock<Mutex<BTreeMap<MakerId, u64>>> = LazyLock::new(Mutex::default);
@@ -44,7 +42,7 @@ const BOOK_GAUGES_EVERY: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, strum::IntoStaticStr, strum::EnumCount, strum::EnumIter)]
 #[strum(serialize_all = "snake_case")]
 enum MidFallback {
-    /// Nothing crossed inside the band once rule B had sat stale orders out.
+    /// Nothing crossed inside the band.
     WalkFoundNothing,
     /// Admission and matching at the walk's price traded nothing.
     NothingAtPrice,
@@ -134,17 +132,6 @@ pub(crate) fn bounded_fallbacks() -> impl Iterator<Item = (&'static str, u64)> {
             BOUNDED_FALLBACKS[reason as usize].load(Ordering::Relaxed),
         )
     })
-}
-
-/// Maker orders rule B sat out while pricing.
-pub(crate) fn walk_sit_outs() -> u64 {
-    WALK_SIT_OUTS.load(Ordering::Relaxed)
-}
-
-/// Orders the walk sat out that admission still let fill at the walk's
-/// price: the fingerprint of the dust-bid lever (issue #62).
-pub(crate) fn walk_benched_filled() -> u64 {
-    WALK_BENCHED_FILLED.load(Ordering::Relaxed)
 }
 
 /// Worker inputs for pair clearing and optional RFQ routing. Internal clearing
@@ -458,7 +445,6 @@ fn clear_pair_bounded(
             return fallback(MidFallback::WalkError);
         }
     };
-    WALK_SIT_OUTS.fetch_add(walk.sit_outs.len() as u64, Ordering::Relaxed);
     if walk.price == mid {
         return clear_pair_or_log(book, base, quote, mid, config);
     }
@@ -483,14 +469,7 @@ fn clear_pair_bounded(
         }
     };
     BOUNDED_OFF_MID.fetch_add(1, Ordering::Relaxed);
-    let benched_filled = cleared
-        .execution
-        .filled_notes
-        .iter()
-        .filter(|filled| walk.sit_outs.contains(&filled.note_id))
-        .count();
-    WALK_BENCHED_FILLED.fetch_add(benched_filled as u64, Ordering::Relaxed);
-    log_bounded_price(base, quote, mid, &walk, &cleared, benched_filled);
+    log_bounded_price(base, quote, mid, &walk, &cleared);
     Some(cleared.execution)
 }
 
@@ -500,7 +479,6 @@ fn log_bounded_price(
     mid: BatchPrice,
     walk: &BoundedPrice,
     cleared: &Cleared,
-    benched_filled: usize,
 ) {
     tracing::info!(
         %base,
@@ -515,9 +493,7 @@ fn log_bounded_price(
         released_base = cleared.released.base,
         released_quote = cleared.released.quote,
         stop = ?walk.stop,
-        sit_outs = walk.sit_outs.len(),
         price_setter = ?walk.price_setter,
-        benched_filled,
         "pair cleared at its bounded price"
     );
 }
@@ -1104,17 +1080,16 @@ mod tests {
             }
         }
 
-        /// Rule B sits the maker's stale ask out, so the walk finds nothing;
-        /// the mid still trades it, exactly as without a band.
+        /// Nothing crosses inside the band: the walk finds nothing and the
+        /// mid is tried, exactly as without a band.
         #[test]
-        fn when_the_walk_finds_nothing_the_mid_still_trades() {
+        fn when_the_walk_finds_nothing_the_mid_is_tried() {
             let mut book = Book::new();
-            let stale_ask = book.order(SELL, -300, 5, false, Some((7, 1)));
-            book.order(BUY, -190, 5, false, Some((7, 2)));
-            let buyer = book.order(BUY, 20, 5, false, None);
+            book.order(SELL, 300, 5, false, Some((7, 1)));
+            book.order(BUY, -300, 5, false, None);
             assert!(book.walk(30).is_none());
             let before = fallbacks("walk_found_nothing");
-            assert_eq!(book.tick(30, false), sorted(vec![stale_ask, buyer]));
+            assert!(book.tick(30, false).is_empty());
             assert!(fallbacks("walk_found_nothing") > before);
         }
 
@@ -1135,23 +1110,6 @@ mod tests {
             let before = fallbacks("nothing_at_price");
             assert_eq!(book.tick(30, false), sorted(vec![seller, small_buyer]));
             assert!(fallbacks("nothing_at_price") > before);
-        }
-
-        /// Known gap, issue #62: a dust bid benches the maker's own ask in
-        /// the walk, the price rises to the next maker's ask, and the benched
-        /// ask still fills first. The metric counts it.
-        #[test]
-        fn the_dust_bid_lever_shows_in_the_metric() {
-            let mut book = Book::new();
-            let x_ask = book.order(SELL, 50, 50, false, Some((1, 1)));
-            book.order(BUY, 55, 1, false, Some((1, 2)));
-            book.order(SELL, 80, 50, false, Some((2, 1)));
-            book.order(BUY, 500, 60, false, None);
-            let walk = book.walk(30).unwrap();
-            assert_eq!(walk.sit_outs, vec![x_ask]);
-            let before = walk_benched_filled();
-            assert!(book.tick(30, false).contains(&x_ask));
-            assert!(walk_benched_filled() > before);
         }
     }
 

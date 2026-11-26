@@ -130,13 +130,6 @@ fn append_price_metrics(body: &mut String, feed: &FeedMetrics, snapshot: &PriceS
             "solver_matcher_bounded_fallback_total{{reason=\"{reason}\"}} {count}"
         );
     }
-    let _ = writeln!(
-        body,
-        "solver_matcher_walk_sit_outs_total {}\n\
-         solver_matcher_walk_benched_filled_total {}",
-        crate::matcher::walk_sit_outs(),
-        crate::matcher::walk_benched_filled()
-    );
 }
 
 /// How often the node refuses or drops our settlements, and how many inputs
@@ -519,8 +512,6 @@ mod tests {
             "solver_matcher_bounded_fallback_total{reason=\"walk_found_nothing\"} ".to_string(),
             "solver_matcher_bounded_fallback_total{reason=\"nothing_at_price\"} ".to_string(),
             "solver_matcher_bounded_fallback_total{reason=\"walk_error\"} ".to_string(),
-            "solver_matcher_walk_sit_outs_total ".to_string(),
-            "solver_matcher_walk_benched_filled_total ".to_string(),
         ] {
             assert!(body.contains(&line), "missing {line:?} in:\n{body}");
         }

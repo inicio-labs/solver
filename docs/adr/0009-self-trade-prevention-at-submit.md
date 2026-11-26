@@ -68,7 +68,7 @@ Where the result differs from a replay in seq order, or the rule leaves a gap:
 
 1. A cancel sent with a lower seq than its own submit stops that order for good.
 2. A fill can't be undone: an older order can trade before a late newer one arrives.
-3. **Known limitation:** rounding on a nearly filled remainder can leave it slightly across the maker's other side, and this rule doesn't cancel it ([#93](https://github.com/inicio-labs/solver/issues/93)). With ADR 0005 removed nothing does, so the two can fill each other. Rule B of the bounded price (ADR 0007) still keeps such a pair from setting a band price.
+3. **Known limitation:** rounding on a nearly filled remainder can leave it slightly across the maker's other side, and this rule doesn't cancel it ([#93](https://github.com/inicio-labs/solver/issues/93)). With ADR 0005 removed nothing does: the two can fill each other, and on a pair with a band they can set the batch price (rule B of ADR 0007 is removed too).
 4. Lineages claimed before the storage migration never cross. ADR 0005 covered the pairs open before the switch-on until they drained; it was removed only after that (runbook).
 5. Who gets the credit when a maker cancel and a crossing submit race (the final state is the same).
 6. The same note resent with a new request ID and a higher seq gets `already_registered` and keeps its first seq.

@@ -588,9 +588,6 @@ pub fn spawn_gateway_thread(
                 )
                 .with_cap(cfg.unconfirmed_cap);
                 let mut session = pool.intake_session();
-                if cfg.cancel_crossing_on_submit {
-                    session = session.with_self_trade_check();
-                }
                 if cfg.live_at_accept {
                     let height = watcher.synced_height();
                     session =
@@ -609,6 +606,11 @@ pub fn spawn_gateway_thread(
                 workers.spawn_local(async move {
                     run_watcher(watcher, watch_interval, watcher_cancel).await;
                     "watcher"
+                });
+                let (counting_pool, counting_cancel) = (pool.clone(), cancel.clone());
+                workers.spawn(async move {
+                    count_crossed_pairs(counting_pool, counting_cancel).await;
+                    "crossed pairs"
                 });
                 let _ = ready_tx.send(Ok(()));
                 tracing::info!(%addr, "maker gateway listening");
@@ -633,7 +635,35 @@ pub fn spawn_gateway_thread(
     Ok((handle, ready_rx))
 }
 
-/// Keep the server and both workers supervised until shutdown. Dropping a
+/// How often the crossed-pairs gauge is counted.
+const CROSSED_PAIRS_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Count, every few minutes until `cancel`, the crossed pairs of makers' open
+/// orders at their submitted prices (ADR 0009) for `/metrics`. A read-only
+/// query on the open rows; a failure leaves the gauge absent until the next
+/// count.
+async fn count_crossed_pairs(pool: DbPool, cancel: CancellationToken) {
+    loop {
+        match pool.read(maker_db::crossed_open_pairs_tx).await {
+            Ok(pairs) => {
+                if pairs > 0 {
+                    tracing::error!(pairs, "makers' open orders cross at their submitted prices");
+                }
+                metrics::record_crossed_pairs(Some(pairs));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not count crossed maker orders");
+                metrics::record_crossed_pairs(None);
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(CROSSED_PAIRS_INTERVAL) => {}
+        }
+    }
+}
+
+/// Keep the server and its workers supervised until shutdown. Dropping a
 /// JoinSet would abort tasks, including an intake whose blocking DB worker
 /// may already have committed, so every worker is drained after cancellation.
 async fn supervise_gateway<S, E>(
@@ -713,12 +743,6 @@ mod tests {
     }
 
     async fn gateway_with_stream_limit(stream_limit: usize) -> Gateway {
-        gateway_with(stream_limit, false).await
-    }
-
-    /// A gateway whose intake runs self-trade prevention at submit when
-    /// `self_trade` is set.
-    async fn gateway_with(stream_limit: usize, self_trade: bool) -> Gateway {
         let db = TestDb::new().await.unwrap();
         let key = crate::maker::new_api_key();
         let hash = api_key_hash(&key);
@@ -736,11 +760,13 @@ mod tests {
         let (intake, queues) = IntakeSender::new(16, 16);
         let (facts_tx, facts) = mpsc::channel(16);
         let stop = CancellationToken::new();
-        let mut session = db.pool.intake_session();
-        if self_trade {
-            session = session.with_self_trade_check();
-        }
-        tokio::spawn(run_intake(session, queues, facts_tx, 500, stop.clone()));
+        tokio::spawn(run_intake(
+            db.pool.intake_session(),
+            queues,
+            facts_tx,
+            500,
+            stop.clone(),
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let events = EventWake::default();
@@ -1237,7 +1263,6 @@ mod tests {
             stream: TEST_STREAM,
             settlement_buffer: Duration::ZERO,
             live_at_accept: false,
-            cancel_crossing_on_submit: false,
             unconfirmed_cap: Default::default(),
         };
         // No node answers here: watcher rounds fail and are retried.
@@ -1493,7 +1518,7 @@ mod tests {
         stop.cancel();
     }
 
-    /// With the check on, a submit far below its maker's history on the pair
+    /// A submit far below its maker's history on the pair
     /// is refused with FAILED_PRECONDITION: on a retry and by GetCommand too,
     /// and counted under that code.
     #[tokio::test]
@@ -1508,7 +1533,7 @@ mod tests {
             stop,
             calls,
             ..
-        } = gateway_with(MAX_EVENT_STREAMS, true).await;
+        } = gateway().await;
         let order = pswap_note(1);
         let keys = crate::types::OrderKeys::from_note(&order).unwrap();
         db.pool

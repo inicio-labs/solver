@@ -2,10 +2,10 @@
 //! ([`crate::clearing::bounded`]) fed with the pair's orders, cheapest sell
 //! and highest buy first, straight from the book's index.
 //!
-//! With self-trade prevention on, a maker whose own bid and ask clash first
-//! has the older order of every clashing pair sat out (rule B), so orders
-//! that will never trade cannot set the price. Admission still applies ADR
-//! 0005 at the price the walk returns.
+//! A maker whose own bid and ask clash has the older order of every clashing
+//! pair sat out while pricing (rule B), so orders that will never trade
+//! cannot set the price. Such pairs are cancelled at submit (ADR 0009); rule
+//! B covers the ones rounding leaves on nearly filled remainders (#93).
 
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap};
@@ -50,7 +50,6 @@ struct BookLegs<'a> {
     quote: TokenId,
     band: Band,
     fee_ppm: u32,
-    self_trade_prevention: bool,
     /// Rule B per maker the walk has met: a pair has a handful of makers.
     decided: Vec<(MakerId, Vec<NoteId>)>,
 }
@@ -59,9 +58,7 @@ impl ClearingBook {
     /// The pair's bounded price at `mid` with a band of `band_bps` each side,
     /// or `None` when nothing crosses inside the band. At most
     /// `max_orders_per_side` orders count on each side; sat-out orders take no
-    /// slot. Without `self_trade_prevention` nothing sits out, as admission
-    /// then skips ADR 0005.
-    #[allow(clippy::too_many_arguments)]
+    /// slot.
     pub(in crate::matcher) fn bounded_price(
         &self,
         base: TokenId,
@@ -70,7 +67,6 @@ impl ClearingBook {
         band_bps: u16,
         fee_ppm: u32,
         max_orders_per_side: usize,
-        self_trade_prevention: bool,
     ) -> Result<Option<BoundedPrice>, ClearingError> {
         let band = Band::new(mid, band_bps)?;
         let ids = |pair| {
@@ -88,7 +84,6 @@ impl ClearingBook {
             quote,
             band,
             fee_ppm,
-            self_trade_prevention,
             decided: Vec::new(),
         };
         let Some(walked) = bounded::walk(&band, max_orders_per_side, &mut legs)? else {
@@ -121,7 +116,7 @@ impl Legs<NoteId> for BookLegs<'_> {
                 .orders
                 .get(&id)
                 .ok_or(ClearingError::InternalInvariant("missing indexed order"))?;
-            if let Some(tag) = order.maker_tag().filter(|_| self.self_trade_prevention) {
+            if let Some(tag) = order.maker_tag() {
                 let at = match self
                     .decided
                     .iter()
@@ -155,7 +150,7 @@ impl BookLegs<'_> {
     /// trade inside the band (bids at or above its bottom, asks at or below
     /// its top), the older order of every bid and ask that clash (bid at or
     /// above ask) sits out. A newer order counts as newer even when it sits
-    /// out itself, so at any single price this is ADR 0005's decision.
+    /// out itself.
     fn rule_b(&self, maker_id: MakerId) -> Result<Vec<NoteId>, ClearingError> {
         let (mut bids, mut asks) = (Vec::new(), Vec::new());
         for id in self
@@ -208,7 +203,7 @@ impl BookLegs<'_> {
             }
         }
         // Newest first. A bid and an ask never share a sequence (one per
-        // submit); if one ever did, the ask counts as newer, as in ADR 0005.
+        // submit); if one ever did, the ask counts as newer.
         zone.sort_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| (a.2 == OrderSide::BuyBase).cmp(&(b.2 == OrderSide::BuyBase)))

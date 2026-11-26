@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 
 use crate::db::maker_db::{AcceptFallback, DeadCause};
 use crate::maker::MakerId;
@@ -39,17 +39,16 @@ static COUNTS: LazyLock<Mutex<BTreeMap<Key, u64>>> = LazyLock::new(Mutex::defaul
 static INTAKE_DEPTH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static INTAKE_FULL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static OPEN_STREAMS: AtomicU64 = AtomicU64::new(0);
-/// What self-trade prevention at submit cannot see, counted once at startup
-/// (`maker_db::stp_readiness_tx`): open lineages without amounts, open maker
-/// orders without their maker. Unset until a count succeeds, so the two
-/// gauges are absent then: a failed or skipped count never reads as
-/// "nothing unseen".
-static STP_READINESS: OnceLock<(i64, i64)> = OnceLock::new();
+/// Crossed pairs of makers' open orders at their submitted prices
+/// (`maker_db::crossed_open_pairs_tx`), counted every few minutes: 0 unless
+/// self-trade prevention at submit has a bug (ADR 0009). Negative while no
+/// count has succeeded, or the last one failed: the gauge is absent then, so
+/// a failed count never reads as "none".
+static CROSSED_PAIRS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
-/// Record the startup count of what self-trade prevention at submit cannot
-/// see (ADR 0009).
-pub(crate) fn record_stp_readiness(lineages_without_amounts: i64, orders_without_maker: i64) {
-    let _ = STP_READINESS.set((lineages_without_amounts, orders_without_maker));
+/// Record the latest crossed-pairs count, or `None` when it failed.
+pub(crate) fn record_crossed_pairs(pairs: Option<i64>) {
+    CROSSED_PAIRS.store(pairs.unwrap_or(-1).max(-1), Ordering::Relaxed);
 }
 
 /// The two intake queues.
@@ -180,12 +179,9 @@ fn render_service_wide(body: &mut String) {
         "solver_maker_open_streams {}",
         OPEN_STREAMS.load(Ordering::Relaxed),
     );
-    if let Some((lineages, orders)) = STP_READINESS.get() {
-        let _ = writeln!(
-            body,
-            "solver_maker_open_lineages_without_amounts {lineages}\n\
-             solver_maker_open_orders_without_maker_id {orders}",
-        );
+    let crossed = CROSSED_PAIRS.load(Ordering::Relaxed);
+    if crossed >= 0 {
+        let _ = writeln!(body, "solver_maker_crossed_open_pairs {crossed}");
     }
 }
 
@@ -267,28 +263,23 @@ pub(crate) fn render(body: &mut String) {
 mod tests {
     use super::*;
 
-    /// The readiness gauges are absent until a count is recorded, then show
-    /// what it found. The value is process-wide and set once, so this is the
-    /// only test that records it.
+    /// The crossed-pairs gauge is absent until a count succeeds, shows it,
+    /// and is absent again after a failed count. Process-wide: the only
+    /// test that records it.
     #[test]
-    fn readiness_gauges_appear_only_after_a_count() {
-        let mut body = String::new();
-        render_service_wide(&mut body);
-        assert!(
-            !body.contains("solver_maker_open_lineages_without_amounts"),
-            "{body}"
-        );
-        record_stp_readiness(3, 0);
-        let mut body = String::new();
-        render_service_wide(&mut body);
-        assert!(
-            body.contains("solver_maker_open_lineages_without_amounts 3\n"),
-            "{body}"
-        );
-        assert!(
-            body.contains("solver_maker_open_orders_without_maker_id 0\n"),
-            "{body}"
-        );
+    fn the_crossed_pairs_gauge_shows_only_a_successful_count() {
+        let rendered = || {
+            let mut body = String::new();
+            render_service_wide(&mut body);
+            body
+        };
+        assert!(!rendered().contains("solver_maker_crossed_open_pairs"));
+        record_crossed_pairs(Some(0));
+        assert!(rendered().contains("solver_maker_crossed_open_pairs 0\n"));
+        record_crossed_pairs(Some(2));
+        assert!(rendered().contains("solver_maker_crossed_open_pairs 2\n"));
+        record_crossed_pairs(None);
+        assert!(!rendered().contains("solver_maker_crossed_open_pairs"));
     }
 
     /// The self-trade counters render with their labels (ADR 0009).

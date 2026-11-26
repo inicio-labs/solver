@@ -222,13 +222,8 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
         )])
     };
     let first = note(1);
-    let outcomes = crate::gateway::intake::intake_round_tx(
-        &mut intake,
-        &round(1, &first)?,
-        Some(&gate),
-        false,
-    )?
-    .outcomes;
+    let outcomes =
+        crate::gateway::intake::intake_round_tx(&mut intake, &round(1, &first)?, &gate)?.outcomes;
     assert!(outcomes[0].1.live.is_some());
     conn.batch_execute("SET lock_timeout = '200ms'")?;
     let claim = conn.batch_execute("UPDATE sync_state SET owner_epoch = owner_epoch + 1");
@@ -241,7 +236,7 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     let second = note(2);
     let commands = round(2, &second)?;
     let refused = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
+        crate::gateway::intake::intake_round_tx(conn, &commands, &gate)
     });
     assert!(
         matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
@@ -277,7 +272,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     )];
     let go_live = |conn: &mut PgConnection| {
         conn.transaction::<_, DbError, _>(|conn| {
-            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate), false)
+            crate::gateway::intake::intake_round_tx(conn, &round, &gate)
         })
     };
     conn.batch_execute(
@@ -1061,7 +1056,7 @@ fn a_round_without_a_submit_never_checks_the_owner_epoch() -> Result<()> {
         },
     )];
     let outcomes = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
+        crate::gateway::intake::intake_round_tx(conn, &commands, &gate)
     })?;
     assert!(matches!(
         outcomes.outcomes[0].1.reply,

@@ -244,75 +244,6 @@ fn the_lineage_view_admits_what_the_order_view_admits() -> Result<()> {
     Ok(())
 }
 
-/// The startup count finds open lineages without amounts and open maker
-/// rows without their maker, and nothing else.
-#[test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn the_startup_count_finds_what_the_check_cannot_see() -> Result<()> {
-    let mut fixture = TestSchema::migrated()?;
-    let conn = &mut fixture.conn;
-    let alpha = maker(conn, "alpha")?;
-    let notes: Vec<Note> = (1..=7).map(|s| order(s, Side::Sell, 50, 100)).collect();
-    // 0 and 1 go live at accept (still pending), 2 waits for its note, 3 to
-    // 6 are activated by the watcher.
-    for (index, note) in notes.iter().enumerate() {
-        submit(conn, alpha, 1 + index as u64, note, index < 2)?;
-    }
-    let activated: Vec<_> = maker_db::pending_submissions_tx(conn)?
-        .into_iter()
-        .filter(|s| notes[3..].iter().any(|note| note.id() == s.note.id()))
-        .collect();
-    conn.transaction::<_, DbError, _>(|conn| maker_db::activate_tx(conn, &activated, 1))?;
-    let user = order_of(8, Side::Sell, 50, 100, NoteType::Public);
-    conn.transaction::<_, DbError, _>(|conn| {
-        insert_orders_batch_tx(conn, &[NewOrderRow::parsed(&user, 1)?], 1)
-    })?;
-    let ready = maker_db::stp_readiness_tx(conn)?;
-    assert_eq!(
-        (ready.lineages_without_amounts, ready.orders_without_maker),
-        (0, 0)
-    );
-    // As if claimed or stored before the migration. Without amounts: 0 and
-    // 2 (pending), 4 (an open row) and 5 (its row finished). Without its
-    // maker: 1 (open), 6 (stopped) and the user's order (no claim).
-    let ids = |indexes: &[usize]| indexes.iter().map(|i| id(&notes[*i])).collect::<Vec<_>>();
-    diesel::update(
-        maker_lineages::table.filter(maker_lineages::note_id.eq_any(ids(&[0, 2, 4, 5]))),
-    )
-    .set((
-        maker_lineages::offered_amount.eq(None::<i64>),
-        maker_lineages::requested_amount.eq(None::<i64>),
-    ))
-    .execute(conn)?;
-    for (note, status) in [(&notes[5], "executed"), (&notes[6], "stopped")] {
-        diesel::sql_query("UPDATE orders SET status = $1 WHERE note_id = $2")
-            .bind::<diesel::sql_types::Text, _>(status)
-            .bind::<Binary, _>(id(note))
-            .execute(conn)?;
-    }
-    diesel::sql_query("UPDATE orders SET maker_id = NULL WHERE note_id = ANY($1)")
-        .bind::<diesel::sql_types::Array<Binary>, _>(ids(&[1, 6]))
-        .execute(conn)?;
-    let ready = maker_db::stp_readiness_tx(conn)?;
-    assert_eq!(
-        (ready.lineages_without_amounts, ready.orders_without_maker),
-        (3, 1)
-    );
-    // A cancelled lineage is no longer open.
-    run(
-        conn,
-        alpha,
-        9,
-        &MakerCommand::CancelOrder {
-            lineage_id: lineage_of(&notes[2]),
-        },
-        false,
-    )?;
-    let ready = maker_db::stp_readiness_tx(conn)?;
-    assert_eq!(ready.lineages_without_amounts, 2);
-    Ok(())
-}
-
 /// The check compares a late submit with every newer lineage of its maker,
 /// in any state, so lineage history is kept: no code deletes a claim.
 #[test]
@@ -393,16 +324,12 @@ fn every_stop_records_its_source_once() -> Result<()> {
     conn.transaction::<_, DbError, _>(|conn| {
         maker_db::close_unconfirmed_tx(conn, [&capped], Close::NoteNotReceived)
     })?;
-    conn.transaction::<_, DbError, _>(|conn| {
-        maker_db::lock_makers_ordered_tx(conn, &[alpha])?;
-        maker_db::cancel_self_trades_tx(conn, &[id(&notes[2]), id(&notes[0])])
-    })?;
     conn.transaction::<_, DbError, _>(maker_db::cancel_unconfirmed_tx)?;
     let row = |note: &Note, source: &str| (lineage_of(note), Some(source.to_owned()), None);
     let mut expected = vec![
         row(&notes[0], "maker"),
         row(&notes[1], "cap"),
-        row(&notes[2], "stp_reservation"),
+        row(&notes[2], "escape_hatch"),
         row(&notes[3], "escape_hatch"),
     ];
     expected.sort();
@@ -673,22 +600,12 @@ fn cancel_cmd(maker_id: MakerId, seq: u64, note: &Note) -> (Header, MakerCommand
     )
 }
 
-/// One intake round with the check on: live at accept on (a fresh watcher
-/// block) or off. Cancels must come first, as intake orders them.
+/// One intake round: live at accept on (a fresh watcher block) or off.
+/// Cancels must come first, as intake orders them.
 fn stp_round(
     conn: &mut PgConnection,
     commands: &[(Header, MakerCommand)],
     live: bool,
-) -> Result<IntakeRound> {
-    round(conn, commands, live, true)
-}
-
-/// One intake round, with the check on or off.
-fn round(
-    conn: &mut PgConnection,
-    commands: &[(Header, MakerCommand)],
-    live: bool,
-    check: bool,
 ) -> Result<IntakeRound> {
     let epoch = postgres_test::epoch(conn)?;
     let gate = if live {
@@ -696,8 +613,7 @@ fn round(
     } else {
         AcceptGate::epoch_only(epoch)
     };
-    Ok(conn
-        .transaction::<_, DbError, _>(|conn| intake_round_tx(conn, commands, Some(&gate), check))?)
+    Ok(conn.transaction::<_, DbError, _>(|conn| intake_round_tx(conn, commands, &gate))?)
 }
 
 fn cancelled(note: &Note) -> (Vec<u8>, OrderState, String) {
@@ -1401,7 +1317,8 @@ fn a_stale_watcher_read_adds_nothing_after_a_stop() -> Result<()> {
     Ok(())
 }
 
-/// The owner-epoch guard is taken with the check on and live at accept off.
+/// Every round with a submit takes the owner-epoch guard, live at accept on
+/// or off.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 fn the_check_takes_the_owner_epoch_guard() -> Result<()> {
@@ -1410,31 +1327,11 @@ fn the_check_takes_the_owner_epoch_guard() -> Result<()> {
     let alpha = maker(conn, "alpha")?;
     let gate = AcceptGate::epoch_only(postgres_test::epoch(conn)? + 1);
     let refused = conn.transaction::<_, DbError, _>(|conn| {
-        intake_round_tx(conn, &[sub(alpha, 1, &ask(1, 100))], Some(&gate), true)
+        intake_round_tx(conn, &[sub(alpha, 1, &ask(1, 100))], &gate)
     });
     assert!(
         matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
         "{refused:?}"
-    );
-    Ok(())
-}
-
-/// With the check off, crossing orders stay as before.
-#[test]
-#[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn with_the_check_off_nothing_changes() -> Result<()> {
-    let mut fixture = TestSchema::migrated()?;
-    let conn = &mut fixture.conn;
-    let alpha = maker(conn, "alpha")?;
-    let (old, new) = (ask(1, 100), bid(2, 100));
-    for (seq, note) in [(1, &old), (2, &new)] {
-        let round = round(conn, &[sub(alpha, seq, note)], true, false)?;
-        assert!(round.self_trade.updates.is_empty());
-    }
-    assert!(in_book(conn, &old)? && in_book(conn, &new)?);
-    assert_eq!(
-        postgres_test::statuses(conn, alpha)?,
-        [went_live(&old), went_live(&new)]
     );
     Ok(())
 }
@@ -1496,7 +1393,7 @@ fn a_crossing_submit_and_a_reservation_of_its_loser_serialize() -> Result<()> {
         };
         let submit = |conn: &mut PgConnection| {
             let gate = AcceptGate::new(epoch, || Some(BlockNumber::from(7)));
-            intake_round_tx(conn, &commands, Some(&gate), true).map(|_| ())
+            intake_round_tx(conn, &commands, &gate).map(|_| ())
         };
         let (mut leader, mut follower) = (connect(&fixture.url)?, connect(&fixture.url)?);
         let follower_pid: i32 =
@@ -1586,11 +1483,10 @@ fn a_late_submit_beside_a_higher_one_still_sees_the_newer_order() -> Result<()> 
     Ok(())
 }
 
-/// With the check on, a submit with more than 1,000 of its maker's orders
+/// A submit with more than 1,000 of its maker's orders
 /// on the pair above its seq is refused before it is claimed, the same on
 /// every retry; 1,000 is fine, another pair's history does not count, an
-/// earlier accepted submit still replays, and with the check off nothing is
-/// refused.
+/// earlier accepted submit still replays.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
 fn a_submit_far_below_its_makers_history_is_refused() -> Result<()> {
@@ -1655,61 +1551,52 @@ fn a_submit_far_below_its_makers_history_is_refused() -> Result<()> {
         reply(stp_round(conn, &[sub(alpha, 1, &early)], false)?),
         CommandReply::Replayed(CommandResult::Accepted)
     );
-    // With the check off, nothing is refused.
-    let off = round(conn, &[sub(alpha, 9_999, &ask(5, 100))], false, false)?;
-    assert_eq!(reply(off), CommandReply::Committed(CommandResult::Accepted));
     Ok(())
 }
 
-/// The runbook's soak check 1, run as the runbook prints it: it finds each
-/// crossed pair of a maker's open orders, a parent retired while its
-/// settlement is unresolved included, and none the rule prevented.
+/// The periodic count finds each crossed pair of a maker's open orders at
+/// their submitted prices, a parent retired while its settlement is
+/// unresolved included, and none the rule prevented. The runbook prints the
+/// same query for listing them.
 #[test]
 #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
-fn the_runbooks_real_miss_check_finds_crossed_pairs() -> Result<()> {
+fn the_crossed_pairs_count_finds_each_crossed_open_pair() -> Result<()> {
     use super::postgres_db::mark_orders_onchain_nullified_tx;
-    #[derive(QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = BigInt)]
-        misses: i64,
-    }
     let runbook = include_str!("../../../../docs/postgres-runbook.md");
-    let start = runbook
-        .find("WITH open_lineages AS (")
-        .expect("check 1 in the runbook");
-    let end = start + runbook[start..].find(">= :switch_on;").unwrap() + ">= :switch_on".len();
-    let check = &runbook[start..end];
-    let misses = |conn: &mut PgConnection, switch_on: &str| -> Result<i64> {
-        let check = check.replace(":switch_on", &format!("'{switch_on}'::timestamptz"));
-        Ok(
-            diesel::sql_query(format!("SELECT count(*) AS misses FROM ({check}) found"))
-                .get_result::<Count>(conn)?
-                .misses,
-        )
-    };
+    assert!(
+        runbook.contains(maker_db::CROSSED_OPEN_PAIRS),
+        "the runbook prints the gauge's query"
+    );
     let mut fixture = TestSchema::migrated()?;
     let conn = &mut fixture.conn;
-    // With the check off: a crossed pair of live orders.
+    // Written without the self-trade step: a crossed pair of live orders.
     let alpha = maker(conn, "alpha")?;
-    round(conn, &[sub(alpha, 1, &ask(1, 100))], true, false)?;
-    round(conn, &[sub(alpha, 2, &bid(2, 101))], true, false)?;
-    assert_eq!(misses(conn, "-infinity")?, 1);
-    assert_eq!(misses(conn, "infinity")?, 0, "both from before switch-on");
+    submit(conn, alpha, 1, &ask(1, 100), true)?;
+    submit(conn, alpha, 2, &bid(2, 101), true)?;
+    assert_eq!(maker_db::crossed_open_pairs_tx(conn)?, 1);
     // And one whose ask is a parent the watcher retired while its
     // settlement is unresolved.
     let beta = maker(conn, "beta")?;
     let retired = ask(3, 100);
-    round(conn, &[sub(beta, 1, &retired)], true, false)?;
+    submit(conn, beta, 1, &retired, true)?;
     postgres_test::reserve(conn, 9, &[&retired], 40)?;
     conn.transaction::<_, DbError, _>(|conn| {
         mark_orders_onchain_nullified_tx(conn, &[id(&retired)])
     })?;
-    round(conn, &[sub(beta, 2, &bid(4, 101))], true, false)?;
-    assert_eq!(misses(conn, "-infinity")?, 2);
-    // With the check on, the rule leaves no crossed pair.
+    submit(conn, beta, 2, &bid(4, 101), true)?;
+    assert_eq!(maker_db::crossed_open_pairs_tx(conn)?, 2);
+    // Equal prices cross too.
+    let delta = maker(conn, "delta")?;
+    submit(conn, delta, 1, &ask(7, 100), true)?;
+    submit(conn, delta, 2, &bid(8, 100), true)?;
+    assert_eq!(maker_db::crossed_open_pairs_tx(conn)?, 3);
+    // Through intake, the rule leaves no crossed pair.
     let gamma = maker(conn, "gamma")?;
     stp_round(conn, &[sub(gamma, 1, &ask(5, 100))], true)?;
     stp_round(conn, &[sub(gamma, 2, &bid(6, 101))], true)?;
-    assert_eq!(misses(conn, "-infinity")?, 2);
+    assert_eq!(maker_db::crossed_open_pairs_tx(conn)?, 3);
+    // A cancel takes a pair out.
+    postgres_test::cancel(conn, alpha, 3, &ask(1, 100))?;
+    assert_eq!(maker_db::crossed_open_pairs_tx(conn)?, 2);
     Ok(())
 }

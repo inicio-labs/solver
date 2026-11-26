@@ -177,6 +177,49 @@ WHERE maker_id = $1 AND market = $2 AND root_seq > $3";
 /// read.
 pub const MAX_NEWER_LINEAGES: i64 = 1_000;
 
+/// Every crossed pair of a maker's open orders on one pair at the prices it
+/// submitted: what self-trade prevention at submit leaves none of. Open is
+/// what the rule counts open: pending without an accept block, an order row
+/// active, settling or waiting, or a parent with an unresolved settlement;
+/// not stopped or cut off. Read from the open rows' indexes, not the whole
+/// lineage history. The runbook prints this query for listing the pairs.
+pub const CROSSED_OPEN_PAIRS: &str = "\
+WITH open_ids AS (
+    SELECT lineage_id FROM maker_lineages
+    WHERE state = 'pending' AND accept_block IS NULL
+    UNION
+    SELECT lineage_id FROM orders
+    WHERE status IN ('active', 'settling', 'waiting') AND maker_id IS NOT NULL
+    UNION
+    SELECT o.lineage_id FROM settlement_inputs si
+    JOIN orders o ON o.note_id = si.parent_note_id
+    WHERE o.maker_id IS NOT NULL
+), open_lineages AS (
+    SELECT l.* FROM eligible_lineages l JOIN open_ids USING (lineage_id)
+    WHERE l.offered_amount IS NOT NULL
+)
+SELECT a.maker_id, a.lineage_id, a.root_seq,
+       b.lineage_id AS crossing_lineage_id, b.root_seq AS crossing_seq
+FROM open_lineages a
+JOIN open_lineages b
+  ON b.maker_id = a.maker_id AND b.market = a.market AND b.direction > a.direction
+WHERE a.offered_amount::numeric * b.offered_amount
+      >= a.requested_amount::numeric * b.requested_amount";
+
+/// How many pairs [`CROSSED_OPEN_PAIRS`] finds: 0 unless the rule has a bug.
+pub fn crossed_open_pairs_tx(conn: &mut PgConnection) -> DbResult<i64> {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = BigInt)]
+        pairs: i64,
+    }
+    let count: Count = diesel::sql_query(format!(
+        "SELECT count(*) AS pairs FROM ({CROSSED_OPEN_PAIRS}) crossed"
+    ))
+    .get_result(conn)?;
+    Ok(count.pairs)
+}
+
 /// Whether more than [`MAX_NEWER_LINEAGES`] of `maker_id`'s lineages on
 /// `market` have a seq above `seq`. Reads at most one more than the limit,
 /// along `maker_lineages_seq_idx`.

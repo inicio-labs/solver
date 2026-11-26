@@ -291,78 +291,39 @@ It closes every such order, sends each maker `OrderStatus CANCELLED` (`note_not_
 
 ## Self-trade prevention at submit
 
-`engine.maker_cancel_crossing_on_submit` (off by default, [ADR 0009](adr/0009-self-trade-prevention-at-submit.md)) cancels the lower-seq order of a maker's crossing bid and ask on one pair when a `SubmitOrder` is accepted. It needs the maker gateway. The old rule (`engine.maker_self_trade_prevention`, ADR 0005) stays on beside it until the soak below passes.
+[ADR 0009](adr/0009-self-trade-prevention-at-submit.md) cancels the lower-seq order of a maker's crossing bid and ask on one pair when a `SubmitOrder` is accepted. It runs whenever the maker gateway does. ADR 0005's rule at reservation, and both switches, are removed.
 
-**Before switch-on**, on each network:
+**Deploying this build** on a network: only once the soak of the build before it has passed there, with the rule switched on. That build's runbook, in this same section, gives the gate: checks 1, 2 and 3 return no rows since the switch-on, and both startup counts read 0. Deployed where the rule was never switched on, this build switches it on with no soak. The keys `engine.maker_self_trade_prevention` and `engine.maker_cancel_crossing_on_submit` are ignored now: delete them from the config.
 
-1. Deploy this build with the switch **off** first (`migrate-db`, then `check-db`, which checks `SELECT` on the new view `eligible_lineages`; grant it if your default grants don't cover new views, see [Fresh deployment](#fresh-deployment) step 2) and run it for at least a day. This applies the storage migration while nothing depends on it, and gives the baseline in step 4.
-2. Every maker has run the self-trade checks of the guide's section 15 against a test network with the switch **on**: the changes in the guide's "What changes for your client" list break strict clients.
-3. Nothing the rule cannot see is open. The startup log line `maker orders self-trade prevention at submit cannot see` and the gauges `solver_maker_open_lineages_without_amounts` and `solver_maker_open_orders_without_maker_id` give the counts at startup (the gauges are absent until a count succeeds: no gauge is not 0). The query below lists the first kind at any time, per order. Orders claimed before the storage migration have no amounts and are never compared with any order, not even a new one. Expiry does not clear them (nothing retires an expired order), and neither does a note that never lands. What clears one: its maker's `CancelOrder`, a `CancelAll` with a higher seq covering it, a full fill, or a spend of its note that the watcher sees. Ask the maker to cancel what is left. An open order row without a maker should not exist after the migration (its backfill and the insert trigger cover every open row): a non-zero second count is a solver bug, so report it.
-
-   ```sql
-   SELECT l.maker_id, l.lineage_id, l.root_seq, l.state, l.expires_at_unix_ms
-   FROM eligible_lineages l
-   WHERE l.offered_amount IS NULL
-     AND (l.state = 'pending' OR EXISTS (
-          SELECT 1 FROM orders o
-          WHERE o.lineage_id = l.lineage_id
-            AND o.status IN ('active', 'settling', 'waiting')))
-   ORDER BY l.maker_id, l.root_seq;
-   ```
-4. Take a baseline of `solver_executor_reservation_stopped_input_total` from step 1's run, as a daily increase: makers' own cancels racing the matcher count there too. Counters restart at zero with the process, so compare daily increases, never totals.
-5. Tell the makers the switch-on date. Turn the switch on and restart. Once the restarted solver is ready (`/readyz`), take the database's clock as the switch-on time: `SELECT now();`. The queries below take it as `:switch_on` (`psql -v switch_on="'2026-12-01 10:00:07+00'"`). A time taken before the restart is too early: submits the old process accepted with the switch off would show as real misses in check 1. After a rollback, take the time the same way when the switch goes back on.
-
-**Soak checks** (run daily; each joins orders to `maker_lineages` through `lineage_id`; plain `SELECT`s, so they run on a read-only session or a standby):
+**Crossed pairs:** `solver_maker_crossed_open_pairs` (counted every 5 minutes; absent until a count succeeds, and after a failed one) is the number of crossed pairs of a maker's open orders at the prices it submitted. It must be 0. Alert on `solver_maker_crossed_open_pairs > 0`, and on `absent(solver_maker_crossed_open_pairs)` for 15 minutes on a solver with the gateway. If it is not 0, list the pairs with this query (a plain `SELECT`: a read-only session or a standby is fine), ask the maker to cancel the older order of each pair, and report it: the rule has a bug. A pair that rounding left on a nearly filled remainder ([#93](https://github.com/inicio-labs/solver/issues/93)) does not show here: it crosses at the remainder's price, not the submitted one.
 
 ```sql
--- 1. Real misses: crossed pairs at the submitted prices where at least one
---    order is from after switch-on. MUST be 0 at all times. If not: keep the
---    rows, switch off and restart, and ask the maker to cancel the older order
---    of each pair; then report it (the rule has a bug).
-WITH open_lineages AS (
-    -- Not stopped or cut off, and pending, with an open row, or a parent
-    -- retired while its settlement is unresolved: what the rule counts open.
-    SELECT l.*, m.created_at
-    FROM eligible_lineages l
-    JOIN maker_lineages m USING (lineage_id)
+WITH open_ids AS (
+    SELECT lineage_id FROM maker_lineages
+    WHERE state = 'pending' AND accept_block IS NULL
+    UNION
+    SELECT lineage_id FROM orders
+    WHERE status IN ('active', 'settling', 'waiting') AND maker_id IS NOT NULL
+    UNION
+    SELECT o.lineage_id FROM settlement_inputs si
+    JOIN orders o ON o.note_id = si.parent_note_id
+    WHERE o.maker_id IS NOT NULL
+), open_lineages AS (
+    SELECT l.* FROM eligible_lineages l JOIN open_ids USING (lineage_id)
     WHERE l.offered_amount IS NOT NULL
-      AND ((l.state = 'pending' AND l.accept_block IS NULL)
-           OR EXISTS (SELECT 1 FROM orders o
-                      WHERE o.lineage_id = l.lineage_id
-                        AND o.status IN ('active', 'settling', 'waiting'))
-           OR EXISTS (SELECT 1 FROM settlement_inputs si
-                      JOIN orders o ON o.note_id = si.parent_note_id
-                      WHERE o.lineage_id = l.lineage_id)))
-SELECT a.maker_id, a.lineage_id, a.root_seq, b.lineage_id, b.root_seq
+)
+SELECT a.maker_id, a.lineage_id, a.root_seq,
+       b.lineage_id AS crossing_lineage_id, b.root_seq AS crossing_seq
 FROM open_lineages a
 JOIN open_lineages b
   ON b.maker_id = a.maker_id AND b.market = a.market AND b.direction > a.direction
 WHERE a.offered_amount::numeric * b.offered_amount
-      >= a.requested_amount::numeric * b.requested_amount
-  AND greatest(a.created_at, b.created_at) >= :switch_on;
+      >= a.requested_amount::numeric * b.requested_amount;
+```
 
--- 2. Old pairs: the same, both orders from before switch-on. They drain as
---    the orders fill, expire or are cancelled; ask the maker to cancel any
---    that lingers. Same query, ending with:
---      AND greatest(a.created_at, b.created_at) < :switch_on;
+**Stops by who wrote them**, per maker per day (`stp_reservation` rows are from before ADR 0005's removal):
 
--- 3. The old rule's stops on orders from after switch-on that a newer
---    opposite order, claimed while they were still open, crosses at the
---    submitted prices: should be 0 (the new rule cancels those first). The
---    old rule's other stops, for rounding, are not listed.
-SELECT s.maker_id, s.lineage_id, s.created_at
-FROM maker_stops s
-JOIN maker_lineages x ON x.maker_id = s.maker_id AND x.lineage_id = s.lineage_id
-WHERE s.source = 'stp_reservation' AND x.created_at >= :switch_on
-  AND EXISTS (
-      SELECT 1 FROM maker_lineages y
-      WHERE y.maker_id = x.maker_id AND y.market = x.market
-        AND y.direction <> x.direction AND y.root_seq > x.root_seq
-        AND y.created_at < s.created_at
-        AND x.offered_amount::numeric * y.offered_amount
-            >= x.requested_amount::numeric * y.requested_amount);
-
--- 4. Stops by who wrote them, per maker per day.
+```sql
 SELECT maker_id, coalesce(source, '(before 2026-11-25)') AS source,
        date_trunc('day', created_at) AS day, count(*)
 FROM maker_stops
@@ -376,15 +337,13 @@ ORDER BY 3 DESC, 1, 2;
 - `solver_maker_stp_on_submit_cancels_total{loser="older"}`: normal re-quoting. It includes orders a settlement held, which that settlement may still fill.
 - `solver_maker_submits_dead_on_arrival_total{reason}`: submits the maker had already cancelled or cut off.
 - `solver_gateway_requests_total{method="submit_order",code="failed_precondition"}`: submits refused because more than 1,000 of the maker's orders on the pair have a higher seq: a seq counter gone backwards, often a clock that is behind after a restart. Tell the maker.
-- `solver_maker_submits_near_expiry_total`: counted whatever the switch. A high share means the maker sends expiries of 30 s or less: tell them. Such a submit never trades, but with the switch on it still cancels the maker's older crossing orders.
+- `solver_maker_submits_near_expiry_total`: a high share means the maker sends expiries of 30 s or less: tell them. Such a submit never trades, but it still cancels the maker's older crossing orders.
 - `solver_maker_stp_newer_rows_total`: orders of the maker read because they have a higher seq than a submit's. A steady trickle is normal with several senders or retries.
-- `solver_executor_reservation_stopped_input_total` (global, always shown): compare its daily increase with the baseline from step 4; a few more a day is expected.
+- `solver_executor_reservation_stopped_input_total` (global, always shown): reservations refused because an input got a stop after the matcher chose it. A few a day is normal: makers' own cancels racing the matcher count there too. Compare daily increases, never totals: counters restart at zero with the process.
 
-**Rollback:** set the switch to `false` and restart. Never delete `maker_stops` rows: they are cancels the makers were told about. Reverting the storage migration as well (`revert-db`) means running a build from before it, and drops the stored amounts and the stops' `source` and `caused_by_lineage` (checks 3 and 4 lose their history): orders claimed before it is applied again count as pre-migration, and step 3 above must pass again.
+**Rollback:** deploy the build before this one, and set its `engine.maker_cancel_crossing_on_submit = true` (its `engine.maker_self_trade_prevention` is on by default, which brings ADR 0005's rule back too). Never delete `maker_stops` rows: they are cancels the makers were told about. Reverting the storage migration as well (`revert-db`) means running a build from before it, and drops the stored amounts and the stops' `source` and `caused_by_lineage`.
 
 **The storage migration** takes `ACCESS EXCLUSIVE` on `orders`, `maker_lineages` and `maker_stops` until it commits: new columns with a CHECK scan their table, three indexes are built without `CONCURRENTLY`, and the open order rows get their maker in one `UPDATE`. It turns its own statement timeout off. With the solver stopped, as for every migration here, it takes seconds on a large `orders`; to size it first, time `migrate-db` on a restored copy. Its insert trigger, which copies the maker onto new order rows, is pinned to the schema the migration ran in: after restoring into a schema with another name, or renaming it, run `ALTER FUNCTION <schema>.orders_fill_maker_id() SET search_path = <schema>`, or every order insert fails.
-
-**Removing the old rule** (one change, after the soak), on every network that will run that build, since switch-on: checks 1, 2 and 3 return no rows, both startup counts are 0, and rounding on nearly filled remainders stays a known limitation ([#93](https://github.com/inicio-labs/solver/issues/93)). The change removes ADR 0005's matcher, executor and reservation code and its switch (`engine.maker_self_trade_prevention`), makes the rule at submit always on (no `engine.maker_cancel_crossing_on_submit`), and turns check 1 into a periodic metric.
 
 ## Backup and restore
 

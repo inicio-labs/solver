@@ -4,7 +4,7 @@
 - **Date:** 2026-11-14
 - **Deciders:** Vaibhav Jindal.
 - **Scope:** private-note maker orders submitted through the maker gateway (ADR 0003).
-- **Related:** [ADR 0003](0003-market-maker-v1-gateway.md) (the gateway and its watcher), [ADR 0005](0005-maker-self-trade-prevention.md) (self-trade prevention), [market maker guide](../market-maker-guide.md#13-orders-live-at-accept), [runbook](../postgres-runbook.md#maker-orders-live-at-accept), issues [#67](https://github.com/inicio-labs/solver/issues/67) (strikes, last look, node trouble, expiry-based cap, switching off without a restart), [#68](https://github.com/inicio-labs/solver/issues/68) (caps on unconfirmed orders), [#69](https://github.com/inicio-labs/solver/issues/69) (a note spent by a waiting transaction).
+- **Related:** [ADR 0003](0003-market-maker-v1-gateway.md) (the gateway and its watcher), [ADR 0009](0009-self-trade-prevention-at-submit.md) (self-trade prevention at submit), [market maker guide](../market-maker-guide.md#13-orders-live-at-accept), [runbook](../postgres-runbook.md#maker-orders-live-at-accept), issues [#67](https://github.com/inicio-labs/solver/issues/67) (strikes, last look, node trouble, expiry-based cap, switching off without a restart), [#68](https://github.com/inicio-labs/solver/issues/68) (caps on unconfirmed orders), [#69](https://github.com/inicio-labs/solver/issues/69) (a note spent by a waiting transaction).
 
 ## Context
 

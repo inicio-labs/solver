@@ -4,7 +4,7 @@
 - **Date:** 2026-10-29
 - **Deciders:** Vaibhav Jindal.
 - **Scope:** PSWAP batch clearing in the 0.17 solver, per configured pair.
-- **Related:** [ADR 0004](0004-binance-bookticker-prices.md) (the Binance mid), [ADR 0005](0005-maker-self-trade-prevention.md) (self-trade prevention at admission), [market maker guide](../market-maker-guide.md), issue [#62](https://github.com/inicio-labs/solver/issues/62) (deferred items).
+- **Related:** [ADR 0004](0004-binance-bookticker-prices.md) (the Binance mid), [ADR 0005](0005-maker-self-trade-prevention.md) (self-trade prevention at admission, removed; replaced by [ADR 0009](0009-self-trade-prevention-at-submit.md)), [market maker guide](../market-maker-guide.md), issue [#62](https://github.com/inicio-labs/solver/issues/62) (deferred items).
 
 ## Context
 
@@ -52,16 +52,16 @@ Cost per pair and round: one index seek per side plus at most `2 × max_orders_p
 
 A maker's own crossed orders must not set the price. When the walk first reaches a maker's order, it decides that maker once:
 - take the maker's active orders on the pair that could trade inside the band (bids at or above `L`, asks at or below `H`);
-- for every bid and ask of the maker that clash (bid at or above ask), the **older** order sits out (age = `root_seq`, as in ADR 0005). A newer order counts as newer even when it sits out itself;
+- for every bid and ask of the maker that clash (bid at or above ask), the **older** order sits out (age = `root_seq`). A newer order counts as newer even when it sits out itself;
 - sit-outs are skipped and take no slot.
 
-At any single price this is exactly ADR 0005's decision. The maker's normal two-sided quote (bid below ask) clashes with nothing and is never touched.
+At any single price this was ADR 0005's decision; that rule is removed. A maker's orders that cross at their submitted prices are now cancelled at submit ([ADR 0009](0009-self-trade-prevention-at-submit.md)), so rule B meets only the pairs rounding leaves slightly crossed on nearly filled remainders (#93). The maker's normal two-sided quote (bid below ask) clashes with nothing and is never touched.
 
-Without it, a maker could pump the price at no cost: a tiny ask at +25 bps and a tiny bid at +26 bps form a pair the walk would count, the walk's last pair would set `P` at +25 bps for every buyer, and admission would then sit one of them out, so they never trade. With rule B the same book clears at the maker's real ask.
+Without it, a maker could pump the price at no cost: a tiny ask at +25 bps and a tiny bid at +26 bps form a pair the walk would count, and the walk's last pair would set `P` at +25 bps for every buyer. Self-trade prevention at submit cancels the older order of such a pair; rule B keeps any pair that remains from setting the price. With rule B the same book clears at the maker's real ask.
 
 ### Admission: unchanged
 
-Admission and matching run at the chosen price exactly as before, including ADR 0005 recomputed at that price, its window, and its cancels. The walk's sit-outs are not reused (see the consequences).
+Admission and matching run at the chosen price exactly as before. Since ADR 0005 was removed, admission does not look at makers: their crossing orders are cancelled at submit (ADR 0009). The walk's sit-outs are not reused (see the consequences).
 
 ### Fallback to the mid
 
@@ -94,7 +94,7 @@ When `P = M` matching runs once. The fallback keeps every pair trading wherever 
 - **Known gaps, deferred to #62:**
   - no collar: with thin makers the batch price can reach the band edge through a small extra ask placed there;
   - an all-or-nothing order can leave the walk on the mid while nothing executes there;
-  - a maker can bench its own ask with a dust bid and still fill it first at the higher price; `solver_matcher_walk_benched_filled_total` counts this, and reusing the walk's sit-outs at admission would close it.
+  - a maker can bench its own ask with a dust bid and still fill it first at the higher price; `solver_matcher_walk_benched_filled_total` counts this, and reusing the walk's sit-outs at admission would close it. Self-trade prevention at submit now cancels the older of such a bid and ask, so only a rounding-crossed remainder (#93) can do it.
 
 ## Alternatives considered
 

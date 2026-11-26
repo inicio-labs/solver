@@ -366,8 +366,8 @@ clears crossing orders between the two tokens automatically.
   - `solver_matcher_oldest_matched_order_age_seconds`: how long ago the matcher first chose the order, matched longest ago, that has still not settled. The clock runs while the order is in flight, or back in the book and chosen again; it stops when the order leaves the book, or when it is back and a clearing tick does not choose it. 0 when there is none.
   - `solver_executor_oldest_unfinished_age_seconds`: how long the executor has held its oldest unfinished work: a settlement waiting for its outcome, batches held while it verifies it can settle (node, fee, database), or the batch it is working on. 0 when there is none. Both ages live in memory and start again after a restart.
   - `solver_fee_balance_base_units`, `solver_fee_base_fee_base_units` and `solver_fee_checked_timestamp_seconds`: what the last fee headroom check saw. Absent before the first check, and on a chain that charges no fee (no fee parameters, or a base fee of 0), where the check stops early.
-  - `solver_matcher_tick_duration_seconds` (histogram; buckets 1, 2, 5, 10, 20, 50, 100, 200, 500 ms, 1, 2 and 5 s): how long each matching tick took, from its timer to its end (queued updates, expiry, clearing, routing). The quote split's solver-safety test compares it with the public API idle and loaded.
-  - Price API (public, own thread): `solver_price_api_open_connections`, `solver_price_api_refused_connections_total` (closed at accept because `engine.price_query_max_connections` were open), and `solver_price_mirror_queue_length` (book changes queued for the API's depth mirror at its last round; it grows only if the mirror falls behind).
+  - `solver_matcher_tick_duration_seconds` (histogram; buckets 1, 2, 5, 10, 20, 50, 100, 200, 500 ms, 1, 2 and 5 s): how long each matching tick took, from the time it was due (so a tick that starts late counts its wait) to its end (queued updates, expiry, clearing, routing). Compare it with the public API idle and loaded to see whether wallet traffic slows matching.
+  - Price API (public, own thread): `solver_price_api_open_connections`, `solver_price_api_refused_connections_total` (closed at accept because the cap was reached), `solver_price_api_max_connections` (the cap in force: `engine.price_query_max_connections`, lowered at start if the open-file limit leaves less than it plus 256 descriptors for the rest of the solver), and `solver_price_mirror_backlog` (book changes the matcher sent to the API's depth mirror that quotes cannot see yet: up to one 250 ms round of changes while the mirror keeps up; it grows while the mirror falls behind, stalls or has stopped).
   - `solver_price_quote_mid{symbol}`: the mid the matcher clears at. Maker intake: `solver_maker_intake_queue_depth{queue}`, `solver_maker_intake_full_total{queue}`, `solver_maker_open_streams`.
 
   Suggested alerts: the oldest unfinished age over a few minutes (the executor is stuck; nothing settles); the oldest matched age over a few minutes while settlements still confirm (one order keeps failing); matched orders waiting and no confirmation in 10 minutes; failures (released plus failed before submission) over a quarter of attempts in 10 minutes.
@@ -405,6 +405,8 @@ GET /v2/pairs                                     # tokens and pairs the solver 
 GET /v2/pair-price?offered_faucet=&requested_faucet=
 GET /v2/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=&min_fill_step=
 GET /v1/swap-eta?offered_faucet=&offered_amount=&requested_faucet=&requested_amount=   # frozen
+GET /livez                                        # health checks for a load balancer
+GET /readyz
 ```
 ```jsonc
 // GET /v1/price/0x8fe0…?precision=4

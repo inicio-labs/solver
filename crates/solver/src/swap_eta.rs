@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use miden_protocol::asset::AssetAmount;
@@ -152,10 +153,47 @@ impl DepthChange {
 #[derive(Debug, Default)]
 pub(crate) struct DepthBook {
     levels: HashMap<(TokenId, TokenId), BTreeMap<RateKey, u128>>,
+    /// Changes applied since start, for [`depth_backlog`].
+    applied: u64,
+}
+
+/// Book changes the matcher has sent to the price API's depth mirror, and
+/// changes the mirror has applied (published at the end of each of its
+/// rounds). Their difference is the mirror's backlog.
+static DEPTH_SENT: AtomicU64 = AtomicU64::new(0);
+static DEPTH_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+/// The matcher sent the mirror one change (whether or not the mirror still
+/// runs: a stopped mirror then shows as a growing backlog).
+pub(crate) fn note_depth_sent() {
+    DEPTH_SENT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// The mirror has now applied `total` changes since start.
+pub(crate) fn publish_depth_applied(total: u64) {
+    DEPTH_APPLIED.store(total, AtomicOrdering::Relaxed);
+}
+
+/// Changes sent to the mirror and not yet applied, read at scrape time: up
+/// to one round's worth (the mirror applies them every 250 ms) while it
+/// keeps up, growing while it falls behind, stalls or has stopped.
+pub(crate) fn depth_backlog() -> u64 {
+    // Applied first: it never runs ahead of sent, so the later read of sent
+    // is at least as large.
+    let applied = DEPTH_APPLIED.load(AtomicOrdering::Relaxed);
+    DEPTH_SENT
+        .load(AtomicOrdering::Relaxed)
+        .saturating_sub(applied)
 }
 
 impl DepthBook {
+    /// Changes applied since this mirror started.
+    pub(crate) fn applied(&self) -> u64 {
+        self.applied
+    }
+
     pub(crate) fn apply(&mut self, change: DepthChange) {
+        self.applied += 1;
         match change {
             DepthChange::Added { pair, rate, volume } => {
                 *self

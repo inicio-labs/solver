@@ -35,7 +35,7 @@ tower-http = { version = "0.6", default-features = false, features = ["timeout",
 # The price API's own HTTP/1.1-only connection loop (connection cap, header
 # timeout, small per-connection buffer); axum::serve exposes none of these.
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "http1", "server-graceful"] }
 hex = "0.4"
 subtle = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -64,6 +64,11 @@ tokio-stream = { version = "0.1", default-features = false }
 # Pure-Rust Protobuf compiler: neither developers nor CI need a system protoc.
 protox = "0.9"
 tonic-prost-build = "0.14"
+
+# The price API raises the process's open-file limit and sizes its connection
+# cap under it (getrlimit/setrlimit).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 miden-crypto.workspace = true

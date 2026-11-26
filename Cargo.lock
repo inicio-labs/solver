@@ -5396,6 +5396,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "libc",
  "miden-client",
  "miden-client-sqlite-store",
  "miden-core",

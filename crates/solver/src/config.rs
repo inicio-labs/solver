@@ -32,13 +32,6 @@ const MAX_BAND_BPS: u16 = 100;
 pub(crate) enum ConfigError {
     #[error("engine.price_precision must be \"full\" or an integer 0..=18, got {0:?}")]
     InvalidPricePrecision(String),
-    #[error("engine.{name} must be between {min} and {max}, got {value}")]
-    PriceQuerySettingOutOfRange {
-        name: &'static str,
-        value: u64,
-        min: u64,
-        max: u64,
-    },
     #[error("rpc.prover_timeout_ms must be at least 1")]
     ZeroProverTimeout,
     #[error("binance.{0} must be set to a positive value")]
@@ -65,7 +58,7 @@ pub(crate) enum ConfigError {
     #[error("engine.{0} must be at least 1")]
     ZeroMakerIntakeLimit(&'static str),
     #[error("engine.{name} must be between {min} and {max}, got {value}")]
-    MakerSettingOutOfRange {
+    SettingOutOfRange {
         name: &'static str,
         value: u64,
         min: u64,
@@ -310,7 +303,8 @@ pub struct EngineConfig {
     /// publicly — front it with a reverse proxy / rate limiter.
     #[serde(default = "default_price_query_bind")]
     pub price_query_bind: String,
-    /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default 50.
+    /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default
+    /// 50, at most 400 (a full request must fit the API's 16 KiB buffer).
     #[serde(default = "default_price_query_max_batch")]
     pub price_query_max_batch: usize,
     /// Per-request processing timeout in ms. Default 3000. The server's
@@ -322,7 +316,10 @@ pub struct EngineConfig {
     #[serde(default = "default_price_query_workers")]
     pub price_query_workers: usize,
     /// Open connections the price API keeps at once; a connection over the
-    /// cap is closed at accept. Default 1024.
+    /// cap is closed at accept. Default 1024. At start the solver raises its
+    /// open-file limit as far as the system allows and lowers this cap (with a
+    /// warning) if the limit leaves less than the cap plus 256 descriptors for
+    /// its own connections and files.
     #[serde(default = "default_price_query_max_connections")]
     pub price_query_max_connections: usize,
     /// How long a connection may take to send a request's headers, counted
@@ -635,35 +632,6 @@ impl SolverConfig {
         if self.rpc.prover_timeout_ms == 0 {
             return Err(ConfigError::ZeroProverTimeout);
         }
-        for (name, value, min, max) in [
-            (
-                "price_query_workers",
-                u64::try_from(self.engine.price_query_workers).unwrap_or(u64::MAX),
-                1,
-                64,
-            ),
-            (
-                "price_query_max_connections",
-                u64::try_from(self.engine.price_query_max_connections).unwrap_or(u64::MAX),
-                1,
-                65_536,
-            ),
-            (
-                "price_query_header_timeout_ms",
-                self.engine.price_query_header_timeout_ms,
-                1_000,
-                600_000,
-            ),
-        ] {
-            if !(min..=max).contains(&value) {
-                return Err(ConfigError::PriceQuerySettingOutOfRange {
-                    name,
-                    value,
-                    min,
-                    max,
-                });
-            }
-        }
         if PricePrecision::parse(&self.engine.price_precision).is_none() {
             return Err(ConfigError::InvalidPricePrecision(
                 self.engine.price_precision.clone(),
@@ -704,6 +672,32 @@ impl SolverConfig {
         }
         for (name, value, min, max) in [
             (
+                "price_query_workers",
+                u64::try_from(self.engine.price_query_workers).unwrap_or(u64::MAX),
+                1,
+                64,
+            ),
+            (
+                "price_query_max_connections",
+                u64::try_from(self.engine.price_query_max_connections).unwrap_or(u64::MAX),
+                1,
+                65_536,
+            ),
+            (
+                "price_query_header_timeout_ms",
+                self.engine.price_query_header_timeout_ms,
+                1_000,
+                600_000,
+            ),
+            // A full `/v1/prices?ids=` request must fit the API's 16 KiB
+            // request buffer (an id is about 33 bytes with its comma).
+            (
+                "price_query_max_batch",
+                u64::try_from(self.engine.price_query_max_batch).unwrap_or(u64::MAX),
+                1,
+                400,
+            ),
+            (
                 "maker_unconfirmed_cancel_after_secs",
                 self.engine.maker_unconfirmed_cancel_after_secs,
                 10,
@@ -717,7 +711,7 @@ impl SolverConfig {
             ),
         ] {
             if !(min..=max).contains(&value) {
-                return Err(ConfigError::MakerSettingOutOfRange {
+                return Err(ConfigError::SettingOutOfRange {
                     name,
                     value,
                     min,
@@ -857,6 +851,8 @@ mod tests {
             error.contains("engine.price_query_max_connections"),
             "{error}"
         );
+        let error = check(|c| c.engine.price_query_max_batch = 401);
+        assert!(error.contains("engine.price_query_max_batch"), "{error}");
         let error = check(|c| c.engine.price_query_header_timeout_ms = 999);
         assert!(
             error.contains("engine.price_query_header_timeout_ms"),

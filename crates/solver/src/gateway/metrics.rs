@@ -147,14 +147,19 @@ fn code_name(code: tonic::Code) -> &'static str {
 }
 
 fn render_service_wide(body: &mut String) {
-    for (index, queue) in QUEUE_NAMES.iter().enumerate() {
-        let _ = writeln!(
-            body,
-            "solver_maker_intake_queue_depth{{queue=\"{queue}\"}} {}\n\
-             solver_maker_intake_full_total{{queue=\"{queue}\"}} {}",
-            INTAKE_DEPTH[index].load(Ordering::Relaxed),
-            INTAKE_FULL[index].load(Ordering::Relaxed),
-        );
+    // One metric at a time, every queue in it: the text format wants each
+    // metric's lines together.
+    for (metric, values) in [
+        ("solver_maker_intake_queue_depth", &INTAKE_DEPTH),
+        ("solver_maker_intake_full_total", &INTAKE_FULL),
+    ] {
+        for (queue, value) in QUEUE_NAMES.iter().zip(values.iter()) {
+            let _ = writeln!(
+                body,
+                "{metric}{{queue=\"{queue}\"}} {}",
+                value.load(Ordering::Relaxed)
+            );
+        }
     }
     let _ = writeln!(
         body,

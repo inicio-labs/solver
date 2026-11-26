@@ -59,45 +59,58 @@ pub(crate) fn ticks() -> u64 {
 /// Upper bounds, in milliseconds, of the tick duration histogram.
 const TICK_MILLIS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
 
-/// How long each matching tick took, from the timer firing to the end of the
-/// tick (applying queued updates, expiry, clearing, routing, gauges): a
-/// Prometheus histogram's cumulative buckets, sum and count. The quote split's
-/// solver-safety test compares it with the quote side loaded and idle.
+/// How long each matching tick took, from the time it was due (its timer's
+/// deadline, so a tick that starts late counts its wait) to its end
+/// (applying queued updates, expiry, clearing, routing, gauges): a
+/// Prometheus histogram's cumulative buckets, sum and count.
 struct TickTimes {
     buckets: [AtomicU64; TICK_MILLIS.len()],
     sum_us: AtomicU64,
     count: AtomicU64,
 }
 
-static TICK_TIMES: TickTimes = TickTimes {
-    buckets: [const { AtomicU64::new(0) }; TICK_MILLIS.len()],
-    sum_us: AtomicU64::new(0),
-    count: AtomicU64::new(0),
-};
-
-fn record_tick(elapsed: Duration) {
-    let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-    // The count first: a scrape reads the buckets first, so no bucket it
-    // reads can exceed the count it reads after.
-    TICK_TIMES.count.fetch_add(1, Ordering::Relaxed);
-    TICK_TIMES.sum_us.fetch_add(micros, Ordering::Relaxed);
-    for (bucket, bound) in TICK_TIMES.buckets.iter().zip(TICK_MILLIS) {
-        if micros <= bound * 1000 {
-            bucket.fetch_add(1, Ordering::Relaxed);
+impl TickTimes {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; TICK_MILLIS.len()],
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
+    }
+
+    /// Writes go count first, then the buckets from the widest down, and
+    /// [`Self::read`] reads the buckets from the narrowest up and the count
+    /// last, so a read racing a write never sees a bucket above a wider one
+    /// or above the count.
+    fn record(&self, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Release);
+        self.sum_us.fetch_add(micros, Ordering::Relaxed);
+        for (bucket, bound) in self.buckets.iter().zip(TICK_MILLIS).rev() {
+            if micros <= bound * 1000 {
+                bucket.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    /// Each bound in seconds with the ticks that took at most that long, the
+    /// sum in seconds, and the count.
+    fn read(&self) -> (Vec<(f64, u64)>, f64, u64) {
+        let buckets = TICK_MILLIS
+            .iter()
+            .zip(&self.buckets)
+            .map(|(bound, count)| (*bound as f64 / 1000.0, count.load(Ordering::Acquire)))
+            .collect();
+        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        (buckets, sum, self.count.load(Ordering::Acquire))
     }
 }
 
-/// The tick duration histogram: each bound in seconds with the ticks that
-/// took at most that long, the sum in seconds, and the count (read last).
+static TICK_TIMES: TickTimes = TickTimes::new();
+
+/// The tick duration histogram, for `/metrics`.
 pub(crate) fn tick_times() -> (Vec<(f64, u64)>, f64, u64) {
-    let buckets = TICK_MILLIS
-        .iter()
-        .zip(&TICK_TIMES.buckets)
-        .map(|(bound, count)| (*bound as f64 / 1000.0, count.load(Ordering::Relaxed)))
-        .collect();
-    let sum = TICK_TIMES.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    (buckets, sum, TICK_TIMES.count.load(Ordering::Relaxed))
+    TICK_TIMES.read()
 }
 
 /// Seconds since the order matched longest ago, and still not settled, was
@@ -249,8 +262,7 @@ pub(super) async fn run_worker(
         // matching; it drains the already queued committed updates in order.
         tokio::select! {
             biased;
-            _ = interval.tick() => {
-                let started = Instant::now();
+            due = interval.tick() => {
                 TICKS.fetch_add(1, Ordering::Relaxed);
                 let now = now_millis();
                 ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
@@ -275,7 +287,7 @@ pub(super) async fn run_worker(
                     publish_book_gauges(&book, &runtime.prices.borrow());
                     book_gauges_at = Some(Instant::now());
                 }
-                record_tick(started.elapsed());
+                TICK_TIMES.record(due.elapsed());
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -598,30 +610,20 @@ mod tests {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
     }
 
-    /// A 3 ms tick lands in every bucket from 5 ms up. The histogram is
-    /// process-wide and other tests tick too, so compare
-    /// against the values before recording.
+    /// A 3 ms tick lands in every bucket from 5 ms up and in none below.
     #[test]
     fn a_tick_is_counted_in_every_bucket_at_or_above_its_duration() {
-        let bucket = |bound: f64| -> u64 {
-            tick_times()
-                .0
-                .into_iter()
-                .find(|(b, _)| *b == bound)
-                .unwrap()
-                .1
-        };
-        let (before_5ms, before_5s) = (bucket(0.005), bucket(5.0));
-        let before_count = tick_times().2;
-        record_tick(Duration::from_millis(3));
-        assert!(bucket(0.005) > before_5ms);
-        assert!(bucket(5.0) > before_5s);
-        assert!(tick_times().2 > before_count);
-        let (buckets, sum, count) = tick_times();
-        assert!(buckets.windows(2).all(|pair| pair[0].1 <= pair[1].1));
-        assert!(buckets.last().unwrap().1 <= count);
-        assert!(sum >= 0.003);
+        let times = TickTimes::new();
+        times.record(Duration::from_millis(3));
+        times.record(Duration::from_secs(9));
+        let (buckets, sum, count) = times.read();
+        let counts: Vec<u64> = buckets.iter().map(|(_, count)| *count).collect();
+        assert_eq!(counts, [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(buckets[2].0, 0.005);
+        assert_eq!(count, 2, "the 9 s tick is above every bound, in +Inf only");
+        assert!((sum - 9.003).abs() < 1e-9);
     }
+
     fn iusdt() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()
     }

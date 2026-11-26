@@ -12,6 +12,8 @@ pub mod postgres_pool;
 pub mod postgres_schema;
 #[cfg(test)]
 pub mod postgres_test;
+#[cfg(test)]
+mod stp_tests;
 
 pub use error::{DbError, DbResult};
 pub use postgres_pool::{IntakeSession, PgPool as DbPool};

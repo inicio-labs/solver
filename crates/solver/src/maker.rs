@@ -222,10 +222,12 @@ impl CommandHeader {
 /// A validated maker command.
 #[derive(Debug, Clone)]
 pub enum MakerCommand {
-    /// A PSWAP note, already parsed; `keys` were computed from it.
+    /// A PSWAP note, already parsed; `keys` and `amounts` (offered,
+    /// requested) were computed from it.
     Submit {
         note: Box<Note>,
         keys: OrderKeys,
+        amounts: (u64, u64),
         expires_at_unix_ms: Option<u64>,
     },
     CancelAll {
@@ -253,11 +255,12 @@ impl MakerCommand {
         if note.metadata().note_type() != NoteType::Private {
             return Err(SubmitError::PublicNote);
         }
-        crate::types::Order::from_note(&note)?;
+        let order = crate::types::Order::from_note(&note)?;
         let keys = OrderKeys::from_note(&note)?;
         Ok(Self::Submit {
             note: Box::new(note),
             keys,
+            amounts: (order.offered_amount, order.requested_amount),
             expires_at_unix_ms: None,
         })
     }

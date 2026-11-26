@@ -72,8 +72,10 @@ every schema change is a stop-then-start deploy:
 2. With the **new** binary: `solver-bin migrate-db` (migration role).
 3. If the migration adds a table or view and your default grants don't cover
    new relations, grant it to the writer and reader roles now. The
-   live-at-accept migration adds the view `eligible_orders`; both roles need
-   `SELECT` on it.
+   live-at-accept migration adds the view `eligible_orders`, and the
+   self-trade storage migration the view `eligible_lineages`; both roles need
+   `SELECT` on each. Reverting the self-trade storage migration drops
+   `eligible_lineages` with its grants, so grant it again after a re-apply.
 4. `solver-bin check-db` with the writer URL. It checks the migration history
    and that the role can read the views the solver reads directly.
 5. Start the new binary. Startup runs the same checks for the writer and the

@@ -328,6 +328,11 @@ pub enum CommandResult {
     Applied { cutoff: u64, settling: u64 },
     /// Targeted cancel applied; `settling` as for [`CommandResult::Applied`].
     Stopped { settling: u64 },
+    /// A submit refused, with self-trade prevention at submit on (ADR 0009):
+    /// more than [`MAX_NEWER_LINEAGES`](crate::db::maker_db::MAX_NEWER_LINEAGES)
+    /// of the maker's orders on the pair have a higher seq. Nothing was
+    /// claimed; the gateway answers `FAILED_PRECONDITION`.
+    SeqBelowHistory,
 }
 
 /// What a maker command returns to its caller.
@@ -413,6 +418,7 @@ mod tests {
                 settling: 2,
             },
             CommandResult::Stopped { settling: 0 },
+            CommandResult::SeqBelowHistory,
         ] {
             let text = serde_json::to_string(&result).unwrap();
             assert_eq!(

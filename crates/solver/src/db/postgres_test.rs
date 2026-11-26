@@ -193,6 +193,16 @@ pub fn order_of(
     }
 }
 
+/// An ask offering 100 of A at `price` B per 100, and a bid paying `price`
+/// B for 100 A: a bid crosses an ask at or below its price.
+pub fn ask(serial: u32, price: u64) -> Note {
+    order(serial, Side::Sell, 100, price)
+}
+
+pub fn bid(serial: u32, price: u64) -> Note {
+    order(serial, Side::Buy, price, 100)
+}
+
 /// A private sell on another pair: faucet A for a third faucet.
 pub fn order_on_other_pair(serial: u32, offered: u64, requested: u64) -> Note {
     let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
@@ -330,4 +340,99 @@ pub fn resolutions(
             _ => None,
         })
         .collect())
+}
+
+/// The owner epoch in `sync_state`.
+pub fn epoch(conn: &mut PgConnection) -> Result<i64> {
+    use super::postgres_schema::sync_state;
+    use diesel::prelude::*;
+    Ok(sync_state::table
+        .find(1_i16)
+        .select(sync_state::owner_epoch)
+        .first(conn)?)
+}
+
+/// The status of `note`'s order row, if it has one.
+pub fn status(conn: &mut PgConnection, note: &Note) -> Result<Option<String>> {
+    use super::postgres_schema::orders;
+    use diesel::prelude::*;
+    Ok(orders::table
+        .find(id(note))
+        .select(orders::status)
+        .first(conn)
+        .optional()?)
+}
+
+/// Set the status of `note`'s order row.
+pub fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> {
+    use super::postgres_schema::orders;
+    use diesel::prelude::*;
+    diesel::update(orders::table.find(id(note)))
+        .set(orders::status.eq(status))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// The accepted submission of `note` the watcher has yet to see.
+pub fn pending(conn: &mut PgConnection, note: &Note) -> Result<maker_db::PendingSubmission> {
+    Ok(maker_db::pending_submissions_tx(conn)?
+        .into_iter()
+        .find(|s| s.note.id() == note.id())
+        .expect("a pending submission"))
+}
+
+/// The OrderStatus events of `maker_id`: (note, state, reason).
+pub fn statuses(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+) -> Result<Vec<(Vec<u8>, crate::gateway::proto::OrderState, String)>> {
+    use crate::gateway::proto::event_body::Kind;
+    Ok(events(conn, maker_id)?
+        .into_iter()
+        .filter_map(|kind| match kind {
+            Kind::OrderStatus(status) => {
+                let state = status.state();
+                Some((status.note_id, state, status.reason))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Add `count` closed lineages of `maker_id` on `market`, at even seqs from
+/// `first`, as a long quoting history.
+pub fn history(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    market: &[u8],
+    direction: &[u8],
+    first: i64,
+    count: i64,
+) -> Result<()> {
+    let last = first + 2 * (count - 1);
+    use diesel::prelude::*;
+    use diesel::sql_types::{BigInt, Binary};
+    diesel::sql_query(
+        "INSERT INTO maker_commands (maker_id, request_id, seq, kind, payload, result)
+         SELECT $1, 'h' || g, g, 'submit', '\\x00', '{\"result\":\"accepted\"}'
+         FROM generate_series($2::bigint, $3::bigint, 2) g",
+    )
+    .bind::<BigInt, _>(maker_id)
+    .bind::<BigInt, _>(first)
+    .bind::<BigInt, _>(last)
+    .execute(conn)?;
+    diesel::sql_query(
+        "INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
+                                     market, direction, state,
+                                     offered_amount, requested_amount)
+         SELECT $4 || int8send(g), $1, 'h' || g, g, int8send(g), $4, $5, 'rejected', 100, 100
+         FROM generate_series($2::bigint, $3::bigint, 2) g",
+    )
+    .bind::<BigInt, _>(maker_id)
+    .bind::<BigInt, _>(first)
+    .bind::<BigInt, _>(last)
+    .bind::<Binary, _>(market)
+    .bind::<Binary, _>(direction)
+    .execute(conn)?;
+    Ok(())
 }

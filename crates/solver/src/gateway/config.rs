@@ -32,6 +32,9 @@ pub struct GatewayConfig {
     pub settlement_buffer: Duration,
     /// Submits go live at accept (ADR 0008).
     pub live_at_accept: bool,
+    /// A submit cancels its maker's older crossing orders and loses to a
+    /// newer one (ADR 0009).
+    pub cancel_crossing_on_submit: bool,
     /// When the watcher cancels an order that went live at accept whose note
     /// never arrived. It applies whether or not the switch is on.
     pub unconfirmed_cap: super::UnconfirmedCap,

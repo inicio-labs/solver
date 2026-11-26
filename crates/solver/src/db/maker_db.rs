@@ -199,10 +199,12 @@ pub enum AcceptMode {
     Fresh(BlockNumber),
 }
 
-/// Intake's live-at-accept gate (ADR 0008).
+/// Intake's owner-epoch guard, and its live-at-accept gate (ADR 0008).
 pub struct AcceptGate {
     owner_epoch: i64,
-    fresh_block: Box<dyn Fn() -> Option<BlockNumber> + Send + Sync>,
+    /// `None` when live at accept is off: the gate then only guards the
+    /// owner epoch, for self-trade prevention at submit (ADR 0009).
+    fresh_block: Option<Box<dyn Fn() -> Option<BlockNumber> + Send + Sync>>,
 }
 
 impl AcceptGate {
@@ -214,7 +216,15 @@ impl AcceptGate {
     ) -> Self {
         Self {
             owner_epoch,
-            fresh_block: Box::new(fresh_block),
+            fresh_block: Some(Box::new(fresh_block)),
+        }
+    }
+
+    /// Only the owner-epoch guard: every submit takes the confirmed path.
+    pub fn epoch_only(owner_epoch: i64) -> Self {
+        Self {
+            owner_epoch,
+            fresh_block: None,
         }
     }
 
@@ -242,7 +252,10 @@ impl AcceptGate {
                 current,
             });
         }
-        Ok((self.fresh_block)().map_or(AcceptMode::Stale, AcceptMode::Fresh))
+        Ok(match &self.fresh_block {
+            None => AcceptMode::Off,
+            Some(fresh_block) => fresh_block().map_or(AcceptMode::Stale, AcceptMode::Fresh),
+        })
     }
 }
 
@@ -272,6 +285,29 @@ pub fn execute_command_tx(
     command: &MakerCommand,
     accept: AcceptMode,
 ) -> DbResult<CommandOutcome> {
+    write_command_tx(conn, header, command, accept, false)
+}
+
+/// [`execute_command_tx`] in an intake round with self-trade prevention at
+/// submit on (ADR 0009): a submit is only claimed (the round decides which
+/// claims go live), and one with more than [`MAX_NEWER_LINEAGES`] of its
+/// maker's orders on the pair above its seq is refused before the claim.
+/// An exact retry still gets its stored reply.
+pub fn claim_command_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    command: &MakerCommand,
+) -> DbResult<CommandOutcome> {
+    write_command_tx(conn, header, command, AcceptMode::Off, true)
+}
+
+fn write_command_tx(
+    conn: &mut PgConnection,
+    header: &CommandHeader,
+    command: &MakerCommand,
+    accept: AcceptMode,
+    refuse_below_history: bool,
+) -> DbResult<CommandOutcome> {
     let replayed = |reply| CommandOutcome {
         reply,
         update: None,
@@ -294,9 +330,11 @@ pub fn execute_command_tx(
             amounts,
             expires_at_unix_ms,
         } => {
-            let claimed =
-                claim_lineage_tx(conn, header, note, keys, *amounts, *expires_at_unix_ms)?;
-            if claimed {
+            if refuse_below_history
+                && self_trade::far_below_history_tx(conn, maker_id, &keys.market, header.seq)?
+            {
+                (CommandResult::SeqBelowHistory, None)
+            } else if claim_lineage_tx(conn, header, note, keys, *amounts, *expires_at_unix_ms)? {
                 match accept {
                     AcceptMode::Off => {}
                     AcceptMode::Stale => fallback = Some(AcceptFallback::WatcherStale),
@@ -304,13 +342,10 @@ pub fn execute_command_tx(
                         live = go_live_at_accept_tx(conn, block, maker_id, &keys.lineage_id, note)?;
                     }
                 }
-            }
-            let result = if claimed {
-                CommandResult::Accepted
+                (CommandResult::Accepted, None)
             } else {
-                CommandResult::AlreadyRegistered
-            };
-            (result, None)
+                (CommandResult::AlreadyRegistered, None)
+            }
         }
         MakerCommand::CancelAll { scope } => {
             let cutoff: i64 = diesel::insert_into(maker_cutoffs::table)
@@ -414,7 +449,7 @@ fn claim_lineage_tx(
 /// and only if it is kept, flag the lineage with `accept_block` and report
 /// LIVE. An order cancelled before its submit leaves no row and takes the
 /// confirmed path. The claim guaranteed that the note has no row yet.
-fn go_live_at_accept_tx(
+pub(crate) fn go_live_at_accept_tx(
     conn: &mut PgConnection,
     accept_block: BlockNumber,
     maker_id: MakerId,
@@ -1890,10 +1925,54 @@ pub enum EventKind {
     SettlementResolved,
 }
 
-/// Append an event to `maker_id`'s feed in the caller's business transaction
-/// and return its sequence. The counter row update serializes appenders, so a
+/// One event to append: its lineage, kind and encoded body.
+type NewEvent<'a> = (Option<&'a [u8]>, EventKind, Vec<u8>);
+
+/// Append `events` to `maker_id`'s feed in order, in the caller's business
+/// transaction, and return the first one's sequence (`None` for no events).
+/// One counter update for all of them, then one insert per
+/// [`INSERT_CHUNK_ROWS`]. The counter row update serializes appenders, so a
 /// maker's committed sequences are contiguous; a rolled-back transaction
 /// returns its numbers with it.
+fn append_events_tx(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    events: &[NewEvent],
+) -> DbResult<Option<u64>> {
+    let count = i64::try_from(events.len())?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let next: i64 = diesel::update(makers::table.find(maker_id))
+        .set(makers::next_event_seq.eq(makers::next_event_seq + count))
+        .returning(makers::next_event_seq)
+        .get_result(conn)?;
+    EventWake::mark_appended();
+    let first = next - count;
+    let numbered: Vec<_> = events.iter().zip(first..).collect();
+    for chunk in numbered.chunks(INSERT_CHUNK_ROWS) {
+        let rows: Vec<_> = chunk
+            .iter()
+            .map(|((lineage_id, kind, payload), event_seq)| {
+                let kind: &'static str = (*kind).into();
+                (
+                    maker_events::maker_id.eq(maker_id),
+                    maker_events::event_seq.eq(*event_seq),
+                    maker_events::kind.eq(kind),
+                    maker_events::lineage_id.eq(*lineage_id),
+                    maker_events::payload.eq(payload),
+                )
+            })
+            .collect();
+        diesel::insert_into(maker_events::table)
+            .values(rows)
+            .execute(conn)?;
+    }
+    Ok(Some(u64::try_from(first)?))
+}
+
+/// Append one event to `maker_id`'s feed (see [`append_events_tx`]) and
+/// return its sequence.
 pub fn append_event_tx(
     conn: &mut PgConnection,
     maker_id: MakerId,
@@ -1901,24 +1980,14 @@ pub fn append_event_tx(
     lineage_id: Option<&[u8]>,
     payload: &[u8],
 ) -> DbResult<u64> {
-    let next: i64 = diesel::update(makers::table.find(maker_id))
-        .set(makers::next_event_seq.eq(makers::next_event_seq + 1))
-        .returning(makers::next_event_seq)
-        .get_result(conn)?;
-    let event_seq = next - 1;
-    EventWake::mark_appended();
-    let kind: &'static str = kind.into();
-    diesel::insert_into(maker_events::table)
-        .values((
-            maker_events::maker_id.eq(maker_id),
-            maker_events::event_seq.eq(event_seq),
-            maker_events::kind.eq(kind),
-            maker_events::lineage_id.eq(lineage_id),
-            maker_events::payload.eq(payload),
-        ))
-        .execute(conn)?;
-    Ok(u64::try_from(event_seq)?)
+    append_events_tx(conn, maker_id, &[(lineage_id, kind, payload.to_vec())])?
+        .ok_or(DbError::Corrupt("one event appended none"))
 }
+
+mod self_trade;
+pub use self_trade::{
+    self_trade_round_tx, DeadCause, SelfTradeRound, StpCancel, Submitted, MAX_NEWER_LINEAGES,
+};
 
 #[cfg(test)]
 mod tests {

@@ -12,16 +12,17 @@ use miden_protocol::block::BlockNumber;
 use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::Note;
 
-use super::maker_db::{
-    self, AcceptFallback, AcceptGate, AcceptMode, Close, CommandOutcome, PendingSubmission,
-};
+use super::maker_db::{self, AcceptFallback, AcceptGate, AcceptMode, Close, CommandOutcome};
 use super::postgres_db::{
     self, confirm_settlement_tx, finish_discarded_settlement_tx, live_book_update_tx,
     test_consumer, NodeAnswer,
 };
 use super::postgres_models::NewOrderRow;
-use super::postgres_schema::{maker_lineages, maker_stops, orders, sync_state};
-use super::postgres_test::{self, cancel, events, id, maker, reserve, resolutions, TestSchema};
+use super::postgres_schema::{maker_lineages, maker_stops, orders};
+use super::postgres_test::{
+    self, cancel, epoch, id, maker, pending, reserve, resolutions, set_status, status, statuses,
+    TestSchema,
+};
 use super::{postgres_migrations, DbError};
 use crate::gateway::intake::tests::pswap_note as note;
 use crate::gateway::proto;
@@ -29,13 +30,6 @@ use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, MakerCommand, MakerId,
 };
 use crate::types::{OrderId, OrderKeys};
-
-fn epoch(conn: &mut PgConnection) -> Result<i64> {
-    Ok(sync_state::table
-        .find(1_i16)
-        .select(sync_state::owner_epoch)
-        .first(conn)?)
-}
 
 /// Run `command` through intake's write with live at accept on, the watcher
 /// fresh at `block` (or stale for `None`).
@@ -83,52 +77,12 @@ fn command(
     Ok(())
 }
 
-fn status(conn: &mut PgConnection, note: &Note) -> Result<Option<String>> {
-    Ok(orders::table
-        .find(id(note))
-        .select(orders::status)
-        .first(conn)
-        .optional()?)
-}
-
-fn set_status(conn: &mut PgConnection, note: &Note, status: &str) -> Result<()> {
-    diesel::update(orders::table.find(id(note)))
-        .set(orders::status.eq(status))
-        .execute(conn)?;
-    Ok(())
-}
-
 /// The lineage's state and accept block (set only if it went live at accept).
 fn lineage(conn: &mut PgConnection, note: &Note) -> Result<(String, Option<i64>)> {
     Ok(maker_lineages::table
         .filter(maker_lineages::note_id.eq(id(note)))
         .select((maker_lineages::state, maker_lineages::accept_block))
         .first(conn)?)
-}
-
-fn pending(conn: &mut PgConnection, note: &Note) -> Result<PendingSubmission> {
-    Ok(maker_db::pending_submissions_tx(conn)?
-        .into_iter()
-        .find(|s| s.note.id() == note.id())
-        .expect("a pending submission"))
-}
-
-/// Every event of `maker_id`, decoded.
-/// The OrderStatus events of `maker_id`: (note, state, reason).
-fn statuses(
-    conn: &mut PgConnection,
-    maker_id: MakerId,
-) -> Result<Vec<(Vec<u8>, proto::OrderState, String)>> {
-    Ok(events(conn, maker_id)?
-        .into_iter()
-        .filter_map(|kind| match kind {
-            proto::event_body::Kind::OrderStatus(status) => {
-                let state = status.state();
-                Some((status.note_id, state, status.reason))
-            }
-            _ => None,
-        })
-        .collect())
 }
 
 fn live(state: proto::OrderState) -> bool {
@@ -268,8 +222,13 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
         )])
     };
     let first = note(1);
-    let outcomes =
-        crate::gateway::intake::intake_round_tx(&mut intake, &round(1, &first)?, Some(&gate))?;
+    let outcomes = crate::gateway::intake::intake_round_tx(
+        &mut intake,
+        &round(1, &first)?,
+        Some(&gate),
+        false,
+    )?
+    .outcomes;
     assert!(outcomes[0].1.live.is_some());
     conn.batch_execute("SET lock_timeout = '200ms'")?;
     let claim = conn.batch_execute("UPDATE sync_state SET owner_epoch = owner_epoch + 1");
@@ -282,7 +241,7 @@ fn a_new_owner_stops_an_old_intake_from_going_live() -> Result<()> {
     let second = note(2);
     let commands = round(2, &second)?;
     let refused = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
     });
     assert!(
         matches!(refused, Err(DbError::IntakeEpochMoved { .. })),
@@ -318,7 +277,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     )];
     let go_live = |conn: &mut PgConnection| {
         conn.transaction::<_, DbError, _>(|conn| {
-            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate))
+            crate::gateway::intake::intake_round_tx(conn, &round, Some(&gate), false)
         })
     };
     conn.batch_execute(
@@ -348,7 +307,7 @@ fn a_failed_go_live_leaves_nothing_behind() -> Result<()> {
     // The maker's retry of the same command is not a replay: it goes live.
     conn.batch_execute("DROP TRIGGER fail_event ON maker_events")?;
     let outcomes = go_live(conn)?;
-    assert!(outcomes[0].1.live.is_some());
+    assert!(outcomes.outcomes[0].1.live.is_some());
     assert_eq!(status(conn, &order)?.as_deref(), Some("active"));
     assert_eq!(lineage(conn, &order)?, ("pending".into(), Some(7)));
     assert_eq!(
@@ -1102,10 +1061,10 @@ fn a_round_without_a_submit_never_checks_the_owner_epoch() -> Result<()> {
         },
     )];
     let outcomes = conn.transaction::<_, DbError, _>(|conn| {
-        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate))
+        crate::gateway::intake::intake_round_tx(conn, &commands, Some(&gate), false)
     })?;
     assert!(matches!(
-        outcomes[0].1.reply,
+        outcomes.outcomes[0].1.reply,
         CommandReply::Committed(CommandResult::Applied { .. })
     ));
     Ok(())

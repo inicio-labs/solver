@@ -12,9 +12,11 @@ use super::error::IntakeError;
 use diesel::pg::PgConnection;
 
 use super::metrics as gateway_metrics;
-use crate::db::maker_db::{execute_command_tx, AcceptGate, AcceptMode, CommandOutcome};
+use crate::db::maker_db::{
+    self, execute_command_tx, AcceptGate, AcceptMode, CommandOutcome, SelfTradeRound, Submitted,
+};
 use crate::db::{DbResult, IntakeSession};
-use crate::maker::{CommandHeader, CommandReply, MakerCommand, MakerId};
+use crate::maker::{CommandHeader, CommandReply, CommandResult, MakerCommand, MakerId};
 
 type Reply = oneshot::Sender<Result<CommandReply, IntakeError>>;
 
@@ -141,16 +143,25 @@ pub async fn run_intake(
             .unzip();
         let size = commands.len();
         let gate = session.accept_gate();
+        let self_trade = session.self_trade_check();
         let mut publication = session.publication_guard().await;
         let outcome = session
-            .transaction(move |conn| intake_round_tx(conn, &commands, gate.as_deref()))
+            .transaction(move |conn| intake_round_tx(conn, &commands, gate.as_deref(), self_trade))
             .await;
         match outcome {
-            Ok(mut outcomes) => {
-                let maker_updates: Vec<_> = outcomes
+            Ok(IntakeRound {
+                mut outcomes,
+                self_trade,
+            }) => {
+                let mut maker_updates: Vec<_> = outcomes
                     .iter_mut()
                     .filter_map(|(_, outcome)| outcome.update.take())
                     .collect();
+                // The matcher applies every maker update before the round's
+                // new orders (`ClearingBook::apply`): a loser leaves the book
+                // before any winner enters it.
+                maker_updates.extend(self_trade.updates.iter().cloned());
+                count_self_trade(&self_trade);
                 let mut active = Vec::new();
                 for (maker_id, outcome) in &mut outcomes {
                     if let Some(order) = outcome.live.take() {
@@ -189,7 +200,7 @@ pub async fn run_intake(
                 // that wakes for another reason (a keep-alive, another event)
                 // reads it; the reply and the stream are separate calls. The
                 // core writer's append flag is not ours to take.
-                if went_live {
+                if went_live || self_trade.appended {
                     wake.notify();
                 }
             }
@@ -206,10 +217,24 @@ pub async fn run_intake(
     }
 }
 
-/// One intake round's writes, in its transaction: with live at accept on and
-/// a submit in the round, the owner-epoch guard first (see
-/// [`AcceptGate::resolve`]), then the maker rows the round touches, in ID
-/// order, then every command.
+/// What one intake round wrote.
+#[derive(Debug)]
+pub(crate) struct IntakeRound {
+    /// Each command's outcome, in the round's order.
+    pub outcomes: Vec<(MakerId, CommandOutcome)>,
+    /// What self-trade prevention at submit did (empty when it is off).
+    pub self_trade: SelfTradeRound,
+}
+
+/// One intake round's writes, in its transaction: with live at accept or
+/// self-trade prevention at submit on and a submit in the round, the
+/// owner-epoch guard first (see [`AcceptGate::resolve`]), then the maker
+/// rows the round touches, in ID order, then every command.
+///
+/// With self-trade prevention at submit on (ADR 0009), submits only claim
+/// their lineages; then one step reads the makers' orders, cancels the
+/// losers, and puts the winners live at accept in arrival order. Off, each
+/// submit goes live as it is claimed, as before.
 ///
 /// `commands` must hold the round's cancels before its submits, as
 /// [`run_intake`] orders them: the matcher applies a round's cancels before
@@ -219,7 +244,8 @@ pub(crate) fn intake_round_tx(
     conn: &mut PgConnection,
     commands: &[(CommandHeader, MakerCommand)],
     gate: Option<&AcceptGate>,
-) -> DbResult<Vec<(MakerId, CommandOutcome)>> {
+    self_trade: bool,
+) -> DbResult<IntakeRound> {
     let has_submit = commands
         .iter()
         .any(|(_, command)| matches!(command, MakerCommand::Submit { .. }));
@@ -230,14 +256,83 @@ pub(crate) fn intake_round_tx(
         // lock taken.
         _ => AcceptMode::Off,
     };
-    crate::db::maker_db::prelock_command_makers_tx(conn, commands)?;
-    commands
-        .iter()
-        .map(|(header, command)| {
-            let outcome = execute_command_tx(conn, header, command, accept)?;
-            Ok((header.maker_id, outcome))
-        })
-        .collect()
+    maker_db::prelock_command_makers_tx(conn, commands)?;
+    let mut outcomes = Vec::with_capacity(commands.len());
+    // The claims the self-trade step decides on; none with the check off.
+    let mut submitted = Vec::new();
+    for (index, (header, command)) in commands.iter().enumerate() {
+        let outcome = if self_trade {
+            // Claim only: the step below decides which claims go live.
+            maker_db::claim_command_tx(conn, header, command)?
+        } else {
+            execute_command_tx(conn, header, command, accept)?
+        };
+        let claimed = outcome.reply == CommandReply::Committed(CommandResult::Accepted);
+        if let (
+            true,
+            MakerCommand::Submit {
+                note,
+                keys,
+                amounts,
+                ..
+            },
+        ) = (self_trade && claimed, command)
+        {
+            submitted.push(Submitted {
+                index,
+                header,
+                note,
+                keys,
+                amounts: *amounts,
+            });
+        }
+        outcomes.push((header.maker_id, outcome));
+    }
+    // With no claims it returns at once, before any statement.
+    let mut round = maker_db::self_trade_round_tx(conn, &submitted, accept)?;
+    for (index, order) in std::mem::take(&mut round.live) {
+        outcomes[index].1.live = Some(order);
+    }
+    for (index, fallback) in std::mem::take(&mut round.fallbacks) {
+        outcomes[index].1.fallback = Some(fallback);
+    }
+    Ok(IntakeRound {
+        outcomes,
+        self_trade: round,
+    })
+}
+
+/// Count, after its commit, what self-trade prevention at submit did in a
+/// round, and log the round if it cancelled anything.
+fn count_self_trade(round: &SelfTradeRound) {
+    for cancel in &round.cancels {
+        gateway_metrics::count_stp_cancel(cancel.maker_id, cancel.entering);
+    }
+    for (maker_id, cause) in &round.dead_on_arrival {
+        gateway_metrics::count_dead_on_arrival(*maker_id, *cause);
+    }
+    for (maker_id, rows) in &round.newer_rows {
+        gateway_metrics::count_by(gateway_metrics::STP_NEWER_ROWS, *maker_id, *rows);
+    }
+    // One line per maker the round cancelled orders of.
+    let mut by_maker: std::collections::BTreeMap<MakerId, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for cancel in &round.cancels {
+        let (older, entering) = by_maker.entry(cancel.maker_id).or_default();
+        if cancel.entering {
+            *entering += 1;
+        } else {
+            *older += 1;
+        }
+    }
+    for (maker_id, (older, entering)) in by_maker {
+        tracing::info!(
+            maker_id,
+            older,
+            entering,
+            "self-trade prevention at submit cancelled crossing maker orders"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -530,9 +625,9 @@ pub(crate) mod tests {
                 pid_tx.send(pid)?;
                 barrier.wait();
                 let outcomes = conn.transaction::<_, crate::db::DbError, _>(|conn| {
-                    intake_round_tx(conn, &commands, Some(&gate))
+                    intake_round_tx(conn, &commands, Some(&gate), false)
                 })?;
-                Ok(outcomes[0].1.live.is_some())
+                Ok(outcomes.outcomes[0].1.live.is_some())
             }
         });
         ingest.join().expect("ingest thread")?;
@@ -541,6 +636,66 @@ pub(crate) mod tests {
             "went live at accept"
         );
         Ok(())
+    }
+
+    /// With live at accept off, a round whose submit cancels an older
+    /// crossing order of its maker sends the matcher that cancel and wakes
+    /// the event streams for its CANCELLED, with no other commit.
+    #[tokio::test]
+    #[ignore = "requires SOLVER_TEST_DATABASE_URL"]
+    async fn a_self_trade_cancel_reaches_the_matcher_and_wakes_streams() {
+        use crate::db::postgres_test::{ask, bid, lineage_of};
+
+        let db = TestDb::new().await.unwrap();
+        let alpha = maker(&db).await;
+        let wake = crate::maker::EventWake::default();
+        let mut woken = wake.subscribe();
+        let session = db
+            .pool
+            .intake_session()
+            .with_event_wake(wake)
+            .with_self_trade_check();
+        let (intake, queues) = IntakeSender::new(4, 4);
+        let (book_tx, mut book_rx) = mpsc::channel(4);
+        let stop = CancellationToken::new();
+        let writer = tokio::spawn(run_intake(session, queues, book_tx, 10, stop.clone()));
+
+        let old = ask(1, 100);
+        intake
+            .execute(
+                header(alpha, "s1", 1),
+                MakerCommand::submit(old.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(book_rx.try_recv().is_err(), "nothing to tell the matcher");
+        // Process-wide counters: compare with what other tests left.
+        let older =
+            || gateway_metrics::counted(gateway_metrics::STP_CANCELS, alpha, ("loser", "older"));
+        let before = older();
+        intake
+            .execute(
+                header(alpha, "s2", 2),
+                MakerCommand::submit(bid(2, 100)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older(), before + 1, "counted after the commit");
+        let update = book_rx.recv().await.unwrap();
+        assert_eq!(
+            update.maker_updates,
+            [MakerUpdate::LineageCancelled {
+                maker_id: alpha,
+                lineage_id: lineage_of(&old),
+            }]
+        );
+        assert!(update.active.is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken.changed())
+            .await
+            .expect("streams woken for CANCELLED")
+            .unwrap();
+        stop.cancel();
+        writer.await.unwrap();
     }
 
     /// With live at accept on, a fresh submit is in the round's one matcher

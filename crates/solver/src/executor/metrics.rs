@@ -35,6 +35,9 @@ static FAILED_BEFORE_SUBMIT: [[AtomicU64; 2]; FailedStage::COUNT] =
 static OLDEST_HELD_MS: AtomicU64 = AtomicU64::new(0);
 /// When the executor took the batch it is working on now (0: none).
 static IN_HAND_MS: AtomicU64 = AtomicU64::new(0);
+/// Reservations refused because an input's maker had stopped its lineage
+/// after the matcher chose it.
+static RESERVATION_STOPPED_INPUT: AtomicU64 = AtomicU64::new(0);
 
 /// Where a settlement failed before it was submitted.
 #[derive(
@@ -302,6 +305,17 @@ pub(crate) fn record_fee(balance: u64, base_fee: u64, now_unix: u64) {
     FEE_BALANCE.store(balance, Ordering::Relaxed);
     FEE_BASE.store(base_fee, Ordering::Relaxed);
     FEE_CHECKED_AT.store(now_unix, Ordering::Relaxed);
+}
+
+/// A reservation was refused and one of its inputs has a stop row: a stop
+/// (often self-trade prevention at submit, ADR 0009) landed between the
+/// matcher's choice and the reservation.
+pub(crate) fn record_reservation_stopped_input() {
+    RESERVATION_STOPPED_INPUT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn reservation_stopped_inputs() -> u64 {
+    RESERVATION_STOPPED_INPUT.load(Ordering::Relaxed)
 }
 
 pub(crate) fn settlements_confirmed() -> u64 {

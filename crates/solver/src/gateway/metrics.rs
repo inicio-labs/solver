@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::db::maker_db::AcceptFallback;
 use crate::maker::MakerId;
@@ -32,6 +32,18 @@ static COUNTS: LazyLock<Mutex<BTreeMap<Key, u64>>> = LazyLock::new(Mutex::defaul
 static INTAKE_DEPTH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static INTAKE_FULL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static OPEN_STREAMS: AtomicU64 = AtomicU64::new(0);
+/// What self-trade prevention at submit cannot see, counted once at startup
+/// (`maker_db::stp_readiness_tx`): open lineages without amounts, open maker
+/// orders without their maker. Unset until a count succeeds, so the two
+/// gauges are absent then: a failed or skipped count never reads as
+/// "nothing unseen".
+static STP_READINESS: OnceLock<(i64, i64)> = OnceLock::new();
+
+/// Record the startup count of what self-trade prevention at submit cannot
+/// see (ADR 0009).
+pub(crate) fn record_stp_readiness(lineages_without_amounts: i64, orders_without_maker: i64) {
+    let _ = STP_READINESS.set((lineages_without_amounts, orders_without_maker));
+}
 
 /// The two intake queues.
 #[derive(Clone, Copy)]
@@ -159,8 +171,15 @@ fn render_service_wide(body: &mut String) {
     let _ = writeln!(
         body,
         "solver_maker_open_streams {}",
-        OPEN_STREAMS.load(Ordering::Relaxed)
+        OPEN_STREAMS.load(Ordering::Relaxed),
     );
+    if let Some((lineages, orders)) = STP_READINESS.get() {
+        let _ = writeln!(
+            body,
+            "solver_maker_open_lineages_without_amounts {lineages}\n\
+             solver_maker_open_orders_without_maker_id {orders}",
+        );
+    }
 }
 
 fn add(metric: &'static str, maker_id: MakerId, label: (&'static str, &'static str)) {
@@ -205,6 +224,30 @@ pub(crate) fn render(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness gauges are absent until a count is recorded, then show
+    /// what it found. The value is process-wide and set once, so this is the
+    /// only test that records it.
+    #[test]
+    fn readiness_gauges_appear_only_after_a_count() {
+        let mut body = String::new();
+        render_service_wide(&mut body);
+        assert!(
+            !body.contains("solver_maker_open_lineages_without_amounts"),
+            "{body}"
+        );
+        record_stp_readiness(3, 0);
+        let mut body = String::new();
+        render_service_wide(&mut body);
+        assert!(
+            body.contains("solver_maker_open_lineages_without_amounts 3\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("solver_maker_open_orders_without_maker_id 0\n"),
+            "{body}"
+        );
+    }
 
     #[test]
     fn service_wide_numbers_parse_and_move() {

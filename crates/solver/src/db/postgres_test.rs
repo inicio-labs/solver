@@ -6,9 +6,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use diesel::connection::SimpleConnection;
-use diesel::PgConnection;
+use diesel::{Connection, PgConnection};
+use miden_protocol::account::AccountId;
+use miden_protocol::asset::{AssetAmount, FungibleAsset};
+use miden_protocol::block::BlockNumber;
+use miden_protocol::crypto::utils::Serializable;
+use miden_protocol::note::{Note, NoteType};
+use miden_protocol::testing::account_id::{
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
+    ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2, ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE,
+};
+use miden_protocol::Word;
+use miden_standards::note::{PswapNote, PswapNoteStorage};
 
-use super::{postgres_migrations, DbPool};
+use super::maker_db::{self, AcceptMode, CommandOutcome};
+use crate::maker::{CommandHeader, MakerCommand, MakerId};
+use crate::types::OrderKeys;
+
+use super::{postgres_migrations, DbError, DbPool};
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -99,9 +114,6 @@ pub fn fill(
     miden_protocol::note::Note,
     Option<miden_protocol::note::Note>,
 ) {
-    use miden_protocol::crypto::utils::Serializable;
-    use miden_protocol::note::Note;
-
     let pswap = miden_standards::note::PswapNote::try_from(parent).unwrap();
     let requested = pswap.storage().requested_faucet_id();
     let (payback, remainder) = pswap
@@ -128,8 +140,6 @@ pub fn prepare(
     tx: u8,
     inputs: &[super::postgres_models::SettlementInputRow],
 ) -> Result<()> {
-    use diesel::Connection;
-
     let attempt = super::postgres_models::SettlementAttemptRow {
         tx_id: vec![tx; 32],
         tx_result: vec![tx],
@@ -153,4 +163,113 @@ pub fn revert_after(conn: &mut PgConnection, version: &str) -> Result<()> {
         }
         postgres_migrations::revert_last(conn)?;
     }
+}
+
+/// Which way an order trades on the test pair: a sell offers faucet A for
+/// faucet B, a buy offers B for A.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Sell,
+    Buy,
+}
+
+/// A private PSWAP order offering `offered` for `requested`.
+pub fn order(serial: u32, side: Side, offered: u64, requested: u64) -> Note {
+    order_of(serial, side, offered, requested, NoteType::Private)
+}
+
+pub fn order_of(
+    serial: u32,
+    side: Side,
+    offered: u64,
+    requested: u64,
+    note_type: NoteType,
+) -> Note {
+    let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+    let b = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+    match side {
+        Side::Sell => pswap_order(serial, (a, offered), (b, requested), note_type),
+        Side::Buy => pswap_order(serial, (b, offered), (a, requested), note_type),
+    }
+}
+
+/// A private sell on another pair: faucet A for a third faucet.
+pub fn order_on_other_pair(serial: u32, offered: u64, requested: u64) -> Note {
+    let a = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+    let c = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_2.try_into().unwrap();
+    pswap_order(serial, (a, offered), (c, requested), NoteType::Private)
+}
+
+fn pswap_order(
+    serial: u32,
+    (offered_faucet, offered): (AccountId, u64),
+    (requested_faucet, requested): (AccountId, u64),
+    note_type: NoteType,
+) -> Note {
+    let creator = ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE
+        .try_into()
+        .unwrap();
+    PswapNote::builder()
+        .sender(creator)
+        .storage(
+            PswapNoteStorage::builder()
+                .min_requested_asset(FungibleAsset::new(requested_faucet, requested).unwrap())
+                .min_fill_step(AssetAmount::new(1).unwrap())
+                .creator_account_id(creator)
+                .build(),
+        )
+        .serial_number(Word::from([serial, 0, 0, 0]))
+        .note_type(note_type)
+        .offered_asset(FungibleAsset::new(offered_faucet, offered).unwrap())
+        .build()
+        .unwrap()
+        .into()
+}
+
+pub fn id(note: &Note) -> Vec<u8> {
+    note.id().to_bytes().to_vec()
+}
+
+pub fn lineage_of(note: &Note) -> Vec<u8> {
+    OrderKeys::from_note(note).unwrap().lineage_id
+}
+
+pub fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
+    Ok(maker_db::create_maker_tx(conn, name)?.unwrap())
+}
+
+/// Run one command in its own transaction, live at accept on with a fresh
+/// watcher block when `live` is set.
+pub fn run(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    seq: u64,
+    command: &MakerCommand,
+    live: bool,
+) -> Result<CommandOutcome> {
+    let accept = if live {
+        AcceptMode::Fresh(BlockNumber::from(7))
+    } else {
+        AcceptMode::Off
+    };
+    let header = CommandHeader::new(maker_id, format!("r{seq}"), seq).unwrap();
+    Ok(conn.transaction::<_, DbError, _>(|conn| {
+        maker_db::execute_command_tx(conn, &header, command, accept)
+    })?)
+}
+
+pub fn submit(
+    conn: &mut PgConnection,
+    maker_id: MakerId,
+    seq: u64,
+    note: &Note,
+    live: bool,
+) -> Result<CommandOutcome> {
+    run(
+        conn,
+        maker_id,
+        seq,
+        &MakerCommand::submit(note.clone())?,
+        live,
+    )
 }

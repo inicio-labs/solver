@@ -229,6 +229,30 @@ pub async fn start(
         }
     }
 
+    // Maker orders self-trade prevention at submit cannot see (ADR 0009):
+    // claimed before their amounts were stored, or stored without their
+    // maker. Both must be 0 before the check is switched on. It scans every
+    // order row: a failure is logged and leaves both gauges absent; it never
+    // stops startup.
+    if config.engine.maker_gateway_enabled {
+        match db_pool.read(db::maker_db::stp_readiness_tx).await {
+            Ok(unseen) => {
+                crate::gateway::metrics::record_stp_readiness(
+                    unseen.lineages_without_amounts,
+                    unseen.orders_without_maker,
+                );
+                tracing::info!(
+                    lineages_without_amounts = unseen.lineages_without_amounts,
+                    orders_without_maker = unseen.orders_without_maker,
+                    "maker orders self-trade prevention at submit cannot see"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not count the maker orders self-trade prevention at submit cannot see");
+            }
+        }
+    }
+
     // 2. Env-sourced secrets.
     let admin_token = std::env::var("SOLVER_ADMIN_TOKEN").ok();
     if admin_token.is_none() {

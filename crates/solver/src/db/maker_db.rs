@@ -290,9 +290,11 @@ pub fn execute_command_tx(
         MakerCommand::Submit {
             note,
             keys,
+            amounts,
             expires_at_unix_ms,
         } => {
-            let claimed = claim_lineage_tx(conn, header, note, keys, *expires_at_unix_ms)?;
+            let claimed =
+                claim_lineage_tx(conn, header, note, keys, *amounts, *expires_at_unix_ms)?;
             if claimed {
                 match accept {
                     AcceptMode::Off => {}
@@ -366,24 +368,27 @@ pub fn execute_command_tx(
     })
 }
 
-/// Claim a submit's lineage for its maker. `false` when the lineage is
-/// claimed already, or when its lineage or its note already has an order
-/// row: a maker order is a private note, and its row is written only after
-/// the claim. The note check matters only for a row with a NULL
-/// `lineage_id`, which is a row stored before the 2026-10-03 migration
-/// (every writer since sets it from the note). Without it, go-live at
-/// accept's plain insert could meet such a row and fail the whole round.
+/// Claim a submit's lineage for its maker, with the amounts it was submitted
+/// at. `false` when the lineage is claimed already, or when its lineage or
+/// its note already has an order row: a maker order is a private note, and
+/// its row is written only after the claim. The note check matters only for
+/// a row with a NULL `lineage_id`, which is a row stored before the
+/// 2026-10-03 migration (every writer since sets it from the note). Without
+/// it, go-live at accept's plain insert could meet such a row and fail the
+/// whole round.
 fn claim_lineage_tx(
     conn: &mut PgConnection,
     header: &CommandHeader,
     note: &Note,
     keys: &OrderKeys,
+    (offered, requested): (u64, u64),
     expires_at_unix_ms: Option<u64>,
 ) -> DbResult<bool> {
     let claimed = diesel::sql_query(
         "INSERT INTO maker_lineages (lineage_id, maker_id, request_id, root_seq, note_id,
-                                     market, direction, expires_at_unix_ms)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                                     market, direction, expires_at_unix_ms,
+                                     offered_amount, requested_amount)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
          WHERE NOT EXISTS (SELECT 1 FROM orders WHERE lineage_id = $1 OR note_id = $5)
          ON CONFLICT DO NOTHING",
     )
@@ -395,6 +400,8 @@ fn claim_lineage_tx(
     .bind::<Binary, _>(&keys.market)
     .bind::<Binary, _>(&keys.direction)
     .bind::<Nullable<BigInt>, _>(expires_at_unix_ms.map(i64::try_from).transpose()?)
+    .bind::<BigInt, _>(i64::try_from(offered)?)
+    .bind::<BigInt, _>(i64::try_from(requested)?)
     .execute(conn)?;
     Ok(claimed == 1)
 }
@@ -1652,6 +1659,40 @@ pub fn pending_lineage_stats_tx(conn: &mut PgConnection) -> DbResult<PendingLine
     .get_result(conn)?)
 }
 
+/// What self-trade prevention at submit (ADR 0009) cannot see, counted at
+/// startup: both must be 0 before the check is switched on.
+#[derive(QueryableByName, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StpReadiness {
+    /// Open lineages claimed before their amounts were stored. They never
+    /// cross, so the check cannot cancel them or be cancelled by them.
+    #[diesel(sql_type = BigInt)]
+    pub lineages_without_amounts: i64,
+    /// Open maker order rows without their maker, which the check's read
+    /// cannot find.
+    #[diesel(sql_type = BigInt)]
+    pub orders_without_maker: i64,
+}
+
+/// Count [`StpReadiness`]. A lineage is open while it is pending or one of
+/// its rows is active, settling or waiting, and its maker has not stopped it.
+pub fn stp_readiness_tx(conn: &mut PgConnection) -> DbResult<StpReadiness> {
+    Ok(diesel::sql_query(
+        "SELECT
+            (SELECT count(*) FROM eligible_lineages l
+             WHERE l.offered_amount IS NULL
+               AND (l.state = 'pending' OR EXISTS (
+                    SELECT 1 FROM orders o
+                    WHERE o.lineage_id = l.lineage_id
+                      AND o.status IN ('active', 'settling', 'waiting'))))
+                AS lineages_without_amounts,
+            (SELECT count(*) FROM orders o
+             JOIN maker_lineages l ON l.lineage_id = o.lineage_id
+             WHERE o.status IN ('active', 'settling', 'waiting') AND o.maker_id IS NULL)
+                AS orders_without_maker",
+    )
+    .get_result(conn)?)
+}
+
 /// One maker-owned order admitted by the database's liveness rule.
 #[derive(QueryableByName, Debug, Clone, PartialEq, Eq)]
 pub struct ActiveMakerOrderRow {
@@ -1762,7 +1803,7 @@ mod tests {
     use crate::db::postgres_migrations;
     use crate::db::postgres_models::{NewOrderRow, SettlementAttemptRow, SettlementInputRow};
     use crate::db::postgres_schema::live_orders;
-    use crate::db::postgres_test::{fill, prepare, revert_after, TestSchema};
+    use crate::db::postgres_test::{fill, maker, prepare, revert_after, TestSchema};
     use crate::maker::MakerTag;
 
     /// The migration that adds the maker tables.
@@ -1853,10 +1894,6 @@ mod tests {
 
     fn cancel_all(scope: CutoffScope) -> MakerCommand {
         MakerCommand::CancelAll { scope }
-    }
-
-    fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
-        Ok(create_maker_tx(conn, name)?.unwrap())
     }
 
     /// Store `notes` as ordinary ingested orders.

@@ -1337,9 +1337,11 @@ mod tests {
         /// A public note's claim, as maker intake stored it before it became
         /// private-only: such lineages remain until they end.
         async fn legacy_public_submit(&self, seq: u64, note: &Note) {
+            let order = crate::types::Order::from_note(note).unwrap();
             let command = MakerCommand::Submit {
                 note: Box::new(note.clone()),
                 keys: crate::types::OrderKeys::from_note(note).unwrap(),
+                amounts: (order.offered_amount, order.requested_amount),
                 expires_at_unix_ms: None,
             };
             self.command(&format!("s{seq}"), seq, command).await;

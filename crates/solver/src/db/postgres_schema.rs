@@ -9,6 +9,9 @@ diesel::table! {
     }
 }
 
+// `orders.maker_id` (filled by a trigger from the claim, ADR 0009) is left
+// unmapped on purpose: inserts leave it to the trigger, and only the
+// self-trade check reads it, with plain SQL.
 diesel::table! {
     orders (note_id) {
         note_id -> Binary,
@@ -89,6 +92,8 @@ diesel::table! {
         direction -> Nullable<Binary>,
         expires_at_unix_ms -> Nullable<BigInt>,
         accept_block -> Nullable<BigInt>,
+        offered_amount -> Nullable<BigInt>,
+        requested_amount -> Nullable<BigInt>,
     }
 }
 
@@ -105,6 +110,8 @@ diesel::table! {
     maker_stops (maker_id, lineage_id) {
         maker_id -> BigInt,
         lineage_id -> Binary,
+        source -> Nullable<Text>,
+        caused_by_lineage -> Nullable<Binary>,
     }
 }
 
@@ -155,6 +162,24 @@ diesel::table! {
     }
 }
 
+// A view: `maker_lineages` the maker's cutoffs and stops admit. Read-only.
+diesel::table! {
+    eligible_lineages (lineage_id) {
+        lineage_id -> Binary,
+        maker_id -> BigInt,
+        request_id -> Text,
+        root_seq -> BigInt,
+        note_id -> Binary,
+        state -> Text,
+        market -> Nullable<Binary>,
+        direction -> Nullable<Binary>,
+        expires_at_unix_ms -> Nullable<BigInt>,
+        accept_block -> Nullable<BigInt>,
+        offered_amount -> Nullable<BigInt>,
+        requested_amount -> Nullable<BigInt>,
+    }
+}
+
 diesel::joinable!(settlement_inputs -> orders (parent_note_id));
 diesel::joinable!(api_keys -> makers (maker_id));
 diesel::joinable!(settlement_inputs -> settlement_attempts (tx_id));
@@ -174,4 +199,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     maker_events,
     live_orders,
     eligible_orders,
+    eligible_lineages,
 );

@@ -22,7 +22,7 @@ use super::postgres_db::{
 };
 use super::postgres_models::{NewOrderRow, SettlementInputRow};
 use super::postgres_schema::{maker_lineages, maker_stops, orders, sync_state};
-use super::postgres_test::{self, TestSchema};
+use super::postgres_test::{self, id, maker, TestSchema};
 use super::{postgres_migrations, DbError};
 use crate::gateway::intake::tests::pswap_note as note;
 use crate::gateway::proto;
@@ -30,14 +30,6 @@ use crate::maker::{
     CommandHeader, CommandReply, CommandResult, CutoffScope, MakerCommand, MakerId,
 };
 use crate::types::{OrderId, OrderKeys};
-
-fn id(note: &Note) -> Vec<u8> {
-    note.id().to_bytes().to_vec()
-}
-
-fn maker(conn: &mut PgConnection, name: &str) -> Result<MakerId> {
-    Ok(maker_db::create_maker_tx(conn, name)?.unwrap())
-}
 
 fn epoch(conn: &mut PgConnection) -> Result<i64> {
     Ok(sync_state::table

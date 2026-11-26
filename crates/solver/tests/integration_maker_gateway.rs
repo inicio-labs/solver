@@ -869,11 +869,7 @@ async fn crossing_requote(live_at_accept: bool) -> Result<()> {
     local
         .run_until(Scenario::run(
             move |engine| {
-                engine.maker_cancel_crossing_on_submit = true;
                 engine.maker_live_at_accept = live_at_accept;
-                // The old rule would keep the crossed ask out of the batch on
-                // its own and hide a missing cancel: off, as after the soak.
-                engine.maker_self_trade_prevention = false;
             },
             move |s| Box::pin(async move { requote(s, live_at_accept).await }),
         ))
@@ -1024,14 +1020,9 @@ async fn requote(s: &mut Scenario, live_at_accept: bool) -> Result<()> {
 async fn a_settling_loser_hears_of_its_cancel_in_its_settlement_result() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(Scenario::run(
-            |engine| {
-                engine.maker_cancel_crossing_on_submit = true;
-                engine.maker_live_at_accept = true;
-                engine.maker_self_trade_prevention = false;
-            },
-            |s| Box::pin(settling_loser(s)),
-        ))
+        .run_until(Scenario::run(live_at_accept, |s| {
+            Box::pin(settling_loser(s))
+        }))
         .await
 }
 

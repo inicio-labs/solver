@@ -73,8 +73,8 @@ const SETTLEMENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// First hold for the orders of a pair group whose transaction fails the same
 /// way every time; it doubles per repeat failure, up to `MAX_FAILED_HOLD`.
-/// The cap keeps a held order, and any sit-outs riding with it (ADR 0005),
-/// out of the book for minutes, not an hour, when the cause fixes itself.
+/// The cap keeps a held order out of the book for minutes, not an hour, when
+/// the cause fixes itself.
 const FAILED_HOLD: Duration = Duration::from_secs(30);
 const MAX_FAILED_HOLD: Duration = Duration::from_secs(5 * 60);
 
@@ -135,10 +135,6 @@ struct PendingSettlement {
     fills: Arc<db::maker_db::SettlementFills>,
     /// Remainders this transaction creates when it commits.
     child_notes: Vec<Note>,
-    /// Sit-outs its reservation cancelled (ADR 0005), held by the matcher
-    /// until the confirmation or discard removes them. Not stored: after a
-    /// restart the matcher loads only live orders.
-    cancelled: Vec<NoteId>,
     /// What the node said when it refused this submission, kept until the
     /// release commits (ADR 0008). Not stored: after a restart a refused
     /// attempt is released as `NodeAnswer::Unclear`.
@@ -151,11 +147,7 @@ struct PendingSettlement {
 }
 
 impl PendingSettlement {
-    fn prepared(
-        attempt: SettlementAttemptRow,
-        components: &BatchComponents,
-        cancelled: Vec<NoteId>,
-    ) -> ExecResult<Self> {
+    fn prepared(attempt: SettlementAttemptRow, components: &BatchComponents) -> ExecResult<Self> {
         let tx_id = TransactionId::read_from(&mut SliceReader::new(&attempt.tx_id))?;
         Ok(Self {
             tx_id,
@@ -182,7 +174,6 @@ impl PendingSettlement {
                 .iter()
                 .filter_map(|input| input.remainder.clone())
                 .collect(),
-            cancelled,
             answer: None,
             retry_at: None,
             taken_at_ms: crate::types::now_millis(),
@@ -218,7 +209,6 @@ impl PendingSettlement {
                     parent_notes,
                     fills: Arc::new(recovered.fills),
                     child_notes,
-                    cancelled: Vec::new(),
                     answer: None,
                     retry_at: None,
                     taken_at_ms: loaded_at_ms,
@@ -572,7 +562,6 @@ async fn release_rejected_settlement(
         }
     };
     let attempt_id = settlement.id_bytes().to_vec();
-    let cancelled = settlement.cancelled.clone();
     // Counted for `/metrics` only when this call released the attempt: one
     // already resolved elsewhere is not a release.
     let released = pool
@@ -583,10 +572,8 @@ async fn release_rejected_settlement(
                 &consumed,
                 &answer,
             )?;
-            let mut update = std::mem::take(&mut released.update);
+            let update = std::mem::take(&mut released.update);
             let returned = update.active.len();
-            // Its sit-outs stay cancelled.
-            update.removed.extend(cancelled);
             Ok((update, released.found.then_some((returned, released))))
         })
         .await?;
@@ -789,8 +776,7 @@ impl FailedHolds {
         due
     }
 
-    /// The settlement landed: its inputs, and the sit-outs held with them,
-    /// start over.
+    /// The settlement landed: its inputs start over.
     fn settled(&mut self, batch: &ExecutionBatch) {
         for order in batch.book_orders() {
             self.strikes.remove(&order.id());
@@ -1139,7 +1125,6 @@ impl Executor {
                                 let held = failed.hold(group.book_orders(), Instant::now());
                                 tracing::warn!(
                                     notes = group.filled_notes.len(),
-                                    self_trade_cancels = group.self_trade_cancels().len(),
                                     ?held,
                                     "pair group keeps failing; holding its orders"
                                 );
@@ -1310,29 +1295,20 @@ impl Executor {
             Err(error) => return Ok(execution_failed(batch, FailedStage::Prove, error)),
         };
         let attempt = SettlementAttemptRow::prepared(&result);
-        let pending =
-            match PendingSettlement::prepared(attempt, components, batch.self_trade_cancels()) {
-                Ok(pending) => pending,
-                Err(error) => return Ok(build_failed(error)),
-            };
+        let pending = match PendingSettlement::prepared(attempt, components) {
+            Ok(pending) => pending,
+            Err(error) => return Ok(build_failed(error)),
+        };
         let durable_attempt = pending.attempt.clone();
         let fills = pending.fills.clone();
-        let cancels: Vec<_> = pending
-            .cancelled
-            .iter()
-            .map(|id| id.to_bytes().to_vec())
-            .collect();
         let persisted = self
             .pool
             .write(move |conn| {
-                // Same commit: a crossed maker's sit-outs are cancelled
-                // exactly when its kept order's settlement is reserved.
-                db::postgres_db::reserve_settlement_tx(
+                db::postgres_db::prepare_settlement_tx(
                     conn,
                     &durable_attempt,
                     &inputs,
                     Some(&fills),
-                    &cancels,
                 )
             })
             .await;
@@ -1596,7 +1572,6 @@ impl Executor {
         let attempt_id = settlement.id_bytes().to_vec();
         let consumer = self.solver_id;
         let fills = settlement.fills.clone();
-        let cancelled = settlement.cancelled.clone();
         let activated = self
             .pool
             .write_book_with(&self.book_tx, move |conn| {
@@ -1608,9 +1583,7 @@ impl Executor {
                     consumer,
                     Some(&fills),
                 )?;
-                let mut update = confirmed.update;
-                update.removed.extend(cancelled);
-                Ok((update, confirmed.activated_makers))
+                Ok((confirmed.update, confirmed.activated_makers))
             })
             .await?;
         metrics::record_confirmed(settlement.taken_at_ms, crate::types::now_millis());
@@ -1884,27 +1857,11 @@ mod claim_tests {
                     requested_filled,
                     note: Arc::new(note),
                     arrival_unix: 1,
-                    cancel_on_reserve: Vec::new(),
                 })
                 .collect(),
         };
         let components = BatchComponents::prepare(&batch, solver_id).unwrap();
         assert_eq!(components.inputs.len(), 2);
-        // A pending self-trade cancel is never built as an input.
-        let mut with_cancel = batch.clone();
-        with_cancel.filled_notes[0]
-            .cancel_on_reserve
-            .push(sized_batch(&[1]).filled_notes[0].to_book_order());
-        let inputs = BatchComponents::prepare(&with_cancel, solver_id)
-            .unwrap()
-            .inputs;
-        assert_eq!(
-            inputs
-                .iter()
-                .map(|input| input.note.id())
-                .collect::<Vec<_>>(),
-            [batch.filled_notes[0].note_id, batch.filled_notes[1].note_id]
-        );
         for (input, filled) in components.inputs.iter().zip(&batch.filled_notes) {
             assert_eq!(input.note.id(), filled.note_id);
             assert!(input.remainder.is_none());
@@ -1964,7 +1921,6 @@ mod claim_tests {
                     requested_filled: payment,
                     note: Arc::new(note),
                     arrival_unix: 1,
-                    cancel_on_reserve: Vec::new(),
                 });
             }
             combined.group_ends.push(combined.filled_notes.len());
@@ -1995,7 +1951,6 @@ mod claim_tests {
                     requested_filled: 1,
                     note,
                     arrival_unix: 1,
-                    cancel_on_reserve: Vec::new(),
                 });
             }
             group_ends.push(filled_notes.len());
@@ -2066,49 +2021,6 @@ mod claim_tests {
         // A single group is not split further.
         let single = groups.into_iter().next().unwrap();
         assert_eq!(pair_groups(single).len(), 1);
-    }
-
-    #[test]
-    fn pending_self_trade_cancels_travel_with_their_note() {
-        let mut batch = sized_batch(&[2, 4, 2]);
-        let mut rng = RandomCoin::new(Word::from([7u32, 0, 0, 0]));
-        let sit_out = FilledNote {
-            note: Arc::new(p2id(fee_faucet(), 1, &mut rng)),
-            ..batch.filled_notes[0].clone()
-        }
-        .to_book_order();
-        // ADR 0005: the sit-out rides on its maker's first fill in the pair.
-        batch.filled_notes[2]
-            .cancel_on_reserve
-            .push(sit_out.clone());
-        let transactions = split_batch(&mut batch).unwrap();
-        assert_eq!(transactions[0].self_trade_cancels(), vec![sit_out.id()]);
-        let groups = pair_groups(transactions.into_iter().next().unwrap());
-        assert_eq!(
-            groups
-                .iter()
-                .map(ExecutionBatch::self_trade_cancels)
-                .collect::<Vec<_>>(),
-            vec![Vec::new(), vec![sit_out.id()], Vec::new()]
-        );
-        // A failed group is held, then given back, with its sit-out.
-        let held = groups[1].book_orders();
-        assert_eq!(held.len(), 5);
-        assert_eq!(held[1].id(), sit_out.id());
-
-        // A sit-out's strikes grow with its group's and clear when it settles.
-        let group = &groups[1];
-        let mut failed = FailedHolds::default();
-        let start = Instant::now();
-        failed.hold(group.book_orders(), start);
-        failed.hold(group.book_orders(), start);
-        assert_eq!(failed.strikes[&sit_out.id()].0, 2);
-        failed.settled(group);
-        assert!(
-            !failed.strikes.contains_key(&sit_out.id()),
-            "settling the carrier forgets the sit-out's strikes too"
-        );
-        assert_eq!(failed.hold(group.book_orders(), start), FAILED_HOLD);
     }
 
     #[test]
@@ -2316,15 +2228,12 @@ mod recovery_tests {
 
             let mut rejected_attempt = attempt;
             rejected_attempt.status = SettlementStatus::Rejected.as_str().into();
-            // A sit-out its reservation cancelled leaves the matcher with it.
-            let sit_out = parent_note_with(Word::from([9u32, 0, 0, 0]))?.id();
             let settlement = PendingSettlement {
                 tx_id,
                 attempt: rejected_attempt,
                 parent_notes: vec![parent],
                 fills: Arc::default(),
                 child_notes: Vec::new(),
-                cancelled: vec![sit_out],
                 answer: None,
                 retry_at: None,
                 taken_at_ms: 0,
@@ -2380,8 +2289,7 @@ mod recovery_tests {
             } else {
                 let update = book_rx.try_recv()?;
                 assert_eq!(update.active.len(), usize::from(!consumed));
-                assert_eq!(update.removed.len(), usize::from(consumed) + 1);
-                assert_eq!(update.removed.last(), Some(&sit_out));
+                assert_eq!(update.removed.len(), usize::from(consumed));
                 // Releasing an attempt that is already resolved counts nothing.
                 let again = release_rejected_settlement(
                     &adapter,

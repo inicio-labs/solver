@@ -66,8 +66,6 @@ pub(crate) enum ConfigError {
     },
     #[error("engine.maker_live_at_accept needs {0}")]
     MakerLiveAtAccept(&'static str),
-    #[error("engine.maker_cancel_crossing_on_submit needs engine.maker_gateway_enabled = true")]
-    MakerCancelCrossingOnSubmit,
     #[error("pair {pair}: invalid {side}_faucet_id: {reason}")]
     InvalidFaucet {
         pair: String,
@@ -401,23 +399,11 @@ pub struct EngineConfig {
     /// Already selected settlements continue. Default 30000; zero is allowed.
     #[serde(default = "default_maker_settlement_buffer_ms")]
     pub maker_settlement_buffer_ms: u64,
-    /// Self-trade prevention for maker orders (ADR 0005): a maker whose
-    /// eligible orders cross trades only on the side of its newest order, and
-    /// its older crossing orders are cancelled once that order fills. Default
-    /// `true`; `false` matches as before.
-    #[serde(default = "default_maker_self_trade_prevention")]
-    pub maker_self_trade_prevention: bool,
     /// Maker orders with a private note go live when the gateway accepts
     /// them, before their note is in a block (ADR 0008). Needs the gateway.
     /// Default `false`: an order goes live once its note is in a block.
     #[serde(default)]
     pub maker_live_at_accept: bool,
-    /// Self-trade prevention at submit (ADR 0009): when a maker's bid and ask
-    /// on one pair cross at the prices it submitted, the order with the
-    /// lower seq is cancelled, checked when a `SubmitOrder` is accepted.
-    /// Needs the gateway. Default `false`: as before.
-    #[serde(default)]
-    pub maker_cancel_crossing_on_submit: bool,
     /// An order that went live at accept is cancelled when its note is not in
     /// a block this many seconds after accept AND
     /// `maker_unconfirmed_cancel_after_blocks` blocks after the block the
@@ -513,9 +499,6 @@ fn default_maker_stream_heartbeat_ms() -> u64 {
 }
 fn default_maker_settlement_buffer_ms() -> u64 {
     30_000
-}
-fn default_maker_self_trade_prevention() -> bool {
-    true
 }
 fn default_maker_unconfirmed_cancel_after_secs() -> u64 {
     60
@@ -671,9 +654,6 @@ impl SolverConfig {
                     max,
                 });
             }
-        }
-        if self.engine.maker_cancel_crossing_on_submit && !self.engine.maker_gateway_enabled {
-            return Err(ConfigError::MakerCancelCrossingOnSubmit);
         }
         if self.engine.maker_live_at_accept {
             if !self.engine.maker_gateway_enabled {
@@ -1029,17 +1009,6 @@ mod tests {
         assert_eq!(config.engine.maker_settlement_buffer_ms, 0);
         config.validate().unwrap();
         assert!(check(|c| c.engine.maker_stream_buffer = 0).contains("maker_stream_buffer"));
-    }
-
-    #[test]
-    fn cancel_crossing_on_submit_is_off_by_default_and_needs_the_gateway() {
-        assert!(!example().engine.maker_cancel_crossing_on_submit);
-        accepted(|c| {
-            c.engine.maker_gateway_enabled = true;
-            c.engine.maker_cancel_crossing_on_submit = true;
-        });
-        assert!(check(|c| c.engine.maker_cancel_crossing_on_submit = true)
-            .contains("maker_gateway_enabled"));
     }
 
     #[test]

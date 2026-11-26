@@ -639,12 +639,10 @@ pub struct IntakeSession {
     deadline: Duration,
     publish_order: Arc<Mutex<()>>,
     owner_epoch: i64,
-    /// The owner-epoch guard of a round with a submit, with the
-    /// live-at-accept gate when that is on (ADR 0008). `None` when neither
-    /// live at accept nor self-trade prevention at submit is on.
-    gate: Option<Arc<super::maker_db::AcceptGate>>,
-    /// A submit cancels its maker's older crossing orders (ADR 0009).
-    self_trade: bool,
+    /// The owner-epoch guard of a round with a submit (self-trade
+    /// prevention at submit, ADR 0009), with the live-at-accept gate when
+    /// that is on (ADR 0008).
+    gate: Arc<super::maker_db::AcceptGate>,
     /// Woken after a round that appended events: orders that went live at
     /// accept, or orders self-trade prevention cancelled.
     wake: crate::maker::EventWake,
@@ -686,29 +684,11 @@ impl IntakeSession {
         mut self,
         fresh_block: impl Fn() -> Option<miden_protocol::block::BlockNumber> + Send + Sync + 'static,
     ) -> Self {
-        self.gate = Some(Arc::new(super::maker_db::AcceptGate::new(
+        self.gate = Arc::new(super::maker_db::AcceptGate::new(
             self.owner_epoch,
             fresh_block,
-        )));
+        ));
         self
-    }
-
-    /// Let each submit cancel its maker's older crossing orders, and lose to
-    /// a newer one (ADR 0009). Its rounds take the owner-epoch guard whether
-    /// or not live at accept is on.
-    pub fn with_self_trade_check(mut self) -> Self {
-        self.self_trade = true;
-        if self.gate.is_none() {
-            self.gate = Some(Arc::new(super::maker_db::AcceptGate::epoch_only(
-                self.owner_epoch,
-            )));
-        }
-        self
-    }
-
-    /// Whether self-trade prevention at submit is on.
-    pub(crate) fn self_trade_check(&self) -> bool {
-        self.self_trade
     }
 
     /// Wake `wake` instead of the process's event streams.
@@ -725,7 +705,7 @@ impl IntakeSession {
     /// The owner-epoch guard, with the live-at-accept gate when that is on;
     /// `None` when neither live at accept nor self-trade prevention at
     /// submit is on.
-    pub(crate) fn accept_gate(&self) -> Option<Arc<super::maker_db::AcceptGate>> {
+    pub(crate) fn accept_gate(&self) -> Arc<super::maker_db::AcceptGate> {
         self.gate.clone()
     }
 
@@ -929,8 +909,9 @@ impl PgPool {
             deadline: self.operation_deadline,
             publish_order: self.publish_order.clone(),
             owner_epoch: self.writer_config.owner_epoch,
-            gate: None,
-            self_trade: false,
+            gate: Arc::new(super::maker_db::AcceptGate::epoch_only(
+                self.writer_config.owner_epoch,
+            )),
             wake: crate::maker::EventWake::global().clone(),
             #[cfg(test)]
             drop_next_commit_reply: false,

@@ -13,7 +13,7 @@ use diesel::pg::PgConnection;
 
 use super::metrics as gateway_metrics;
 use crate::db::maker_db::{
-    self, execute_command_tx, AcceptGate, AcceptMode, CommandOutcome, SelfTradeRound, Submitted,
+    self, AcceptGate, AcceptMode, CommandOutcome, SelfTradeRound, Submitted,
 };
 use crate::db::{DbResult, IntakeSession};
 use crate::maker::{CommandHeader, CommandReply, CommandResult, MakerCommand, MakerId};
@@ -143,10 +143,9 @@ pub async fn run_intake(
             .unzip();
         let size = commands.len();
         let gate = session.accept_gate();
-        let self_trade = session.self_trade_check();
         let mut publication = session.publication_guard().await;
         let outcome = session
-            .transaction(move |conn| intake_round_tx(conn, &commands, gate.as_deref(), self_trade))
+            .transaction(move |conn| intake_round_tx(conn, &commands, &gate))
             .await;
         match outcome {
             Ok(IntakeRound {
@@ -222,19 +221,17 @@ pub async fn run_intake(
 pub(crate) struct IntakeRound {
     /// Each command's outcome, in the round's order.
     pub outcomes: Vec<(MakerId, CommandOutcome)>,
-    /// What self-trade prevention at submit did (empty when it is off).
+    /// What self-trade prevention at submit did.
     pub self_trade: SelfTradeRound,
 }
 
-/// One intake round's writes, in its transaction: with live at accept or
-/// self-trade prevention at submit on and a submit in the round, the
-/// owner-epoch guard first (see [`AcceptGate::resolve`]), then the maker
-/// rows the round touches, in ID order, then every command.
+/// One intake round's writes, in its transaction: with a submit in the
+/// round, the owner-epoch guard first (see [`AcceptGate::resolve`]), then
+/// the maker rows the round touches, in ID order, then every command.
 ///
-/// With self-trade prevention at submit on (ADR 0009), submits only claim
-/// their lineages; then one step reads the makers' orders, cancels the
-/// losers, and puts the winners live at accept in arrival order. Off, each
-/// submit goes live as it is claimed, as before.
+/// Submits only claim their lineages; then one step reads the makers'
+/// orders, cancels the losers (self-trade prevention at submit, ADR 0009),
+/// and puts the winners live at accept in arrival order.
 ///
 /// `commands` must hold the round's cancels before its submits, as
 /// [`run_intake`] orders them: the matcher applies a round's cancels before
@@ -243,30 +240,26 @@ pub(crate) struct IntakeRound {
 pub(crate) fn intake_round_tx(
     conn: &mut PgConnection,
     commands: &[(CommandHeader, MakerCommand)],
-    gate: Option<&AcceptGate>,
-    self_trade: bool,
+    gate: &AcceptGate,
 ) -> DbResult<IntakeRound> {
     let has_submit = commands
         .iter()
         .any(|(_, command)| matches!(command, MakerCommand::Submit { .. }));
-    let accept = match gate {
+    let accept = if has_submit {
         // The round's first statement, before any other lock.
-        Some(gate) if has_submit => gate.resolve(conn)?,
-        // Nothing here can go live at accept, so no block is read and no
+        gate.resolve(conn)?
+    } else {
+        // Nothing here is claimed or goes live, so no block is read and no
         // lock taken.
-        _ => AcceptMode::Off,
+        AcceptMode::Off
     };
     maker_db::prelock_command_makers_tx(conn, commands)?;
     let mut outcomes = Vec::with_capacity(commands.len());
-    // The claims the self-trade step decides on; none with the check off.
+    // The claims the self-trade step decides on.
     let mut submitted = Vec::new();
     for (index, (header, command)) in commands.iter().enumerate() {
-        let outcome = if self_trade {
-            // Claim only: the step below decides which claims go live.
-            maker_db::claim_command_tx(conn, header, command)?
-        } else {
-            execute_command_tx(conn, header, command, accept)?
-        };
+        // Claim only: the step below decides which claims go live.
+        let outcome = maker_db::claim_command_tx(conn, header, command)?;
         let claimed = outcome.reply == CommandReply::Committed(CommandResult::Accepted);
         if let (
             true,
@@ -276,7 +269,7 @@ pub(crate) fn intake_round_tx(
                 amounts,
                 ..
             },
-        ) = (self_trade && claimed, command)
+        ) = (claimed, command)
         {
             submitted.push(Submitted {
                 index,
@@ -625,7 +618,7 @@ pub(crate) mod tests {
                 pid_tx.send(pid)?;
                 barrier.wait();
                 let outcomes = conn.transaction::<_, crate::db::DbError, _>(|conn| {
-                    intake_round_tx(conn, &commands, Some(&gate), false)
+                    intake_round_tx(conn, &commands, &gate)
                 })?;
                 Ok(outcomes.outcomes[0].1.live.is_some())
             }
@@ -650,11 +643,7 @@ pub(crate) mod tests {
         let alpha = maker(&db).await;
         let wake = crate::maker::EventWake::default();
         let mut woken = wake.subscribe();
-        let session = db
-            .pool
-            .intake_session()
-            .with_event_wake(wake)
-            .with_self_trade_check();
+        let session = db.pool.intake_session().with_event_wake(wake);
         let (intake, queues) = IntakeSender::new(4, 4);
         let (book_tx, mut book_rx) = mpsc::channel(4);
         let stop = CancellationToken::new();

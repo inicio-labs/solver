@@ -1,6 +1,6 @@
 # 9. Self-trade prevention at submit
 
-- **Status:** Accepted, implemented behind `engine.maker_cancel_crossing_on_submit` (off by default). Replaces [ADR 0005](0005-maker-self-trade-prevention.md) once the [soak](../postgres-runbook.md#self-trade-prevention-at-submit) passes; until then both run.
+- **Status:** Accepted, implemented, always on. It replaced [ADR 0005](0005-maker-self-trade-prevention.md) after a soak with both rules running ([runbook](../postgres-runbook.md#self-trade-prevention-at-submit)); ADR 0005's rule and both switches (`engine.maker_self_trade_prevention`, `engine.maker_cancel_crossing_on_submit`) are removed.
 - **Date:** 2026-11-25
 - **Deciders:** Vaibhav Jindal. Maker requirements from Jordy (Pragma), 2026-10-23 and 2026-11-23.
 - **Scope:** maker orders submitted through the maker gateway (ADR 0003). Users' orders are never touched.
@@ -8,7 +8,7 @@
 
 ## Context
 
-ADR 0005 decides in the matcher, every round, among a maker's eligible orders: the side of the newest order trades, the others sit out, and they are cancelled only when a trading order is reserved. It costs every maker on every pair each round, keeps state in the executor (sit-outs travel with the settlement), and a maker learns of a cancel only at a reservation. Makers asked for the simpler rule exchanges use: a new order cancels the older crossing one.
+ADR 0005 decided in the matcher, every round, among a maker's eligible orders: the side of the newest order trades, the others sit out, and they are cancelled only when a trading order is reserved. It costs every maker on every pair each round, keeps state in the executor (sit-outs travel with the settlement), and a maker learns of a cancel only at a reservation. Makers asked for the simpler rule exchanges use: a new order cancels the older crossing one.
 
 ## Decision
 
@@ -39,8 +39,6 @@ ADR 0005 decides in the matcher, every round, among a maker's eligible orders: t
 4. The losers' stop rows, then their lineage states (pending losers, and dead submits, are closed `rejected`), then their events. A round's statement count does not grow with its losers (below 1,000 of them: stop rows are written 1,000 per statement). Then the winners go live at accept (ADR 0008) in arrival order; with live at accept off they stay pending until their note lands.
 5. After the commit: `LineageCancelled` to the matcher for every loser, after the round's cancels and before its new orders; then the replies; then the event streams are woken if the round appended any event. A stream awake for another reason can read a CANCELLED before its submit's reply, as with LIVE (ADR 0008).
 
-With the switch off the round is exactly as before.
-
 ### What happens to a loser
 
 | The loser is | Effects |
@@ -62,7 +60,7 @@ Only stops that are new have effects: if the maker's own cancel got there first,
 
 ### Locks
 
-Intake takes the round's maker locks up front, in ID order. The step writes stop rows, lineage states and events, never another order's row, so ADR 0006's order holds. A reservation takes the same maker lock: either it sees the stop and fails (counted), or the step sees the order `settling`. Any round with a submit takes the owner-epoch share lock first when either this switch or live at accept is on.
+Intake takes the round's maker locks up front, in ID order. The step writes stop rows, lineage states and events, never another order's row, so ADR 0006's order holds. A reservation takes the same maker lock: either it sees the stop and fails (counted), or the step sees the order `settling`. Any round with a submit takes the owner-epoch share lock first.
 
 ### Limits
 
@@ -70,8 +68,8 @@ Where the result differs from a replay in seq order, or the rule leaves a gap:
 
 1. A cancel sent with a lower seq than its own submit stops that order for good.
 2. A fill can't be undone: an older order can trade before a late newer one arrives.
-3. **Known limitation:** rounding on a nearly filled remainder can leave it slightly across the maker's other side, and this rule doesn't cancel it ([#93](https://github.com/inicio-labs/solver/issues/93)). Until ADR 0005 is removed, its rule can still cancel such a pair, when both orders are eligible at a round's price.
-4. Lineages claimed before the storage migration never cross, and nothing is compared while the switch is off: pairs open before switch-on aren't compared with each other. ADR 0005 covers them until they drain.
+3. **Known limitation:** rounding on a nearly filled remainder can leave it slightly across the maker's other side, and this rule doesn't cancel it ([#93](https://github.com/inicio-labs/solver/issues/93)). With ADR 0005 removed nothing does, so the two can fill each other. Rule B of the bounded price (ADR 0007) still keeps such a pair from setting a band price.
+4. Lineages claimed before the storage migration never cross. ADR 0005 covered the pairs open before the switch-on until they drained; it was removed only after that (runbook).
 5. Who gets the credit when a maker cancel and a crossing submit race (the final state is the same).
 6. The same note resent with a new request ID and a higher seq gets `already_registered` and keeps its first seq.
 7. A seq counter that goes backwards makes the maker's new crossing orders lose to its own history. Far behind (more than 1,000 of its orders on the pair above a submit), the submit is refused with `FAILED_PRECONDITION`, where a replay would accept it, and cancel it if a newer one crosses it. `solver_maker_stp_newer_rows_total` counts what rounds read.
@@ -83,9 +81,9 @@ Where the result differs from a replay in seq order, or the rule leaves a gap:
 
 ## Consequences
 
-- ADR 0005 stays on during the soak. Then one change removes it and both switches, the rule at submit staying always on, and keeps a read-only crossed-pair count (runbook).
+- ADR 0005 ran beside this rule during the soak, then was removed with both switches. Its stop source, `stp_reservation`, stays readable on old rows. A periodic read-only count of crossed open pairs, `solver_maker_crossed_open_pairs`, must stay 0 (runbook).
 - A maker can be cancelled by its own late retry: it must take every seq from one rising counter (guide, section 6).
-- Makers' clients see what the market maker guide lists under "What changes for your client" (section 12).
+- Makers' clients see what the market maker guide lists under "What your client must handle" (section 12).
 
 ## Evidence
 

@@ -1,6 +1,6 @@
 # 5. Self-trade prevention for maker orders
 
-- **Status:** Accepted, implemented. Decided with Vaibhav Jindal on 2026-10-23 to 2026-10-25. D1 to D3 are built with their proposed defaults; D6 is Vaibhav's to send. To be replaced by [ADR 0009](0009-self-trade-prevention-at-submit.md) (self-trade prevention at submit) once its soak passes.
+- **Status:** Superseded by [ADR 0009](0009-self-trade-prevention-at-submit.md) (self-trade prevention at submit), and removed after its soak, with `engine.maker_self_trade_prevention`. Kept as history: old stop rows still carry its source, `stp_reservation`. It was decided with Vaibhav Jindal on 2026-10-23 to 2026-10-25.
 - **Date:** 2026-10-25
 - **Deciders:** Vaibhav Jindal. Maker requirement from Jordy (Pragma), 2026-10-23.
 - **Scope:** PSWAP batch clearing in the 0.17 solver, maker orders only (orders with a maker ID from the gateway).
@@ -196,7 +196,7 @@ The `OrderStatus` event, its `reason` field and the event feed already exist. Wh
 
 ### Formal checks of the design (done 2026-10-25)
 
-Scripts: [`0005/check_rule.py`](0005/check_rule.py) (decision rule), [`0005/check_all_eligible.py`](0005/check_all_eligible.py) (windows), [`0005/check_single_refill.py`](0005/check_single_refill.py) (the rejected window-only variants) and [`0005/check_lifecycle.py`](0005/check_lifecycle.py) (life cycle), plain Python 3 with no dependencies; each runs in seconds. Run them from that directory.
+The scripts that ran these checks were removed with the rule (#104); they are in the history before it.
 
 - **Decision rule, exhaustive:** for all 131,070 side sequences of length 1 to 16, the two-maximum decision equals the literal submission-order replay; the kept set is never empty, is one-sided, contains the newest order and is exactly the final same-side run.
 - **Windows, exhaustive and random:** 364,032 books (3 orders per side with two makers, 4 per side with one maker, window 1 to 3) and 200,000 random books (up to 9 per side, three makers, window 1 to 5). In every case no maker ends up on both sides, no user order is skipped, every maker's newest eligible order is kept, each window is exactly the first `W` orders not skipped, and no side is left empty while users wait. Crowding the windows with 100 crossed sells and 100 crossed buys still lets 50 users trade on each side.

@@ -314,7 +314,6 @@ pub(super) fn internal_clear(
         .iter()
         .map(|filled| filled.note_id)
         .collect();
-    let self_trade_cancels = combined.self_trade_cancels();
     match exec_tx.try_send(combined) {
         Ok(()) => {}
         // Unreachable while the matcher is the only sender; if it ever
@@ -327,23 +326,20 @@ pub(super) fn internal_clear(
     }
     // Keep the parents in memory but off the matchable index. A definite
     // failure reactivates them; confirmation removes them permanently.
-    // Sit-outs waiting to be cancelled leave the index too, until the
-    // executor's final message removes or returns them (ADR 0005).
-    for note_id in sent.iter().chain(&self_trade_cancels) {
+    for note_id in &sent {
         book.deactivate(*note_id);
     }
     book.track_matched(&sent, now_millis());
     tracing::info!(
         pairs = included_pairs,
         orders = sent.len(),
-        self_trade_cancels = self_trade_cancels.len(),
         "combined clearing batch sent to executor"
     );
     Ok(())
 }
 
-/// A pair's accepted plan: its execution batch with the sit-outs to cancel
-/// attached, and what the fills release on each side.
+/// A pair's accepted plan: its execution batch, and what the fills release
+/// on each side.
 struct Cleared {
     execution: ExecutionBatch,
     released: PairAmounts,
@@ -371,7 +367,7 @@ fn clear_pair_at(
     price: BatchPrice,
     config: &ClearingConfig,
 ) -> Result<Option<Cleared>, Box<ClearFailure>> {
-    let (batch, self_trade) = book
+    let batch = book
         .build_pair_batch(base, quote, price, config)
         .map_err(ClearFailure::at("clearing admission failed"))?;
     let plan = match PairMatcher::new(&batch, config).clear() {
@@ -394,10 +390,9 @@ fn clear_pair_at(
         }
         Err(error) => return Err(ClearFailure::at("pair clearing failed")(error)),
     };
-    let mut execution = plan.to_execution_batch(&batch).map_err(ClearFailure::at(
+    let execution = plan.to_execution_batch(&batch).map_err(ClearFailure::at(
         "clearing execution batch construction failed",
     ))?;
-    book.attach_self_trade_cancels(self_trade, &mut execution);
     tracing::info!(
         %base,
         %quote,
@@ -452,7 +447,6 @@ fn clear_pair_bounded(
         band_bps,
         config.protocol_fee_ppm,
         config.max_orders_per_side,
-        config.self_trade_prevention,
     ) {
         Ok(Some(walk)) => walk,
         Ok(None) => {
@@ -1074,7 +1068,7 @@ mod tests {
             fn walk(&self, band_bps: u16) -> Option<BoundedPrice> {
                 let mid = BatchPrice::from_ratio(2, 1).unwrap();
                 self.book
-                    .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100, true)
+                    .bounded_price(imiden(), iusdt(), mid, band_bps, 0, 100)
                     .unwrap()
             }
         }

@@ -9,8 +9,6 @@ pub struct ClearingConfig {
     pub protocol_fee_ppm: u32,
     pub max_orders_per_side: usize,
     pub max_total_intervals: usize,
-    /// Self-trade prevention for maker orders (ADR 0005).
-    pub self_trade_prevention: bool,
 }
 
 impl ClearingConfig {
@@ -31,7 +29,6 @@ impl Default for ClearingConfig {
             protocol_fee_ppm: 0,
             max_orders_per_side: DEFAULT_MAX_ORDERS_PER_SIDE,
             max_total_intervals: DEFAULT_MAX_TOTAL_INTERVALS_PER_SIDE,
-            self_trade_prevention: true,
         }
     }
 }

@@ -186,10 +186,29 @@ async fn a_solver_without_its_gateway_refuses_unconfirmed_orders() -> Result<()>
         let accept = maker_db::AcceptMode::Fresh(BlockNumber::from(3));
         let header = CommandHeader::new(maker, "s1".into(), 1)?;
         let submit = MakerCommand::submit(note)?;
-        let outcome = conn.transaction::<_, solver::db::DbError, _>(|conn| {
-            maker_db::execute_command_tx(conn, &header, &submit, accept)
+        // As an intake round writes it: the claim, then the self-trade step,
+        // which puts the claim live at accept.
+        let round = conn.transaction::<_, solver::db::DbError, _>(|conn| {
+            maker_db::claim_command_tx(conn, &header, &submit)?;
+            let MakerCommand::Submit {
+                note,
+                keys,
+                amounts,
+                ..
+            } = &submit
+            else {
+                unreachable!("a submit")
+            };
+            let claimed = maker_db::Submitted {
+                index: 0,
+                header: &header,
+                note,
+                keys,
+                amounts: *amounts,
+            };
+            maker_db::self_trade_round_tx(conn, &[claimed], accept)
         })?;
-        anyhow::ensure!(outcome.live.is_some(), "the order went live at accept");
+        anyhow::ensure!(round.live.len() == 1, "the order went live at accept");
         Ok(())
     })
     .await??;

@@ -219,7 +219,7 @@ Both must survive restarts, so store them before you send.
 - Take each sequence from **one counter shared by all your processes**, at the moment you send the command.
 - Gaps are fine, and the order in which commands reach us doesn't matter.
 - Don't give each process its own block of numbers. If process B sends `CancelAll` with sequence 2001, every later submit from process A using 1000–1999 is cancelled on arrival.
-- A submit whose sequence is already below a cutoff in its scope still gets `accepted`, but it never goes live and no event follows. With [self-trade prevention at submit](#121-at-submit) on, it still cancels your older crossing orders.
+- A submit whose sequence is already below a cutoff in its scope still gets `accepted`, but it never goes live and no event follows. It still cancels your older crossing orders ([self-trade prevention](#12-self-trade-prevention)).
 - With self-trade prevention at submit on, the sequence also decides which of two crossing orders of yours is cancelled: the lower one. A counter that goes backwards makes your new crossing orders lose to your own old ones, and a submit with more than 1,000 of your orders on its pair above its sequence is refused with `FAILED_PRECONDITION` ([section 14](#14-errors-and-what-to-do)).
 
 **What counts as the same command.** A retry must match the stored command exactly:
@@ -250,7 +250,7 @@ Instead of resending, you can ask for the stored reply with [`GetCommand`](#74-g
 
 For each command in your journal without a reply, either resend it unchanged, or, for a submit you no longer want, send `CancelOrder` for its lineage. That cancel stops the order even if the lost submit reaches us later. Never reuse the abandoned command's request ID or sequence for something else.
 
-With [self-trade prevention at submit](#121-at-submit) on, an abandoned submit that reaches us later still cancels your older orders on its pair that it crosses, even though your `CancelOrder` keeps it from going live. If you abandon a submit that crosses an older quote (lower sequence) you keep, cancel that quote too and replace it with a new note and a higher sequence.
+An abandoned submit that reaches us later still cancels your older orders on its pair that it crosses, even though your `CancelOrder` keeps it from going live. If you abandon a submit that crosses an older quote (lower sequence) you keep, cancel that quote too and replace it with a new note and a higher sequence.
 
 ---
 
@@ -279,7 +279,7 @@ If the note never commits (for example, your wallet's transaction failed), the o
 
 | Reply | What to do |
 |---|---|
-| `accepted` | Stored. The order is **not live and not filled** yet. You get `OrderStatus LIVE` once we see the note on chain (with [live at accept](#13-orders-live-at-accept) on, it goes live with this reply), unless a cancel covers it first, or `OrderStatus CANCELLED` instead if [self-trade prevention at submit](#121-at-submit) cancels it. |
+| `accepted` | Stored. The order is **not live and not filled** yet. You get `OrderStatus LIVE` once we see the note on chain (with [live at accept](#13-orders-live-at-accept) on, it goes live with this reply), unless a cancel covers it first, or `OrderStatus CANCELLED` instead if [self-trade prevention at submit](#12-self-trade-prevention) cancels it. |
 | `already_registered` | An earlier submit already registered this order's lineage. If that was yours (for example, the same note under another request ID), nothing changes. If another maker registered it first, the order is theirs: they receive its events and can cancel it. That can only happen if someone else has your note's bytes. |
 
 Keep the original `Note` for every order. You need it to rebuild your output notes after a fill ([section 10](#10-settlement-accounting)).
@@ -289,7 +289,7 @@ Keep the original `Note` for every order. You need it to rebuild your output not
 We accept **private** order notes only. A public note is refused with `INVALID_ARGUMENT` ("maker order notes must be private"), and nothing is stored.
 
 - Your order's terms stay off chain until it fills.
-- Events for each order arrive in a fixed order: `LIVE` first, then the settlement events. An `OrderStatus CANCELLED` is always last, and can be the only one ([section 12](#121-at-submit)).
+- Events for each order arrive in a fixed order: `LIVE` first, then the settlement events. An `OrderStatus CANCELLED` is always last, and can be the only one ([section 12](#12-self-trade-prevention)).
 
 #### Payback note type
 
@@ -418,7 +418,7 @@ flowchart LR
 | seq 100, offers ETH for USDC | Cancelled: 100 is below 102 and the direction matches. |
 | seq 101, offers USDC for ETH | Not affected by this directional cancel. |
 | A later remainder of seq 100 | Cancelled too. A remainder keeps its root submit sequence, 100. |
-| seq 99, offers ETH for USDC, arriving after the cancel | Cancelled as soon as it arrives. Its reply is still `accepted`, but it never goes live and no event follows. With [self-trade prevention at submit](#121-at-submit) on, it still cancels your older crossing orders. |
+| seq 99, offers ETH for USDC, arriving after the cancel | Cancelled as soon as it arrives. Its reply is still `accepted`, but it never goes live and no event follows. It still cancels your older crossing orders ([self-trade prevention](#12-self-trade-prevention)). |
 | seq 103, offers ETH for USDC | Can trade: 103 is above the cutoff. |
 
 To cancel **both** directions instead, send `CancelAll` with `market.faucetA = ETH` and `market.faucetB = USDC` and no `direction`. Give it its own request ID and a new sequence, for example 104: it cancels every ETH/USDC order in either direction with a submit sequence below 104, including seq 101 and 103 above. Don't resend sequence 102 with a different scope; that returns `ALREADY_EXISTS`.
@@ -616,7 +616,7 @@ stateDiagram-v2
 | Live → Spent elsewhere | The note was spent outside the solver, for example you reclaimed it. |
 | Reserved → Filled | The transaction committed and nothing is left. |
 | Reserved → Live | The transaction committed a partial fill and your remainder (a new note) is live, or the transaction was voided and your order is back. |
-| Reserved → Cancelled | Your cancel covers the remainder or the returned order, [self-trade prevention at submit](#121-at-submit) cancelled the order while the settlement held it, or the operator closed your unconfirmed orders with the escape hatch ([section 13](#13-orders-live-at-accept)). `result.reason` says which. |
+| Reserved → Cancelled | Your cancel covers the remainder or the returned order, [self-trade prevention at submit](#12-self-trade-prevention) cancelled the order while the settlement held it, or the operator closed your unconfirmed orders with the escape hatch ([section 13](#13-orders-live-at-accept)). `result.reason` says which. |
 | Reserved → Spent elsewhere | The transaction was voided and your note was spent elsewhere, or the remainder of a committed fill was consumed outside the solver. |
 | Accepted or Live → Cancelled | Your `CancelOrder` or `CancelAll` covers the order. |
 | Accepted or Live → Cancelled, with `OrderStatus CANCELLED` | [Self-trade prevention](#12-self-trade-prevention) stopped the order (`self_trade_prevention`): it crossed a newer order of yours on the other side. Or (`note_not_received`) the order went live at accept and its note never reached a block ([section 13](#13-orders-live-at-accept)). |
@@ -625,7 +625,7 @@ A partial fill doesn't have its own state: it is a committed `SettlementResolved
 
 Cancelled and Spent elsewhere end the order for the solver, but your tokens can still be in a note ([where your funds are](#where-your-funds-are)). An order that reaches its expiry stays as it is, with no event; we just stop matching it ([section 11](#11-order-expiry)).
 
-The events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. An `OrderStatus CANCELLED` is always the order's last event. With [self-trade prevention at submit](#121-at-submit) on, it can also be its first and only one: an order cancelled before it went live never gets `LIVE`.
+The events for one order always arrive in this order: `LIVE` first, then for each settlement attempt a `SettlementPending` followed by its `SettlementResolved`. An `OrderStatus CANCELLED` is always the order's last event. It can also be its first and only one: an order cancelled before it went live never gets `LIVE`.
 
 ### Each event, and when it is sent
 
@@ -640,7 +640,7 @@ flowchart LR
 
 - **Sent:** once per order, when we verify your submitted note on chain and no cancel covers it. With [live at accept](#13-orders-live-at-accept) on, an order's `LIVE` comes when we accept it, before the note is in a block.
 - **Carries:** `note_id`, `depth` (0), `state = LIVE`, and the order's `lineage_id` on the event.
-- **Not sent:** for remainders after a partial fill (`SettlementResolved` reports those), for an order you cancelled before it went live, or for an order [self-trade prevention at submit](#121-at-submit) cancelled first.
+- **Not sent:** for remainders after a partial fill (`SettlementResolved` reports those), for an order you cancelled before it went live, or for an order [self-trade prevention at submit](#12-self-trade-prevention) cancelled first.
 - **You do:** mark the order live. It can now be matched. Expiry or a later cancel can still stop it.
 
 #### `OrderStatus` · `REJECTED`
@@ -985,29 +985,7 @@ flowchart LR
 
 ## 12. Self-trade prevention
 
-Your buy and your sell on the same pair never fill each other. Two rules do this:
-
-- **[At submit](#121-at-submit)** is the rule we are moving to. We tell you the date it is switched on for each network.
-- **[At reservation](#122-at-reservation)** is the older rule. It stays on beside the new one until the new one has run cleanly for a while; then it is removed.
-
-Both group orders by your maker ID: all the accounts you trade from count as one, and you can ask for a second ID for separate strategies. Orders of other makers, and orders without a maker ID, are never affected.
-
-**While both run**, the rule at submit acts first, when your crossing order is accepted, so the rule at reservation rarely finds anything left to do. It still covers two cases: a nearly filled remainder that ends slightly across your other side through rounding, and orders you submitted before the switch-on date. Where the two sections differ (fees and eligibility, which orders trade), section 12.1 is what happens to orders you send after the switch-on date.
-
-**What changes for your client** when the rule at submit is switched on:
-
-1. `OrderStatus CANCELLED` can be an order's first and only event: it was never `LIVE`.
-2. `OrderStatus CANCELLED` with no `SettlementPending` before it.
-3. A `SettlementResolved` with `result.status = CANCELLED` for an order you never cancelled: `result.reason` is `self_trade_prevention`.
-4. `OrderStatus CANCELLED` can reach you just before the reply to the `SubmitOrder` that caused it.
-5. A late or abandoned submit can cancel your older quotes that it crosses ([section 6](#after-a-restart)).
-6. `SubmitOrder`, and `GetCommand` for that submit, can return `FAILED_PRECONDITION`: a permanent refusal, not a retryable error ([section 14](#14-errors-and-what-to-do)).
-
-Run the self-trade checks in [section 15](#15-checklist-before-going-live) on a test network with the rule on before the switch-on date.
-
-### 12.1 At submit
-
-When your bid and ask on one pair **cross at the prices you submitted** (your bid is at or above your ask), the order with the **lower sequence is cancelled**.
+Your buy and your sell on the same pair never fill each other. When your bid and ask on one pair **cross at the prices you submitted** (your bid is at or above your ask), the order with the **lower sequence is cancelled**.
 
 - Equal prices count. Fees and eligibility play no part.
 - The sequence decides ([section 6](#6-command-identity-request-id-and-sequence)), not the order in which your messages reach us: the result is the one you would get if we applied your commands in sequence order.
@@ -1030,59 +1008,37 @@ What you do:
 - **It isn't a replace:** cancel your same-side quotes yourself.
 - **Reclaim** each cancelled order's note ([section 10](#taking-your-funds-back)).
 - **With live at accept off**, to keep both sides quoted: first submit the replacement for the quote you are about to cross, and wait for its `LIVE`; then send the order that crosses your old quote. Otherwise your old side is out of the book for about one block, and for good if the new note never lands.
-- A nearly filled remainder can end slightly across your other side through rounding. This rule doesn't cancel it; the rule at reservation still can, until it is removed.
-- **Orders you submitted before the solver stored order prices** (we tell you the date) are never compared with any order, not even a new one. Cancel them before the switch-on date.
+- A nearly filled remainder can end slightly across your other side through rounding. This rule doesn't cancel it, and the two can then fill each other ([#93](https://github.com/inicio-labs/solver/issues/93)).
 - A fill can't be undone: an older order can fill before a late newer one reaches us.
 - The same note sent again under a new request ID gets `already_registered` and keeps the sequence of its first submit.
-- We stop matching an order 30 seconds before its expiry (by default). An order sent with less than that left is accepted but never trades; with this rule on, it still cancels your older crossing orders.
+- We stop matching an order 30 seconds before its expiry (by default). An order sent with less than that left is accepted but never trades; it still cancels your older crossing orders.
 - A submit with more than 1,000 of your orders on its pair above its sequence is refused with `FAILED_PRECONDITION`, before anything is registered: your counter is far behind (for example a clock that went back after a restart). Fix the counter, then send the note again with a new request ID and a current sequence.
 
-### 12.2 At reservation
+Orders are grouped by your maker ID: all the accounts you trade from count as one, and you can ask for a second ID for separate strategies. Orders of other makers, and orders without a maker ID, are never affected.
 
-This is the rule for orders submitted before the switch-on date, and for rounding (above). It decides each round, among your orders that are eligible at the round's price. It only matters when your orders **cross**: your bid is above your ask by more than the fee, so both are eligible. A normal two-sided quote, bid below ask, is never touched.
+### What you see
 
-#### The rule
-
-Each round, for each pair where you have eligible orders on both sides:
-
-1. **The side of your newest eligible order wins.** Newest means the highest sequence of the `SubmitOrder` that registered the order ([section 6](#6-command-identity-request-id-and-sequence)). A remainder keeps its order's sequence.
-2. Your orders on the winning side that you submitted **after** your newest order on the other side trade as usual, with their normal price and time priority.
-3. All your other eligible orders on the pair **sit out** the round. A sit-out takes no place in the batch: the next order in line takes it.
-4. If one of your trading orders is reserved for a settlement (you receive its `SettlementPending`), every one of your sit-outs on the pair is **cancelled** in the same step: you receive `OrderStatus CANCELLED` with reason `self_trade_prevention` for each. The cancel is permanent, like `CancelOrder`, and covers the order's future remainders.
-5. If none of your trading orders is reserved, nothing is cancelled. Your sit-outs are checked again in the next round.
-
-The result is the same as replaying your submits in order, where every submit on the other side cancels your older live orders.
-
-`B` is your buy and `S` your sell, numbered in the order you submitted them. All are eligible unless noted. Orders sent before the switch-on date:
-
-| Your orders | Trade this round | Cancelled if one of them is reserved |
-|---|---|---|
-| B1, B2 | B1, B2 | nothing |
-| B1, then S1 | S1 | B1 |
-| B1, then S1, then B2 | B2 | B1 and S1 |
-| B1 and B2, then S1 | S1 | B1 and B2 |
-| B1, then S1 and S2 | S1, S2 | B1 |
-| B1 eligible, S1 not eligible | B1 | nothing |
-
-A small newer order cancels larger older ones on the other side: the rule follows your latest intent, whatever the size.
-
-#### What you see
-
-- `OrderStatus CANCELLED` for each cancelled order, after the `SettlementPending` of your order that trades ([section 8](#orderstatus--cancelled)).
+- `OrderStatus CANCELLED` with reason `self_trade_prevention` for each cancelled order, or for an order in a settlement, that settlement's `SettlementResolved` ([section 8](#orderstatus--cancelled)).
 - The cancelled order leaves `ListActiveMakerOrders`.
-- No event while an order only sits out. It ends when your trading order is reserved, when you cancel one side, or when the price moves so that your orders no longer cross.
 - Your tokens stay in the cancelled order's note until you [reclaim it](#taking-your-funds-back).
 - Your client must accept the `OrderState` value `ORDER_STATE_CANCELLED` (4).
 
-#### Avoiding it
+**What your client must handle:**
 
-- Cancel an old quote before you send its replacement, or send the replacement on the same side.
+1. `OrderStatus CANCELLED` can be an order's first and only event: it was never `LIVE`.
+2. `OrderStatus CANCELLED` with no `SettlementPending` before it.
+3. A `SettlementResolved` with `result.status = CANCELLED` for an order you never cancelled: `result.reason` is `self_trade_prevention`.
+4. `OrderStatus CANCELLED` can reach you just before the reply to the `SubmitOrder` that caused it.
+5. A late or abandoned submit can cancel your older quotes that it crosses ([section 6](#after-a-restart)).
+6. `SubmitOrder`, and `GetCommand` for that submit, can return `FAILED_PRECONDITION`: a permanent refusal, not a retryable error ([section 14](#14-errors-and-what-to-do)).
 
-#### Pairs with a price band
+Run the self-trade checks in [section 15](#15-checklist-before-going-live) on a test network.
+
+### Pairs with a price band
 
 On a pair with a price band ([ADR 0007](adr/0007-bounded-clearing-price.md)), the round's price is not always the Binance mid. It is the price inside the band that trades the most volume, and among those the one closest to the mid. When users buy more than they sell, your ask can set the price; when they sell more, your bid can. Every fully filled order in the round trades at that one price.
 
-Your crossed orders are also checked before the price is chosen: the older of each of your bids and asks that clash is left out while pricing, so your own crossed pair can never set the price. Your normal two-sided quote is not affected. The rule at reservation still decides, at the chosen price, which of your orders trade and which are cancelled.
+Your crossed orders are also checked before the price is chosen: the older of each of your bids and asks that clash is left out while pricing, so your own crossed pair can never set the price. Your normal two-sided quote is not affected. Crossed pairs exist only through rounding (above): the rule at submit cancels the rest before they reach the book.
 
 ---
 
@@ -1124,7 +1080,7 @@ sequenceDiagram
 |---|---|---|---|
 | `OrderStatus CANCELLED` | `note_not_received` | We never saw your note: by default 60 seconds and 20 blocks after accept (both), it was not on chain. A note that differs from what you submitted has another note ID, so it ends this way too. | Retire the order. If your transaction lands later, reclaim the note: we will not trade it. |
 | `OrderStatus UNAVAILABLE` | `note spent outside this solver` | Your note was spent by something else, for example your own reclaim. | Retire the order. |
-| `OrderStatus CANCELLED` | `self_trade_prevention` | With [self-trade prevention at submit](#121-at-submit) on, a newer order of yours crossed it: the usual way a re-quote across your own quote ends the old one. | Retire the order; reclaim the note once it is on chain. |
+| `OrderStatus CANCELLED` | `self_trade_prevention` | A newer order of yours crossed it ([section 12](#12-self-trade-prevention)): the usual way a re-quote across your own quote ends the old one. | Retire the order; reclaim the note once it is on chain. |
 
 ### Re-quoting
 
@@ -1139,7 +1095,7 @@ Cancels work as before. A replacement on the **same side** sent before your canc
 | `INVALID_ARGUMENT` | Missing header; request ID empty or longer than 128 bytes; sequence 0 or above 2^63 − 1; note bytes not a canonical Miden note or not a PSWAP order; a public note; a pair we don't trade; bad expiry; lineage ID not 47 bytes; bad faucet ID; market and direction naming different pairs; bad page token. | Fix the request. Don't retry it unchanged. Nothing was stored, so you may keep the same request ID and sequence. |
 | `UNAUTHENTICATED` | API key missing, unknown or revoked. | Fix the key. Nothing was stored; keep your command identities as they are. |
 | `ALREADY_EXISTS` | The request ID or sequence was used for a different command. | Resolve it from your journal. Never treat it as success. |
-| `FAILED_PRECONDITION` (on `SubmitOrder`, or `GetCommand` for it) | With [self-trade prevention at submit](#121-at-submit) on: more than 1,000 of your orders on the pair have a higher sequence. Stored as refused; nothing was registered. | Fix your sequence counter. Send the note again with a new request ID and a current sequence. |
+| `FAILED_PRECONDITION` (on `SubmitOrder`, or `GetCommand` for it) | More than 1,000 of your orders on the pair have a higher sequence. Stored as refused; nothing was registered. | Fix your sequence counter. Send the note again with a new request ID and a current sequence. |
 | `UNAVAILABLE`, or your deadline expires | We may or may not have stored the command. | Resend the identical command, or call `GetCommand`. Use backoff. |
 | `NOT_FOUND` (from `GetCommand`) | Nothing is stored under that request ID right now. | Resend the original command if you still want it. |
 | `RESOURCE_EXHAUSTED` (on `StreamEvents`) | `too many event subscriptions`: too many open streams. | Close streams you don't need; retry with backoff. |
@@ -1158,10 +1114,10 @@ Run each of these against our test environment:
 - [ ] Lose a reply on purpose and resend the identical command; you get `replayed = true`. Change the note, sequence or expiry under the same request ID and confirm `ALREADY_EXISTS`.
 - [ ] Cancel one order, one direction and a whole market. Send an older submit after a `CancelAll` and confirm it never goes live.
 - [ ] Send a cancel while one of your orders has a settlement pending. The cancel can't stop that settlement: check that the reply counts the order in `settling`, then handle both outcomes. If it commits, book the fill (any remainder comes back `CANCELLED`). If it is voided, the order comes back `CANCELLED`.
-- [ ] Cross your own quote on purpose (a buy above your ask, sent after the ask). Confirm the ask gets `OrderStatus CANCELLED` with reason `self_trade_prevention` (at once with the rule at submit; once your buy is reserved with the rule at reservation), and that your client handles the new state.
-- [ ] With the rule at submit on: create a **new** buy note that crosses that ask and submit it with an unused sequence lower than the ask's, and above any `CancelAll` you sent on that pair (a late order). Confirm it is `accepted` and `CANCELLED`, never `LIVE`, although the ask it lost to is already cancelled.
-- [ ] With the rule at submit on: your client treats `FAILED_PRECONDITION` on `SubmitOrder` as final and does not resend that command unchanged.
-- [ ] With the rule at submit on: put a buy in a settlement (wait for its `SettlementPending`), then send a crossing sell. Confirm the buy gets no `OrderStatus`, and its `SettlementResolved` says `CANCELLED` with `result.reason = self_trade_prevention` (or `FULLY_FILLED`).
+- [ ] Cross your own quote on purpose (a buy above your ask, sent after the ask). Confirm the ask gets `OrderStatus CANCELLED` with reason `self_trade_prevention` at once, and that your client handles the new state.
+- [ ] Create a **new** buy note that crosses that ask and submit it with an unused sequence lower than the ask's, and above any `CancelAll` you sent on that pair (a late order). Confirm it is `accepted` and `CANCELLED`, never `LIVE`, although the ask it lost to is already cancelled.
+- [ ] Your client treats `FAILED_PRECONDITION` on `SubmitOrder` as final and does not resend that command unchanged.
+- [ ] Put a buy in a settlement (wait for its `SettlementPending`), then send a crossing sell. Confirm the buy gets no `OrderStatus`, and its `SettlementResolved` says `CANCELLED` with `result.reason = self_trade_prevention` (or `FULLY_FILLED`).
 - [ ] Test orders with no expiry, an expiry a few seconds away, an expiry that passes while a settlement is pending, and a remainder that comes back after its expiry.
 - [ ] Disconnect after receiving an event but before saving your cursor. Reconnect and confirm the fill is not booked twice.
 - [ ] Stay connected through a quiet period of several minutes and confirm keep-alives arrive and the stream stays open.

@@ -288,8 +288,9 @@ pub(super) async fn run_worker(
                     publish_book_gauges(&book, &runtime.prices.borrow());
                     book_gauges_at = Some(Instant::now());
                 }
-                // Everything the tick changed (queued updates, expiry, orders
-                // picked for a settlement, routing) as one batch.
+                // Everything else the tick changed (expiry, orders picked for
+                // a settlement, routing) as one batch; each queued update was
+                // sent as its own batch when `apply_pending` applied it.
                 book.flush_feed();
                 TICK_TIMES.record(due.elapsed());
             }
@@ -858,7 +859,7 @@ mod tests {
                     })
                     .is_ok());
                 after_first_tick().await;
-                depth.drain(&mut depth_rx);
+                assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
                 assert_eq!(depth.snapshot().len(), 4);
 
                 book_tx
@@ -871,7 +872,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
                 after_next_tick().await;
-                depth.drain(&mut depth_rx);
+                assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
                 assert_eq!(depth.snapshot().len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 

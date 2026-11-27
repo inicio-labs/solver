@@ -400,7 +400,7 @@ impl ClearingBook {
     }
 
     /// Every non-empty directed pair's levels, best first, read straight from
-    /// the index: the reference the depth mirror must match.
+    /// the index: the reference the book copy must match.
     #[cfg(test)]
     pub(super) fn levels(&self) -> crate::matching::types::SwapBookSnapshot {
         use crate::matching::types::BookLevel;
@@ -562,7 +562,7 @@ impl SelfTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::book_feed::{BookCopy, OrderState};
+    use crate::book_feed::{BookCopy, BookEntry, OrderState};
     use crate::matcher::matcher::run_matcher;
     use crate::matcher::matcher::{run_worker, ClearingRuntime};
     use crate::matcher::test_ticks::{after_first_tick, after_next_tick};
@@ -685,19 +685,58 @@ mod tests {
         )
     }
 
-    /// Drain `changes` into `depth`, then compare it with the index itself.
+    /// Flush the feed, apply its batches to `depth`, then compare that copy
+    /// with the index itself.
     fn assert_mirrors(
         book: &mut ClearingBook,
         depth: &mut BookCopy,
-        changes: &mut mpsc::UnboundedReceiver<BookBatch>,
+        batches: &mut mpsc::UnboundedReceiver<BookBatch>,
     ) {
         book.flush_feed();
         assert_eq!(
-            depth.drain(changes).mismatched,
+            depth.drain(batches).mismatched,
             0,
             "digests match the index"
         );
         assert_eq!(depth.snapshot(), book.levels());
+        // The copy holds exactly the indexed orders, with their fields.
+        let indexed: Vec<NoteId> = book
+            .pairs
+            .values()
+            .flat_map(|orders| orders.values().copied())
+            .collect();
+        assert_eq!(depth.len(), indexed.len());
+        for id in indexed {
+            assert_eq!(depth.get(&id), Some(&BookEntry::of(&book.orders[&id])));
+        }
+    }
+
+    /// The entry sent for an order carries the order's own fields.
+    #[test]
+    fn an_entry_carries_the_orders_own_fields() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut book = ClearingBook::with_feed(tx);
+        let mut rng = RandomCoin::new(Word::default());
+        let order = fixture(false, 100, 300, 7, &mut rng);
+        book.insert_or_skip(&order);
+        book.flush_feed();
+        let batch = rx.try_recv().unwrap();
+        let [OrderState::Live(entry)] = batch.orders[..] else {
+            panic!("one live order: {:?}", batch.orders);
+        };
+        let a: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap();
+        let b: TokenId = ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap();
+        assert_eq!(entry.id, order.note.id());
+        assert_eq!(entry.pair, (a, b), "offered, then requested");
+        assert_eq!((entry.rate.requested, entry.rate.offered), (300, 100));
+        assert_eq!(entry.priority, 7);
+        assert_eq!(entry.min_fill_step, 1);
+        // The index holds it under the same price.
+        let key = book.pairs[&(a, b)]
+            .iter()
+            .find_map(|(key, id)| (*id == entry.id).then_some(key.rate))
+            .unwrap();
+        assert_eq!((key.requested, key.offered), (300, 100));
     }
 
     /// A finished step sends one batch with each touched order's state at
@@ -738,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_mirror_matches_the_index_through_every_change() {
+    fn the_book_copy_matches_the_index_through_every_change() {
         let mut rng = RandomCoin::new(Word::default());
         let (depth_tx, mut changes) = mpsc::unbounded_channel();
         let mut book = ClearingBook::with_feed(depth_tx);
@@ -960,7 +999,7 @@ mod tests {
             cancel.clone(),
         ));
         after_first_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert!(
             exec_rx.try_recv().is_err(),
             "the cancelled quote never reached clearing"
@@ -968,7 +1007,7 @@ mod tests {
         assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
         after_next_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert_eq!(depth.snapshot().len(), 1);
         assert!(!task.is_finished());
         cancel.cancel();
@@ -1053,7 +1092,7 @@ mod tests {
         // The first tick cannot clear, so it must not bypass internal
         // matching by routing an order to an external DEX either.
         after_first_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert_eq!(depth.snapshot().len(), 1);
         assert!(route_rx.try_recv().is_err());
         assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
@@ -1116,7 +1155,7 @@ mod tests {
         ));
 
         after_first_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert!(route_rx.try_recv().is_err());
         assert_eq!(
             depth.snapshot().len(),
@@ -1499,7 +1538,7 @@ mod tests {
         assert!(!book.orders.contains_key(&stale.id()));
         let indexed: usize = book.pairs.values().map(BTreeMap::len).sum();
         assert_eq!(indexed, 2, "the slot still belongs to the holder");
-        // The skipped order never reached the depth mirror, so dropping it
+        // The skipped order never reached the book copy, so dropping it
         // must not remove the holder's volume there either.
         assert_mirrors(&mut book, &mut depth, &mut changes);
         book.remove(stale.id());
@@ -1573,7 +1612,7 @@ mod tests {
             cancel.clone(),
         ));
         after_first_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert!(
             exec_rx.try_recv().is_err(),
             "the expired quote never reached clearing"
@@ -1581,7 +1620,7 @@ mod tests {
         assert_eq!(depth.snapshot().len(), 1, "only the buyer's side is left");
         // The ordered book stream remains open for subsequent updates.
         after_next_tick().await;
-        depth.drain(&mut depth_rx);
+        assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
         assert_eq!(depth.snapshot().len(), 1);
         assert!(!task.is_finished());
         cancel.cancel();

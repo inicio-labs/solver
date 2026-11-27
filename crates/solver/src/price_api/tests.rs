@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
-use crate::book_feed::{BookBatch, BookCopy, BookEntry, OrderState};
+use crate::book_feed::{BookEntry, BookFeed, OrderState};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::test_support::{asset, btc, eth, market, usdt};
@@ -1403,13 +1403,12 @@ async fn a_failed_walk_quotes_the_mid() {
 
 // ── Remembered price + swap-eta long polling ─────────────────────────────────
 
-/// The v2 endpoints on the banded A/B pair, fed by the real depth mirror:
+/// The v2 endpoints on the banded A/B pair, fed by the real book copy:
 /// tests send the matcher's changes and move the Binance price.
 struct Live {
     server: TestServer,
-    depth: tokio::sync::mpsc::UnboundedSender<BookBatch>,
-    /// The matcher's side of the feed: makes batches with its digests.
-    matcher: std::sync::Mutex<BookCopy>,
+    /// The matcher's side of the feed, as the matcher uses it.
+    matcher: std::sync::Mutex<BookFeed>,
     prices: watch::Sender<Arc<PriceSnapshot>>,
     waiters: Arc<tokio::sync::Semaphore>,
 }
@@ -1459,8 +1458,7 @@ async fn live_server(wait_ms: u64, stats: SettlementStats) -> Live {
     let waiters = Arc::clone(&state.waiters);
     Live {
         server: TestServer::new(build_app(state, &config)),
-        depth,
-        matcher: std::sync::Mutex::new(BookCopy::default()),
+        matcher: std::sync::Mutex::new(BookFeed::new(depth)),
         prices: prices_tx,
         waiters,
     }
@@ -1494,8 +1492,12 @@ fn ask_removed() -> OrderState {
 impl Live {
     /// Send what the matcher would for `state`, without waiting.
     fn send(&self, state: OrderState) {
-        let batch = self.matcher.lock().unwrap().batch_for_tests(vec![state]);
-        self.depth.send(batch).unwrap();
+        let mut feed = self.matcher.lock().unwrap();
+        match state {
+            OrderState::Live(entry) => feed.live_entry(entry),
+            OrderState::Gone(id) => feed.gone(id),
+        }
+        feed.flush();
     }
 
     /// Send a matcher change and let the mirror publish it (it republishes
@@ -1780,7 +1782,9 @@ async fn a_waiting_request_answers_when_the_mirror_stops() {
     let live = live_server(5000, running()).await;
     live.change(ask_added()).await;
     live.change(ask_removed()).await;
-    let Live { server, depth, .. } = live;
+    let Live {
+        server, matcher, ..
+    } = live;
     let request = server.get(&buy_order("")).into_future();
     tokio::pin!(request);
     tokio::select! {
@@ -1790,7 +1794,7 @@ async fn a_waiting_request_answers_when_the_mirror_stops() {
     }
     // Shutdown: the matcher drops its sender, the mirror ends.
     let start = tokio::time::Instant::now();
-    drop(depth);
+    drop(matcher);
     request.await.assert_status_ok();
     assert!(start.elapsed() < Duration::from_secs(1));
 }

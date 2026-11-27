@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use miden_protocol::crypto::utils::Serializable;
 use miden_protocol::note::NoteId;
 use tokio::sync::mpsc;
 
@@ -51,20 +50,28 @@ impl BookEntry {
         }
     }
 
-    /// The order's share of its pair's digest. Stable across builds: a
-    /// blake3 hash of the crate's own byte encoding of every field.
+    /// The order's share of its pair's digest. Stable across builds: the
+    /// first 16 bytes of a blake3 hash over every field's fixed-size bytes
+    /// (note ID, both faucet IDs, then the four numbers little-endian).
     fn hash(&self) -> u128 {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.id.to_bytes());
-        hasher.update(&self.pair.0.to_bytes());
-        hasher.update(&self.pair.1.to_bytes());
-        hasher.update(&self.rate.requested.to_le_bytes());
-        hasher.update(&self.rate.offered.to_le_bytes());
-        hasher.update(&self.priority.to_le_bytes());
-        hasher.update(&self.min_fill_step.to_le_bytes());
-        let bytes = hasher.finalize();
+        const LEN: usize = 32 + 15 + 15 + 4 * 8;
+        let mut bytes = [0u8; LEN];
+        let numbers = [
+            self.rate.requested,
+            self.rate.offered,
+            self.priority,
+            self.min_fill_step,
+        ];
+        bytes[..32].copy_from_slice(&self.id.as_bytes());
+        bytes[32..47].copy_from_slice(&<[u8; 15]>::from(self.pair.0));
+        bytes[47..62].copy_from_slice(&<[u8; 15]>::from(self.pair.1));
+        for (i, number) in numbers.iter().enumerate() {
+            let at = 62 + 8 * i;
+            bytes[at..at + 8].copy_from_slice(&number.to_le_bytes());
+        }
+        let hash = blake3::hash(&bytes);
         let mut first = [0u8; 16];
-        first.copy_from_slice(&bytes.as_bytes()[..16]);
+        first.copy_from_slice(&hash.as_bytes()[..16]);
         u128::from_le_bytes(first)
     }
 }
@@ -74,8 +81,9 @@ impl BookEntry {
 pub(crate) enum OrderState {
     /// In the matchable index now, with these fields.
     Live(BookEntry),
-    /// Not in it any more (filled, picked for a settlement, cancelled,
-    /// expired, or never indexable).
+    /// Was in it during the step and is not at its end (filled, picked for
+    /// a settlement, cancelled, expired). An order the index never held is
+    /// never sent.
     Gone(NoteId),
 }
 
@@ -103,16 +111,18 @@ pub(crate) fn backlog() -> u64 {
     SENT.load(Ordering::Relaxed).saturating_sub(applied)
 }
 
-/// Batches whose digests did not match the copy after applying them. Any
-/// is a bug: the in-process channel loses nothing.
+/// Batches after which at least one pair's digest differed from the
+/// matcher's. Any is a bug: the in-process channel loses nothing. Nothing
+/// repairs the copy, so a pair out of step counts again with every batch
+/// that touches it (logged once, when it goes out of step).
 static DIGEST_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn digest_mismatches() -> u64 {
     DIGEST_MISMATCHES.load(Ordering::Relaxed)
 }
 
-/// What applying batches did: the pairs they touched, and how many of those
-/// pairs then held a digest other than the matcher's (each one a bug).
+/// What applying batches did: the pairs they touched, and how many batches
+/// left a pair with a digest other than the matcher's (each one a bug).
 #[derive(Debug, Default)]
 pub(crate) struct Applied {
     pub(crate) touched: HashSet<Pair>,
@@ -131,13 +141,17 @@ impl Applied {
 /// price levels with their total offered volume.
 #[derive(Debug, Default)]
 pub(crate) struct BookCopy {
-    entries: HashMap<NoteId, BookEntry>,
+    /// Each live order with its hash, so removing it costs no rehash.
+    entries: HashMap<NoteId, (BookEntry, u128)>,
     /// Each held pair's order count and digest (the wrapping sum of its
     /// orders' hashes); a pair leaves when its last order does.
     pairs: HashMap<Pair, (usize, u128)>,
     /// `None` on the matcher's side, which needs no levels.
     levels: Option<HashMap<Pair, BTreeMap<RateKey, u128>>>,
     applied: u64,
+    /// Pairs whose digest differed after the last batch touching them, so
+    /// each goes out of step (and back) in the log once.
+    out_of_step: HashSet<Pair>,
 }
 
 impl BookCopy {
@@ -150,7 +164,12 @@ impl BookCopy {
     }
 
     pub(crate) fn get(&self, id: &NoteId) -> Option<&BookEntry> {
-        self.entries.get(id)
+        self.entries.get(id).map(|(entry, _)| entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// The digest of `pair` (0 when it holds no order).
@@ -161,9 +180,10 @@ impl BookCopy {
     /// Hold `entry`, replacing an older one with its ID. The pairs touched.
     pub(crate) fn insert(&mut self, entry: BookEntry) -> [Option<Pair>; 2] {
         let old = self.remove(&entry.id);
+        let hash = entry.hash();
         let (count, digest) = self.pairs.entry(entry.pair).or_default();
         *count += 1;
-        *digest = digest.wrapping_add(entry.hash());
+        *digest = digest.wrapping_add(hash);
         if let Some(levels) = &mut self.levels {
             *levels
                 .entry(entry.pair)
@@ -171,16 +191,16 @@ impl BookCopy {
                 .entry(entry.rate)
                 .or_default() += u128::from(entry.rate.offered);
         }
-        self.entries.insert(entry.id, entry);
+        self.entries.insert(entry.id, (entry, hash));
         [old, Some(entry.pair)]
     }
 
     /// Drop the entry with `id`, if held. Its pair.
     pub(crate) fn remove(&mut self, id: &NoteId) -> Option<Pair> {
-        let entry = self.entries.remove(id)?;
+        let (entry, hash) = self.entries.remove(id)?;
         if let Some((count, digest)) = self.pairs.get_mut(&entry.pair) {
             *count -= 1;
-            *digest = digest.wrapping_sub(entry.hash());
+            *digest = digest.wrapping_sub(hash);
             if *count == 0 {
                 self.pairs.remove(&entry.pair);
             }
@@ -202,8 +222,9 @@ impl BookCopy {
     }
 
     /// Apply `batch`. A pair whose digest then differs from the batch's, or
-    /// that the batch changed without giving a digest for, is counted,
-    /// logged and reported.
+    /// that the batch changed without giving a digest for, is out of step:
+    /// the batch is counted and reported, and the pair logged when it goes
+    /// out of step and when it is back.
     pub(crate) fn apply(&mut self, batch: &BookBatch) -> Applied {
         let mut touched = HashSet::new();
         for state in &batch.orders {
@@ -220,11 +241,15 @@ impl BookCopy {
         let mut mismatched = 0;
         for &pair in &touched {
             if sent.get(&pair) != Some(&self.digest(pair)) {
-                mismatched += 1;
-                DIGEST_MISMATCHES.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(?pair, "book copy differs from the matcher's book");
+                mismatched = 1;
+                if self.out_of_step.insert(pair) {
+                    tracing::error!(?pair, "book copy differs from the matcher's book");
+                }
+            } else if self.out_of_step.remove(&pair) {
+                tracing::warn!(?pair, "book copy matches the matcher's book again");
             }
         }
+        DIGEST_MISMATCHES.fetch_add(mismatched as u64, Ordering::Relaxed);
         Applied {
             touched,
             mismatched,
@@ -243,27 +268,6 @@ impl BookCopy {
     /// Publish that this copy's quotes now see every order state it applied.
     pub(crate) fn publish_applied(&self) {
         APPLIED.store(self.applied, Ordering::Relaxed);
-    }
-
-    /// As the matcher would send `states`: apply them to this copy (the
-    /// sender's) and return the batch with this copy's digests.
-    #[cfg(test)]
-    pub(crate) fn batch_for_tests(&mut self, states: Vec<OrderState>) -> BookBatch {
-        let mut pairs = HashSet::new();
-        for state in &states {
-            match *state {
-                OrderState::Live(entry) => pairs.extend(self.insert(entry).into_iter().flatten()),
-                OrderState::Gone(id) => pairs.extend(self.remove(&id)),
-            }
-        }
-        let digests = pairs
-            .into_iter()
-            .map(|pair| (pair, self.digest(pair)))
-            .collect();
-        BookBatch {
-            orders: states,
-            digests,
-        }
     }
 
     /// Every non-empty pair's levels, best first (empty without levels).
@@ -309,7 +313,11 @@ impl BookFeed {
 
     /// `order` entered the matchable index.
     pub(crate) fn live(&mut self, order: &Order) {
-        let entry = BookEntry::of(order);
+        self.live_entry(BookEntry::of(order));
+    }
+
+    /// An order with these fields entered the matchable index.
+    pub(crate) fn live_entry(&mut self, entry: BookEntry) {
         self.touched_pairs
             .extend(self.copy.insert(entry).into_iter().flatten());
         self.touched_orders.insert(entry.id);
@@ -340,10 +348,16 @@ impl BookFeed {
             .drain()
             .map(|pair| (pair, self.copy.digest(pair)))
             .collect();
+        // A large step (the startup load) leaves no large sets behind.
+        self.touched_orders.shrink_to(SHRINK_TO);
+        self.touched_pairs.shrink_to(SHRINK_TO);
         SENT.fetch_add(orders.len() as u64, Ordering::Relaxed);
         let _ = self.tx.send(BookBatch { orders, digests });
     }
 }
+
+/// Capacity the touched sets keep between steps.
+const SHRINK_TO: usize = 1024;
 
 #[cfg(test)]
 mod tests;

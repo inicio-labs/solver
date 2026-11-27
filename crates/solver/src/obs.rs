@@ -225,8 +225,10 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
         "solver_price_api_open_connections {open}\n\
          solver_price_api_refused_connections_total {refused}\n\
          solver_price_api_max_connections {cap}\n\
-         solver_price_mirror_backlog {}",
-        crate::swap_eta::depth_backlog()
+         solver_price_mirror_backlog {}\n\
+         solver_price_mirror_digest_mismatches_total {}",
+        crate::book_feed::backlog(),
+        crate::book_feed::digest_mismatches()
     );
     for (cause, count) in exec::settlements_released() {
         let _ = writeln!(
@@ -668,6 +670,7 @@ mod tests {
             "solver_price_api_refused_connections_total ",
             "solver_price_api_max_connections ",
             "solver_price_mirror_backlog ",
+            "solver_price_mirror_digest_mismatches_total ",
         ] {
             value(name);
         }

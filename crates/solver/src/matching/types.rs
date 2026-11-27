@@ -208,5 +208,5 @@ pub struct BookLevel {
 }
 
 /// The live book as the price API sees it: per directed `(offered, requested)`
-/// pair, every level, best first (see [`crate::swap_eta::DepthBook`]).
+/// pair, every level, best first (see [`crate::book_feed::BookCopy`]).
 pub type SwapBookSnapshot = std::collections::HashMap<(TokenId, TokenId), Vec<BookLevel>>;

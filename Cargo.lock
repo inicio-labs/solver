@@ -5389,6 +5389,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
+ "blake3",
  "consume-script",
  "diesel",
  "diesel_migrations",

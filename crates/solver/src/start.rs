@@ -375,7 +375,7 @@ pub async fn start(
         &pipeline_config,
         channels.book_rx,
         channels.exec_tx,
-        channels.depth_tx,
+        channels.feed_tx,
         channels.subscribe_tx,
         clearing,
     );
@@ -530,7 +530,7 @@ pub async fn start(
     let spawned = crate::price_api::spawn_price_api_thread(
         price_api_cfg,
         channels.prices_rx,
-        channels.depth_rx,
+        channels.feed_rx,
         channels.stats_rx,
         tokens,
         market_plan,

@@ -9,13 +9,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin::AdminState;
+use crate::book_feed::BookBatch;
 use crate::config::EngineConfig;
 use crate::db;
 use crate::ingest::{self, MidenClient};
 use crate::matcher;
 use crate::price::PriceSnapshot;
 use crate::router::{QuotesSnapshot, RouteBatch};
-use crate::swap_eta::{DepthChange, SettlementStats};
+use crate::swap_eta::SettlementStats;
 use crate::types::{BookUpdate, ExecutionBatch, TokenId};
 
 /// Bounded buffer for the high-volume pipeline channels (orders, exec
@@ -173,9 +174,10 @@ pub struct PipelineChannels {
     /// Binance quotes (price feed → matcher, price API, metrics), latest-wins.
     pub prices_tx: watch::Sender<Arc<PriceSnapshot>>,
     pub prices_rx: watch::Receiver<Arc<PriceSnapshot>>,
-    /// Every change to the active book (matcher → swap-eta API's depth mirror).
-    pub depth_tx: mpsc::UnboundedSender<DepthChange>,
-    pub depth_rx: mpsc::UnboundedReceiver<DepthChange>,
+    /// The active book, one batch per finished matcher step (matcher → the
+    /// price API's book copy); see [`crate::book_feed`].
+    pub feed_tx: mpsc::UnboundedSender<BookBatch>,
+    pub feed_rx: mpsc::UnboundedReceiver<BookBatch>,
     /// Settlement times and whether the executor takes batches (executor →
     /// swap-eta API), latest-wins.
     pub stats_tx: watch::Sender<Arc<SettlementStats>>,
@@ -195,7 +197,7 @@ pub fn create_channels() -> PipelineChannels {
     // The depth feed is unbounded so the matcher never waits on or drops a
     // change: it only sends what its index already did, and the price API's
     // mirror drains it (see `price_api::mirror_depth`).
-    let (depth_tx, depth_rx) = mpsc::unbounded_channel::<DepthChange>();
+    let (feed_tx, feed_rx) = mpsc::unbounded_channel::<BookBatch>();
     let (stats_tx, stats_rx) =
         watch::channel::<Arc<SettlementStats>>(Arc::new(SettlementStats::new()));
     let (exec_tx, exec_rx) = mpsc::channel::<ExecutionBatch>(EXEC_CHANNEL_BUF);
@@ -211,8 +213,8 @@ pub fn create_channels() -> PipelineChannels {
         book_rx,
         prices_tx,
         prices_rx,
-        depth_tx,
-        depth_rx,
+        feed_tx,
+        feed_rx,
         stats_tx,
         stats_rx,
         exec_tx,
@@ -246,7 +248,7 @@ pub fn spawn_core_services(
     config: &PipelineConfig,
     book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
-    depth_tx: mpsc::UnboundedSender<DepthChange>,
+    feed_tx: mpsc::UnboundedSender<BookBatch>,
     subscribe_tx: mpsc::Sender<(TokenId, TokenId)>,
     clearing: matcher::ClearingRuntime,
 ) -> CoreHandles {
@@ -258,7 +260,7 @@ pub fn spawn_core_services(
             book_rx,
             exec_tx,
             match_interval,
-            depth_tx,
+            feed_tx,
             clearing,
             matcher_cancel.clone(),
         )

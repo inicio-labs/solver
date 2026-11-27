@@ -15,11 +15,12 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use super::{build_app, PriceApiConfig, PriceApiState};
+use crate::book_feed::{BookEntry, BookFeed, OrderState};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, RateKey, SwapBookSnapshot};
 use crate::price::test_support::{asset, btc, eth, market, usdt};
 use crate::price::{MarketPlan, PairRules, PriceSnapshot};
-use crate::swap_eta::{DepthChange, RememberedPrices, SettlementStats};
+use crate::swap_eta::{RememberedPrices, SettlementStats};
 use rust_decimal::Decimal;
 
 /// Long enough that a slow test cannot make a fresh quote stale.
@@ -1402,11 +1403,12 @@ async fn a_failed_walk_quotes_the_mid() {
 
 // ── Remembered price + swap-eta long polling ─────────────────────────────────
 
-/// The v2 endpoints on the banded A/B pair, fed by the real depth mirror:
+/// The v2 endpoints on the banded A/B pair, fed by the real book copy:
 /// tests send the matcher's changes and move the Binance price.
 struct Live {
     server: TestServer,
-    depth: tokio::sync::mpsc::UnboundedSender<DepthChange>,
+    /// The matcher's side of the feed, as the matcher uses it.
+    matcher: std::sync::Mutex<BookFeed>,
     prices: watch::Sender<Arc<PriceSnapshot>>,
     waiters: Arc<tokio::sync::Semaphore>,
 }
@@ -1456,35 +1458,52 @@ async fn live_server(wait_ms: u64, stats: SettlementStats) -> Live {
     let waiters = Arc::clone(&state.waiters);
     Live {
         server: TestServer::new(build_app(state, &config)),
-        depth,
+        matcher: std::sync::Mutex::new(BookFeed::new(depth)),
         prices: prices_tx,
         waiters,
     }
 }
 
-fn ask_added() -> DepthChange {
-    let level = ask_level();
-    DepthChange::Added {
+/// A resting order on the A/B pair at `rate` (a ratio) offering `volume`,
+/// as the matcher's feed carries it: its own amounts in that ratio.
+fn entry(seed: u64, rate: RateKey, volume: u64) -> BookEntry {
+    BookEntry {
+        id: miden_protocol::note::NoteId::try_from_hex(&format!("0x{seed:064x}")).unwrap(),
         pair: (faucet_a(), faucet_b()),
-        rate: level.rate,
-        volume: level.volume,
+        rate: RateKey::new(rate.requested * volume / rate.offered, volume),
+        priority: seed,
+        min_fill_step: 0,
     }
 }
 
-fn ask_removed() -> DepthChange {
+fn ask_entry() -> BookEntry {
     let level = ask_level();
-    DepthChange::Removed {
-        pair: (faucet_a(), faucet_b()),
-        rate: level.rate,
-        volume: level.volume,
-    }
+    entry(1, level.rate, level.volume)
+}
+
+fn ask_added() -> OrderState {
+    OrderState::Live(ask_entry())
+}
+
+fn ask_removed() -> OrderState {
+    OrderState::Gone(ask_entry().id)
 }
 
 impl Live {
+    /// Send what the matcher would for `state`, without waiting.
+    fn send(&self, state: OrderState) {
+        let mut feed = self.matcher.lock().unwrap();
+        match state {
+            OrderState::Live(entry) => feed.live_entry(entry),
+            OrderState::Gone(id) => feed.gone(id),
+        }
+        feed.flush();
+    }
+
     /// Send a matcher change and let the mirror publish it (it republishes
     /// at most every 250 ms).
-    async fn change(&self, change: DepthChange) {
-        self.depth.send(change).unwrap();
+    async fn change(&self, state: OrderState) {
+        self.send(state);
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -1556,12 +1575,8 @@ async fn a_new_order_replaces_the_remembered_price() {
     let h = live_server(5000, running()).await;
     h.gap().await;
     // A dearer ask arrives: the live book is priced, not the memory.
-    let dearer = DepthChange::Added {
-        pair: (faucet_a(), faucet_b()),
-        rate: RateKey::new(2_002_000, 1_000_000),
-        volume: 1_000_000_000,
-    };
-    h.change(dearer).await;
+    let dearer = entry(2, RateKey::new(2_002_000, 1_000_000), 1_000_000_000);
+    h.change(OrderState::Live(dearer)).await;
     let live = h.buyer_price().await;
     assert_ne!(live, ASK_PRICE);
     assert_ne!(live, "0.5");
@@ -1579,7 +1594,7 @@ async fn swap_eta_waits_for_the_book_and_answers_full_on_its_change() {
         _ = tokio::time::sleep(Duration::from_millis(1_300)) => {}
     }
     let start = tokio::time::Instant::now();
-    h.depth.send(ask_added()).unwrap();
+    h.send(ask_added());
     let v: Value = request.await.json();
     assert_eq!(v["fillStatus"], "full");
     assert_eq!(v["expectedPrice"], ASK_PRICE);
@@ -1706,13 +1721,11 @@ async fn a_waiting_order_is_judged_at_the_price_the_makers_return_at() {
         _ = tokio::time::sleep(Duration::from_millis(800)) => {}
     }
     let start = tokio::time::Instant::now();
-    h.depth
-        .send(DepthChange::Added {
-            pair: (faucet_a(), faucet_b()),
-            rate: RateKey::new(2_003_000, 1_000_000),
-            volume: 1_000_000_000,
-        })
-        .unwrap();
+    h.send(OrderState::Live(entry(
+        3,
+        RateKey::new(2_003_000, 1_000_000),
+        1_000_000_000,
+    )));
     let v: Value = request.await.json();
     // Judged at the new maker's price: no longer at market, so it answers
     // on that change instead of waiting on.
@@ -1766,11 +1779,12 @@ async fn the_clock_starts_when_the_makers_leave() {
 
 #[tokio::test(start_paused = true)]
 async fn a_waiting_request_answers_when_the_mirror_stops() {
-    let Live { server, depth, .. } = live_server(5000, running()).await;
-    depth.send(ask_added()).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    depth.send(ask_removed()).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let live = live_server(5000, running()).await;
+    live.change(ask_added()).await;
+    live.change(ask_removed()).await;
+    let Live {
+        server, matcher, ..
+    } = live;
     let request = server.get(&buy_order("")).into_future();
     tokio::pin!(request);
     tokio::select! {
@@ -1780,7 +1794,7 @@ async fn a_waiting_request_answers_when_the_mirror_stops() {
     }
     // Shutdown: the matcher drops its sender, the mirror ends.
     let start = tokio::time::Instant::now();
-    drop(depth);
+    drop(matcher);
     request.await.assert_status_ok();
     assert!(start.elapsed() < Duration::from_secs(1));
 }
@@ -1854,12 +1868,8 @@ async fn a_resting_ask_restarts_a_clock_started_while_unpriced() {
     assert_eq!(h.buyer_price().await, ASK_PRICE);
     // No usable price, and some other order on the pair changes meanwhile.
     h.prices.send_replace(Arc::new(PriceSnapshot::default()));
-    let far_ask = DepthChange::Added {
-        pair: (faucet_a(), faucet_b()),
-        rate: RateKey::new(3_000_000, 1_000_000),
-        volume: 1_000_000,
-    };
-    h.change(far_ask).await;
+    let far_ask = entry(4, RateKey::new(3_000_000, 1_000_000), 1_000_000);
+    h.change(OrderState::Live(far_ask)).await;
     h.prices.send_replace(Arc::new(banded_snapshot("2")));
     assert_eq!(h.buyer_price().await, ASK_PRICE);
     tokio::time::sleep(Duration::from_secs(11)).await;

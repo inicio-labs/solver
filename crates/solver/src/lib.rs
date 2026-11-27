@@ -14,6 +14,7 @@ pub mod pipeline;
 pub mod order;
 pub mod config;
 pub mod swap_eta;
+pub mod book_feed;
 pub mod clearing;
 
 pub mod client_factory;

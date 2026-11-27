@@ -22,7 +22,8 @@
 //! decimals and tickers, are read from the DB once at startup and kept in
 //! memory, so public traffic never touches PostgreSQL; a registration change
 //! shows after a restart. The book depth for swap quotes comes from
-//! [`mirror_depth`], which this thread runs: the matcher only sends changes.
+//! [`mirror_depth`], which this thread runs: the matcher sends one batch of
+//! changed orders per finished step.
 //! The mirror also remembers each pair's last makers' price, which
 //! `/v2/pair-price` uses for a few seconds while the book has nothing
 //! crossing inside the band (a maker re-quoting, or a matched order settling).
@@ -61,6 +62,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::book_feed::{BookBatch, BookCopy};
 use crate::clearing::{BatchPrice, OrderSide};
 use crate::db::postgres_models::RegisteredTokenRow;
 use crate::matching::types::{BookLevel, SwapBookSnapshot};
@@ -68,8 +70,8 @@ use crate::price::PricePrecision;
 use crate::price::{MarketPlan, OrderMarket, PriceSnapshot, PriceUnavailable, Valued};
 use crate::swap_eta::{
     eval_can_fill, eval_off_market, fill_price, judge, remembered_price, walk_levels, whole_price,
-    DepthBook, DepthChange, FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, Remembered,
-    RememberedPrices, SettlementStats, VerdictTerms,
+    FillStatus, NoFillReason, PriceBand, Probe, ProposedOrder, Remembered, RememberedPrices,
+    SettlementStats, VerdictTerms,
 };
 use crate::types::TokenId;
 
@@ -991,9 +993,10 @@ async fn get_swap_eta_v1(
 /// How often the depth mirror republishes the book for the quote handlers.
 const DEPTH_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Mirror the matcher's book depth from its changes and publish it for the
-/// quote handlers, at most every [`DEPTH_PUBLISH_INTERVAL`]. Runs on this
-/// thread: the matcher only sends the changes its index already made.
+/// Keep a copy of the matcher's book from its batches ([`crate::book_feed`])
+/// and publish its levels for the quote handlers, at most every
+/// [`DEPTH_PUBLISH_INTERVAL`]. Runs on this thread: the matcher only notes
+/// what its index changed and sends one batch per finished step.
 ///
 /// After each round of changes it also walks every pair those changes
 /// touched, both directions, and remembers the makers' price the walk finds
@@ -1001,21 +1004,19 @@ const DEPTH_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 /// remembered prices go out just before the book, so a handler that reads
 /// the book first never sees older ones.
 async fn mirror_depth(
-    mut changes: mpsc::UnboundedReceiver<DepthChange>,
+    mut batches: mpsc::UnboundedReceiver<BookBatch>,
     book_tx: watch::Sender<Arc<SwapBookSnapshot>>,
     remembered_tx: watch::Sender<Arc<RememberedPrices>>,
     prices: watch::Receiver<Arc<PriceSnapshot>>,
     fee_ppm: u32,
 ) {
-    let mut depth = DepthBook::default();
+    let mut copy = BookCopy::with_levels();
     let mut remembered = RememberedPrices::new();
     let mut previous = Arc::new(SwapBookSnapshot::default());
-    while let Some(change) = changes.recv().await {
-        let first = change.pair();
-        depth.apply(change);
-        let mut touched = depth.drain(&mut changes);
-        touched.insert(first);
-        let book = Arc::new(depth.snapshot());
+    while let Some(batch) = batches.recv().await {
+        let mut touched = copy.apply(&batch).touched;
+        touched.extend(copy.drain(&mut batches).touched);
+        let book = Arc::new(copy.snapshot());
         let snapshot = prices.borrow().clone();
         remember_prices(
             &mut remembered,
@@ -1029,7 +1030,7 @@ async fn mirror_depth(
         remembered_tx.send_replace(Arc::new(remembered.clone()));
         book_tx.send_replace(Arc::clone(&book));
         // Counted once quotes can see them: the backlog is what they miss.
-        crate::swap_eta::publish_depth_applied(depth.applied());
+        copy.publish_applied();
         previous = book;
         tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
     }
@@ -1166,7 +1167,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
 pub fn spawn_price_api_thread(
     cfg: PriceApiConfig,
     prices: watch::Receiver<Arc<PriceSnapshot>>,
-    depth_rx: mpsc::UnboundedReceiver<DepthChange>,
+    feed_rx: mpsc::UnboundedReceiver<BookBatch>,
     stats_rx: watch::Receiver<Arc<SettlementStats>>,
     tokens: Vec<RegisteredTokenRow>,
     markets: MarketPlan,
@@ -1194,7 +1195,7 @@ pub fn spawn_price_api_thread(
                 let (remembered_tx, remembered_rx) =
                     watch::channel(Arc::new(RememberedPrices::new()));
                 tokio::spawn(mirror_depth(
-                    depth_rx,
+                    feed_rx,
                     book_tx,
                     remembered_tx,
                     prices.clone(),

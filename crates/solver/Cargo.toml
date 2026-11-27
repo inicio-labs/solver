@@ -37,6 +37,8 @@ tower-http = { version = "0.6", default-features = false, features = ["timeout",
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service", "http1", "server-graceful"] }
 hex = "0.4"
+# Order-by-order book feed digests (book_feed.rs): stable across builds.
+blake3 = "1"
 subtle = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }

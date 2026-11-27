@@ -9,13 +9,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::clearing_book::{BoundedPrice, ClearingBook, ClearingBootstrap};
 use super::error::MatcherError;
+use crate::book_feed::BookBatch;
 use crate::clearing::{
     BatchPrice, ClearingConfig, ClearingError, ClearingOutcome, PairAmounts, PairMatcher,
     SkipReason,
 };
 use crate::maker::MakerId;
 use crate::price::{PriceSnapshot, PriceUnavailable};
-use crate::swap_eta::DepthChange;
 use crate::types::*;
 
 static SKIPPED_EXECUTOR_FULL_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -225,7 +225,7 @@ pub async fn run_matcher(
     book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
-    depth_tx: mpsc::UnboundedSender<DepthChange>,
+    feed_tx: mpsc::UnboundedSender<BookBatch>,
     runtime: ClearingRuntime,
     cancel: CancellationToken,
 ) -> Result<(), MatcherError> {
@@ -233,7 +233,7 @@ pub async fn run_matcher(
     // backpressure cannot block this worker from receiving book updates.
     tokio::select! {
         _ = cancel.cancelled() => Ok(()),
-        result = run_worker(book_rx, exec_tx, match_interval, depth_tx, runtime) => result,
+        result = run_worker(book_rx, exec_tx, match_interval, feed_tx, runtime) => result,
     }
 }
 
@@ -241,19 +241,20 @@ pub(super) async fn run_worker(
     mut book_rx: mpsc::Receiver<BookUpdate>,
     exec_tx: mpsc::Sender<ExecutionBatch>,
     match_interval: Duration,
-    depth_tx: mpsc::UnboundedSender<DepthChange>,
+    feed_tx: mpsc::UnboundedSender<BookBatch>,
     mut runtime: ClearingRuntime,
 ) -> Result<(), MatcherError> {
     // Configuration is frozen for this worker; validate before admitting orders.
     runtime.config.validate()?;
     let bootstrap = (&mut runtime.bootstrap).await?;
-    let mut book = ClearingBook::with_depth(depth_tx);
+    let mut book = ClearingBook::with_feed(feed_tx);
     for (maker_id, scope, cutoff) in &bootstrap.cutoffs {
         book.raise_maker_cutoff(*maker_id, scope.clone(), *cutoff);
     }
     for order in &bootstrap.orders {
         book.insert_or_skip(order);
     }
+    book.flush_feed();
     let mut interval = tokio::time::interval(match_interval);
     let mut book_gauges_at: Option<Instant> = None;
     loop {
@@ -287,6 +288,10 @@ pub(super) async fn run_worker(
                     publish_book_gauges(&book, &runtime.prices.borrow());
                     book_gauges_at = Some(Instant::now());
                 }
+                // Everything else the tick changed (expiry, orders picked for
+                // a settlement, routing) as one batch; each queued update was
+                // sent as its own batch when `apply_pending` applied it.
+                book.flush_feed();
                 TICK_TIMES.record(due.elapsed());
             }
             update = book_rx.recv() => {
@@ -597,9 +602,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::book_feed::BookCopy;
     use crate::db;
     use crate::matcher::test_ticks::{after_first_tick, after_next_tick};
-    use crate::swap_eta::DepthBook;
     use miden_protocol::account::AccountId;
     use miden_protocol::testing::account_id::{
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET, ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1,
@@ -828,7 +833,7 @@ mod tests {
             })
             .unwrap();
         let (depth_tx, mut depth_rx) = mpsc::unbounded_channel();
-        let mut depth = DepthBook::default();
+        let mut depth = BookCopy::with_levels();
         let worker_runtime = ClearingRuntime {
             bootstrap: bootstrap_rx,
             prices: fresh_prices_rx,
@@ -854,7 +859,7 @@ mod tests {
                     })
                     .is_ok());
                 after_first_tick().await;
-                depth.drain(&mut depth_rx);
+                assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
                 assert_eq!(depth.snapshot().len(), 4);
 
                 book_tx
@@ -867,7 +872,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(book_tx.capacity(), 0, "book-update channel must be full");
                 after_next_tick().await;
-                depth.drain(&mut depth_rx);
+                assert_eq!(depth.drain(&mut depth_rx).mismatched, 0);
                 assert_eq!(depth.snapshot().len(), 3);
                 assert!(exec_rx.try_recv().unwrap().filled_notes.is_empty());
 

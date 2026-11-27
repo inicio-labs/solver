@@ -6,9 +6,6 @@
 //!    one, records into it on each successful settlement, and publishes it over a
 //!    `watch` channel; the price-API thread reads it to compute a 24h median,
 //!    and whether the executor is taking batches (`executor_accepting`).
-//!  * [`DepthBook`] — the price API's mirror of the matcher's resting levels,
-//!    built from the [`DepthChange`]s the matcher sends as orders enter and
-//!    leave its book, so no depth work runs on the matcher.
 //!  * [`walk_levels`] — the matcher's walk (ADR 0007) on the mirrored
 //!    levels, with a probe order added; [`remembered_price`] — the price it
 //!    would find with a pair's remembered makers' order back.
@@ -19,8 +16,7 @@
 //!    it the live book can fill.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use miden_protocol::asset::AssetAmount;
@@ -28,14 +24,13 @@ use ruint::aliases::U256;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
-use tokio::sync::mpsc;
 
 use crate::clearing::bounded::{self, compare, Band, Leg, Legs, Walked};
 use crate::clearing::{
     checked_mul, eligible_units, full_fill_fee, mul_div_floor, BatchPrice, ClearingConfig,
     ClearingError, FillInterval, FillScale, OrderSide, PPM_DENOMINATOR,
 };
-use crate::matching::types::{Amount, BookLevel, RateKey, SwapBookSnapshot};
+use crate::matching::types::{BookLevel, RateKey};
 use crate::price::{OrderMarket, PricePrecision};
 use crate::types::{TokenId, UnixSecs};
 
@@ -119,147 +114,6 @@ pub fn median_of(v: &mut [u64]) -> Option<u64> {
         // u128 to avoid overflow on the sum of two large durations.
         ((v[n / 2 - 1] as u128 + v[n / 2] as u128) / 2) as u64
     })
-}
-
-/// One change to the matcher's active book, sent as it happens. `volume` is
-/// the order's whole offered amount, in offered base units.
-#[derive(Clone, Copy, Debug)]
-pub enum DepthChange {
-    /// An order entered the active book of directed `pair` at `rate`.
-    Added {
-        pair: (TokenId, TokenId),
-        rate: RateKey,
-        volume: Amount,
-    },
-    /// An order left it.
-    Removed {
-        pair: (TokenId, TokenId),
-        rate: RateKey,
-        volume: Amount,
-    },
-}
-
-impl DepthChange {
-    /// The directed pair the change is on.
-    pub(crate) fn pair(&self) -> (TokenId, TokenId) {
-        match *self {
-            DepthChange::Added { pair, .. } | DepthChange::Removed { pair, .. } => pair,
-        }
-    }
-}
-
-/// The matcher's resting levels, rebuilt from its [`DepthChange`]s on the
-/// price API's thread.
-#[derive(Debug, Default)]
-pub(crate) struct DepthBook {
-    levels: HashMap<(TokenId, TokenId), BTreeMap<RateKey, u128>>,
-    /// Changes applied since start, for [`depth_backlog`].
-    applied: u64,
-}
-
-/// Book changes the matcher has sent to the price API's depth mirror, and
-/// changes the mirror has applied (published at the end of each of its
-/// rounds). Their difference is the mirror's backlog.
-static DEPTH_SENT: AtomicU64 = AtomicU64::new(0);
-static DEPTH_APPLIED: AtomicU64 = AtomicU64::new(0);
-
-/// The matcher sent the mirror one change (whether or not the mirror still
-/// runs: a stopped mirror then shows as a growing backlog).
-pub(crate) fn note_depth_sent() {
-    DEPTH_SENT.fetch_add(1, AtomicOrdering::Relaxed);
-}
-
-/// The mirror has now applied `total` changes since start.
-pub(crate) fn publish_depth_applied(total: u64) {
-    DEPTH_APPLIED.store(total, AtomicOrdering::Relaxed);
-}
-
-/// Changes sent to the mirror and not yet applied, read at scrape time: up
-/// to one round's worth (the mirror applies them every 250 ms) while it
-/// keeps up, growing while it falls behind, stalls or has stopped.
-pub(crate) fn depth_backlog() -> u64 {
-    // Applied first: it never runs ahead of sent, so the later read of sent
-    // is at least as large.
-    let applied = DEPTH_APPLIED.load(AtomicOrdering::Relaxed);
-    DEPTH_SENT
-        .load(AtomicOrdering::Relaxed)
-        .saturating_sub(applied)
-}
-
-impl DepthBook {
-    /// Changes applied since this mirror started.
-    pub(crate) fn applied(&self) -> u64 {
-        self.applied
-    }
-
-    pub(crate) fn apply(&mut self, change: DepthChange) {
-        self.applied += 1;
-        match change {
-            DepthChange::Added { pair, rate, volume } => {
-                *self
-                    .levels
-                    .entry(pair)
-                    .or_default()
-                    .entry(rate)
-                    .or_default() += u128::from(volume);
-            }
-            DepthChange::Removed { pair, rate, volume } => {
-                // The mirror sees every change from the matcher's first one,
-                // so removing more than it holds means the two have drifted.
-                let volume = u128::from(volume);
-                let levels = self.levels.entry(pair).or_default();
-                match levels.get_mut(&rate) {
-                    None => tracing::warn!(?pair, "depth mirror: removal for an unknown level"),
-                    Some(held) => {
-                        if *held < volume {
-                            tracing::warn!(
-                                ?pair,
-                                held = *held,
-                                volume,
-                                "depth mirror: level underflow"
-                            );
-                        }
-                        *held = held.saturating_sub(volume);
-                        if *held == 0 {
-                            levels.remove(&rate);
-                        }
-                    }
-                }
-                if levels.is_empty() {
-                    self.levels.remove(&pair);
-                }
-            }
-        }
-    }
-
-    /// Apply every change already queued; the directed pairs they touched.
-    pub(crate) fn drain(
-        &mut self,
-        changes: &mut mpsc::UnboundedReceiver<DepthChange>,
-    ) -> HashSet<(TokenId, TokenId)> {
-        let mut touched = HashSet::new();
-        while let Ok(change) = changes.try_recv() {
-            touched.insert(change.pair());
-            self.apply(change);
-        }
-        touched
-    }
-
-    pub(crate) fn snapshot(&self) -> SwapBookSnapshot {
-        self.levels
-            .iter()
-            .map(|(&pair, levels)| {
-                let levels = levels
-                    .iter()
-                    .map(|(&rate, &volume)| BookLevel {
-                        rate,
-                        volume: Amount::try_from(volume).unwrap_or(Amount::MAX),
-                    })
-                    .collect();
-                (pair, levels)
-            })
-            .collect()
-    }
 }
 
 /// Where an order's price sits against the price the matcher clears at.
@@ -1055,40 +909,6 @@ mod tests {
         let now = 100 + WINDOW_SECS + 10;
         s.record(pair, now, 50); // fresh — this record() call prunes the old one
         assert_eq!(s.median_secs(pair, now), Some(50));
-    }
-
-    // ── DepthBook ─────────────────────────────────────────────────────────
-    #[test]
-    fn depth_book_merges_equal_rates_and_drops_empty_levels() {
-        let pair = (tok_a(), tok_b());
-        let added = |requested, offered, volume| DepthChange::Added {
-            pair,
-            rate: RateKey::new(requested, offered),
-            volume,
-        };
-        let removed = |requested, offered, volume| DepthChange::Removed {
-            pair,
-            rate: RateKey::new(requested, offered),
-            volume,
-        };
-        let mut depth = DepthBook::default();
-        depth.apply(added(4, 2, 100)); // 2 B per A
-        depth.apply(added(2, 1, 50)); // the same rate
-        depth.apply(added(1, 1, 7)); // better
-        let levels: Vec<_> = depth.snapshot()[&pair]
-            .iter()
-            .map(|level| (level.rate.requested, level.rate.offered, level.volume))
-            .collect();
-        assert_eq!(levels, [(1, 1, 7), (4, 2, 150)]);
-
-        depth.apply(removed(4, 2, 100));
-        assert_eq!(depth.snapshot()[&pair][1].volume, 50);
-        depth.apply(removed(2, 1, 50));
-        depth.apply(removed(1, 1, 7));
-        assert!(depth.snapshot().is_empty());
-        // A change for a level the mirror never saw changes nothing.
-        depth.apply(removed(3, 1, 5));
-        assert!(depth.snapshot().is_empty());
     }
 
     // ── quote ─────────────────────────────────────────────────────────────

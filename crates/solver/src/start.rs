@@ -497,6 +497,9 @@ pub async fn start(
         port: config.engine.price_query_port,
         max_batch: config.engine.price_query_max_batch,
         timeout_ms: config.engine.price_query_timeout_ms,
+        workers: config.engine.price_query_workers,
+        max_connections: config.engine.price_query_max_connections,
+        header_timeout_ms: config.engine.price_query_header_timeout_ms,
         swap_eta_wait_ms: config.engine.swap_eta_wait_ms,
         vs_currency: config
             .binance

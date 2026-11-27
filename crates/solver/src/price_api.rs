@@ -7,9 +7,14 @@
 //! ISOLATION (P0): this is a public, unauthenticated surface, so it runs on its
 //! OWN OS thread + multi-thread runtime. It never touches the `!Send` miden
 //! `Client` or the matcher's single-threaded `LocalSet`, so wallet traffic
-//! cannot starve fund settlement. Protections: request timeout, body cap,
-//! batch cap, and a cap on `/v2/swap-eta` requests waiting for liquidity.
-//! No handler blocks a worker: the only await is that wait.
+//! cannot starve fund settlement. Protections: a runtime of
+//! `price_query_workers` threads (default 2, so at most two cores; the accept
+//! loop runs on them too), its own HTTP/1.1-only connection loop with a
+//! connection cap (kept under the process's open-file limit), a header
+//! timeout, a write-stall timeout and a 16 KiB per-connection buffer, request
+//! timeout, body cap, batch cap, and a cap on `/v2/swap-eta` requests waiting
+//! for liquidity. No handler blocks a worker: the only await is that wait.
+//! `/livez` and `/readyz` are for a load balancer's health checks.
 //!
 //! Prices come from the Binance snapshot ([`crate::price::PriceSnapshot`]): a
 //! token is worth the exact midpoint of its `<ASSET><QUOTE>` market, usable
@@ -25,8 +30,13 @@
 //! once at startup.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{self, Poll};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,9 +46,15 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
 use miden_protocol::account::AccountId;
 use serde::Serialize;
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
@@ -64,6 +80,13 @@ pub struct PriceApiConfig {
     pub port: u16,
     pub max_batch: usize,
     pub timeout_ms: u64,
+    /// Worker threads of this API's runtime (`engine.price_query_workers`).
+    pub workers: usize,
+    /// Open connections kept at once (`engine.price_query_max_connections`).
+    pub max_connections: usize,
+    /// Time a connection has to send a request's headers, idle kept-alive
+    /// time included (`engine.price_query_header_timeout_ms`).
+    pub header_timeout_ms: u64,
     /// `/v2/swap-eta`: how long a request may wait for liquidity (its
     /// `wait_ms` default and maximum); `0` turns waiting off.
     pub swap_eta_wait_ms: u64,
@@ -566,14 +589,7 @@ fn registered_decimals(
 /// confirmed the markets at startup it answers `503 not_ready`, so a list a
 /// failing startup would reject is never served or cached.
 async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoResponse, ApiError> {
-    let confirmed = state
-        .prices
-        .borrow()
-        .markets()
-        .clearing_pairs()
-        .next()
-        .is_some();
-    if !confirmed && !state.pairs.pairs.is_empty() {
+    if !markets_confirmed(&state) {
         return Err(ApiError::NotReady);
     }
     Ok((
@@ -583,6 +599,38 @@ async fn get_pairs(State(state): State<PriceApiState>) -> Result<impl IntoRespon
         )],
         Json(PairsResponse::clone(&state.pairs)),
     ))
+}
+
+/// Whether the price feed has confirmed the Binance markets at startup (or
+/// no pair is configured, so there is nothing to confirm). Until then
+/// `/v2/pairs` and `/readyz` answer `503 not_ready`.
+fn markets_confirmed(state: &PriceApiState) -> bool {
+    state.pairs.pairs.is_empty()
+        || state
+            .prices
+            .borrow()
+            .markets()
+            .clearing_pairs()
+            .next()
+            .is_some()
+}
+
+/// `GET /livez`: the API thread answers. It shares the public listener and
+/// its connection cap, so a full cap also silences it: a supervisor deciding
+/// whether to restart the solver should use the observability server's
+/// `/health` on loopback instead, which public traffic cannot reach.
+async fn get_livez() -> impl IntoResponse {
+    no_store("ok")
+}
+
+/// `GET /readyz`: quotes can be served (the markets are confirmed), else
+/// `503 not_ready`. For a load balancer's health check.
+async fn get_readyz(State(state): State<PriceApiState>) -> impl IntoResponse {
+    no_store(if markets_confirmed(&state) {
+        Ok("ready")
+    } else {
+        Err(ApiError::NotReady)
+    })
 }
 
 /// The pair's sells and buys in `book`, best first, for an order offering
@@ -980,6 +1028,8 @@ async fn mirror_depth(
         );
         remembered_tx.send_replace(Arc::new(remembered.clone()));
         book_tx.send_replace(Arc::clone(&book));
+        // Counted once quotes can see them: the backlog is what they miss.
+        crate::swap_eta::publish_depth_applied(depth.applied());
         previous = book;
         tokio::time::sleep(DEPTH_PUBLISH_INTERVAL).await;
     }
@@ -1076,6 +1126,10 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
         .route("/pairs", get(get_pairs))
         .route("/pair-price", get(get_pair_price))
         .route("/swap-eta", get(get_swap_eta))
+        .with_state(state.clone());
+    let health = Router::new()
+        .route("/livez", get(get_livez))
+        .route("/readyz", get(get_readyz))
         .with_state(state);
 
     // Public read-only price data → permissive CORS so browser wallets /
@@ -1088,6 +1142,7 @@ pub fn build_app(state: PriceApiState, cfg: &PriceApiConfig) -> Router {
     Router::new()
         .nest("/v1", v1)
         .nest("/v2", v2)
+        .merge(health)
         // Outer protections (applied to all routes):
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -1122,6 +1177,9 @@ pub fn spawn_price_api_thread(
         .name("price-api".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cfg.workers)
+                .max_blocking_threads(cfg.workers)
+                .thread_name("price-api-worker")
                 .enable_all()
                 .build()
             {
@@ -1168,18 +1226,317 @@ pub fn spawn_price_api_thread(
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
-                tracing::info!(%addr, "price-query API listening");
-                let shutdown = async move { cancel.cancelled().await };
-                if let Err(e) = axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-                {
-                    tracing::error!(error = %e, "price-query API server error");
+                let max_connections =
+                    cap_for_open_file_limit(cfg.max_connections, raise_open_file_limit());
+                MAX_CONNECTIONS.store(max_connections as u64, Ordering::Relaxed);
+                tracing::info!(
+                    %addr,
+                    workers = cfg.workers,
+                    max_connections,
+                    "price-query API listening"
+                );
+                let limits = ConnectionLimits {
+                    max_connections,
+                    header_timeout: Duration::from_millis(cfg.header_timeout_ms),
+                    write_stall_timeout: WRITE_STALL_TIMEOUT,
+                };
+                // On a worker, so the accept loop counts against
+                // `price_query_workers` too: this thread only waits.
+                let server = tokio::spawn(serve(listener, app, limits, cancel));
+                if let Err(error) = server.await {
+                    tracing::error!(%error, "price-query API accept loop failed");
                 }
             });
         })
         .context("spawn price-api thread")?;
     Ok((handle, ready_rx))
+}
+
+/// Per-connection buffer for reading a request (hyper's floor is 8 KiB): our
+/// requests are a short GET line and a few headers, so this bounds what one
+/// connection can hold. `engine.price_query_max_batch` is capped so a full
+/// `/v1/prices?ids=` request fits.
+const READ_BUFFER_BYTES: usize = 16 * 1024;
+/// How long shutdown waits for open connections to finish their requests.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long a write may make no progress before its connection is dropped.
+/// hyper times out only the wait for a request's headers, so a client that
+/// sends requests and never reads the answers would otherwise hold its
+/// connection slot forever.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// File descriptors kept free for the rest of the solver when the API is
+/// full: the database pool and writer, node and prover connections, Binance
+/// websockets, SQLite files, the other listeners and the runtimes' own
+/// handles, with room to spare.
+const FD_RESERVE: u64 = 256;
+/// How long accepting pauses after an error that is not one connection's
+/// (out of file descriptors, for example), as axum::serve does.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_secs(1);
+
+/// Connections the API holds open now, connections closed at accept because
+/// the cap was reached, and the cap in force (after [`cap_for_open_file_limit`]).
+static OPEN_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static REFUSED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static MAX_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// `(open, refused since start, cap in force)` connections, for `/metrics`.
+pub(crate) fn connection_counts() -> (u64, u64, u64) {
+    (
+        OPEN_CONNECTIONS.load(Ordering::Relaxed),
+        REFUSED_CONNECTIONS.load(Ordering::Relaxed),
+        MAX_CONNECTIONS.load(Ordering::Relaxed),
+    )
+}
+
+/// Raise this process's soft open-file limit as far as its hard limit allows
+/// and return the soft limit now in force, or `None` if it cannot be read.
+/// Every connection holds a descriptor, and the whole process shares the
+/// limit, so it decides how many public connections fit beside the solver's
+/// own.
+#[cfg(unix)]
+fn raise_open_file_limit() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit through a valid pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    // macOS refuses values above its per-process maximum even when the hard
+    // limit is unlimited, so try smaller targets in turn.
+    for target in [limit.rlim_max.min(65_536), 32_768, 10_240] {
+        if target <= limit.rlim_cur {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: setrlimit reads one rlimit through a valid pointer.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            limit.rlim_cur = target;
+            break;
+        }
+    }
+    Some(limit.rlim_cur)
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() -> Option<u64> {
+    None
+}
+
+/// The connection cap that fits under the open-file limit: `configured`, or
+/// the limit less [`FD_RESERVE`] when that is smaller (logged), so public
+/// connections can never take the descriptors the matcher, executor and
+/// database pool need.
+fn cap_for_open_file_limit(configured: usize, open_file_limit: Option<u64>) -> usize {
+    let Some(limit) = open_file_limit else {
+        return configured;
+    };
+    let room = usize::try_from(limit.saturating_sub(FD_RESERVE))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    if configured <= room {
+        return configured;
+    }
+    tracing::warn!(
+        configured,
+        open_file_limit = limit,
+        cap = room,
+        "price-query API connection cap lowered to fit the open-file limit"
+    );
+    room
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    max_connections: usize,
+    header_timeout: Duration,
+    write_stall_timeout: Duration,
+}
+
+/// One open connection, counted while it lives.
+struct OpenConnection;
+
+impl OpenConnection {
+    fn new() -> Self {
+        OPEN_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        OPEN_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A socket whose writes and flushes fail with `TimedOut` once they have
+/// made no progress for `limit`; any progress restarts the clock. Reads pass
+/// through untouched (hyper's header timeout covers them).
+struct WriteStallTimeout<S> {
+    inner: S,
+    limit: Duration,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteStallTimeout<S> {
+    fn new(inner: S, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+}
+
+/// `poll` from a write-side call of [`WriteStallTimeout`]: ready clears the
+/// stall clock; pending starts it, and fails the call once it runs out.
+fn within_stall_limit<T>(
+    stalled: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    limit: Duration,
+    cx: &mut task::Context<'_>,
+    poll: Poll<io::Result<T>>,
+) -> Poll<io::Result<T>> {
+    if poll.is_ready() {
+        *stalled = None;
+        return poll;
+    }
+    let clock = stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+    match clock.as_mut().poll(cx) {
+        Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the client stopped reading",
+        ))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteStallTimeout<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteStallTimeout<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        within_stall_limit(&mut this.stalled, this.limit, cx, poll)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        within_stall_limit(&mut this.stalled, this.limit, cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_flush(cx);
+        within_stall_limit(&mut this.stalled, this.limit, cx, poll)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_shutdown(cx);
+        within_stall_limit(&mut this.stalled, this.limit, cx, poll)
+    }
+}
+
+/// An accept error that belongs to one connection (its client gave up before
+/// accept), not to the listener: accepting goes on at once, as axum::serve does.
+fn is_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Accept connections and serve `app` on each, HTTP/1.1 only, until `cancel`;
+/// then stop listening and let open requests finish for at most
+/// [`SHUTDOWN_GRACE`] (connections still open after it end with the runtime).
+/// A connection over `limits.max_connections` is closed at once and counted,
+/// so a flood of connections costs a file descriptor each, briefly, not a task.
+async fn serve(
+    listener: TcpListener,
+    app: Router,
+    limits: ConnectionLimits,
+    cancel: CancellationToken,
+) {
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let graceful = GracefulShutdown::new();
+    loop {
+        let stream = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => stream,
+                Err(error) if is_connection_error(&error) => continue,
+                Err(error) => {
+                    // Out of file descriptors, for example: pause instead of
+                    // spinning on the same error.
+                    tracing::error!(%error, "price-query API accept failed");
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(ACCEPT_ERROR_PAUSE) => continue,
+                    }
+                }
+            },
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            REFUSED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let io = TokioIo::new(WriteStallTimeout::new(stream, limits.write_stall_timeout));
+        let connection = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(limits.header_timeout)
+            .max_buf_size(READ_BUFFER_BYTES)
+            .serve_connection(io, TowerToHyperService::new(app.clone()));
+        let connection = graceful.watch(connection);
+        tokio::spawn(async move {
+            let _slot = slot;
+            let _open = OpenConnection::new();
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "price-query API connection ended");
+            }
+        });
+    }
+    // New connections are refused from here on, not left in the backlog.
+    drop(listener);
+    let open = graceful.count();
+    if tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            open,
+            "price-query API connections still open at shutdown; they end with the runtime"
+        );
+    }
 }
 
 #[cfg(test)]

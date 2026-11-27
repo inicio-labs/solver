@@ -279,23 +279,32 @@ impl FeedMetrics {
         use std::fmt::Write;
 
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
-            // The position keeps two readers on one endpoint apart.
-            let reader = format!("reader=\"{index}\",endpoint=\"{endpoint}\"");
+        // The position keeps two readers on one endpoint apart.
+        let readers: Vec<String> = self
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| format!("reader=\"{index}\",endpoint=\"{endpoint}\""))
+            .collect();
+        // One metric at a time, every reader in it: the text format wants
+        // each metric's lines together.
+        for (index, reader) in readers.iter().enumerate() {
             let connected = u8::from(self.connected[index].load(Ordering::Relaxed));
             let _ = writeln!(body, "solver_price_feed_connected{{{reader}}} {connected}");
-            for (metric, counters) in [
-                ("solver_price_feed_connections_total", &self.connections),
-                ("solver_price_feed_frames_total", &self.frames),
-                (
-                    "solver_price_feed_discarded_frames_total",
-                    &self.discarded_frames,
-                ),
-                (
-                    "solver_price_feed_rejected_quotes_total",
-                    &self.rejected_quotes,
-                ),
-            ] {
+        }
+        for (metric, counters) in [
+            ("solver_price_feed_connections_total", &self.connections),
+            ("solver_price_feed_frames_total", &self.frames),
+            (
+                "solver_price_feed_discarded_frames_total",
+                &self.discarded_frames,
+            ),
+            (
+                "solver_price_feed_rejected_quotes_total",
+                &self.rejected_quotes,
+            ),
+        ] {
+            for (index, reader) in readers.iter().enumerate() {
                 let _ = writeln!(body, "{metric}{{{reader}}} {}", load(&counters[index]));
             }
         }

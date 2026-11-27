@@ -56,6 +56,9 @@ fn cfg() -> PriceApiConfig {
         port: 0,
         max_batch: 3,
         timeout_ms: 2000,
+        workers: 2,
+        max_connections: 1024,
+        header_timeout_ms: 75_000,
         swap_eta_wait_ms: 5000,
         vs_currency: "usdt".into(),
         precision: "full".into(),
@@ -85,13 +88,14 @@ fn markets() -> MarketPlan {
     .unwrap()
 }
 
-/// Register `registered` = (faucet, decimals, ticker) and serve `snapshot`.
-async fn serve(
+/// The API's router with `registered` = (faucet, decimals, ticker) and
+/// `snapshot`, `book` and `stats` as its inputs.
+fn app(
     registered: &[(AccountId, Option<u8>, Option<&str>)],
     snapshot: PriceSnapshot,
     book: SwapBookSnapshot,
     stats: SettlementStats,
-) -> Harness {
+) -> axum::Router {
     let tokens = registered
         .iter()
         .map(|(id, decimals, ticker)| RegisteredTokenRow {
@@ -114,8 +118,18 @@ async fn serve(
         remembered_rx,
         stats_rx,
     );
+    build_app(state, &cfg())
+}
+
+/// Register `registered` = (faucet, decimals, ticker) and serve `snapshot`.
+async fn serve(
+    registered: &[(AccountId, Option<u8>, Option<&str>)],
+    snapshot: PriceSnapshot,
+    book: SwapBookSnapshot,
+    stats: SettlementStats,
+) -> Harness {
     Harness {
-        server: TestServer::new(build_app(state, &cfg())),
+        server: TestServer::new(app(registered, snapshot, book, stats)),
     }
 }
 
@@ -841,6 +855,37 @@ async fn pairs_wait_for_the_binance_market_check() {
     let r = h.server.get("/v2/pairs").await;
     assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.json::<Value>()["error"], "not_ready");
+}
+
+#[tokio::test]
+async fn livez_always_answers_and_is_never_cached() {
+    let h = harness(&[(eth(), Some(18), Some("ETH"))], &[], true).await;
+    let r = h.server.get("/livez").await;
+    assert_eq!(r.status_code(), StatusCode::OK);
+    assert_eq!(r.text(), "ok");
+    assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+}
+
+#[tokio::test]
+async fn readyz_waits_for_the_binance_market_check() {
+    // Same rule as /v2/pairs: not ready until the feed confirms the markets.
+    let h = harness(&[(eth(), Some(18), Some("ETH"))], &[], true).await;
+    let r = h.server.get("/readyz").await;
+    assert_eq!(r.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json::<Value>()["error"], "not_ready");
+    assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+
+    let confirmed = PriceSnapshot::for_tests(&[(eth(), usdt(), "2", received(true))], &[], TTL);
+    let h = serve(
+        &[(eth(), Some(18), Some("ETH"))],
+        confirmed,
+        SwapBookSnapshot::default(),
+        SettlementStats::new(),
+    )
+    .await;
+    let r = h.server.get("/readyz").await;
+    assert_eq!(r.status_code(), StatusCode::OK);
+    assert_eq!(r.text(), "ready");
 }
 
 #[tokio::test]
@@ -1822,4 +1867,279 @@ async fn a_resting_ask_restarts_a_clock_started_while_unpriced() {
     // The real gap: the maker re-quotes.
     h.change(ask_removed()).await;
     assert_eq!(h.buyer_price().await, ASK_PRICE);
+}
+
+// ── The connection loop, on a real socket ────────────────────────────────────
+
+mod connections {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpSocket, TcpStream};
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::{
+        cap_for_open_file_limit, connection_counts, serve as serve_connections, ConnectionLimits,
+        FD_RESERVE,
+    };
+    use super::*;
+
+    /// A running connection loop and its address; `stop` ends it.
+    struct Running {
+        addr: std::net::SocketAddr,
+        cancel: CancellationToken,
+        done: tokio::task::JoinHandle<()>,
+    }
+
+    impl Running {
+        async fn stop(self) {
+            self.cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(10), self.done)
+                .await
+                .expect("the loop stops within its grace period")
+                .unwrap();
+        }
+    }
+
+    const LONG: Duration = Duration::from_secs(30);
+
+    async fn start(
+        max_connections: usize,
+        header_timeout: Duration,
+        write_stall_timeout: Duration,
+    ) -> Running {
+        let app = app(
+            &[],
+            PriceSnapshot::default(),
+            SwapBookSnapshot::default(),
+            SettlementStats::new(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let limits = ConnectionLimits {
+            max_connections,
+            header_timeout,
+            write_stall_timeout,
+        };
+        let done = tokio::spawn(serve_connections(listener, app, limits, cancel.clone()));
+        Running { addr, cancel, done }
+    }
+
+    /// Send `request`, then read one whole response (headers and the body
+    /// its `content-length` gives), or what arrives before the peer closes or
+    /// `wait` passes.
+    async fn exchange(stream: &mut TcpStream, request: &[u8], wait: Duration) -> Vec<u8> {
+        stream.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let _ = tokio::time::timeout(wait, async {
+            while !whole_response(&out) {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+        .await;
+        out
+    }
+
+    fn whole_response(bytes: &[u8]) -> bool {
+        let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        bytes.len() >= end + 4 + length
+    }
+
+    /// Whether the peer has closed: a read returns end of stream (or a reset).
+    async fn closed(stream: &mut TcpStream, wait: Duration) -> bool {
+        let mut byte = [0u8; 1];
+        matches!(
+            tokio::time::timeout(wait, stream.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    /// Whether a fresh connection gets an answer to `/livez` within `wait`.
+    async fn answered(addr: std::net::SocketAddr, wait: Duration) -> bool {
+        let Ok(mut stream) = TcpStream::connect(addr).await else {
+            return false;
+        };
+        exchange(&mut stream, LIVEZ, wait)
+            .await
+            .starts_with(b"HTTP/1.1 200")
+    }
+
+    const LIVEZ: &[u8] = b"GET /livez HTTP/1.1\r\nHost: test\r\n\r\n";
+
+    #[tokio::test]
+    async fn a_connection_over_the_cap_is_closed_and_counted() {
+        let running = start(1, LONG, LONG).await;
+        let mut first = TcpStream::connect(running.addr).await.unwrap();
+        let answer = exchange(&mut first, LIVEZ, Duration::from_secs(5)).await;
+        assert!(
+            answer.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        let refused_before = connection_counts().1;
+
+        // The first connection is kept alive and holds the only slot.
+        let mut second = TcpStream::connect(running.addr).await.unwrap();
+        assert!(closed(&mut second, Duration::from_secs(5)).await);
+        assert!(connection_counts().1 > refused_before);
+
+        // The kept connection still works, and a slot frees once it closes.
+        let again = exchange(&mut first, LIVEZ, Duration::from_secs(5)).await;
+        assert!(again.starts_with(b"HTTP/1.1 200"));
+        drop(first);
+        let mut reused = false;
+        for _ in 0..50 {
+            if answered(running.addr, Duration::from_millis(500)).await {
+                reused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reused, "the freed slot is reused");
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn http2_is_not_spoken() {
+        let running = start(8, LONG, LONG).await;
+        let mut stream = TcpStream::connect(running.addr).await.unwrap();
+        // HTTP/2 with prior knowledge starts with this preface; an HTTP/2
+        // server would answer with a SETTINGS frame.
+        let answer = exchange(
+            &mut stream,
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            answer.is_empty() || answer.starts_with(b"HTTP/1.1 "),
+            "answered {answer:?}"
+        );
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_client_too_slow_with_its_headers_is_dropped() {
+        let running = start(8, Duration::from_secs(1), LONG).await;
+        let mut stream = TcpStream::connect(running.addr).await.unwrap();
+        stream
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: te")
+            .await
+            .unwrap();
+        assert!(closed(&mut stream, Duration::from_secs(5)).await);
+        running.stop().await;
+    }
+
+    /// hyper starts the header timer whenever a connection waits for its
+    /// next request, so an idle kept-alive connection is closed after it
+    /// too. A load balancer's idle timeout must stay below it (see
+    /// `engine.price_query_header_timeout_ms`).
+    #[tokio::test]
+    async fn an_idle_kept_alive_connection_is_closed_after_the_header_timeout() {
+        let running = start(8, Duration::from_secs(1), LONG).await;
+        let mut stream = TcpStream::connect(running.addr).await.unwrap();
+        let answer = exchange(&mut stream, LIVEZ, Duration::from_secs(5)).await;
+        assert!(answer.starts_with(b"HTTP/1.1 200"));
+        // Kept alive at first, closed once idle past the timeout.
+        assert!(!closed(&mut stream, Duration::from_millis(300)).await);
+        assert!(closed(&mut stream, Duration::from_secs(5)).await);
+        running.stop().await;
+    }
+
+    /// A client that pipelines requests and never reads the answers blocks
+    /// the server's writes; without a write timeout it would hold its slot
+    /// forever (the header timer does not run while a response is written).
+    #[tokio::test]
+    async fn a_client_that_never_reads_loses_its_slot() {
+        let running = start(1, LONG, Duration::from_secs(1)).await;
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(1024).unwrap();
+        let stalled = socket.connect(running.addr).await.unwrap();
+        let (_read_half, mut write_half) = stalled.into_split();
+        // Far more answers than the socket buffers hold, never read.
+        let writer = tokio::spawn(async move {
+            let requests = LIVEZ.repeat(20_000);
+            let _ = write_half.write_all(&requests).await;
+            write_half
+        });
+        // The stalled connection holds the only slot until its write times out.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut freed = false;
+        for _ in 0..60 {
+            if answered(running.addr, Duration::from_millis(500)).await {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(freed, "the slot of a client that stopped reading is freed");
+        writer.abort();
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_and_ends_idle_connections() {
+        let running = start(8, LONG, LONG).await;
+        let addr = running.addr;
+        let mut idle = TcpStream::connect(addr).await.unwrap();
+        let answer = exchange(&mut idle, LIVEZ, Duration::from_secs(5)).await;
+        assert!(answer.starts_with(b"HTTP/1.1 200"));
+        running.stop().await;
+        assert!(closed(&mut idle, Duration::from_secs(5)).await);
+        assert!(TcpStream::connect(addr).await.is_err());
+    }
+
+    /// While a request is still being answered at shutdown, the listener is
+    /// already closed: a new connection is refused at once, not left waiting
+    /// in the backlog for the drain.
+    #[tokio::test]
+    async fn new_connections_are_refused_while_shutdown_drains() {
+        let running = start(8, LONG, LONG).await;
+        let addr = running.addr;
+        // A half-sent request keeps its connection busy through the drain.
+        let mut busy = TcpStream::connect(addr).await.unwrap();
+        busy.write_all(b"GET /livez HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        running.cancel.cancel();
+        let mut refused = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "connections are refused during the drain");
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(10), running.done)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn the_cap_leaves_descriptors_for_the_rest_of_the_solver() {
+        // Unknown limit: the configured cap stands.
+        assert_eq!(cap_for_open_file_limit(1024, None), 1024);
+        // Room enough: unchanged.
+        assert_eq!(cap_for_open_file_limit(1024, Some(65_536)), 1024);
+        // A 1024 soft limit leaves 1024 - FD_RESERVE for the API.
+        let room = usize::try_from(1024 - FD_RESERVE).unwrap();
+        assert_eq!(cap_for_open_file_limit(1024, Some(1024)), room);
+        // Never below one.
+        assert_eq!(cap_for_open_file_limit(1024, Some(10)), 1);
+    }
 }

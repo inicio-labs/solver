@@ -205,6 +205,29 @@ fn append_health_metrics(body: &mut String, last_sync_unix_seconds: u64) {
          solver_settlement_duration_seconds_sum {sum_seconds}\n\
          solver_settlement_duration_seconds_count {confirmed}"
     );
+    // Buckets first, the count last: `tick_times` reads them in that order.
+    let (tick_buckets, tick_sum, ticks_timed) = crate::matcher::tick_times();
+    for (bound, count) in tick_buckets {
+        let _ = writeln!(
+            body,
+            "solver_matcher_tick_duration_seconds_bucket{{le=\"{bound}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "solver_matcher_tick_duration_seconds_bucket{{le=\"+Inf\"}} {ticks_timed}\n\
+         solver_matcher_tick_duration_seconds_sum {tick_sum}\n\
+         solver_matcher_tick_duration_seconds_count {ticks_timed}"
+    );
+    let (open, refused, cap) = crate::price_api::connection_counts();
+    let _ = writeln!(
+        body,
+        "solver_price_api_open_connections {open}\n\
+         solver_price_api_refused_connections_total {refused}\n\
+         solver_price_api_max_connections {cap}\n\
+         solver_price_mirror_backlog {}",
+        crate::swap_eta::depth_backlog()
+    );
     for (cause, count) in exec::settlements_released() {
         let _ = writeln!(
             body,
@@ -268,12 +291,30 @@ fn append_book_metrics(body: &mut String) {
 pub(crate) fn exposition_errors(body: &str) -> Vec<String> {
     let mut errors = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // The text format wants each metric's lines in one group; a histogram's
+    // `_bucket`, `_sum` and `_count` lines are one metric.
+    let mut finished = std::collections::HashSet::new();
+    let mut current: Option<String> = None;
     for (number, line) in body.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         match parse_sample(line) {
             Ok(series) => {
+                let name = series.split('{').next().unwrap_or_default();
+                let family = ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|suffix| name.strip_suffix(suffix))
+                    .unwrap_or(name)
+                    .to_string();
+                if current.as_deref() != Some(family.as_str()) {
+                    if finished.contains(&family) {
+                        errors.push(format!("line {}: metric {family} is split", number + 1));
+                    }
+                    if let Some(previous) = current.replace(family) {
+                        finished.insert(previous);
+                    }
+                }
                 if !seen.insert(series.clone()) {
                     errors.push(format!("line {}: repeated series {series}", number + 1));
                 }
@@ -597,6 +638,41 @@ mod tests {
         assert_eq!(value(&after, bounced), value(&before, bounced) + 3);
     }
 
+    /// The tick histogram and the price API's connection numbers render as
+    /// valid series: cumulative buckets, `+Inf` equal to the count.
+    #[test]
+    fn health_metrics_include_tick_times_and_price_api_connections() {
+        let mut body = String::new();
+        append_health_metrics(&mut body, 0);
+        assert_eq!(exposition_errors(&body), Vec::<String>::new());
+        let value = |prefix: &str| -> f64 {
+            body.lines()
+                .find_map(|line| line.strip_prefix(prefix)?.trim().parse().ok())
+                .unwrap_or_else(|| panic!("missing {prefix:?} in:\n{body}"))
+        };
+        let buckets: Vec<f64> = body
+            .lines()
+            .filter(|line| line.starts_with("solver_matcher_tick_duration_seconds_bucket"))
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(buckets.len(), 13, "twelve bounds and +Inf");
+        assert!(buckets.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            value("solver_matcher_tick_duration_seconds_bucket{le=\"+Inf\"}"),
+            value("solver_matcher_tick_duration_seconds_count")
+        );
+        assert!(body.contains("solver_matcher_tick_duration_seconds_bucket{le=\"0.001\"} "));
+        assert!(body.contains("solver_matcher_tick_duration_seconds_bucket{le=\"5\"} "));
+        for name in [
+            "solver_price_api_open_connections ",
+            "solver_price_api_refused_connections_total ",
+            "solver_price_api_max_connections ",
+            "solver_price_mirror_backlog ",
+        ] {
+            value(name);
+        }
+    }
+
     #[test]
     fn maker_metrics_report_what_the_watcher_published() {
         let mut body = String::new();
@@ -721,6 +797,12 @@ mod tests {
             assert_eq!(exposition_errors(bad).len(), 1, "{bad:?} passed");
         }
         assert_eq!(exposition_errors("solver_x 1\nsolver_x 2\n").len(), 1);
+        // One metric's lines in two groups, a histogram's parts included.
+        let split = "solver_h_bucket{le=\"1\"} 1\nsolver_y 2\nsolver_h_count 1\n";
+        assert_eq!(exposition_errors(split).len(), 1, "{split:?} passed");
+        let together =
+            "solver_h_bucket{le=\"1\"} 1\nsolver_h_sum 0.5\nsolver_h_count 1\nsolver_y 2\n";
+        assert_eq!(exposition_errors(together), Vec::<String>::new());
     }
 
     #[test]

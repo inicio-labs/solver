@@ -55,6 +55,7 @@ impl ClearingBook {
 
     fn send_depth(&self, change: DepthChange) {
         if let Some(depth_tx) = &self.depth_tx {
+            crate::swap_eta::note_depth_sent();
             let _ = depth_tx.send(change);
         }
     }

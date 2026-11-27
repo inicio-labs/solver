@@ -56,6 +56,63 @@ pub(crate) fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Upper bounds, in milliseconds, of the tick duration histogram.
+const TICK_MILLIS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+
+/// How long each matching tick took, from the time it was due (its timer's
+/// deadline, so a tick that starts late counts its wait) to its end
+/// (applying queued updates, expiry, clearing, routing, gauges): a
+/// Prometheus histogram's cumulative buckets, sum and count.
+struct TickTimes {
+    buckets: [AtomicU64; TICK_MILLIS.len()],
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+impl TickTimes {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; TICK_MILLIS.len()],
+            sum_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Writes go count first, then the buckets from the widest down, and
+    /// [`Self::read`] reads the buckets from the narrowest up and the count
+    /// last, so a read racing a write never sees a bucket above a wider one
+    /// or above the count.
+    fn record(&self, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Release);
+        self.sum_us.fetch_add(micros, Ordering::Relaxed);
+        for (bucket, bound) in self.buckets.iter().zip(TICK_MILLIS).rev() {
+            if micros <= bound * 1000 {
+                bucket.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    /// Each bound in seconds with the ticks that took at most that long, the
+    /// sum in seconds, and the count.
+    fn read(&self) -> (Vec<(f64, u64)>, f64, u64) {
+        let buckets = TICK_MILLIS
+            .iter()
+            .zip(&self.buckets)
+            .map(|(bound, count)| (*bound as f64 / 1000.0, count.load(Ordering::Acquire)))
+            .collect();
+        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        (buckets, sum, self.count.load(Ordering::Acquire))
+    }
+}
+
+static TICK_TIMES: TickTimes = TickTimes::new();
+
+/// The tick duration histogram, for `/metrics`.
+pub(crate) fn tick_times() -> (Vec<(f64, u64)>, f64, u64) {
+    TICK_TIMES.read()
+}
+
 /// Seconds since the order matched longest ago, and still not settled, was
 /// first matched, aged at `now_ms`; 0 when there is none.
 pub(crate) fn oldest_matched_order_age_secs(now_ms: u64) -> u64 {
@@ -205,7 +262,7 @@ pub(super) async fn run_worker(
         // matching; it drains the already queued committed updates in order.
         tokio::select! {
             biased;
-            _ = interval.tick() => {
+            due = interval.tick() => {
                 TICKS.fetch_add(1, Ordering::Relaxed);
                 let now = now_millis();
                 ORDERED_UPDATE_BACKLOG.store(book_rx.len() as u64, Ordering::Relaxed);
@@ -230,6 +287,7 @@ pub(super) async fn run_worker(
                     publish_book_gauges(&book, &runtime.prices.borrow());
                     book_gauges_at = Some(Instant::now());
                 }
+                TICK_TIMES.record(due.elapsed());
             }
             update = book_rx.recv() => {
                 book.apply(update.ok_or(MatcherError::IngestStopped)?);
@@ -551,6 +609,21 @@ mod tests {
     fn imiden() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET.try_into().unwrap()
     }
+
+    /// A 3 ms tick lands in every bucket from 5 ms up and in none below.
+    #[test]
+    fn a_tick_is_counted_in_every_bucket_at_or_above_its_duration() {
+        let times = TickTimes::new();
+        times.record(Duration::from_millis(3));
+        times.record(Duration::from_secs(9));
+        let (buckets, sum, count) = times.read();
+        let counts: Vec<u64> = buckets.iter().map(|(_, count)| *count).collect();
+        assert_eq!(counts, [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(buckets[2].0, 0.005);
+        assert_eq!(count, 2, "the 9 s tick is above every bound, in +Inf only");
+        assert!((sum - 9.003).abs() < 1e-9);
+    }
+
     fn iusdt() -> TokenId {
         ACCOUNT_ID_PUBLIC_FUNGIBLE_FAUCET_1.try_into().unwrap()
     }

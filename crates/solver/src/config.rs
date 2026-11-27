@@ -58,7 +58,7 @@ pub(crate) enum ConfigError {
     #[error("engine.{0} must be at least 1")]
     ZeroMakerIntakeLimit(&'static str),
     #[error("engine.{name} must be between {min} and {max}, got {value}")]
-    MakerSettingOutOfRange {
+    SettingOutOfRange {
         name: &'static str,
         value: u64,
         min: u64,
@@ -305,13 +305,33 @@ pub struct EngineConfig {
     /// publicly — front it with a reverse proxy / rate limiter.
     #[serde(default = "default_price_query_bind")]
     pub price_query_bind: String,
-    /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default 50.
+    /// Max token ids per batch (`/v1/prices?ids=`); over-limit → `400`. Default
+    /// 50, at most 400 (a full request must fit the API's 16 KiB buffer).
     #[serde(default = "default_price_query_max_batch")]
     pub price_query_max_batch: usize,
     /// Per-request processing timeout in ms. Default 3000. The server's
     /// timeout is this plus `swap_eta_wait_ms`.
     #[serde(default = "default_price_query_timeout_ms")]
     pub price_query_timeout_ms: u64,
+    /// Worker threads of the price API's own runtime. Default 2, so wallet
+    /// traffic can use at most two cores of the solver host.
+    #[serde(default = "default_price_query_workers")]
+    pub price_query_workers: usize,
+    /// Open connections the price API keeps at once; a connection over the
+    /// cap is closed at accept. Default 1024. At start the solver raises its
+    /// open-file limit as far as the system allows and lowers this cap (with a
+    /// warning) if the limit leaves less than the cap plus 256 descriptors for
+    /// its own connections and files.
+    #[serde(default = "default_price_query_max_connections")]
+    pub price_query_max_connections: usize,
+    /// How long a connection may take to send a request's headers, counted
+    /// from when it is ready for the next request, so an idle kept-alive
+    /// connection is closed after it too. Behind a load balancer it must stay
+    /// above the balancer's idle timeout (an AWS ALB's is 60 s by default),
+    /// or the balancer can send a request on a connection this end is
+    /// closing. Default 75000.
+    #[serde(default = "default_price_query_header_timeout_ms")]
+    pub price_query_header_timeout_ms: u64,
     /// `/v2/swap-eta`: how long an at-market order that cannot fill in full
     /// may wait for makers (the default and the maximum of its `wait_ms`).
     /// `0` turns waiting off. Default 5000.
@@ -459,6 +479,15 @@ fn default_price_query_max_batch() -> usize {
 }
 fn default_price_query_timeout_ms() -> u64 {
     3000
+}
+fn default_price_query_workers() -> usize {
+    2
+}
+fn default_price_query_max_connections() -> usize {
+    1024
+}
+fn default_price_query_header_timeout_ms() -> u64 {
+    75_000
 }
 fn default_price_precision() -> String {
     "full".to_string()
@@ -651,6 +680,32 @@ impl SolverConfig {
         }
         for (name, value, min, max) in [
             (
+                "price_query_workers",
+                u64::try_from(self.engine.price_query_workers).unwrap_or(u64::MAX),
+                1,
+                64,
+            ),
+            (
+                "price_query_max_connections",
+                u64::try_from(self.engine.price_query_max_connections).unwrap_or(u64::MAX),
+                1,
+                65_536,
+            ),
+            (
+                "price_query_header_timeout_ms",
+                self.engine.price_query_header_timeout_ms,
+                1_000,
+                600_000,
+            ),
+            // A full `/v1/prices?ids=` request must fit the API's 16 KiB
+            // request buffer (an id is about 33 bytes with its comma).
+            (
+                "price_query_max_batch",
+                u64::try_from(self.engine.price_query_max_batch).unwrap_or(u64::MAX),
+                1,
+                400,
+            ),
+            (
                 "maker_unconfirmed_cancel_after_secs",
                 self.engine.maker_unconfirmed_cancel_after_secs,
                 10,
@@ -664,7 +719,7 @@ impl SolverConfig {
             ),
         ] {
             if !(min..=max).contains(&value) {
-                return Err(ConfigError::MakerSettingOutOfRange {
+                return Err(ConfigError::SettingOutOfRange {
                     name,
                     value,
                     min,
@@ -796,6 +851,33 @@ mod tests {
         let mut config = example();
         change(&mut config);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn price_query_limits_must_be_in_range() {
+        let error = check(|c| c.engine.price_query_workers = 0);
+        assert!(error.contains("engine.price_query_workers"), "{error}");
+        let error = check(|c| c.engine.price_query_max_connections = 0);
+        assert!(
+            error.contains("engine.price_query_max_connections"),
+            "{error}"
+        );
+        let error = check(|c| c.engine.price_query_max_batch = 401);
+        assert!(error.contains("engine.price_query_max_batch"), "{error}");
+        let error = check(|c| c.engine.price_query_header_timeout_ms = 999);
+        assert!(
+            error.contains("engine.price_query_header_timeout_ms"),
+            "{error}"
+        );
+        accepted(|c| {
+            c.engine.price_query_workers = 1;
+            c.engine.price_query_max_connections = 1;
+            c.engine.price_query_header_timeout_ms = 1_000;
+        });
+        let defaults = example();
+        assert_eq!(defaults.engine.price_query_workers, 2);
+        assert_eq!(defaults.engine.price_query_max_connections, 1024);
+        assert_eq!(defaults.engine.price_query_header_timeout_ms, 75_000);
     }
 
     #[test]
